@@ -2,22 +2,36 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
+  <link rel="stylesheet" href="../common/theme.css" />
   <link rel="stylesheet" href="dashboard.css" />
   <title>meshscript — решения</title>
 </head>
 <body>
   <aside id="sidebar" class="sidebar">
-    <h2>История</h2>
-    <div id="sessions" class="sessions"></div>
+    <h2>Уроки недели</h2>
+    <div id="week" class="week"></div>
   </aside>
   <main class="main">
-    <header class="head"><h1 id="title">Решение</h1></header>
+    <header class="head">
+      <h1 id="title">Решение</h1>
+      <div class="actions">
+        <button id="themeBtn" title="Светлая/тёмная тема" class="iconbtn">🌙</button>
+        <button id="settingsBtn" title="Настройки" class="iconbtn">⚙️</button>
+      </div>
+    </header>
     <div id="chat" class="chat"></div>
-    <div class="composer">
-      <input id="file" type="file" accept=".pdf,.doc,.docx,image/*" />
-      <textarea id="input" placeholder="Уточните задание или задайте вопрос…"></textarea>
-      <button id="send">Отправить</button>
-    </div>
+    <footer class="composer">
+      <div id="filechip" class="filechip" hidden>
+        <span id="filename"></span>
+        <button id="clearfile" title="Убрать файл">✕</button>
+      </div>
+      <div class="row">
+        <button id="attach" class="attach" title="Прикрепить файл (PDF, Word, фото)">📎</button>
+        <input id="file" type="file" accept=".pdf,.doc,.docx,image/*" hidden />
+        <textarea id="input" placeholder="Уточните задание или задайте вопрос…"></textarea>
+        <button id="send" class="send" title="Отправить">↑</button>
+      </div>
+    </footer>
   </main>
   <script type="module" src="dashboard.js"></script>
 </body>

@@ -12,7 +12,8 @@ import { createSession, addMessage, listSessions, listMessages } from '../lib/su
 async function openDashboard(payload) {
   const url = chrome.runtime.getURL(
     `src/dashboard/dashboard.html?subject=${encodeURIComponent(payload.subject)}` +
-    `&task=${encodeURIComponent(payload.task || '')}`
+    `&task=${encodeURIComponent(payload.task || '')}` +
+    `&day=${encodeURIComponent(payload.day || '')}`
   );
   await chrome.tabs.create({ url });
 }

@@ -10,7 +10,7 @@
  *  3. Pair each SUBJECT with the following task-looking text, SKIPPING
  *     schedule noise (lesson times like "12:30 - 13:10", room numbers,
  *     UI labels), grouped under the most recent DATE header seen.
- *  4. Return the FIRST date group that has homework (next upcoming day).
+ *  4. Return EVERY date group that has homework (the whole visible week).
  *
  * A MESH_DEBUG message returns diagnostics so the selectors can be tuned
  * against the real page without guessing.
@@ -160,14 +160,17 @@ function pairSubjects(groupFrags) {
   return results;
 }
 
-/** Main scan: first day group that has homework = next upcoming day. */
+/** Main scan: every day group that has homework, in page order (the week). */
 function scanHomeworks() {
   const { groups } = buildGroups();
+  const days = [];
   for (const g of groups) {
     const subjects = pairSubjects(g.frags);
-    if (subjects.length) return { day: g.day, subjects };
+    if (subjects.length) days.push({ day: g.day, subjects });
   }
-  return { day: null, subjects: [] };
+  // Keep day/subjects of the nearest day for backwards compatibility.
+  const first = days[0] || { day: null, subjects: [] };
+  return { day: first.day, subjects: first.subjects, days };
 }
 
 /** Diagnostics for tuning against the real DOM. */

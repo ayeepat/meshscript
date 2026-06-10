@@ -13,8 +13,8 @@ browser session.
 manifest.json
 src/
   content/scraper.js          # DOM scraping, pattern/vocabulary based
-  popup/                      # subject list + Solve + file upload
-  dashboard/                  # full-window solve view with sidebar history
+  popup/                      # week of homework (collapsible days) + Solve + file upload
+  dashboard/                  # full-window solve view; sidebar = week's lessons
   settings/                   # keys, editable prompts, history viewer
   background/service-worker.js# Gemini + GDZ fallback + Supabase orchestration
   lib/                        # gemini.js, supabase.js, prompts.js, subject-router.js
@@ -56,9 +56,13 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 
 ### 6. Use it
 1. Log into Mesh and open `school.mos.ru/diary/homeworks/homeworks`.
-2. Click the extension icon. It scans the next upcoming day with homework.
-3. Press **Solve** on a subject to open the full-window dashboard, or upload a
-   file where prompted (PDF / Word / screenshot).
+2. Click the extension icon. It scans the whole visible week of homework;
+   each day is a collapsible section (the nearest day starts expanded).
+3. Press **Solve** on a subject to open the full-window dashboard. The
+   sidebar lists every lesson of the week — click one to solve it (the AI
+   is only called when you open a lesson, and each lesson keeps its own
+   chat while the tab is open). Solve history (7-day TTL) is viewable in
+   Settings, not in the sidebar.
 
 ## Notes & trade-offs
 - **No auth.** Rows are scoped by an anonymous `device_id`. With the anon key +

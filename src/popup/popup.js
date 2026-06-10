@@ -1,4 +1,7 @@
 /** Popup: scans active Mesh tab, renders subjects, handles uploads + Solve. */
+import { initTheme } from '../common/theme.js';
+
+initTheme();
 
 const FILE_KEYWORDS = ['pdf file', 'прикреплённые задания', 'файл', 'тест мэш', 'доделать упр'];
 const uploads = {}; // subject -> {mimeType, dataBase64, name}
@@ -61,63 +64,89 @@ function sendScan(tabId) {
   });
 }
 
+function buildCard(day, item) {
+  const card = document.createElement('div');
+  card.className = 'card';
+  card.innerHTML = `
+    <div class="subject"></div>
+    <div class="task"></div>
+    <div class="row"></div>`;
+  card.querySelector('.subject').textContent = item.subject;
+  card.querySelector('.task').textContent = item.task;
+  const row = card.querySelector('.row');
+
+  const solveBtn = document.createElement('button');
+  solveBtn.className = 'solve';
+  solveBtn.textContent = 'Solve';
+  solveBtn.onclick = () => {
+    chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', payload: { subject: item.subject, task: item.task, day } });
+  };
+  row.appendChild(solveBtn);
+
+  if (needsFile(item.task)) {
+    const drop = document.createElement('label');
+    drop.className = 'drop';
+    drop.textContent = '📎 Загрузить файл';
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.pdf,.doc,.docx,image/*';
+    input.style.display = 'none';
+    input.onchange = async () => {
+      if (input.files[0]) {
+        uploads[item.subject] = await fileToInline(input.files[0]);
+        drop.textContent = '✓ ' + uploads[item.subject].name;
+        drop.classList.add('has');
+      }
+    };
+    drop.appendChild(input);
+    drop.ondragover = (e) => { e.preventDefault(); };
+    drop.ondrop = async (e) => {
+      e.preventDefault();
+      if (e.dataTransfer.files[0]) {
+        uploads[item.subject] = await fileToInline(e.dataTransfer.files[0]);
+        drop.textContent = '✓ ' + uploads[item.subject].name;
+        drop.classList.add('has');
+      }
+    };
+    row.appendChild(drop);
+  }
+  return card;
+}
+
 function render(data) {
   const dayEl = document.getElementById('day');
   const listEl = document.getElementById('list');
-  dayEl.textContent = data.day || 'Ближайший день не найден';
+  const days = (data.days || []).filter((d) => d.subjects?.length);
   listEl.innerHTML = '';
-  if (!data.subjects?.length) {
+
+  if (!days.length) {
+    dayEl.textContent = 'Ближайший день не найден';
     listEl.innerHTML = '<p class="muted">Домашние задания не найдены на этой странице. Откройте страницу с домашними заданиями (можно прошлую дату) и нажмите на иконку снова.</p>';
     return;
   }
-  for (const item of data.subjects) {
-    const card = document.createElement('div');
-    card.className = 'card';
-    card.innerHTML = `
-      <div class="subject"></div>
-      <div class="task"></div>
-      <div class="row"></div>`;
-    card.querySelector('.subject').textContent = item.subject;
-    card.querySelector('.task').textContent = item.task;
-    const row = card.querySelector('.row');
 
-    const solveBtn = document.createElement('button');
-    solveBtn.className = 'solve';
-    solveBtn.textContent = 'Solve';
-    solveBtn.onclick = () => {
-      chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', payload: { subject: item.subject, task: item.task } });
-    };
-    row.appendChild(solveBtn);
+  dayEl.textContent = 'Домашние задания на неделю';
+  // Save the week scan so the dashboard sidebar can show it.
+  chrome.storage.local.set({ weekHomework: { days, scannedAt: Date.now() } });
 
-    if (needsFile(item.task)) {
-      const drop = document.createElement('label');
-      drop.className = 'drop';
-      drop.textContent = '📎 Загрузить файл';
-      const input = document.createElement('input');
-      input.type = 'file';
-      input.accept = '.pdf,.doc,.docx,image/*';
-      input.style.display = 'none';
-      input.onchange = async () => {
-        if (input.files[0]) {
-          uploads[item.subject] = await fileToInline(input.files[0]);
-          drop.textContent = '✓ ' + uploads[item.subject].name;
-          drop.classList.add('has');
-        }
-      };
-      drop.appendChild(input);
-      drop.ondragover = (e) => { e.preventDefault(); };
-      drop.ondrop = async (e) => {
-        e.preventDefault();
-        if (e.dataTransfer.files[0]) {
-          uploads[item.subject] = await fileToInline(e.dataTransfer.files[0]);
-          drop.textContent = '✓ ' + uploads[item.subject].name;
-          drop.classList.add('has');
-        }
-      };
-      row.appendChild(drop);
+  days.forEach((group, idx) => {
+    const details = document.createElement('details');
+    details.className = 'daygroup';
+    if (idx === 0) details.open = true; // nearest day starts expanded
+    const summary = document.createElement('summary');
+    const dname = document.createElement('span');
+    dname.className = 'dname';
+    dname.textContent = group.day || 'Без даты';
+    const count = document.createElement('span');
+    count.className = 'count';
+    count.textContent = group.subjects.length;
+    summary.append(dname, count);
+    details.appendChild(summary);
+    for (const item of group.subjects) {
+      details.appendChild(buildCard(group.day, item));
     }
-    listEl.appendChild(card);
-  }
+    listEl.appendChild(details);
+  });
 }
 
 async function init() {

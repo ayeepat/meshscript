@@ -1,5 +1,24 @@
-/** Settings: API keys, provider, editable base prompts, 7-day history viewer. */
+/** Settings: theme, API keys, provider, editable base prompts, 7-day history viewer. */
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
+import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
+
+initTheme();
+
+const segButtons = [...document.querySelectorAll('#themeSeg button')];
+
+function markActivePref(pref) {
+  for (const b of segButtons) b.classList.toggle('active', b.dataset.pref === pref);
+}
+
+for (const b of segButtons) {
+  b.onclick = async () => {
+    await setThemePref(b.dataset.pref);
+    markActivePref(b.dataset.pref);
+  };
+}
+getThemePref().then(markActivePref);
+// Follow theme changes made elsewhere (e.g. the dashboard toggle).
+document.addEventListener('themechange', async () => markActivePref(await getThemePref()));
 
 const KEY_FIELDS = ['openrouterApiKey', 'geminiApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);

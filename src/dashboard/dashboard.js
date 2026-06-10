@@ -1,15 +1,33 @@
-/** Full-window dashboard: sidebar history + chat solve view. */
+/**
+ * Full-window dashboard: week-of-homework sidebar + chat solve view.
+ * Each sidebar lesson keeps its own chat in this tab. The AI is only called
+ * when a lesson is opened for the first time (or you send a follow-up).
+ * Chat history (7-day TTL) lives in Settings, not here.
+ */
 import { buildFirstUserMessage } from '../lib/subject-router.js';
+import { initTheme, toggleTheme } from '../common/theme.js';
+
+// Keep the theme button icon in sync with the resolved theme.
+document.addEventListener('themechange', (e) => {
+  document.getElementById('themeBtn').textContent = e.detail === 'dark' ? '☀️' : '🌙';
+});
+initTheme();
 
 const params = new URLSearchParams(location.search);
-const subject = params.get('subject') || '';
+const initialSubject = params.get('subject') || '';
 const initialTask = params.get('task') || '';
-let sessionId = null;
-const history = []; // [{role:'user'|'assistant', content:string}] — sent to the AI for memory
+const initialDay = params.get('day') || '';
 
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
-titleEl.textContent = subject ? `${subject} — решение` : 'Решение';
+const weekEl = document.getElementById('week');
+
+// key -> { key, day, subject, task, sessionId, history: [{role, content}], started, pending }
+const chats = new Map();
+let activeKey = null;
+
+const keyFor = (day, subject) => `${day || '?'}||${subject}`;
+const activeChat = () => chats.get(activeKey);
 
 /* ---------- Minimal safe markdown renderer (no external libs) ---------- */
 
@@ -83,6 +101,17 @@ function bubble(role, text, { animate = false } = {}) {
   return d;
 }
 
+/** Re-render the whole chat from a lesson's stored history (no animation). */
+function renderChat(chat) {
+  chatEl.innerHTML = '';
+  if (!chat) {
+    chatEl.innerHTML = '<p class="hintmsg">Выберите урок слева, чтобы получить решение.</p>';
+    return;
+  }
+  for (const m of chat.history) bubble(m.role, m.content);
+  if (chat.pending) chat.thinkingEl = bubble('assistant', 'Думаю…');
+}
+
 function fileToInline(file) {
   return new Promise((resolve, reject) => {
     const r = new FileReader();
@@ -92,81 +121,167 @@ function fileToInline(file) {
   });
 }
 
-function send(task, files) {
-  const prior = history.slice(); // turns BEFORE this message
-  history.push({ role: 'user', content: task });
+/**
+ * Send a message within a lesson's chat. The response is appended to that
+ * lesson's history even if the user switched to another lesson meanwhile;
+ * the DOM is only touched when the lesson is the active one.
+ */
+function sendToChat(chat, text, files) {
+  const prior = chat.history.slice(); // turns BEFORE this message
+  chat.history.push({ role: 'user', content: text });
+  chat.pending = true;
+  if (activeKey === chat.key) {
+    bubble('user', text);
+    chat.thinkingEl = bubble('assistant', 'Думаю…');
+  }
+  renderSidebar();
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
-      { type: 'SOLVE', payload: { subject, task, files, sessionId, history: prior } },
+      { type: 'SOLVE', payload: { subject: chat.subject, task: text, files, sessionId: chat.sessionId, history: prior } },
       (resp) => {
+        chat.pending = false;
+        let answer;
         if (chrome.runtime.lastError || !resp?.ok) {
-          bubble('assistant', 'Ошибка: ' + (resp?.error || chrome.runtime.lastError?.message));
-          return resolve();
+          answer = 'Ошибка: ' + (resp?.error || chrome.runtime.lastError?.message);
+        } else {
+          chat.sessionId = resp.result.sessionId || chat.sessionId;
+          answer = resp.result.answer;
         }
-        sessionId = resp.result.sessionId || sessionId;
-        history.push({ role: 'assistant', content: resp.result.answer });
-        bubble('assistant', resp.result.answer, { animate: true });
+        chat.history.push({ role: 'assistant', content: answer });
+        if (activeKey === chat.key) {
+          chat.thinkingEl?.remove();
+          bubble('assistant', answer, { animate: true });
+        }
+        renderSidebar();
         resolve();
       }
     );
   });
 }
 
-async function loadSessions() {
-  chrome.runtime.sendMessage({ type: 'LIST_SESSIONS' }, (resp) => {
-    if (!resp?.ok) return;
-    const box = document.getElementById('sessions');
-    box.innerHTML = '';
-    for (const s of resp.sessions || []) {
-      const el = document.createElement('div');
-      el.className = 's';
-      el.textContent = `${s.subject || '?'}: ${(s.task_text || '').slice(0, 40)}`;
-      el.onclick = () => openSession(s);
-      box.appendChild(el);
-    }
-  });
+/** First open of a lesson: full subject prompt from Settings + the task. */
+async function startLesson(chat) {
+  chat.started = true;
+  const firstMessage = await buildFirstUserMessage(chat.subject, chat.task);
+  await sendToChat(chat, firstMessage, []);
 }
 
-function openSession(s) {
-  sessionId = s.id;
-  titleEl.textContent = `${s.subject} — решение`;
-  chatEl.innerHTML = '';
-  history.length = 0;
-  chrome.runtime.sendMessage({ type: 'LIST_MESSAGES', sessionId: s.id }, (resp) => {
-    if (!resp?.ok) return;
-    for (const m of resp.messages || []) {
-      const role = m.role === 'assistant' ? 'assistant' : 'user';
-      history.push({ role, content: m.content });
-      bubble(role, m.content); // no animation for restored history
-    }
-  });
+async function activateLesson(key) {
+  const chat = chats.get(key);
+  if (!chat || key === activeKey) return;
+  activeKey = key;
+  titleEl.textContent = `${chat.subject} — решение`;
+  renderChat(chat);
+  renderSidebar();
+  if (!chat.started) await startLesson(chat); // the only place the API gets triggered automatically
 }
 
-document.getElementById('send').onclick = async () => {
-  const input = document.getElementById('input');
-  const fileInput = document.getElementById('file');
-  const task = input.value.trim();
-  const files = fileInput.files[0] ? [await fileToInline(fileInput.files[0])] : [];
-  if (!task && !files.length) return;
-  bubble('user', task || ('📎 ' + files[0].name));
-  input.value = '';
-  fileInput.value = '';
-  const thinking = bubble('assistant', 'Думаю…');
-  await send(task, files);
-  thinking.remove();
-  loadSessions();
-};
+/* ---------- Sidebar: whole week, grouped by day, scrollable ---------- */
 
-// Auto-run the initial task from the popup:
-// first message = full subject prompt from Settings + the task itself.
-(async function init() {
-  await loadSessions();
-  if (initialTask) {
-    const firstMessage = await buildFirstUserMessage(subject, initialTask);
-    bubble('user', firstMessage);
-    const thinking = bubble('assistant', 'Думаю…');
-    await send(firstMessage, []);
-    thinking.remove();
-    loadSessions();
+function renderSidebar() {
+  weekEl.innerHTML = '';
+  if (!chats.size) {
+    weekEl.innerHTML = '<p class="hintmsg">Нет данных о неделе. Откройте попап на странице дневника, чтобы просканировать домашние задания.</p>';
+    return;
   }
+  let lastDay = null;
+  for (const chat of chats.values()) {
+    if (chat.day !== lastDay) {
+      lastDay = chat.day;
+      const hdr = document.createElement('div');
+      hdr.className = 'dayhdr';
+      hdr.textContent = chat.day || 'Без даты';
+      weekEl.appendChild(hdr);
+    }
+    const el = document.createElement('div');
+    el.className = 'lesson' + (chat.key === activeKey ? ' active' : '');
+    const status = chat.pending ? '⏳ ' : chat.started ? '✓ ' : '';
+    el.innerHTML = '<div class="subj"></div><div class="t"></div>';
+    el.querySelector('.subj').textContent = status + chat.subject;
+    el.querySelector('.t').textContent = (chat.task || '').slice(0, 80);
+    el.onclick = () => activateLesson(chat.key);
+    weekEl.appendChild(el);
+  }
+}
+
+/* ---------- Composer ---------- */
+
+const inputEl = document.getElementById('input');
+const fileInput = document.getElementById('file');
+const fileChip = document.getElementById('filechip');
+const fileNameEl = document.getElementById('filename');
+
+function clearAttachment() {
+  fileInput.value = '';
+  fileChip.hidden = true;
+}
+
+document.getElementById('attach').onclick = () => fileInput.click();
+fileInput.onchange = () => {
+  if (fileInput.files[0]) {
+    fileNameEl.textContent = '📎 ' + fileInput.files[0].name;
+    fileChip.hidden = false;
+  }
+};
+document.getElementById('clearfile').onclick = clearAttachment;
+
+async function sendFromComposer() {
+  const chat = activeChat();
+  if (!chat) return;
+  const text = inputEl.value.trim();
+  const files = fileInput.files[0] ? [await fileToInline(fileInput.files[0])] : [];
+  if (!text && !files.length) return;
+  inputEl.value = '';
+  clearAttachment();
+  await sendToChat(chat, text || ('📎 ' + files[0].name), files);
+}
+
+document.getElementById('send').onclick = sendFromComposer;
+inputEl.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendFromComposer();
+  }
+});
+
+document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
+document.getElementById('themeBtn').onclick = toggleTheme;
+
+/* ---------- Init: load week from the last popup scan ---------- */
+
+(async function init() {
+  const { weekHomework } = await chrome.storage.local.get('weekHomework');
+  for (const group of weekHomework?.days || []) {
+    for (const item of group.subjects || []) {
+      const key = keyFor(group.day, item.subject);
+      if (!chats.has(key)) {
+        chats.set(key, {
+          key, day: group.day, subject: item.subject, task: item.task,
+          sessionId: null, history: [], started: false, pending: false
+        });
+      }
+    }
+  }
+
+  // Lesson the user pressed "Solve" on. If it's missing from the saved week
+  // (e.g. opened from an old link), add it so it still works.
+  let startKey = null;
+  if (initialSubject) {
+    startKey = keyFor(initialDay, initialSubject);
+    if (!chats.has(startKey)) {
+      const match = [...chats.values()].find((c) => c.subject === initialSubject);
+      if (match) {
+        startKey = match.key;
+      } else {
+        chats.set(startKey, {
+          key: startKey, day: initialDay, subject: initialSubject, task: initialTask,
+          sessionId: null, history: [], started: false, pending: false
+        });
+      }
+    }
+  }
+
+  renderSidebar();
+  if (startKey) await activateLesson(startKey);
+  else renderChat(null);
 })();
