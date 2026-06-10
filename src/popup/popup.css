@@ -1,0 +1,16 @@
+* { box-sizing: border-box; }
+body { width: 380px; margin: 0; font-family: system-ui, sans-serif; background: #fafafa; color: #1a1a1a; }
+.top { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid #e5e5e5; }
+.top h1 { font-size: 15px; margin: 0; }
+.gear { background: none; border: none; font-size: 16px; cursor: pointer; }
+.day { padding: 8px 14px; font-weight: 600; color: #444; }
+.list { padding: 8px 14px 14px; }
+.muted { color: #999; font-size: 13px; }
+.card { background: #fff; border: 1px solid #e8e8e8; border-radius: 8px; padding: 10px; margin-bottom: 10px; }
+.card .subject { font-weight: 600; font-size: 13px; }
+.card .task { font-size: 12px; color: #555; margin: 4px 0 8px; white-space: pre-wrap; }
+.row { display: flex; gap: 8px; align-items: center; }
+.solve { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 12px; }
+.solve:hover { background: #1d4ed8; }
+.drop { border: 1.5px dashed #bbb; border-radius: 6px; padding: 8px; font-size: 11px; color: #777; text-align: center; flex: 1; cursor: pointer; }
+.drop.has { border-color: #2563eb; color: #2563eb; }

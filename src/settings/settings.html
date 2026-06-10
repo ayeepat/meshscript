@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <title>meshscript — настройки</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 30px auto; padding: 0 16px; color: #1a1a1a; }
+    h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 28px; }
+    label { display: block; font-size: 13px; margin: 10px 0 4px; font-weight: 600; }
+    input, textarea { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
+    textarea { min-height: 80px; }
+    button { margin-top: 14px; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 10px 16px; cursor: pointer; }
+    .ok { color: #16a34a; font-size: 13px; margin-left: 10px; }
+    .session { border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; margin: 6px 0; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>Настройки meshscript</h1>
+
+  <h2>Ключи API</h2>
+  <label>Gemini API Key</label>
+  <input id="geminiApiKey" type="password" placeholder="AIza..." />
+  <label>Supabase URL</label>
+  <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
+  <label>Supabase anon key</label>
+  <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
+
+  <h2>Базовые промпты (по категориям)</h2>
+  <label>Точные науки (Алгебра/Геометрия/Физика/Химия)</label>
+  <textarea id="p_worked_solution"></textarea>
+  <label>Языки (Английский) — только ответы</label>
+  <textarea id="p_direct_answer"></textarea>
+  <label>Параграфы (История/Общество/География) — конспект</label>
+  <textarea id="p_paragraph_summary"></textarea>
+  <label>Русский язык — полное упражнение</label>
+  <textarea id="p_russian_full"></textarea>
+
+  <div><button id="save">Сохранить</button><span id="status" class="ok"></span></div>
+
+  <h2>История (последние 7 дней)</h2>
+  <button id="reload">Обновить историю</button>
+  <div id="history"></div>
+
+  <script type="module" src="settings.js"></script>
+</body>
+</html>

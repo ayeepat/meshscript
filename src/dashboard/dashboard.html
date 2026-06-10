@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8" />
+  <link rel="stylesheet" href="dashboard.css" />
+  <title>meshscript — решения</title>
+</head>
+<body>
+  <aside id="sidebar" class="sidebar">
+    <h2>История</h2>
+    <div id="sessions" class="sessions"></div>
+  </aside>
+  <main class="main">
+    <header class="head"><h1 id="title">Решение</h1></header>
+    <div id="chat" class="chat"></div>
+    <div class="composer">
+      <input id="file" type="file" accept=".pdf,.doc,.docx,image/*" />
+      <textarea id="input" placeholder="Уточните задание или задайте вопрос…"></textarea>
+      <button id="send">Отправить</button>
+    </div>
+  </main>
+  <script type="module" src="dashboard.js"></script>
+</body>
+</html>

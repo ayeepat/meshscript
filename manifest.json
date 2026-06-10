@@ -1,0 +1,38 @@
+{
+  "manifest_version": 3,
+  "name": "meshscript",
+  "version": "0.1.0",
+  "description": "Personal homework assistant for the Mesh (school.mos.ru) platform.",
+  "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
+  "host_permissions": [
+    "https://school.mos.ru/*",
+    "https://*.supabase.co/*",
+    "https://generativelanguage.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "src/background/service-worker.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup/popup.html",
+    "default_title": "meshscript",
+    "default_icon": {
+      "16": "assets/icons/icon16.png",
+      "48": "assets/icons/icon48.png",
+      "128": "assets/icons/icon128.png"
+    }
+  },
+  "options_page": "src/settings/settings.html",
+  "icons": {
+    "16": "assets/icons/icon16.png",
+    "48": "assets/icons/icon48.png",
+    "128": "assets/icons/icon128.png"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://school.mos.ru/diary/homeworks/homeworks*"],
+      "js": ["src/content/scraper.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

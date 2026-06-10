@@ -1,0 +1,17 @@
+* { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { display: flex; font-family: system-ui, sans-serif; color: #1a1a1a; }
+.sidebar { width: 260px; background: #111827; color: #e5e7eb; padding: 16px; overflow-y: auto; }
+.sidebar h2 { font-size: 13px; text-transform: uppercase; color: #9ca3af; }
+.sessions .s { padding: 8px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+.sessions .s:hover { background: #1f2937; }
+.main { flex: 1; display: flex; flex-direction: column; height: 100vh; }
+.head { padding: 14px 20px; border-bottom: 1px solid #e5e7eb; }
+.head h1 { font-size: 16px; margin: 0; }
+.chat { flex: 1; overflow-y: auto; padding: 20px; background: #f9fafb; }
+.msg { max-width: 760px; margin-bottom: 14px; padding: 12px 14px; border-radius: 10px; white-space: pre-wrap; line-height: 1.5; }
+.msg.user { background: #dbeafe; margin-left: auto; }
+.msg.assistant { background: #fff; border: 1px solid #e5e7eb; }
+.composer { display: flex; gap: 8px; padding: 12px 20px; border-top: 1px solid #e5e7eb; align-items: flex-end; }
+.composer textarea { flex: 1; resize: vertical; min-height: 44px; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
+.composer button { background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 10px 16px; cursor: pointer; }
