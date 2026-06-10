@@ -1,9 +1,9 @@
 /**
  * Background service worker (MV3, type: module).
- * Orchestrates: GDZ fallback attempt -> Gemini, and Supabase persistence.
+ * Orchestrates: GDZ fallback attempt -> AI provider, and Supabase persistence.
  * All API keys live here / in storage, never in content scripts.
  */
-import { askGemini } from '../lib/gemini.js';
+import { askAI } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/supabase.js';
@@ -18,16 +18,14 @@ async function openDashboard(payload) {
 }
 
 /**
- * Best-effort GDZ (reshebnik) lookup. EXPECTED TO OFTEN FAIL: GDZ sites are
- * Cloudflare-protected and block cross-origin fetches. We try once, swallow
- * any error, and let the caller fall back to Gemini-direct (the reliable path).
+ * Best-effort GDZ (reshebnik) lookup.
+ * REALITY CHECK: GDZ is behind Cloudflare's JS challenge; a programmatic
+ * fetch() from an extension is blocked by Cloudflare + CORS. There is no
+ * reliable automated scrape. We attempt a best-effort fetch (expected to
+ * fail) and ALWAYS return a clickable search URL for manual verification.
+ * The AI provider remains the reliable solver.
  */
 async function tryGdz(subject, task) {
-  // REALITY CHECK: GDZ is behind Cloudflare's JS challenge; a programmatic
-  // fetch() from an extension is blocked by Cloudflare + CORS. There is no
-  // reliable automated scrape. We attempt a best-effort fetch (expected to
-  // fail) and ALWAYS return a clickable search URL for manual verification.
-  // Gemini-direct remains the reliable solver.
   const __gdzSearchUrl = 'https://gdz.ru/search/?search=' + encodeURIComponent((subject + ' ' + task).trim());
   try {
     const res = await fetch(__gdzSearchUrl, { method: 'GET', redirect: 'follow' });
@@ -38,11 +36,11 @@ async function tryGdz(subject, task) {
     }
     return { html, searchUrl: __gdzSearchUrl };
   } catch (_e) {
-    return { html: null, searchUrl: __gdzSearchUrl }; // blocked -> Gemini handles it
+    return { html: null, searchUrl: __gdzSearchUrl }; // blocked -> AI handles it
   }
 }
 
-/** Solve a task: GDZ first (best-effort), then Gemini. Persist to Supabase. */
+/** Solve a task: GDZ first (best-effort), then AI. Persist to Supabase. */
 async function solve({ subject, task, files = [], sessionId = null }) {
   const category = categoryForSubject(subject);
 
@@ -55,10 +53,10 @@ async function solve({ subject, task, files = [], sessionId = null }) {
     }
   }
 
-  await tryGdz(subject, task); // currently always returns null; reliable path is Gemini
+  await tryGdz(subject, task); // best-effort only; reliable path is the AI provider
 
   const systemPrompt = await buildSystemPrompt(subject);
-  const answer = await askGemini(systemPrompt, task || '(см. вложение)', files);
+  const answer = await askAI(systemPrompt, task || '(см. вложение)', files);
 
   // Persist (non-fatal if Supabase not configured).
   try {

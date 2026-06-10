@@ -1,12 +1,13 @@
-/** Settings: API keys, editable base prompts, 7-day history viewer. */
+/** Settings: API keys, provider, editable base prompts, 7-day history viewer. */
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 
-const KEY_FIELDS = ['geminiApiKey', 'supabaseUrl', 'supabaseAnonKey'];
+const KEY_FIELDS = ['geminiApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 
 async function load() {
-  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides']);
+  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides', 'aiProvider']);
   for (const f of KEY_FIELDS) document.getElementById(f).value = stored[f] || '';
+  document.getElementById('aiProvider').value = stored.aiProvider || 'groq';
   const overrides = stored.promptOverrides || {};
   for (const cat of CATS) {
     document.getElementById('p_' + cat).value = overrides[cat] || DEFAULT_PROMPTS[cat];
@@ -16,6 +17,7 @@ async function load() {
 async function save() {
   const data = {};
   for (const f of KEY_FIELDS) data[f] = document.getElementById(f).value.trim();
+  data.aiProvider = document.getElementById('aiProvider').value;
   const promptOverrides = {};
   for (const cat of CATS) {
     const v = document.getElementById('p_' + cat).value.trim();

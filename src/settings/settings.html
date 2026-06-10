@@ -7,17 +7,28 @@
     body { font-family: system-ui, sans-serif; max-width: 720px; margin: 30px auto; padding: 0 16px; color: #1a1a1a; }
     h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 28px; }
     label { display: block; font-size: 13px; margin: 10px 0 4px; font-weight: 600; }
-    input, textarea { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
+    input, textarea, select { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
     textarea { min-height: 80px; }
     button { margin-top: 14px; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 10px 16px; cursor: pointer; }
     .ok { color: #16a34a; font-size: 13px; margin-left: 10px; }
     .session { border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; margin: 6px 0; font-size: 13px; }
+    .hint { font-size: 12px; color: #777; margin: 2px 0 0; }
   </style>
 </head>
 <body>
   <h1>Настройки meshscript</h1>
 
+  <h2>AI-провайдер</h2>
+  <label>Провайдер</label>
+  <select id="aiProvider">
+    <option value="groq">Groq (бесплатно, без карты)</option>
+    <option value="gemini">Gemini</option>
+  </select>
+  <p class="hint">Groq: бесплатный ключ на https://console.groq.com/keys</p>
+
   <h2>Ключи API</h2>
+  <label>Groq API Key</label>
+  <input id="groqApiKey" type="password" placeholder="gsk_..." />
   <label>Gemini API Key</label>
   <input id="geminiApiKey" type="password" placeholder="AIza..." />
   <label>Supabase URL</label>
@@ -30,7 +41,7 @@
   <textarea id="p_worked_solution"></textarea>
   <label>Языки (Английский) — только ответы</label>
   <textarea id="p_direct_answer"></textarea>
-  <label>Параграфы (История/Общество/География) — конспект</label>
+  <label>Параграфы (История/Обществознание/География) — конспект</label>
   <textarea id="p_paragraph_summary"></textarea>
   <label>Русский язык — полное упражнение</label>
   <textarea id="p_russian_full"></textarea>
