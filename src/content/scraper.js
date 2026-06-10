@@ -4,19 +4,12 @@
  * Mesh (school.mos.ru) is a React/MUI app with OBFUSCATED, randomly
  * generated class names. We never rely on class names.
  *
- * Real-world facts this version handles:
- *  - The homeworks page is usually ONE scrollable list, not per-day cards.
- *  - Subject name and task text are typically in SEPARATE sibling nodes,
- *    not nested, so we pair a subject node with the nearest following
- *    task-looking text rather than reading an ancestor's combined text.
- *  - Task text may be short on screen and fully present only after expand;
- *    we read whatever is in the DOM and let the user upload a file if needed.
- *
  * Strategy:
  *  1. Walk all visible text nodes in document order (TreeWalker).
  *  2. Tag each as: DATE header, SUBJECT, or other TEXT.
- *  3. Pair each SUBJECT with the nearest following task-looking TEXT,
- *     grouped under the most recent DATE header seen.
+ *  3. Pair each SUBJECT with the following task-looking text, SKIPPING
+ *     schedule noise (lesson times like "12:30 - 13:10", room numbers,
+ *     UI labels), grouped under the most recent DATE header seen.
  *  4. Return the FIRST date group that has homework (next upcoming day).
  *
  * A MESH_DEBUG message returns diagnostics so the selectors can be tuned
@@ -36,10 +29,35 @@ const MONTH = 'января|февраля|марта|апреля|мая|июн
 const DATE_RE = new RegExp('\\b\\d{1,2}\\s+(?:' + MONTH + ')\\b|\\b\\d{1,2}[./]\\d{1,2}(?:[./]\\d{2,4})?\\b', 'i');
 
 // A text looks like a task if it has numbering/markers or is reasonably long.
-const TASK_MARKER_RE = /(№|§|п\.|стр\.|упр|задани|параграф|читать|выучить|реш|номер|ex\.?\s*\d|p\.\s*\d|страниц)/i;
+const TASK_MARKER_RE = /(№|§|п\.|стр\.|упр|задани|параграф|читать|выучить|реш|номер|подготов|характерист|пересказ|сочинени|конспект|ex\.?\s*\d|p\.\s*\d|страниц)/i;
+
+// Schedule/UI noise that must NEVER become the task text.
+const TIME_RE = /^\d{1,2}:\d{2}(\s*[-–—]\s*\d{1,2}:\d{2})?$/;
+const NOISE_RE = new RegExp(
+  '^(?:' +
+  [
+    'урок\\s*№?\\s*\\d*',
+    'каб(?:инет)?\\.?\\s*\\S*',
+    'домашн(?:ее|ие)\\s+задани[ея]',
+    'оценок нет', 'нет оценок', 'оценки', 'оценка',
+    'показать (?:ещё|еще|все)', 'свернуть', 'развернуть', 'подробнее',
+    'перейти к уроку', 'комментарий учителя', 'прикреплённые материалы',
+    'учитель[:\\s].*', 'тема урока'
+  ].join('|') +
+  ')$', 'i'
+);
 
 function normalize(text) {
   return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+function isNoise(text) {
+  const t = normalize(text);
+  if (!t) return true;
+  if (TIME_RE.test(t)) return true;                 // "12:30 - 13:10", "08:30"
+  if (NOISE_RE.test(t)) return true;                // UI labels, rooms, etc.
+  if (/^[\d\s:№.,;\-–—()/]+$/.test(t)) return true; // digits/punctuation only
+  return false;
 }
 
 function matchSubject(text) {
@@ -84,6 +102,7 @@ function collectTextFragments() {
 }
 
 function classify(text) {
+  if (TIME_RE.test(text)) return 'NOISE'; // never treat a lesson time as a date
   if ((DATE_RE.test(text) || WEEKDAY_RE.test(text)) && text.length <= 60) return 'DATE';
   if (matchSubject(text)) return 'SUBJECT';
   return 'TEXT';
@@ -110,23 +129,29 @@ function buildGroups() {
   return { frags, groups };
 }
 
-/** Pair subjects with the nearest following task text. */
+/**
+ * Pair subjects with the following task text.
+ * Skips noise (times, rooms, UI labels) and keeps collecting real task
+ * fragments until the next subject/date, a size cap, or the window ends.
+ */
 function pairSubjects(groupFrags) {
   const results = [];
   const seen = new Set();
   for (let i = 0; i < groupFrags.length; i++) {
     const subject = matchSubject(groupFrags[i].text);
     if (!subject) continue;
-    let task = '';
-    for (let j = i + 1; j < Math.min(i + 7, groupFrags.length); j++) {
+    const pieces = [];
+    for (let j = i + 1; j < Math.min(i + 20, groupFrags.length); j++) {
       const cand = groupFrags[j].text;
-      if (matchSubject(cand)) break;
-      if (TASK_MARKER_RE.test(cand) || cand.length >= 8) {
-        task = task ? (task + ' ' + cand) : cand;
-        if (task.length > 12) break;
+      if (matchSubject(cand)) break;            // next lesson starts
+      if (classify(cand) === 'DATE') break;     // next day starts
+      if (isNoise(cand)) continue;              // time slot, room, UI label
+      if (TASK_MARKER_RE.test(cand) || cand.length >= 12) {
+        pieces.push(cand);
+        if (pieces.join(' ').length >= 500) break; // enough text collected
       }
     }
-    task = normalize(task);
+    const task = normalize(pieces.join(' '));
     const key = subject + '||' + task.slice(0, 60);
     if (seen.has(key)) continue;
     seen.add(key);
@@ -152,7 +177,7 @@ function debugScan() {
     totalFragments: frags.length,
     dateHeaders: groups.map((g) => g.day).filter(Boolean).slice(0, 20),
     subjectsSeen: frags.map((f) => matchSubject(f.text)).filter(Boolean).slice(0, 40),
-    sample: frags.slice(0, 60).map((f) => ({ kind: classify(f.text), text: f.text.slice(0, 80) }))
+    sample: frags.slice(0, 80).map((f) => ({ kind: classify(f.text), noise: isNoise(f.text), text: f.text.slice(0, 80) }))
   };
 }
 
