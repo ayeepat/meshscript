@@ -178,7 +178,7 @@ async function solveTestOnScreen() {
   const box = document.getElementById('testAnswer');
   btn.disabled = true;
   box.hidden = false;
-  box.textContent = 'Смотрю на экран…';
+  box.textContent = '👀 Смотрю…';
   try {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
@@ -197,7 +197,7 @@ async function solveTestOnScreen() {
     const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'jpeg', quality: 85 });
     const screenshot = { mimeType: 'image/jpeg', dataBase64: dataUrl.split(',')[1], name: 'screen.jpg' };
 
-    box.textContent = 'Решаю…';
+    box.textContent = '🧠 Решаю…';
     const resp = await new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot } }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
@@ -221,6 +221,8 @@ function showTab(which) {
   document.getElementById('testView').hidden = !isTest;
   document.getElementById('tabHw').classList.toggle('active', !isTest);
   document.getElementById('tabTest').classList.toggle('active', isTest);
+  // Shrink the popup on the test tab so it covers less of the page underneath.
+  document.body.classList.toggle('compact', isTest);
 }
 
 async function scanHomework() {

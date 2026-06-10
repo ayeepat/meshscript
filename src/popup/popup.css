@@ -5,7 +5,19 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
   background: var(--bg); color: var(--text);
   -webkit-font-smoothing: antialiased;
+  transition: width 0.15s ease;
 }
+/* Compact mode: shown when the Тест tab is active so the popup covers less
+   of the page underneath. */
+body.compact { width: 240px; }
+body.compact .top { padding: 8px 12px 6px; }
+body.compact .top h1 { font-size: 14px; }
+body.compact .gear { width: 26px; height: 26px; font-size: 12px; }
+body.compact .tabs { margin: 6px 12px 0; padding: 2px; }
+body.compact .tab { padding: 5px 0; font-size: 12px; }
+body.compact .testview { padding: 8px 12px 12px; }
+body.compact .bigbtn { padding: 9px 12px; font-size: 13px; border-radius: 10px; }
+body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; line-height: 1.5; border-radius: 10px; }
 .top {
   display: flex; align-items: center; justify-content: space-between;
   padding: 14px 16px 10px;
