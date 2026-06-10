@@ -1,6 +1,6 @@
 /**
  * Background service worker (MV3, type: module).
- * Orchestrates: GDZ fallback attempt -> AI provider, and Supabase persistence.
+ * Orchestrates the AI provider call and Supabase persistence.
  * All API keys live here / in storage, never in content scripts.
  */
 import { askAI } from '../lib/ai.js';
@@ -18,30 +18,12 @@ async function openDashboard(payload) {
   await chrome.tabs.create({ url });
 }
 
-/**
- * Best-effort GDZ (reshebnik) lookup.
- * REALITY CHECK: GDZ is behind Cloudflare's JS challenge; a programmatic
- * fetch() from an extension is blocked by Cloudflare + CORS. There is no
- * reliable automated scrape. We attempt a best-effort fetch (expected to
- * fail) and ALWAYS return a clickable search URL for manual verification.
- * The AI provider remains the reliable solver.
- */
-async function tryGdz(subject, task) {
-  const __gdzSearchUrl = 'https://gdz.ru/search/?search=' + encodeURIComponent((subject + ' ' + task).trim());
-  try {
-    const res = await fetch(__gdzSearchUrl, { method: 'GET', redirect: 'follow' });
-    if (!res.ok) return { html: null, searchUrl: __gdzSearchUrl };
-    const html = await res.text();
-    if (/cloudflare|cf-browser-verification|challenge-platform|just a moment/i.test(html)) {
-      return { html: null, searchUrl: __gdzSearchUrl };
-    }
-    return { html, searchUrl: __gdzSearchUrl };
-  } catch (_e) {
-    return { html: null, searchUrl: __gdzSearchUrl }; // blocked -> AI handles it
-  }
-}
+// NOTE: an earlier version attempted a GDZ (reshebnik) lookup before the AI
+// call. GDZ sits behind Cloudflare's JS challenge, the fetch always failed,
+// and its result was discarded — it only added latency to every solve. The
+// AI provider is the solver.
 
-/** Solve a task: GDZ first (best-effort), then AI with chat history. Persist to Supabase. */
+/** Solve a task with the AI provider + chat history. Persist to Supabase. */
 async function solve({ subject, task, files = [], sessionId = null, history = [] }) {
   const category = categoryForSubject(subject);
 
@@ -53,8 +35,6 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
       return { answer: ask, needsUpload: true, sessionId };
     }
   }
-
-  await tryGdz(subject, task); // best-effort only; reliable path is the AI provider
 
   const systemPrompt = await buildSystemPrompt(subject);
   const answer = await askAI(systemPrompt, task || '(см. вложение)', files, history);

@@ -19,9 +19,10 @@ async function getKey() {
  * @param {string} systemPrompt
  * @param {string} userText
  * @param {Array<{mimeType:string, dataBase64:string}>} files inline files
+ * @param {Array<{role:string, content:string}>} history prior chat turns
  * @returns {Promise<string>}
  */
-export async function askGemini(systemPrompt, userText, files = []) {
+export async function askGemini(systemPrompt, userText, files = [], history = []) {
   const key = await getKey();
   const parts = [{ text: userText }];
   for (const f of files) {
@@ -29,7 +30,10 @@ export async function askGemini(systemPrompt, userText, files = []) {
   }
   const body = {
     system_instruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: 'user', parts }]
+    contents: [
+      ...history.map((m) => ({ role: m.role === 'assistant' ? 'model' : 'user', parts: [{ text: m.content }] })),
+      { role: 'user', parts }
+    ]
   };
   const res = await fetch(ENDPOINT(key), {
     method: 'POST',

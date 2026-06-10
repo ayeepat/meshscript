@@ -16,7 +16,7 @@ src/
   popup/                      # week of homework (collapsible days) + Solve + file upload
   dashboard/                  # full-window solve view; sidebar = week's lessons
   settings/                   # keys, editable prompts, history viewer
-  background/service-worker.js# Gemini + GDZ fallback + Supabase orchestration
+  background/service-worker.js# AI provider + Supabase orchestration
   lib/                        # gemini.js, supabase.js, prompts.js, subject-router.js
 supabase/schema.sql           # tables + pg_cron 7-day auto-delete
 assets/icons/                 # icon16/48/128.png (you add these)
@@ -68,8 +68,10 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 - **No auth.** Rows are scoped by an anonymous `device_id`. With the anon key +
   permissive RLS, anyone with the key could access data. Fine for a private
   2–3 user tool; do not publish the anon key.
-- **GDZ fallback** is best-effort only. GDZ/reshebnik sites are Cloudflare
-  protected and usually block cross-origin fetches, so the reliable path is
-  Gemini-direct. See comments in `service-worker.js`.
+- **No GDZ scraping.** GDZ/reshebnik sites sit behind Cloudflare and block
+  cross-origin fetches, so the AI provider is the solver (a best-effort GDZ
+  fetch existed earlier and was removed — it only added latency).
+- **Popup file uploads** attached next to a task are handed to the dashboard
+  and included with the lesson's first AI message.
 - **Russian language guard:** a bare “Упр. 25” with no uploaded page photo makes
   the assistant ask for a photo instead of inventing the exercise text.

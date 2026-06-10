@@ -4,8 +4,8 @@
  * when a lesson is opened for the first time (or you send a follow-up).
  * Chat history (7-day TTL) lives in Settings, not here.
  */
-import { buildFirstUserMessage } from '../lib/subject-router.js';
 import { initTheme, toggleTheme } from '../common/theme.js';
+import { extractMath, restoreMath } from '../common/tex.js';
 
 // Keep the theme button icon in sync with the resolved theme.
 document.addEventListener('themechange', (e) => {
@@ -26,7 +26,8 @@ const weekEl = document.getElementById('week');
 const chats = new Map();
 let activeKey = null;
 
-const keyFor = (day, subject) => `${day || '?'}||${subject}`;
+// Task is part of the key: one subject can have two homeworks in a day.
+const keyFor = (day, subject, task) => `${day || '?'}||${subject}||${(task || '').slice(0, 40)}`;
 const activeChat = () => chats.get(activeKey);
 
 /* ---------- Minimal safe markdown renderer (no external libs) ---------- */
@@ -43,7 +44,9 @@ function inlineMd(s) {
 }
 
 function mdToHtml(md) {
-  const lines = escapeHtml(md).split(/\r?\n/);
+  // Pull LaTeX out first so markdown processing can't mangle *, _ inside it.
+  const { text, chunks } = extractMath(md);
+  const lines = escapeHtml(text).split(/\r?\n/);
   let html = '';
   let list = null; // 'ul' | 'ol'
   const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
@@ -66,7 +69,7 @@ function mdToHtml(md) {
     html += `<p>${inlineMd(line)}</p>`;
   }
   closeList();
-  return html;
+  return restoreMath(html, chunks);
 }
 
 /* ---------- Typewriter: starts slow, accelerates, finishes fast ---------- */
@@ -75,6 +78,7 @@ function typewriter(el, fullText) {
   let i = 0;
   let chunk = 1; // chars per frame; grows each frame -> accelerating reveal
   function step() {
+    if (!el.isConnected) return; // user switched lessons mid-animation
     i += Math.round(chunk);
     chunk = Math.min(chunk * 1.08 + 0.3, 60);
     el.innerHTML = mdToHtml(fullText.slice(0, i));
@@ -159,11 +163,26 @@ function sendToChat(chat, text, files) {
   });
 }
 
-/** First open of a lesson: full subject prompt from Settings + the task. */
+/**
+ * First open of a lesson: send the task as-is. The subject prompt from
+ * Settings is applied as the SYSTEM prompt by the service worker — sending
+ * it here too would duplicate it and break the bare-"Упр. N" photo guard.
+ * If the popup attached a file for this lesson, include it.
+ */
 async function startLesson(chat) {
   chat.started = true;
-  const firstMessage = await buildFirstUserMessage(chat.subject, chat.task);
-  await sendToChat(chat, firstMessage, []);
+  let text = chat.task;
+  let files = [];
+  try {
+    const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
+    if (pendingUpload?.file && pendingUpload.subject === chat.subject &&
+        (!pendingUpload.day || pendingUpload.day === chat.day)) {
+      files = [pendingUpload.file];
+      text += '\n\n📎 ' + (pendingUpload.file.name || 'файл');
+      await chrome.storage.local.remove('pendingUpload');
+    }
+  } catch (_e) { /* upload is best-effort */ }
+  await sendToChat(chat, text, files);
 }
 
 async function activateLesson(key) {
@@ -253,7 +272,7 @@ document.getElementById('themeBtn').onclick = toggleTheme;
   const { weekHomework } = await chrome.storage.local.get('weekHomework');
   for (const group of weekHomework?.days || []) {
     for (const item of group.subjects || []) {
-      const key = keyFor(group.day, item.subject);
+      const key = keyFor(group.day, item.subject, item.task);
       if (!chats.has(key)) {
         chats.set(key, {
           key, day: group.day, subject: item.subject, task: item.task,
@@ -263,21 +282,24 @@ document.getElementById('themeBtn').onclick = toggleTheme;
     }
   }
 
-  // Lesson the user pressed "Solve" on. If it's missing from the saved week
-  // (e.g. opened from an old link), add it so it still works.
+  // Lesson the user pressed "Solve" on. Match it against the saved week,
+  // loosening the criteria step by step; if it's missing entirely (e.g.
+  // opened from an old link), add it so it still works.
   let startKey = null;
   if (initialSubject) {
-    startKey = keyFor(initialDay, initialSubject);
-    if (!chats.has(startKey)) {
-      const match = [...chats.values()].find((c) => c.subject === initialSubject);
-      if (match) {
-        startKey = match.key;
-      } else {
-        chats.set(startKey, {
-          key: startKey, day: initialDay, subject: initialSubject, task: initialTask,
-          sessionId: null, history: [], started: false, pending: false
-        });
-      }
+    const all = [...chats.values()];
+    const match =
+      all.find((c) => c.day === initialDay && c.subject === initialSubject && c.task === initialTask) ||
+      all.find((c) => c.subject === initialSubject && c.task === initialTask) ||
+      all.find((c) => c.subject === initialSubject);
+    if (match) {
+      startKey = match.key;
+    } else {
+      startKey = keyFor(initialDay, initialSubject, initialTask);
+      chats.set(startKey, {
+        key: startKey, day: initialDay, subject: initialSubject, task: initialTask,
+        sessionId: null, history: [], started: false, pending: false
+      });
     }
   }
 

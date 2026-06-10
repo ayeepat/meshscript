@@ -4,7 +4,7 @@ import { initTheme } from '../common/theme.js';
 initTheme();
 
 const FILE_KEYWORDS = ['pdf file', 'прикреплённые задания', 'файл', 'тест мэш', 'доделать упр'];
-const uploads = {}; // subject -> {mimeType, dataBase64, name}
+const uploads = {}; // `${day}||${subject}` -> {mimeType, dataBase64, name}
 
 function needsFile(task) {
   const t = (task || '').toLowerCase();
@@ -75,10 +75,18 @@ function buildCard(day, item) {
   card.querySelector('.task').textContent = item.task;
   const row = card.querySelector('.row');
 
+  const upKey = `${day || '?'}||${item.subject}`;
+
   const solveBtn = document.createElement('button');
   solveBtn.className = 'solve';
   solveBtn.textContent = 'Solve';
-  solveBtn.onclick = () => {
+  solveBtn.onclick = async () => {
+    // Hand the attached file (if any) to the dashboard via storage.
+    if (uploads[upKey]) {
+      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, file: uploads[upKey] } });
+    } else {
+      await chrome.storage.local.remove('pendingUpload'); // drop stale leftovers
+    }
     chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', payload: { subject: item.subject, task: item.task, day } });
   };
   row.appendChild(solveBtn);
@@ -91,22 +99,17 @@ function buildCard(day, item) {
     input.type = 'file';
     input.accept = '.pdf,.doc,.docx,image/*';
     input.style.display = 'none';
-    input.onchange = async () => {
-      if (input.files[0]) {
-        uploads[item.subject] = await fileToInline(input.files[0]);
-        drop.textContent = '✓ ' + uploads[item.subject].name;
-        drop.classList.add('has');
-      }
+    const setFile = async (file) => {
+      uploads[upKey] = await fileToInline(file);
+      drop.textContent = '✓ ' + uploads[upKey].name;
+      drop.classList.add('has');
     };
+    input.onchange = () => { if (input.files[0]) setFile(input.files[0]); };
     drop.appendChild(input);
     drop.ondragover = (e) => { e.preventDefault(); };
-    drop.ondrop = async (e) => {
+    drop.ondrop = (e) => {
       e.preventDefault();
-      if (e.dataTransfer.files[0]) {
-        uploads[item.subject] = await fileToInline(e.dataTransfer.files[0]);
-        drop.textContent = '✓ ' + uploads[item.subject].name;
-        drop.classList.add('has');
-      }
+      if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
     };
     row.appendChild(drop);
   }

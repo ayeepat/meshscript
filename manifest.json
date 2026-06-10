@@ -3,7 +3,7 @@
   "name": "meshscript",
   "version": "0.2.0",
   "description": "Personal homework assistant for the Mesh (school.mos.ru) platform.",
-  "permissions": ["storage", "activeTab", "scripting", "sidePanel"],
+  "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [
     "https://school.mos.ru/*",
     "https://*.supabase.co/*",

@@ -24,9 +24,10 @@ async function getKey() {
  * @param {string} systemPrompt
  * @param {string} userText
  * @param {Array<{mimeType:string, dataBase64:string}>} files inline files
+ * @param {Array<{role:string, content:string}>} history prior chat turns
  * @returns {Promise<string>}
  */
-export async function askGroq(systemPrompt, userText, files = []) {
+export async function askGroq(systemPrompt, userText, files = [], history = []) {
   const key = await getKey();
   const hasImages = files.some((f) => (f.mimeType || '').startsWith('image/'));
   const model = hasImages ? VISION_MODEL : TEXT_MODEL;
@@ -52,7 +53,10 @@ export async function askGroq(systemPrompt, userText, files = []) {
     model,
     messages: [
       { role: 'system', content: systemPrompt },
-      { role: 'user', content: hasImages ? userContent : userText }
+      ...history.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+      // files.length (not hasImages): a PDF/Word attachment still needs its
+      // "can't read this directly" note delivered to the model.
+      { role: 'user', content: files.length ? userContent : userText }
     ],
     temperature: 0.3
   };

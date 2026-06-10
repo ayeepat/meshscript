@@ -35,12 +35,3 @@ export async function buildSystemPrompt(subject) {
   const base = await basePromptForSubject(subject);
   return `${base}\n\nПредмет: ${subject}.`;
 }
-
-/**
- * Build the FIRST user message for a new solve session:
- * the full subject prompt from Settings, then the task itself.
- */
-export async function buildFirstUserMessage(subject, task) {
-  const base = await basePromptForSubject(subject);
-  return `${base}\n\nВот задание, которое нужно выполнить:\n${task}`;
-}
