@@ -4,52 +4,95 @@
   <meta charset="UTF-8" />
   <title>meshscript — настройки</title>
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 720px; margin: 30px auto; padding: 0 16px; color: #1a1a1a; }
-    h1 { font-size: 20px; } h2 { font-size: 15px; margin-top: 28px; }
-    label { display: block; font-size: 13px; margin: 10px 0 4px; font-weight: 600; }
-    input, textarea, select { width: 100%; padding: 8px; border: 1px solid #d1d5db; border-radius: 6px; font: inherit; }
-    textarea { min-height: 80px; }
-    button { margin-top: 14px; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 10px 16px; cursor: pointer; }
-    .ok { color: #16a34a; font-size: 13px; margin-left: 10px; }
-    .session { border: 1px solid #e5e7eb; border-radius: 6px; padding: 8px; margin: 6px 0; font-size: 13px; }
-    .hint { font-size: 12px; color: #777; margin: 2px 0 0; }
+    :root {
+      --bg: #F2F2F7; --card: #FFFFFF; --text: #1C1C1E; --secondary: #8E8E93;
+      --accent: #007AFF; --separator: rgba(60, 60, 67, 0.12); --green: #34C759;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
+      max-width: 720px; margin: 0 auto; padding: 32px 20px 60px;
+      background: var(--bg); color: var(--text);
+      -webkit-font-smoothing: antialiased;
+    }
+    h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.4px; margin: 0 0 24px; }
+    h2 {
+      font-size: 13px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.5px; color: var(--secondary); margin: 28px 0 8px 16px;
+    }
+    .group { background: var(--card); border-radius: 18px; padding: 6px 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }
+    label { display: block; font-size: 13px; margin: 14px 0 6px; font-weight: 600; }
+    input, textarea, select {
+      width: 100%; padding: 11px 14px; border: none; background: var(--bg);
+      border-radius: 12px; font: inherit; font-size: 14px; color: var(--text);
+      outline: none; transition: box-shadow 0.15s ease;
+    }
+    input:focus, textarea:focus, select:focus { box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.25); }
+    textarea { min-height: 90px; resize: vertical; }
+    select { appearance: none; -webkit-appearance: none; cursor: pointer; }
+    .group > :last-child { margin-bottom: 14px; }
+    button {
+      margin-top: 18px; background: var(--accent); color: #fff; border: none;
+      border-radius: 14px; padding: 13px 22px; cursor: pointer;
+      font: inherit; font-size: 15px; font-weight: 600;
+      transition: transform 0.1s ease, filter 0.15s ease;
+    }
+    button:hover { filter: brightness(1.08); }
+    button:active { transform: scale(0.97); }
+    .ok { color: var(--green); font-size: 14px; font-weight: 600; margin-left: 12px; }
+    .session {
+      background: var(--card); border-radius: 14px; padding: 12px 16px;
+      margin: 8px 0; font-size: 13px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .hint { font-size: 12px; color: var(--secondary); margin: 6px 0 0; }
+    #history { margin-top: 8px; }
+    .secondary-btn { background: var(--card); color: var(--accent); box-shadow: 0 1px 2px rgba(0,0,0,0.06); }
   </style>
 </head>
 <body>
-  <h1>Настройки meshscript</h1>
+  <h1>Настройки</h1>
 
   <h2>AI-провайдер</h2>
-  <label>Провайдер</label>
-  <select id="aiProvider">
-    <option value="groq">Groq (бесплатно, без карты)</option>
-    <option value="gemini">Gemini</option>
-  </select>
-  <p class="hint">Groq: бесплатный ключ на https://console.groq.com/keys</p>
+  <div class="group">
+    <label>Провайдер</label>
+    <select id="aiProvider">
+      <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
+      <option value="groq">Groq (бесплатно, без карты)</option>
+      <option value="gemini">Gemini (напрямую)</option>
+    </select>
+    <p class="hint">OpenRouter: ключ на https://openrouter.ai/keys · Groq: https://console.groq.com/keys</p>
+  </div>
 
   <h2>Ключи API</h2>
-  <label>Groq API Key</label>
-  <input id="groqApiKey" type="password" placeholder="gsk_..." />
-  <label>Gemini API Key</label>
-  <input id="geminiApiKey" type="password" placeholder="AIza..." />
-  <label>Supabase URL</label>
-  <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
-  <label>Supabase anon key</label>
-  <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
+  <div class="group">
+    <label>OpenRouter API Key</label>
+    <input id="openrouterApiKey" type="password" placeholder="sk-or-v1-..." />
+    <label>Groq API Key</label>
+    <input id="groqApiKey" type="password" placeholder="gsk_..." />
+    <label>Gemini API Key</label>
+    <input id="geminiApiKey" type="password" placeholder="AIza..." />
+    <label>Supabase URL</label>
+    <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
+    <label>Supabase anon key</label>
+    <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
+  </div>
 
   <h2>Базовые промпты (по категориям)</h2>
-  <label>Точные науки (Алгебра/Геометрия/Физика/Химия)</label>
-  <textarea id="p_worked_solution"></textarea>
-  <label>Языки (Английский) — только ответы</label>
-  <textarea id="p_direct_answer"></textarea>
-  <label>Параграфы (История/Обществознание/География) — конспект</label>
-  <textarea id="p_paragraph_summary"></textarea>
-  <label>Русский язык — полное упражнение</label>
-  <textarea id="p_russian_full"></textarea>
+  <div class="group">
+    <label>Точные науки (Алгебра/Геометрия/Физика/Химия)</label>
+    <textarea id="p_worked_solution"></textarea>
+    <label>Языки (Английский) — только ответы</label>
+    <textarea id="p_direct_answer"></textarea>
+    <label>Параграфы (История/Обществознание/География) — конспект</label>
+    <textarea id="p_paragraph_summary"></textarea>
+    <label>Русский язык — полное упражнение</label>
+    <textarea id="p_russian_full"></textarea>
+  </div>
 
   <div><button id="save">Сохранить</button><span id="status" class="ok"></span></div>
 
   <h2>История (последние 7 дней)</h2>
-  <button id="reload">Обновить историю</button>
+  <button id="reload" class="secondary-btn">Обновить историю</button>
   <div id="history"></div>
 
   <script type="module" src="settings.js"></script>

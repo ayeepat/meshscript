@@ -1,14 +1,17 @@
 /**
  * Provider dispatcher. Chooses the AI backend based on the 'aiProvider'
- * setting in chrome.storage.local. Defaults to Groq (free, no billing).
- *   - 'groq'   -> Groq (recommended; free, no card)
- *   - 'gemini' -> Google Gemini (requires working free tier / billing)
+ * setting in chrome.storage.local. Defaults to OpenRouter (Gemini 2.5 Flash).
+ *   - 'openrouter' -> OpenRouter / google/gemini-2.5-flash (recommended)
+ *   - 'groq'       -> Groq (free, no card)
+ *   - 'gemini'     -> Google Gemini direct
  */
+import { askOpenRouter } from './openrouter.js';
 import { askGroq } from './groq.js';
 import { askGemini } from './gemini.js';
 
 export async function askAI(systemPrompt, userText, files = []) {
-  const { aiProvider = 'groq' } = await chrome.storage.local.get('aiProvider');
+  const { aiProvider = 'openrouter' } = await chrome.storage.local.get('aiProvider');
   if (aiProvider === 'gemini') return askGemini(systemPrompt, userText, files);
-  return askGroq(systemPrompt, userText, files);
+  if (aiProvider === 'groq') return askGroq(systemPrompt, userText, files);
+  return askOpenRouter(systemPrompt, userText, files);
 }

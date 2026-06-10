@@ -1,13 +1,13 @@
 /** Settings: API keys, provider, editable base prompts, 7-day history viewer. */
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 
-const KEY_FIELDS = ['geminiApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
+const KEY_FIELDS = ['openrouterApiKey', 'geminiApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 
 async function load() {
   const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides', 'aiProvider']);
   for (const f of KEY_FIELDS) document.getElementById(f).value = stored[f] || '';
-  document.getElementById('aiProvider').value = stored.aiProvider || 'groq';
+  document.getElementById('aiProvider').value = stored.aiProvider || 'openrouter';
   const overrides = stored.promptOverrides || {};
   for (const cat of CATS) {
     document.getElementById('p_' + cat).value = overrides[cat] || DEFAULT_PROMPTS[cat];
