@@ -194,8 +194,10 @@ async function solveTestOnScreen() {
       pageText = inj?.result || '';
     } catch (_e) { /* keep going with just the screenshot */ }
 
-    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'jpeg', quality: 85 });
-    const screenshot = { mimeType: 'image/jpeg', dataBase64: dataUrl.split(',')[1], name: 'screen.jpg' };
+    // PNG is lossless — small numbers and formulas stay crisp, which matters
+    // more than file size since the screenshot is sent once and discarded.
+    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
+    const screenshot = { mimeType: 'image/png', dataBase64: dataUrl.split(',')[1], name: 'screen.png' };
 
     box.textContent = '🧠 Решаю…';
     const resp = await new Promise((resolve) => {
