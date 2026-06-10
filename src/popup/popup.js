@@ -20,9 +20,45 @@ function fileToInline(file) {
   });
 }
 
-async function getActiveTabId() {
+async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tab?.id;
+  return tab;
+}
+
+function showMessage(html) {
+  document.getElementById('list').innerHTML = html;
+}
+
+/**
+ * Try to message an already-present content script. If that fails (script not
+ * injected yet on this tab), programmatically inject it, then retry once.
+ */
+function sendScan(tabId) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, { type: 'MESH_SCAN' }, (resp) => {
+      if (chrome.runtime.lastError || !resp) {
+        // Not injected yet -> inject and retry.
+        chrome.scripting.executeScript(
+          { target: { tabId }, files: ['src/content/scraper.js'] },
+          () => {
+            if (chrome.runtime.lastError) {
+              resolve({ ok: false, error: chrome.runtime.lastError.message });
+              return;
+            }
+            chrome.tabs.sendMessage(tabId, { type: 'MESH_SCAN' }, (resp2) => {
+              if (chrome.runtime.lastError || !resp2) {
+                resolve({ ok: false, error: chrome.runtime.lastError?.message || 'no response' });
+              } else {
+                resolve(resp2);
+              }
+            });
+          }
+        );
+      } else {
+        resolve(resp);
+      }
+    });
+  });
 }
 
 function render(data) {
@@ -31,7 +67,7 @@ function render(data) {
   dayEl.textContent = data.day || 'Ближайший день не найден';
   listEl.innerHTML = '';
   if (!data.subjects?.length) {
-    listEl.innerHTML = '<p class="muted">Домашние задания не найдены. Откройте страницу домашних заданий Mesh.</p>';
+    listEl.innerHTML = '<p class="muted">Домашние задания не найдены на этой странице. Откройте страницу с домашними заданиями (можно прошлую дату) и нажмите на иконку снова.</p>';
     return;
   }
   for (const item of data.subjects) {
@@ -86,16 +122,23 @@ function render(data) {
 
 async function init() {
   document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
-  const tabId = await getActiveTabId();
-  if (!tabId) return;
-  chrome.tabs.sendMessage(tabId, { type: 'MESH_SCAN' }, (resp) => {
-    if (chrome.runtime.lastError || !resp?.ok) {
-      document.getElementById('list').innerHTML =
-        '<p class="muted">Не удалось сканировать. Откройте school.mos.ru/diary/homeworks/homeworks и перезагрузите страницу.</p>';
-      return;
-    }
-    render(resp.data);
-  });
+
+  const tab = await getActiveTab();
+  if (!tab || !tab.id) {
+    showMessage('<p class="muted">Не удалось определить активную вкладку.</p>');
+    return;
+  }
+  if (!/^https:\/\/school\.mos\.ru\/diary\//.test(tab.url || '')) {
+    showMessage('<p class="muted">Откройте страницу дневника Mesh (school.mos.ru/diary/...) и нажмите на иконку снова.</p>');
+    return;
+  }
+
+  const resp = await sendScan(tab.id);
+  if (!resp.ok) {
+    showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + (resp.error || '') + '</small></p>');
+    return;
+  }
+  render(resp.data);
 }
 
 init();
