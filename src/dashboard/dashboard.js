@@ -1,9 +1,11 @@
 /** Full-window dashboard: sidebar history + chat solve view. */
+import { buildFirstUserMessage } from '../lib/subject-router.js';
 
 const params = new URLSearchParams(location.search);
 const subject = params.get('subject') || '';
 const initialTask = params.get('task') || '';
 let sessionId = null;
+const history = []; // [{role:'user'|'assistant', content:string}] — sent to the AI for memory
 
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
@@ -28,15 +30,18 @@ function fileToInline(file) {
 }
 
 function send(task, files) {
+  const prior = history.slice(); // turns BEFORE this message
+  history.push({ role: 'user', content: task });
   return new Promise((resolve) => {
     chrome.runtime.sendMessage(
-      { type: 'SOLVE', payload: { subject, task, files, sessionId } },
+      { type: 'SOLVE', payload: { subject, task, files, sessionId, history: prior } },
       (resp) => {
         if (chrome.runtime.lastError || !resp?.ok) {
           bubble('assistant', 'Ошибка: ' + (resp?.error || chrome.runtime.lastError?.message));
           return resolve();
         }
         sessionId = resp.result.sessionId || sessionId;
+        history.push({ role: 'assistant', content: resp.result.answer });
         bubble('assistant', resp.result.answer);
         resolve();
       }
@@ -63,9 +68,14 @@ function openSession(s) {
   sessionId = s.id;
   titleEl.textContent = `${s.subject} — решение`;
   chatEl.innerHTML = '';
+  history.length = 0;
   chrome.runtime.sendMessage({ type: 'LIST_MESSAGES', sessionId: s.id }, (resp) => {
     if (!resp?.ok) return;
-    for (const m of resp.messages || []) bubble(m.role === 'assistant' ? 'assistant' : 'user', m.content);
+    for (const m of resp.messages || []) {
+      const role = m.role === 'assistant' ? 'assistant' : 'user';
+      history.push({ role, content: m.content });
+      bubble(role, m.content);
+    }
   });
 }
 
@@ -84,13 +94,15 @@ document.getElementById('send').onclick = async () => {
   loadSessions();
 };
 
-// Auto-run the initial task from the popup.
+// Auto-run the initial task from the popup:
+// first message = full subject prompt from Settings + the task itself.
 (async function init() {
   await loadSessions();
   if (initialTask) {
-    bubble('user', initialTask);
+    const firstMessage = await buildFirstUserMessage(subject, initialTask);
+    bubble('user', firstMessage);
     const thinking = bubble('assistant', 'Думаю…');
-    await send(initialTask, []);
+    await send(firstMessage, []);
     thinking.remove();
     loadSessions();
   }

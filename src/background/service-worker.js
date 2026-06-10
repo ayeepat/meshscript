@@ -40,8 +40,8 @@ async function tryGdz(subject, task) {
   }
 }
 
-/** Solve a task: GDZ first (best-effort), then AI. Persist to Supabase. */
-async function solve({ subject, task, files = [], sessionId = null }) {
+/** Solve a task: GDZ first (best-effort), then AI with chat history. Persist to Supabase. */
+async function solve({ subject, task, files = [], sessionId = null, history = [] }) {
   const category = categoryForSubject(subject);
 
   // Russian-full guard: bare "Упр 25" with no image -> ask for a photo.
@@ -56,7 +56,7 @@ async function solve({ subject, task, files = [], sessionId = null }) {
   await tryGdz(subject, task); // best-effort only; reliable path is the AI provider
 
   const systemPrompt = await buildSystemPrompt(subject);
-  const answer = await askAI(systemPrompt, task || '(см. вложение)', files);
+  const answer = await askAI(systemPrompt, task || '(см. вложение)', files, history);
 
   // Persist (non-fatal if Supabase not configured).
   try {
