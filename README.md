@@ -58,6 +58,11 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 1. Log into Mesh and open `school.mos.ru/diary/homeworks/homeworks`.
 2. Click the extension icon. It scans the whole visible week of homework;
    each day is a collapsible section (the nearest day starts expanded).
+   For in-app Mesh tests, open the test page, switch the popup to the
+   **Тест** tab and press the button: the extension screenshots the visible
+   screen + extracts the page text and replies with question numbers and
+   answers only (no explanations). Scroll to the next question and press
+   again. Test answers are not persisted.
 3. Press **Solve** on a subject to open the full-window dashboard. The
    sidebar lists every lesson of the week — click one to solve it (the AI
    is only called when you open a lesson, and each lesson keeps its own

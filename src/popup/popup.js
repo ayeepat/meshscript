@@ -1,5 +1,11 @@
-/** Popup: scans active Mesh tab, renders subjects, handles uploads + Solve. */
+/**
+ * Popup: two tabs.
+ *  - Домашка: scans the Mesh diary tab, renders the week, uploads + Solve.
+ *  - Тест: screenshots the active tab + extracts its text, sends both to the
+ *    AI and shows ONLY question numbers + answers (in-app Mesh tests).
+ */
 import { initTheme } from '../common/theme.js';
+import { extractMath, restoreMath } from '../common/tex.js';
 
 initTheme();
 
@@ -152,25 +158,95 @@ function render(data) {
   });
 }
 
-async function init() {
-  document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
+/* ---------- Тест tab: screenshot + page text -> «№N: ответ» ---------- */
 
+function escapeHtml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+/** Minimal render: bold, line breaks, and LaTeX via tex.js. */
+function renderAnswer(el, raw) {
+  const { text, chunks } = extractMath(raw);
+  const html = escapeHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/\n/g, '<br>');
+  el.innerHTML = restoreMath(html, chunks);
+}
+
+async function solveTestOnScreen() {
+  const btn = document.getElementById('solveTest');
+  const box = document.getElementById('testAnswer');
+  btn.disabled = true;
+  box.hidden = false;
+  box.textContent = 'Смотрю на экран…';
+  try {
+    const tab = await getActiveTab();
+    if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
+
+    // Page text is best-effort: some pages forbid injection — the screenshot
+    // alone is usually enough for the vision model.
+    let pageText = '';
+    try {
+      const [inj] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: () => document.body.innerText.slice(0, 15000)
+      });
+      pageText = inj?.result || '';
+    } catch (_e) { /* keep going with just the screenshot */ }
+
+    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'jpeg', quality: 85 });
+    const screenshot = { mimeType: 'image/jpeg', dataBase64: dataUrl.split(',')[1], name: 'screen.jpg' };
+
+    box.textContent = 'Решаю…';
+    const resp = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot } }, (r) => {
+        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+        else resolve(r || { ok: false, error: 'нет ответа' });
+      });
+    });
+    if (!resp.ok) throw new Error(resp.error || 'нет ответа');
+    renderAnswer(box, resp.answer);
+  } catch (e) {
+    box.textContent = 'Ошибка: ' + (e?.message || e);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+/* ---------- Tabs + init ---------- */
+
+function showTab(which) {
+  const isTest = which === 'test';
+  document.getElementById('hwView').hidden = isTest;
+  document.getElementById('testView').hidden = !isTest;
+  document.getElementById('tabHw').classList.toggle('active', !isTest);
+  document.getElementById('tabTest').classList.toggle('active', isTest);
+}
+
+async function scanHomework() {
   const tab = await getActiveTab();
   if (!tab || !tab.id) {
     showMessage('<p class="muted">Не удалось определить активную вкладку.</p>');
     return;
   }
   if (!/^https:\/\/school\.mos\.ru\/diary\//.test(tab.url || '')) {
-    showMessage('<p class="muted">Откройте страницу дневника Mesh (school.mos.ru/diary/...) и нажмите на иконку снова.</p>');
+    showMessage('<p class="muted">Откройте страницу дневника Mesh (school.mos.ru/diary/...) и нажмите на иконку снова. Для теста МЭШ откройте вкладку «Тест».</p>');
     return;
   }
-
   const resp = await sendScan(tab.id);
   if (!resp.ok) {
     showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + (resp.error || '') + '</small></p>');
     return;
   }
   render(resp.data);
+}
+
+function init() {
+  document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
+  document.getElementById('tabHw').onclick = () => showTab('hw');
+  document.getElementById('tabTest').onclick = () => showTab('test');
+  document.getElementById('solveTest').onclick = solveTestOnScreen;
+  scanHomework();
 }
 
 init();

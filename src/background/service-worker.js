@@ -5,7 +5,7 @@
  */
 import { askAI } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
-import { PROMPT_CATEGORIES } from '../lib/prompts.js';
+import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/supabase.js';
 
 // Open the full-window dashboard when the popup asks to "Solve".
@@ -56,6 +56,19 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   }
 }
 
+/**
+ * Solve an in-app Mesh test from a screenshot + extracted page text.
+ * Answers are concise («№N: ответ») and intentionally NOT persisted.
+ */
+async function solveTest({ text, screenshot }) {
+  const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
+  const systemPrompt =
+    promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
+  const userText = 'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
+    (text || '(текст не извлечён, смотри скриншот)');
+  return askAI(systemPrompt, userText, screenshot ? [screenshot] : []);
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   (async () => {
     try {
@@ -66,6 +79,9 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           break;
         case 'SOLVE':
           sendResponse({ ok: true, result: await solve(msg.payload) });
+          break;
+        case 'SOLVE_TEST':
+          sendResponse({ ok: true, answer: await solveTest(msg.payload) });
           break;
         case 'LIST_SESSIONS':
           sendResponse({ ok: true, sessions: await listSessions() });
