@@ -164,9 +164,22 @@ function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+/**
+ * Pull out only the final-answers block the model emits after solving with
+ * full reasoning. The prompt mandates a `===ОТВЕТЫ===` separator; we keep
+ * whatever comes after the LAST one (in case the model also mentions the
+ * marker inside its work). If the marker is missing entirely, fall back to
+ * the raw text so the user still sees something.
+ */
+function extractFinalAnswers(raw) {
+  const parts = raw.split(/={2,}\s*ОТВЕТЫ\s*={2,}/i);
+  const tail = parts.length >= 2 ? parts[parts.length - 1] : raw;
+  return tail.replace(/^\s+|\s+$/g, '');
+}
+
 /** Minimal render: bold, line breaks, and LaTeX via tex.js. */
 function renderAnswer(el, raw) {
-  const { text, chunks } = extractMath(raw);
+  const { text, chunks } = extractMath(extractFinalAnswers(raw));
   const html = escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
