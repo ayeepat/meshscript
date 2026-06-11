@@ -45,10 +45,8 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
     if (!sid) {
       const session = await createSession(subject, task);
       sid = session.id;
-      await addMessage(sid, 'user', task || '(файл)');
-    } else {
-      await addMessage(sid, 'user', task || '(файл)');
     }
+    await addMessage(sid, 'user', task || '(файл)');
     await addMessage(sid, 'assistant', answer);
     return { answer, sessionId: sid };
   } catch (e) {

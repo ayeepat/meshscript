@@ -165,16 +165,29 @@ function escapeHtml(s) {
 }
 
 /**
- * Pull out only the final-answers block the model emits after solving with
- * full reasoning. The prompt mandates a `===ОТВЕТЫ===` separator; we keep
- * whatever comes after the LAST one (in case the model also mentions the
- * marker inside its work). If the marker is missing entirely, fall back to
- * the raw text so the user still sees something.
+ * Pull out only the final answers the model emits after solving with full
+ * reasoning. Three-tier strategy because Flash skips formatting rules ~10%
+ * of the time:
+ *  1. Trust the `===ОТВЕТЫ===` separator the prompt mandates.
+ *  2. If absent, scan for «№N: …» / «N) …» / «N. …» lines anywhere — the
+ *     model almost always lists answers in that shape even when it ignores
+ *     the marker, and we can pluck them out.
+ *  3. As a last resort, return the last non-empty line (the model's final
+ *     conclusion) so the user still sees something useful.
  */
 function extractFinalAnswers(raw) {
+  // (1) marker
   const parts = raw.split(/={2,}\s*ОТВЕТЫ\s*={2,}/i);
-  const tail = parts.length >= 2 ? parts[parts.length - 1] : raw;
-  return tail.replace(/^\s+|\s+$/g, '');
+  if (parts.length >= 2) {
+    const tail = parts[parts.length - 1].trim();
+    if (tail) return tail;
+  }
+  // (2) numbered answer lines
+  const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const numbered = lines.filter((l) => /^(?:№|#)?\s*\d+\s*[.):]/.test(l));
+  if (numbered.length) return numbered.join('\n');
+  // (3) last non-empty line
+  return lines[lines.length - 1] || raw.trim();
 }
 
 /** Minimal render: bold, line breaks, and LaTeX via tex.js. */
@@ -252,7 +265,7 @@ async function scanHomework() {
   }
   const resp = await sendScan(tab.id);
   if (!resp.ok) {
-    showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + (resp.error || '') + '</small></p>');
+    showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + escapeHtml(resp.error || '') + '</small></p>');
     return;
   }
   render(resp.data);
