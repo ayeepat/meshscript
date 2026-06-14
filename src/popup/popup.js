@@ -142,6 +142,7 @@ async function tryAutoFetch(card) {
   const why = {
     no_lesson_id: 'нет id задания',
     no_token: 'нет входа в МЭШ',
+    no_student_id: 'не нашёл student_id',
     api_error: 'МЭШ API ' + (found?.status || ''),
     no_urls: 'файла нет в задании',
     auth_redirect: 'нужна авторизация',
