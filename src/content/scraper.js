@@ -340,34 +340,92 @@ function scanFromText() {
  * Everything is best-effort: any failure returns no URLs and the popup falls
  * back to manual upload (unchanged behaviour).
  *
- * NOTE: HW_API is the one Mesh-specific assumption. If auto-fetch comes back
- * empty on a card you KNOW has a file, confirm this endpoint against the real
- * Network tab (DevTools → XHR while opening a homework) and adjust it here.
+ * Endpoint verified against the real Mesh Network tab (2026): the homeworks
+ * list URL `/diary/homeworks/homeworks/<id>_normal` carries a LESSON-schedule
+ * item id, and its detail (incl. attachment file URLs) comes from
+ * `/api/family/web/v1/lesson_schedule_items/<id>`. The call needs the Bearer
+ * token plus Mesh's `X-mes-*` headers; `person_id` is the JWT `msh` claim and
+ * `student_id` lives in localStorage. The attachment files themselves are
+ * served from the SAME origin (school.mos.ru/ej/attachments/...).
  */
-const HW_API = (id) => `https://school.mos.ru/api/family/web/v1/homeworks/${id}`;
 const FILE_URL_RE = /https?:\/\/[^\s"'<>]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|gif|webp|txt|rtf)(?:\?[^\s"'<>]*)?/i;
-const MESH_FILE_HINT_RE = /(uchebnik\.mos\.ru|\/files?\/|\/storage\/|\/attachments?\/|file_id=)/i;
+const MESH_FILE_HINT_RE = /(uchebnik\.mos\.ru|\/ej\/attachments?\/|\/files?\/|\/storage\/|file_id=)/i;
 
-/** Try to find Mesh's auth token in localStorage / cookies for the API header. */
+const LESSON_API = (id, studentId, personId) => {
+  const u = new URL(`https://school.mos.ru/api/family/web/v1/lesson_schedule_items/${id}`);
+  if (studentId) u.searchParams.set('student_id', studentId);
+  u.searchParams.set('type', 'OO');
+  if (personId) u.searchParams.set('person_id', personId);
+  return u.toString();
+};
+
+/** Try to find Mesh's auth token (raw JWT) in localStorage / cookies. */
 function findAuthToken() {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i) || '';
-      if (/token|aupd|auth/i.test(k)) {
-        const v = localStorage.getItem(k) || '';
-        if (v.length > 20 && !/\s/.test(v)) return v.replace(/^"|"$/g, '');
+      if (!/token|aupd|auth/i.test(k)) continue;
+      let v = (localStorage.getItem(k) || '').trim();
+      if (!v) continue;
+      // Some Mesh builds wrap the token in JSON ({"token":"…"} or {"value":…}).
+      if (v[0] === '{') {
+        try {
+          const o = JSON.parse(v);
+          v = o.token || o.value || o.access_token || o.accessToken || '';
+        } catch { /* not JSON, fall through */ }
       }
+      v = v.replace(/^"|"$/g, '');
+      if (v.length > 20 && !/\s/.test(v)) return v;
     }
   } catch { /* storage blocked */ }
   const m = document.cookie.match(/(?:aupd_token|auth_token)=([^;]+)/);
   return m ? decodeURIComponent(m[1]) : null;
 }
 
+/** Decode a JWT payload (no verification — we just want its claims). */
+function jwtPayload(token) {
+  try {
+    const part = String(token).split('.')[1];
+    return JSON.parse(atob(part.replace(/-/g, '+').replace(/_/g, '/')));
+  } catch { return null; }
+}
+
+/** student_id isn't in the token — scan localStorage values for it. */
+function findStudentId() {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const v = localStorage.getItem(localStorage.key(i)) || '';
+      const m = v.match(/"(?:student_id|studentId|profile_id|profileId)"\s*:\s*"?(\d{4,})"?/);
+      if (m) return m[1];
+    }
+  } catch { /* storage blocked */ }
+  return null;
+}
+
+/** Mesh family-web headers required by both the API and the file download. */
+function meshHeaders(token) {
+  const h = {
+    Accept: 'application/json, text/plain, */*',
+    'X-mes-subsystem': 'familyweb',
+    'X-Mes-Role': 'student',
+    'X-Mes-RoleId': '1'
+  };
+  if (token) h['Authorization'] = 'Bearer ' + token;
+  return h;
+}
+
 /** Recursively collect file-looking URLs from an arbitrary JSON value. */
 function collectFileUrls(node, out = new Set(), depth = 0) {
   if (depth > 8 || out.size >= 8) return out;
   if (typeof node === 'string') {
-    if (FILE_URL_RE.test(node) || (/^https?:\/\//.test(node) && MESH_FILE_HINT_RE.test(node))) out.add(node);
+    let s = node;
+    // Mesh often stores attachment paths relative ("/ej/attachments/…"); absolutise.
+    if (s[0] === '/' && MESH_FILE_HINT_RE.test(s)) s = 'https://school.mos.ru' + s;
+    if (FILE_URL_RE.test(s) || (/^https?:\/\//.test(s) && MESH_FILE_HINT_RE.test(s))) {
+      // Mesh filenames contain spaces/Cyrillic; encodeURI makes the download
+      // URL safe and is idempotent on already-encoded strings (% is untouched).
+      out.add(encodeURI(s));
+    }
   } else if (Array.isArray(node)) {
     for (const v of node) collectFileUrls(v, out, depth + 1);
   } else if (node && typeof node === 'object') {
@@ -377,20 +435,25 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
 }
 
 /**
- * Ask the same-origin family API for a homework and pull out file URLs.
- * @returns {Promise<{ok:boolean, urls:string[], token:string|null}>}
+ * Ask the same-origin family API for a lesson item and pull out file URLs.
+ * The service worker downloads them, so we also return the token + headers it
+ * needs (same Bearer + X-mes-* set).
+ * @returns {Promise<{ok:boolean, urls:string[], token:string|null, headers:object}>}
  */
-async function listMaterialUrls(homeworkId) {
+async function listMaterialUrls(lessonId) {
   const token = findAuthToken();
-  if (!homeworkId) return { ok: false, urls: [], token };
+  const headers = meshHeaders(token);
+  if (!lessonId) return { ok: false, urls: [], token, headers };
   try {
-    const headers = { Accept: 'application/json' };
-    if (token) { headers['Auth-Token'] = token; headers['Authorization'] = 'Bearer ' + token; }
-    const res = await fetch(HW_API(homeworkId), { credentials: 'include', headers });
-    if (!res.ok) return { ok: false, urls: [], token };
+    const personId = jwtPayload(token)?.msh || null;
+    const studentId = findStudentId();
+    const res = await fetch(LESSON_API(lessonId, studentId, personId), {
+      credentials: 'include', headers
+    });
+    if (!res.ok) return { ok: false, urls: [], token, headers };
     const json = await res.json();
-    return { ok: true, urls: [...collectFileUrls(json)].slice(0, 5), token };
-  } catch { return { ok: false, urls: [], token }; }
+    return { ok: true, urls: [...collectFileUrls(json)].slice(0, 5), token, headers };
+  } catch { return { ok: false, urls: [], token, headers }; }
 }
 
 /* ---------- Entry point ---------- */

@@ -7,8 +7,9 @@ import { askAI } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/supabase.js';
-import { isBareTextbookRef } from '../lib/task-classifier.js';
+import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
+import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
 
 // Follow-ups re-send prior turns as context. Cap how many: full worked
 // solutions are long, and on a paid provider every re-sent turn is money.
@@ -31,6 +32,52 @@ async function openDashboard(payload) {
 // AI provider is the solver.
 
 /**
+ * Decide whether we MUST refuse before calling the model, returning the
+ * Russian message to show, or null to proceed. This is the structural backstop
+ * for the fabrication problem: a model handed only a task reference (and no
+ * actual file/page) will otherwise invent plausible-but-wrong answers and even
+ * claim it "read" material it never got.
+ *
+ *  - audio: this tool can NEVER process sound. If the task needs listening and
+ *    no readable text/file is attached (a transcript can't arrive as audio),
+ *    refuse the audio outright.
+ *  - attachment: task points at a file/variant/worksheet but nothing readable
+ *    is attached -> ask for it (Office files like .docx don't count: unreadable).
+ *  - textbook ref: bare «Упр. 25 / §3» with no page photo -> ask for the photo.
+ *
+ * "Readable" = image, PDF or plain text (see file-kinds). An attached .docx or
+ * an empty file does not satisfy the requirement.
+ */
+function missingInputGate(category, task, files) {
+  const hasReadable = files.some(isReadableFile);
+  const cls = classifyTask(task);
+  const audio = needsAudio(task);
+
+  if (cls.kind === 'attachment' && !hasReadable) {
+    let msg = 'Не могу решить это задание без самого материала. ' +
+      'Пришлите файл варианта/задания (PDF, фото или скриншот страницы), и я всё решу.';
+    if (audio) {
+      msg += '\n\n🎧 Аудирование я прослушать не могу в принципе — для него пришлите ' +
+        'расшифровку (текст) записи, тогда решу и эту часть.';
+    }
+    return msg;
+  }
+
+  if (audio && !hasReadable) {
+    return 'В этом задании нужно аудирование, а звук я прослушать не могу. ' +
+      'Пришлите расшифровку (текст) записи или фото/скан заданий — тогда решу.';
+  }
+
+  if ((category === PROMPT_CATEGORIES.RUSSIAN_FULL || cls.kind === 'textbook') &&
+      isBareTextbookRef(task) && !hasReadable) {
+    return 'Чтобы решить это упражнение без ошибок, загрузите, пожалуйста, ' +
+      'фото страницы учебника с этим заданием.';
+  }
+
+  return null;
+}
+
+/**
  * Solve a task with the AI provider + chat history. Persist to Supabase.
  * @param {object} p
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
@@ -39,20 +86,23 @@ async function openDashboard(payload) {
 async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta) {
   const category = categoryForSubject(subject);
 
-  // Russian-full guard: bare "Упр 25" with no image -> ask for a photo
-  // WITHOUT spending a (possibly paid) API call on a guess. Only on the
-  // first turn — once a photo arrived earlier in the chat, follow-ups pass.
-  if (category === PROMPT_CATEGORIES.RUSSIAN_FULL && history.length === 0) {
-    if (isBareTextbookRef(task) && files.length === 0) {
-      const ask = 'Чтобы выписать упражнение без ошибок, загрузите, пожалуйста, фото страницы учебника с этим упражнением.';
-      return { answer: ask, needsUpload: true, sessionId };
-    }
+  // Hard refusal gate — runs in CODE, before any model call, only on the first
+  // turn (later turns may carry a clarification or a just-attached file). A soft
+  // prompt guard alone doesn't reliably stop a model inventing answers to
+  // material it never received, so when a required input is genuinely missing we
+  // refuse deterministically instead of guessing. See missingInputGate.
+  if (history.length === 0) {
+    const gate = missingInputGate(category, task, files);
+    if (gate) return { answer: gate, needsUpload: true, sessionId };
   }
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
+  // PDFs require a PDF-capable backend; force OpenRouter (Gemini reads PDFs
+  // natively) even if the user picked Groq, which cannot read them at all.
+  const provider = hasPdf(files) ? 'openrouter' : undefined;
   const answer = await askAI(
     systemPrompt, task || '(см. вложение)', files,
-    history.slice(-MAX_HISTORY_TURNS), { onDelta }
+    history.slice(-MAX_HISTORY_TURNS), { onDelta, provider }
   );
 
   // Persist (non-fatal if Supabase not configured).
@@ -106,23 +156,46 @@ function nameFromUrl(url) {
   catch { return 'attachment'; }
 }
 
-async function downloadFile(url, token) {
+// Mesh frequently serves attachments as application/octet-stream. Downstream
+// (openrouter/groq) routes PDFs and images by mime, so recover the real type
+// from the filename extension whenever the server's content-type is generic.
+const EXT_MIME = {
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+  txt: 'text/plain', csv: 'text/csv', rtf: 'application/rtf', md: 'text/markdown',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+};
+
+function inferMime(name, contentType) {
+  const ct = (contentType || '').split(';')[0].trim().toLowerCase();
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return ct;
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return EXT_MIME[ext] || ct || 'application/octet-stream';
+}
+
+async function downloadFile(url, headers) {
   try {
-    const headers = {};
-    if (token) { headers['Auth-Token'] = token; headers['Authorization'] = 'Bearer ' + token; }
     const res = await fetch(url, { credentials: 'include', headers });
     if (!res.ok) return null;
     const buf = await res.arrayBuffer();
     if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) return null; // skip empty / >12MB
-    const mimeType = (res.headers.get('content-type') || '').split(';')[0] || 'application/octet-stream';
-    return { mimeType, dataBase64: abToBase64(buf), name: nameFromUrl(url) };
+    const name = nameFromUrl(url);
+    return { mimeType: inferMime(name, res.headers.get('content-type')), dataBase64: abToBase64(buf), name };
   } catch { return null; }
 }
 
-async function downloadFiles({ urls = [], token = null }) {
+// `headers` come straight from the content script's discovery (Bearer token +
+// Mesh's X-mes-* set). A bare `token` is still accepted for backward-compat.
+async function downloadFiles({ urls = [], headers = null, token = null }) {
+  const hdrs = headers || (token ? { Authorization: 'Bearer ' + token } : {});
   const files = [];
   for (const url of urls.slice(0, 5)) {
-    const f = await downloadFile(url, token);
+    const f = await downloadFile(url, hdrs);
     if (f) files.push(f);
   }
   return files;

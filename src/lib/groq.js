@@ -17,6 +17,7 @@
  */
 
 import { postJson, postStream } from './http.js';
+import { isImageFile } from './file-kinds.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -39,22 +40,23 @@ async function getKey() {
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
-  const hasImages = files.some((f) => (f.mimeType || '').startsWith('image/'));
+  const hasImages = files.some(isImageFile);
   const model = hasImages ? VISION_MODEL : TEXT_MODEL;
 
   // Build OpenAI-style content. Images go as data URLs; non-image files
   // (e.g. PDF/Word) can't be read directly here, so we note them in text.
   const userContent = [{ type: 'text', text: userText }];
   for (const f of files) {
-    if ((f.mimeType || '').startsWith('image/')) {
+    if (isImageFile(f)) {
+      const m = (f.mimeType || '').startsWith('image/') ? f.mimeType : 'image/png';
       userContent.push({
         type: 'image_url',
-        image_url: { url: `data:${f.mimeType};base64,${f.dataBase64}` }
+        image_url: { url: `data:${m};base64,${f.dataBase64}` }
       });
     } else {
       userContent.push({
         type: 'text',
-        text: `[Приложен файл ${f.mimeType}, который нельзя прочитать напрямую. Попросите фото/скриншот, если нужен текст.]`
+        text: `[Приложен файл ${f.name || ''} (${f.mimeType}), который нельзя прочитать напрямую. Попросите фото/скриншот или PDF, если нужен текст. Не выдумывай его содержимое.]`
       });
     }
   }

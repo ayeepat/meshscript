@@ -20,14 +20,26 @@
 const ATTACHMENT_RE = new RegExp(
   [
     'файл', 'пдф', '\\bpdf\\b', 'ворд', '\\bword\\b', '\\bdocx?\\b',
-    'документ', 'презентаци', 'приложен', 'прикреп', 'вложен',
+    'презентаци', '\\bpptx?\\b', '\\bxlsx?\\b', '\\btxt\\b', 'таблиц',
+    'документ', 'приложен', 'прикреп', 'вложен',
     'скан', 'распечат', 'раздат', 'карточк', 'бланк',
     // [а-яё]* not \w*: \w is ASCII-only in JS and never matches Cyrillic.
     'рабоч[а-яё]*\\s+лист', 'лист[а-яё]*\\s+с\\s+задани',
-    'тест\\s+мэш', 'мэш[\\s-]*тест', 'по\\s+ссылке', 'доделать\\s+упр'
+    'тест\\s+мэш', 'мэш[\\s-]*тест', 'по\\s+ссылке', 'доделать\\s+упр',
+    // OGE/EGE/VPR variants are distributed as an attached file; listening
+    // (аудирование) and audio links also imply external material.
+    'вариант\\s*\\d', '\\bогэ\\b', '\\bегэ\\b', '\\bвпр\\b',
+    'аудир', 'аудиозап', 'drive\\.google', 'disk\\.yandex'
   ].join('|'),
   'i'
 );
+
+// Detects whether a task needs AUDIO — listening sections or audio links.
+// This tool can never solve those, so callers can warn the user up front.
+const AUDIO_RE = /(аудир|аудиозап|на\s+слух|listening|\.mp3|\.m4a|\.wav|drive\.google|disk\.yandex)/i;
+export function needsAudio(task) {
+  return AUDIO_RE.test(task || '');
+}
 
 // Reference to a numbered item in a textbook: упр./№/стр./задание/§ + digit.
 const REF_RE = /(№|упр[а-яё]*|стр[а-яё]*|задани[а-яё]*|задач[а-яё]*|номер[а-яё]*|параграф[а-яё]*|§|пункт[а-яё]*|п\.|зад\.|ex\.?\s*|p\.|page\s*)\s*\.?\s*\d/i;

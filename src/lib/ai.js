@@ -10,6 +10,10 @@ import { askGroq } from './groq.js';
 
 export async function askAI(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { aiProvider = 'openrouter' } = await chrome.storage.local.get('aiProvider');
-  if (aiProvider === 'groq') return askGroq(systemPrompt, userText, files, history, opts);
+  // opts.provider forces a backend regardless of the setting. The solver uses
+  // it to route PDF solves to OpenRouter: Groq cannot read PDFs and would
+  // otherwise hallucinate an answer to a file it never actually saw.
+  const chosen = opts.provider || aiProvider;
+  if (chosen === 'groq') return askGroq(systemPrompt, userText, files, history, opts);
   return askOpenRouter(systemPrompt, userText, files, history, opts);
 }

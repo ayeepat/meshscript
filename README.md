@@ -83,10 +83,10 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 - **Auto-fetch attachments.** For tasks that reference a file ("сделать из
   прикреплённого файла"), the popup pulls the file straight from your logged-in
   Mesh session and attaches it automatically — no manual download. It falls
-  back to manual upload if nothing is found. The one Mesh-specific assumption is
-  the homework API endpoint (`HW_API` in `src/content/scraper.js`); if
-  auto-fetch comes back empty on a card you know has a file, confirm that
-  endpoint against the real Network tab and adjust it there.
+  back to manual upload if nothing is found. The discovery call hits the
+  verified `lesson_schedule_items/<id>` family-API endpoint (with the Bearer
+  token + `X-mes-*` headers) in `src/content/scraper.js`; the files live on
+  `school.mos.ru/ej/attachments/...` and are pulled by the service worker.
 - **Streaming answers.** The dashboard solve streams tokens live over a
   `chrome.runtime` port (OpenRouter/Groq SSE). The popup test solver stays a
   single round-trip.
