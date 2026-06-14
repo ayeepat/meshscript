@@ -444,6 +444,16 @@ function meshHeaders(token) {
   return h;
 }
 
+/**
+ * Normalise a URL to a SINGLE correct percent-encoding. Mesh's API already
+ * percent-encodes its file URLs (spaces -> %20, Cyrillic -> %D0…). A blind
+ * encodeURI re-encodes the % itself (%D0 -> %25D0), producing a URL the server
+ * 404s on. decode-then-encode is idempotent for both raw and pre-encoded input.
+ */
+function normalizeUrl(s) {
+  try { return encodeURI(decodeURI(s)); } catch { return s; }
+}
+
 /** Recursively collect file-looking URLs from an arbitrary JSON value. */
 function collectFileUrls(node, out = new Set(), depth = 0) {
   if (depth > 8 || out.size >= 8) return out;
@@ -452,9 +462,7 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
     // Mesh often stores attachment paths relative ("/ej/attachments/…"); absolutise.
     if (s[0] === '/' && MESH_FILE_HINT_RE.test(s)) s = 'https://school.mos.ru' + s;
     if (FILE_URL_RE.test(s) || (/^https?:\/\//.test(s) && MESH_FILE_HINT_RE.test(s))) {
-      // Mesh filenames contain spaces/Cyrillic; encodeURI makes the download
-      // URL safe and is idempotent on already-encoded strings (% is untouched).
-      out.add(encodeURI(s));
+      out.add(normalizeUrl(s));
     }
   } else if (Array.isArray(node)) {
     for (const v of node) collectFileUrls(v, out, depth + 1);
@@ -488,7 +496,7 @@ function scanPageForFileLinks() {
     if (!raw) return;
     let s = String(raw).trim();
     if (s[0] === '/') s = location.origin + s; // absolutise relative paths
-    if (/^https?:\/\//.test(s) && looksLikeFileLink(s)) out.add(encodeURI(s));
+    if (/^https?:\/\//.test(s) && looksLikeFileLink(s)) out.add(normalizeUrl(s));
   };
   for (const a of document.querySelectorAll('a[href]')) push(a.getAttribute('href'));
   // Mesh sometimes renders downloads as buttons carrying the URL in a data-attr.
