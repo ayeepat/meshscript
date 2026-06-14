@@ -2,10 +2,13 @@
 
 Manifest V3 Chrome extension: a personal homework assistant for the Mesh
 (`school.mos.ru`) platform. Scans the homeworks page, detects subjects with
-robust DOM traversal (no hardcoded MUI class names), and solves tasks with the
-Gemini API using subject-aware prompts. Solve history is stored in Supabase
-with a 7-day TTL. No login automation — it works inside your already logged-in
-browser session.
+robust DOM traversal (no hardcoded MUI class names), and solves tasks using
+subject-aware prompts. Two AI providers: **OpenRouter** (paid, Gemini 2.5 Flash
+— the main solver, answers stream token-by-token) and **Groq** (free — used for
+menial tasks like classification). Solve history is stored in Supabase with a
+7-day TTL. No login automation — it works inside your already logged-in browser
+session, which also lets it **auto-fetch homework attachments** straight from
+Mesh.
 
 ## File structure
 
@@ -16,8 +19,8 @@ src/
   popup/                      # week of homework (collapsible days) + Solve + file upload
   dashboard/                  # full-window solve view; sidebar = week's lessons
   settings/                   # keys, editable prompts, history viewer
-  background/service-worker.js# AI provider + Supabase orchestration
-  lib/                        # gemini.js, supabase.js, prompts.js, subject-router.js
+  background/service-worker.js# AI provider + Supabase orchestration (+ streaming port)
+  lib/                        # ai.js, openrouter.js, groq.js, http.js, supabase.js, prompts.js, subject-router.js
 supabase/schema.sql           # tables + pg_cron 7-day auto-delete
 assets/icons/                 # icon16/48/128.png (you add these)
 ```
@@ -38,9 +41,12 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 4. From **Project Settings → API**, copy the **Project URL** and the **anon
    public** key. You will paste these into the extension Settings.
 
-### 3. Get a Gemini API key
-1. Go to https://aistudio.google.com/app/apikey (Google AI Studio).
-2. Click **Create API key**, copy it.
+### 3. Get the AI provider keys
+- **OpenRouter** (main solver): https://openrouter.ai/keys → create a key
+  (`sk-or-v1-…`). This is the paid provider — keep usage to actual solves.
+- **Groq** (free, no card): https://console.groq.com/keys → create a key
+  (`gsk_…`). Used for cheap/menial tasks (task classification). Optional but
+  recommended; without it those tasks fall back to local heuristics.
 
 ### 4. Load the extension in Chrome
 1. Open `chrome://extensions`.
@@ -50,7 +56,8 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 ### 5. Configure keys
 1. Click the extension icon → the **⚙️ gear** (opens Settings), or right-click
    the icon → **Options**.
-2. Paste **Gemini API Key**, **Supabase URL**, **Supabase anon key**.
+2. Paste **OpenRouter API Key**, **Groq API Key**, **Supabase URL**,
+   **Supabase anon key**, and pick the provider.
 3. (Optional) Edit the base prompt for any subject category.
 4. Click **Сохранить** (Save).
 
@@ -73,6 +80,23 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
 - **No auth.** Rows are scoped by an anonymous `device_id`. With the anon key +
   permissive RLS, anyone with the key could access data. Fine for a private
   2–3 user tool; do not publish the anon key.
+- **Auto-fetch attachments.** For tasks that reference a file ("сделать из
+  прикреплённого файла"), the popup pulls the file straight from your logged-in
+  Mesh session and attaches it automatically — no manual download. It falls
+  back to manual upload if nothing is found. The one Mesh-specific assumption is
+  the homework API endpoint (`HW_API` in `src/content/scraper.js`); if
+  auto-fetch comes back empty on a card you know has a file, confirm that
+  endpoint against the real Network tab and adjust it there.
+- **Streaming answers.** The dashboard solve streams tokens live over a
+  `chrome.runtime` port (OpenRouter/Groq SSE). The popup test solver stays a
+  single round-trip.
+- **Answer mode.** A Кратко/Объяснить toggle in the dashboard header switches
+  between a concise worked answer (still shows steps) and a full tutor-style
+  explanation.
+- **Paste images.** In the dashboard composer, Ctrl/⌘+V pastes a screenshot or
+  snipped photo of a textbook page directly into the chat.
+- **Friendly errors.** Bad key / no credit / rate-limit failures surface as a
+  short Russian message instead of a raw provider dump (see `src/lib/http.js`).
 - **No GDZ scraping.** GDZ/reshebnik sites sit behind Cloudflare and block
   cross-origin fetches, so the AI provider is the solver (a best-effort GDZ
   fetch existed earlier and was removed — it only added latency).

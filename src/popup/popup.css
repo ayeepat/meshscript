@@ -1,5 +1,6 @@
 /* Popup styles. Color tokens come from ../common/theme.css */
 * { box-sizing: border-box; }
+svg { flex: none; }
 body {
   width: 380px; margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
@@ -12,7 +13,7 @@ body {
 body.compact { width: 240px; }
 body.compact .top { padding: 8px 12px 6px; }
 body.compact .top h1 { font-size: 14px; }
-body.compact .gear { width: 26px; height: 26px; font-size: 12px; }
+body.compact .gear { width: 26px; height: 26px; }
 body.compact .tabs { margin: 6px 12px 0; padding: 2px; }
 body.compact .tab { padding: 5px 0; font-size: 12px; }
 body.compact .testview { padding: 8px 12px 12px; }
@@ -29,12 +30,13 @@ body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; li
 }
 .top h1 { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; margin: 0; }
 .gear {
-  background: var(--card); border: none; font-size: 15px; cursor: pointer;
+  background: var(--card); border: none; color: var(--secondary); cursor: pointer;
   width: 32px; height: 32px; border-radius: 50%;
   display: grid; place-items: center;
   box-shadow: var(--shadow-btn);
-  transition: transform 0.1s ease;
+  transition: transform 0.1s ease, color 0.15s ease;
 }
+.gear:hover { color: var(--text); }
 .gear:active { transform: scale(0.92); }
 .day { padding: 12px 16px 4px; font-weight: 600; font-size: 13px; color: var(--secondary); text-transform: uppercase; letter-spacing: 0.4px; }
 .list { padding: 8px 16px 16px; }
@@ -60,10 +62,17 @@ body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; li
   background: var(--input-bg); border: none; border-radius: 980px;
   padding: 8px 14px; font-size: 12.5px; font-weight: 500; color: var(--secondary);
   flex: 1; cursor: pointer; min-width: 0;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
   transition: background 0.15s ease, color 0.15s ease;
 }
+.drop .dropicon { display: inline-flex; flex: none; }
+.drop .droplabel { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .drop:hover { background: var(--hover); color: var(--text); }
+/* Classifier says a file/photo is likely required — make the button speak up. */
+.drop.need {
+  color: var(--accent); font-weight: 600;
+  box-shadow: inset 0 0 0 1.5px var(--focus-ring);
+}
 .drop.has { background: var(--accent); color: var(--on-accent); }
 
 /* Collapsible day groups */
@@ -116,6 +125,7 @@ body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; li
   width: 100%; background: var(--accent); color: var(--on-accent);
   border: none; border-radius: 14px; padding: 12px 16px; cursor: pointer;
   font: inherit; font-size: 14px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   transition: transform 0.1s ease, filter 0.15s ease;
 }
 .bigbtn:hover { filter: brightness(1.08); }
@@ -127,3 +137,23 @@ body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; li
   box-shadow: var(--shadow-card);
   white-space: normal; word-break: break-word;
 }
+.copybtn-lg {
+  width: 100%; margin-top: 8px;
+  background: var(--card); color: var(--accent); border: none;
+  box-shadow: var(--shadow-btn);
+  border-radius: 12px; padding: 10px 16px; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 600;
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  transition: background 0.15s ease;
+}
+.copybtn-lg:hover { background: var(--hover); }
+
+/* Inline progress indicator for status lines */
+.spinner {
+  display: inline-block; width: 13px; height: 13px;
+  margin-right: 8px; vertical-align: -2px;
+  border: 2px solid var(--separator); border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
