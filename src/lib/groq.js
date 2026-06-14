@@ -4,11 +4,19 @@
  * service worker. Key is entered in Settings and stored in
  * chrome.storage.local. Never hardcoded, never exposed to content scripts.
  *
+ * Groq is the cheap workhorse: classification and other menial tasks go here
+ * so the paid OpenRouter budget is spent only on real solving.
+ *
  * Models:
  *  - Text:  llama-3.3-70b-versatile
  *  - Vision (images/PDF page photos): meta-llama/llama-4-scout-17b-16e-instruct
  * Get a free key at https://console.groq.com/keys
+ *
+ * Streams when opts.onDelta is given. Set opts.responseFormat = 'json_object'
+ * for structured replies. (json_object disables streaming — parsed whole.)
  */
+
+import { postJson, postStream } from './http.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -16,7 +24,7 @@ const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
 
 async function getKey() {
   const { groqApiKey } = await chrome.storage.local.get('groqApiKey');
-  if (!groqApiKey) throw new Error('Groq API key not set. Open Settings.');
+  if (!groqApiKey) throw new Error('Ключ Groq не задан. Откройте настройки расширения.');
   return groqApiKey;
 }
 
@@ -25,9 +33,11 @@ async function getKey() {
  * @param {string} userText
  * @param {Array<{mimeType:string, dataBase64:string}>} files inline files
  * @param {Array<{role:string, content:string}>} history prior chat turns
+ * @param {{onDelta?:(c:string)=>void, responseFormat?:string}} [opts]
  * @returns {Promise<string>}
  */
-export async function askGroq(systemPrompt, userText, files = [], history = []) {
+export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
+  const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
   const hasImages = files.some((f) => (f.mimeType || '').startsWith('image/'));
   const model = hasImages ? VISION_MODEL : TEXT_MODEL;
@@ -60,13 +70,14 @@ export async function askGroq(systemPrompt, userText, files = [], history = []) 
     ],
     temperature: 0.3
   };
+  if (responseFormat === 'json_object') body.response_format = { type: 'json_object' };
 
-  const res = await fetch(ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` },
-    body: JSON.stringify(body)
-  });
-  if (!res.ok) throw new Error(`Groq error ${res.status}: ${await res.text()}`);
-  const json = await res.json();
+  const headers = { Authorization: `Bearer ${key}` };
+
+  if (onDelta && responseFormat !== 'json_object') {
+    return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta });
+  }
+
+  const json = await postJson(ENDPOINT, { headers, body, label: 'Groq' });
   return json?.choices?.[0]?.message?.content || '(пустой ответ)';
 }

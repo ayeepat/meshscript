@@ -6,15 +6,66 @@
  */
 import { initTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
+import { classifyTask } from '../lib/task-classifier.js';
+import { iconSvg } from '../common/icons.js';
 
 initTheme();
 
-const FILE_KEYWORDS = ['pdf file', 'прикреплённые задания', 'файл', 'тест мэш', 'доделать упр'];
-const uploads = {}; // `${day}||${subject}` -> {mimeType, dataBase64, name}
+const uploads = {}; // `${day}||${subject}` -> [{mimeType, dataBase64, name}, ...]
+const autoFetched = new Set(); // upKeys we've already auto-pulled from Mesh
 
-function needsFile(task) {
-  const t = (task || '').toLowerCase();
-  return FILE_KEYWORDS.some((k) => t.includes(k));
+// Upload buttons of the current render, in card order, so the async Groq
+// classification can refine their labels after the instant regex pass.
+let cardDrops = [];
+
+// Only the caption span is touched so the hidden <input> inside the label
+// survives relabeling.
+function setDropKind(drop, kind) {
+  if (drop.classList.contains('has')) return; // a file is already attached
+  drop.classList.toggle('need', kind === 'attachment' || kind === 'textbook');
+  const icon = kind === 'textbook' ? 'camera' : 'paperclip';
+  const caption =
+    kind === 'attachment' ? 'Прикрепите файл' :
+    kind === 'textbook' ? 'Фото страницы' :
+    'Файл';
+  drop.querySelector('.dropicon').innerHTML = iconSvg(icon, 13);
+  drop.querySelector('.droplabel').textContent = caption;
+}
+
+function setDropLoading(drop, label) {
+  drop.classList.add('need');
+  drop.querySelector('.dropicon').innerHTML = '<span class="spinner" aria-hidden="true"></span>';
+  drop.querySelector('.droplabel').textContent = label;
+}
+
+function setDropAttached(drop, files) {
+  drop.classList.remove('need');
+  drop.classList.add('has');
+  drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
+  drop.querySelector('.droplabel').textContent =
+    files.length === 1 ? files[0].name : `${files.length} файла из МЭШ`;
+}
+
+/**
+ * Ask the background to classify all scanned tasks in one batched call to
+ * Groq (free tier; cached). Falls back silently — the regex-based labels
+ * already on screen are a fine answer when Groq isn't configured.
+ */
+function refineDropLabels() {
+  if (!cardDrops.length) return;
+  const drops = cardDrops; // snapshot: a re-render replaces the array
+  chrome.runtime.sendMessage(
+    { type: 'CLASSIFY_TASKS', payload: { tasks: drops.map((c) => c.task) } },
+    (resp) => {
+      if (chrome.runtime.lastError || !resp?.ok || drops !== cardDrops) return;
+      resp.kinds.forEach((kind, i) => {
+        const card = drops[i];
+        if (!card) return;
+        setDropKind(card.drop, kind);
+        if (kind === 'attachment') tryAutoFetch(card);
+      });
+    }
+  );
 }
 
 function fileToInline(file) {
@@ -32,6 +83,53 @@ function fileToInline(file) {
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
+}
+
+function sendToContent(tabId, msg) {
+  return new Promise((resolve) => {
+    chrome.tabs.sendMessage(tabId, msg, (resp) => {
+      if (chrome.runtime.lastError) resolve(null);
+      else resolve(resp);
+    });
+  });
+}
+
+function sendToBackground(msg) {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage(msg, (resp) => {
+      if (chrome.runtime.lastError) resolve(null);
+      else resolve(resp);
+    });
+  });
+}
+
+/**
+ * Pull files attached to a homework straight from the logged-in Mesh session.
+ * Two steps, split for MV3 reasons (see scraper listMaterialUrls):
+ *  1. the content script discovers the file URLs (same-origin API call);
+ *  2. the service worker downloads them (cross-origin, host_permissions).
+ * On success the drop shows the file as already attached, so the user never
+ * leaves the page to download it.
+ */
+async function tryAutoFetch(card) {
+  const { homeworkId, upKey, drop } = card;
+  if (!homeworkId || autoFetched.has(upKey) || uploads[upKey]?.length) return;
+  autoFetched.add(upKey);
+  const tab = await getActiveTab();
+  if (!tab?.id) return;
+  setDropLoading(drop, 'Ищу файл в МЭШ…');
+
+  const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId });
+  if (!found?.ok || !found.urls?.length) { setDropKind(drop, 'attachment'); return; }
+
+  const dl = await sendToBackground({ type: 'DOWNLOAD_FILES', payload: { urls: found.urls, token: found.token } });
+  if (dl?.ok && dl.files?.length) {
+    uploads[upKey] = dl.files;
+    setDropAttached(drop, dl.files);
+  } else {
+    // Nothing downloadable — restore the manual "attach a file" prompt.
+    setDropKind(drop, 'attachment');
+  }
 }
 
 function showMessage(html) {
@@ -85,11 +183,11 @@ function buildCard(day, item) {
 
   const solveBtn = document.createElement('button');
   solveBtn.className = 'solve';
-  solveBtn.textContent = 'Solve';
+  solveBtn.textContent = 'Решить';
   solveBtn.onclick = async () => {
-    // Hand the attached file (if any) to the dashboard via storage.
-    if (uploads[upKey]) {
-      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, file: uploads[upKey] } });
+    // Hand any attached files (manual or auto-fetched) to the dashboard.
+    if (uploads[upKey]?.length) {
+      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, files: uploads[upKey] } });
     } else {
       await chrome.storage.local.remove('pendingUpload'); // drop stale leftovers
     }
@@ -97,28 +195,37 @@ function buildCard(day, item) {
   };
   row.appendChild(solveBtn);
 
-  if (needsFile(item.task)) {
-    const drop = document.createElement('label');
-    drop.className = 'drop';
-    drop.textContent = '📎 Загрузить файл';
-    const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.pdf,.doc,.docx,image/*';
-    input.style.display = 'none';
-    const setFile = async (file) => {
-      uploads[upKey] = await fileToInline(file);
-      drop.textContent = '✓ ' + uploads[upKey].name;
-      drop.classList.add('has');
-    };
-    input.onchange = () => { if (input.files[0]) setFile(input.files[0]); };
-    drop.appendChild(input);
-    drop.ondragover = (e) => { e.preventDefault(); };
-    drop.ondrop = (e) => {
-      e.preventDefault();
-      if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
-    };
-    row.appendChild(drop);
-  }
+  // Upload is ALWAYS available — no vocabulary covers every phrasing a
+  // teacher uses. Classification only decides how loudly to suggest it:
+  // regex gives an instant label, the batched Groq call refines it.
+  const drop = document.createElement('label');
+  drop.className = 'drop';
+  drop.innerHTML = '<span class="dropicon"></span><span class="droplabel"></span>';
+  const firstKind = classifyTask(item.task).kind;
+  setDropKind(drop, firstKind);
+  const cardObj = { task: item.task, drop, homeworkId: item.homeworkId, upKey };
+  cardDrops.push(cardObj);
+  // Attachment tasks: try to pull the file straight from Mesh right away.
+  if (firstKind === 'attachment') tryAutoFetch(cardObj);
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.pdf,.doc,.docx,image/*';
+  input.style.display = 'none';
+  const setFile = async (file) => {
+    uploads[upKey] = [await fileToInline(file)];
+    drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
+    drop.querySelector('.droplabel').textContent = file.name;
+    drop.classList.remove('need');
+    drop.classList.add('has');
+  };
+  input.onchange = () => { if (input.files[0]) setFile(input.files[0]); };
+  drop.appendChild(input);
+  drop.ondragover = (e) => { e.preventDefault(); };
+  drop.ondrop = (e) => {
+    e.preventDefault();
+    if (e.dataTransfer.files[0]) setFile(e.dataTransfer.files[0]);
+  };
+  row.appendChild(drop);
   return card;
 }
 
@@ -127,6 +234,7 @@ function render(data) {
   const listEl = document.getElementById('list');
   const days = (data.days || []).filter((d) => d.subjects?.length);
   listEl.innerHTML = '';
+  cardDrops = [];
 
   if (!days.length) {
     dayEl.textContent = 'Ближайший день не найден';
@@ -156,9 +264,16 @@ function render(data) {
     }
     listEl.appendChild(details);
   });
+
+  refineDropLabels();
 }
 
 /* ---------- Тест tab: screenshot + page text -> «№N: ответ» ---------- */
+
+function setStatus(el, text) {
+  el.innerHTML = '<span class="spinner" aria-hidden="true"></span>';
+  el.append(text);
+}
 
 function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -190,42 +305,63 @@ function extractFinalAnswers(raw) {
   return lines[lines.length - 1] || raw.trim();
 }
 
-/** Minimal render: bold, line breaks, and LaTeX via tex.js. */
+/**
+ * Format the model's reply into «№N: ответ» lines. The test prompt now asks
+ * for JSON ({reasoning, answers:[{n,a}]}), so parsing is deterministic; the
+ * old text-scan stays only as a fallback if JSON ever comes back malformed.
+ */
+function formatTestAnswers(raw) {
+  const fromObj = (obj) => {
+    if (!obj || !Array.isArray(obj.answers)) return null;
+    const lines = obj.answers
+      .filter((x) => x && (x.a != null))
+      .map((x) => `№${x.n}: ${x.a}`);
+    return lines.length ? lines.join('\n') : null;
+  };
+  try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
+  const m = raw.match(/\{[\s\S]*\}/); // JSON embedded in prose
+  if (m) { try { const r = fromObj(JSON.parse(m[0])); if (r) return r; } catch { /* ignore */ } }
+  return extractFinalAnswers(raw); // legacy fallback
+}
+
+/** Minimal render: bold, line breaks, and LaTeX via tex.js. Returns the plain
+ *  final-answers text so the caller can offer a one-tap copy. */
 function renderAnswer(el, raw) {
-  const { text, chunks } = extractMath(extractFinalAnswers(raw));
+  const plain = formatTestAnswers(raw);
+  const { text, chunks } = extractMath(plain);
   const html = escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
   el.innerHTML = restoreMath(html, chunks);
+  return plain;
 }
 
 async function solveTestOnScreen() {
   const btn = document.getElementById('solveTest');
   const box = document.getElementById('testAnswer');
+  const copyBtn = document.getElementById('copyTest');
   btn.disabled = true;
+  copyBtn.hidden = true;
   box.hidden = false;
-  box.textContent = '👀 Смотрю…';
+  setStatus(box, 'Читаю страницу…');
   try {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
 
-    // Page text is best-effort: some pages forbid injection — the screenshot
-    // alone is usually enough for the vision model.
-    let pageText = '';
-    try {
-      const [inj] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: () => document.body.innerText.slice(0, 15000)
-      });
-      pageText = inj?.result || '';
-    } catch (_e) { /* keep going with just the screenshot */ }
-
-    // PNG is lossless — small numbers and formulas stay crisp, which matters
-    // more than file size since the screenshot is sent once and discarded.
-    const dataUrl = await chrome.tabs.captureVisibleTab(undefined, { format: 'png' });
+    // Text extraction and screenshot are independent — run them together so
+    // the user waits for the slower of the two, not their sum. Page text is
+    // best-effort: some pages forbid injection — the screenshot (PNG, lossless
+    // so small numbers/formulas stay crisp) is usually enough on its own.
+    const [pageText, dataUrl] = await Promise.all([
+      chrome.scripting
+        .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
+        .then(([inj]) => inj?.result || '')
+        .catch(() => ''),
+      chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
+    ]);
     const screenshot = { mimeType: 'image/png', dataBase64: dataUrl.split(',')[1], name: 'screen.png' };
 
-    box.textContent = '🧠 Решаю…';
+    setStatus(box, 'Решаю…');
     const resp = await new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot } }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
@@ -233,7 +369,17 @@ async function solveTestOnScreen() {
       });
     });
     if (!resp.ok) throw new Error(resp.error || 'нет ответа');
-    renderAnswer(box, resp.answer);
+    const plain = renderAnswer(box, resp.answer);
+    const copyLabel = document.getElementById('copyTestLabel');
+    copyBtn.hidden = false;
+    copyLabel.textContent = 'Скопировать ответы';
+    copyBtn.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(plain);
+        copyLabel.textContent = 'Скопировано';
+        setTimeout(() => (copyLabel.textContent = 'Скопировать ответы'), 1500);
+      } catch (_e) { /* clipboard blocked — ignore */ }
+    };
   } catch (e) {
     box.textContent = 'Ошибка: ' + (e?.message || e);
   } finally {

@@ -20,7 +20,7 @@ getThemePref().then(markActivePref);
 // Follow theme changes made elsewhere (e.g. the dashboard toggle).
 document.addEventListener('themechange', async () => markActivePref(await getThemePref()));
 
-const KEY_FIELDS = ['openrouterApiKey', 'geminiApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
+const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 
 async function load() {
@@ -45,7 +45,7 @@ async function save() {
   data.promptOverrides = promptOverrides;
   await chrome.storage.local.set(data);
   const s = document.getElementById('status');
-  s.textContent = '✓ Сохранено';
+  s.textContent = 'Сохранено';
   setTimeout(() => (s.textContent = ''), 2000);
 }
 

@@ -1,5 +1,6 @@
 /* Dashboard styles. Color tokens come from ../common/theme.css */
 * { box-sizing: border-box; }
+svg { flex: none; }
 html, body { height: 100%; margin: 0; }
 body {
   display: flex;
@@ -28,7 +29,9 @@ body {
 }
 .week .lesson:hover { background: var(--hover); }
 .week .lesson.active { background: var(--accent); color: var(--on-accent); }
-.week .lesson .subj { font-weight: 600; }
+.week .lesson .subj { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.week .lesson .donemark { display: inline-flex; color: var(--green); }
+.week .lesson.active .donemark { color: var(--on-accent); }
 .week .lesson .t {
   font-size: 11.5px; color: var(--secondary); margin-top: 2px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -46,14 +49,31 @@ body {
   border-bottom: 0.5px solid var(--separator);
 }
 .head h1 { font-size: 17px; font-weight: 700; letter-spacing: -0.3px; margin: 0; }
-.head .actions { display: flex; gap: 8px; }
+.head .actions { display: flex; align-items: center; gap: 8px; }
+
+/* Answer-mode segmented control (Кратко / Объяснить) */
+.modeseg {
+  display: flex; gap: 2px; padding: 3px;
+  background: var(--input-bg, var(--card)); border-radius: 11px;
+}
+.modeseg button {
+  background: transparent; border: none; cursor: pointer;
+  color: var(--secondary); font: inherit; font-size: 12.5px; font-weight: 600;
+  padding: 5px 11px; border-radius: 8px;
+  transition: color 0.15s ease, background 0.15s ease;
+}
+.modeseg button:hover { color: var(--text); }
+.modeseg button.active {
+  background: var(--card); color: var(--text); box-shadow: var(--shadow-btn);
+}
 .iconbtn {
-  background: var(--card); border: none; font-size: 15px; cursor: pointer;
+  background: var(--card); border: none; color: var(--secondary); cursor: pointer;
   width: 32px; height: 32px; border-radius: 50%;
   display: grid; place-items: center;
   box-shadow: var(--shadow-btn);
-  transition: transform 0.1s ease;
+  transition: transform 0.1s ease, color 0.15s ease;
 }
+.iconbtn:hover { color: var(--text); }
 .iconbtn:active { transform: scale(0.92); }
 
 /* ---------- Chat ---------- */
@@ -70,7 +90,24 @@ body {
   background: var(--card); border: none; white-space: normal;
   border-bottom-left-radius: 6px;
   box-shadow: var(--shadow-card);
+  position: relative; padding-right: 42px;
 }
+/* Status bubble while waiting for an answer */
+.msg.assistant.thinking {
+  display: flex; align-items: center; gap: 8px;
+  color: var(--secondary); padding-right: 16px;
+}
+/* Copy button: tucked top-right of the bubble, fades in on hover. */
+.msg.assistant .copybtn {
+  position: absolute; top: 8px; right: 8px;
+  width: 26px; height: 26px; border-radius: 8px;
+  border: none; cursor: pointer;
+  background: var(--input-bg); color: var(--secondary);
+  display: grid; place-items: center;
+  opacity: 0; transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+.msg.assistant:hover .copybtn { opacity: 1; }
+.msg.assistant .copybtn:hover { background: var(--accent); color: var(--on-accent); }
 /* Rendered markdown inside assistant bubbles */
 .msg p { margin: 0 0 8px; }
 .msg p:last-child { margin-bottom: 0; }
@@ -101,17 +138,19 @@ body {
   box-shadow: var(--shadow-btn);
   max-width: 60%;
 }
+.filechip[hidden] { display: none; }
+.filechip > svg { color: var(--secondary); }
 .filechip span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .filechip button {
   background: var(--hover); color: var(--secondary); border: none; border-radius: 50%;
-  width: 20px; height: 20px; cursor: pointer; font-size: 10px; line-height: 1;
+  width: 20px; height: 20px; cursor: pointer;
   display: grid; place-items: center; flex: none;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .filechip button:hover { background: var(--accent); color: var(--on-accent); }
 .attach {
   background: var(--card); color: var(--secondary); border: none; border-radius: 50%;
-  width: 38px; height: 38px; cursor: pointer; font-size: 16px; flex: none;
+  width: 38px; height: 38px; cursor: pointer; flex: none;
   display: grid; place-items: center;
   box-shadow: var(--shadow-btn);
   transition: transform 0.1s ease, color 0.15s ease;
@@ -129,9 +168,18 @@ body {
 .send {
   background: var(--accent); color: var(--on-accent); border: none; border-radius: 50%;
   width: 38px; height: 38px; cursor: pointer; flex: none;
-  font-size: 18px; font-weight: 700; line-height: 1;
   display: grid; place-items: center;
   transition: transform 0.1s ease, filter 0.15s ease;
 }
 .send:hover { filter: brightness(1.08); }
 .send:active { transform: scale(0.92); }
+
+/* Inline progress indicator (chat status bubble + sidebar) */
+.spinner {
+  display: inline-block; width: 12px; height: 12px; flex: none;
+  border: 2px solid var(--separator); border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+.week .lesson.active .spinner { border-color: rgba(255, 255, 255, 0.35); border-top-color: var(--on-accent); }
+@keyframes spin { to { transform: rotate(360deg); } }

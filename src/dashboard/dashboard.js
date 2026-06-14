@@ -6,10 +6,11 @@
  */
 import { initTheme, toggleTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
+import { iconSvg } from '../common/icons.js';
 
 // Keep the theme button icon in sync with the resolved theme.
 document.addEventListener('themechange', (e) => {
-  document.getElementById('themeBtn').textContent = e.detail === 'dark' ? '☀️' : '🌙';
+  document.getElementById('themeBtn').innerHTML = iconSvg(e.detail === 'dark' ? 'sun' : 'moon', 16);
 });
 initTheme();
 
@@ -25,6 +26,7 @@ const weekEl = document.getElementById('week');
 // key -> { key, day, subject, task, sessionId, history: [{role, content}], started, pending }
 const chats = new Map();
 let activeKey = null;
+let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
 
 // Task is part of the key: one subject can have two homeworks in a day.
 const keyFor = (day, subject, task) => `${day || '?'}||${subject}||${(task || '').slice(0, 40)}`;
@@ -74,7 +76,12 @@ function mdToHtml(md) {
 
 /* ---------- Typewriter: starts slow, accelerates, finishes fast ---------- */
 
+// Re-parsing the full markdown every frame is O(n²); for long answers that
+// janks badly and the reveal drags on. Above this length we render once.
+const TYPEWRITER_MAX = 1500;
+
 function typewriter(el, fullText) {
+  if (fullText.length > TYPEWRITER_MAX) { el.innerHTML = mdToHtml(fullText); return; }
   let i = 0;
   let chunk = 1; // chars per frame; grows each frame -> accelerating reveal
   function step() {
@@ -91,15 +98,57 @@ function typewriter(el, fullText) {
 
 /* ---------- Chat UI ---------- */
 
+function copyButton(getText) {
+  const b = document.createElement('button');
+  b.className = 'copybtn';
+  b.title = 'Скопировать ответ';
+  b.innerHTML = iconSvg('copy', 13);
+  b.onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(getText());
+      b.innerHTML = iconSvg('check', 13);
+      setTimeout(() => (b.innerHTML = iconSvg('copy', 13)), 1200);
+    } catch (_e) { /* clipboard blocked — ignore */ }
+  };
+  return b;
+}
+
 function bubble(role, text, { animate = false } = {}) {
   const d = document.createElement('div');
   d.className = `msg ${role}`;
   if (role === 'assistant') {
-    if (animate) typewriter(d, text);
-    else d.innerHTML = mdToHtml(text);
+    const body = document.createElement('div');
+    body.className = 'mdbody';
+    if (animate) typewriter(body, text);
+    else body.innerHTML = mdToHtml(text);
+    d.appendChild(body);
+    d.appendChild(copyButton(() => text));
   } else {
     d.textContent = text; // user text stays plain
   }
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return d;
+}
+
+/** Empty assistant bubble whose body is filled live as tokens stream in. */
+function assistantShell() {
+  const d = document.createElement('div');
+  d.className = 'msg assistant';
+  const body = document.createElement('div');
+  body.className = 'mdbody';
+  d.appendChild(body);
+  chatEl.appendChild(d);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return { wrap: d, body };
+}
+
+/** Transient status bubble shown while the answer is being generated. */
+function thinkingBubble() {
+  const d = document.createElement('div');
+  d.className = 'msg assistant thinking';
+  d.innerHTML = '<span class="spinner" aria-hidden="true"></span>';
+  d.append('Думаю…');
   chatEl.appendChild(d);
   chatEl.scrollTop = chatEl.scrollHeight;
   return d;
@@ -113,7 +162,7 @@ function renderChat(chat) {
     return;
   }
   for (const m of chat.history) bubble(m.role, m.content);
-  if (chat.pending) chat.thinkingEl = bubble('assistant', 'Думаю…');
+  if (chat.pending) chat.thinkingEl = thinkingBubble();
 }
 
 function fileToInline(file) {
@@ -126,9 +175,11 @@ function fileToInline(file) {
 }
 
 /**
- * Send a message within a lesson's chat. The response is appended to that
- * lesson's history even if the user switched to another lesson meanwhile;
- * the DOM is only touched when the lesson is the active one.
+ * Send a message within a lesson's chat over a streaming port. Tokens are
+ * revealed live; the answer is appended to that lesson's history even if the
+ * user switched lessons meanwhile — the DOM is only touched when the lesson is
+ * the active one. The active lesson can change mid-stream, so every render
+ * guards on `activeKey === chat.key`.
  */
 function sendToChat(chat, text, files) {
   const prior = chat.history.slice(); // turns BEFORE this message
@@ -136,30 +187,86 @@ function sendToChat(chat, text, files) {
   chat.pending = true;
   if (activeKey === chat.key) {
     bubble('user', text);
-    chat.thinkingEl = bubble('assistant', 'Думаю…');
+    chat.thinkingEl = thinkingBubble();
   }
   renderSidebar();
+
   return new Promise((resolve) => {
-    chrome.runtime.sendMessage(
-      { type: 'SOLVE', payload: { subject: chat.subject, task: text, files, sessionId: chat.sessionId, history: prior } },
-      (resp) => {
-        chat.pending = false;
-        let answer;
-        if (chrome.runtime.lastError || !resp?.ok) {
-          answer = 'Ошибка: ' + (resp?.error || chrome.runtime.lastError?.message);
+    const port = chrome.runtime.connect({ name: 'solve' });
+    let acc = '';        // accumulated streamed text
+    let shell = null;    // live assistant bubble, created on first delta
+    let settled = false;
+
+    // (Re)create the live bubble. Switching lessons wipes the chat DOM via
+    // renderChat, detaching our shell — so rebuild it (with text so far) if the
+    // user comes back mid-stream.
+    const ensureShell = () => {
+      if (activeKey !== chat.key) return;
+      if (shell && shell.wrap.isConnected) return;
+      chat.thinkingEl?.remove();
+      chat.thinkingEl = null;
+      shell = assistantShell();
+      shell.body.innerHTML = mdToHtml(acc);
+    };
+
+    // Re-parsing the full markdown on every token is O(n²) and janks on long
+    // answers. Coalesce: deltas just append to `acc`; the DOM re-renders at
+    // most once per animation frame.
+    let renderPending = false;
+    const flush = () => {
+      renderPending = false;
+      if (settled || activeKey !== chat.key) return;
+      ensureShell();
+      shell.body.innerHTML = mdToHtml(acc);
+      chatEl.scrollTop = chatEl.scrollHeight;
+    };
+    const scheduleRender = () => {
+      if (renderPending || activeKey !== chat.key) return;
+      renderPending = true;
+      requestAnimationFrame(flush);
+    };
+
+    const finish = (answer, { animate = false } = {}) => {
+      if (settled) return;
+      settled = true;
+      chat.pending = false;
+      chat.history.push({ role: 'assistant', content: answer });
+      if (activeKey === chat.key) {
+        chat.thinkingEl?.remove();
+        chat.thinkingEl = null;
+        if (shell && shell.wrap.isConnected) {
+          shell.body.innerHTML = mdToHtml(answer); // clean final render
+          shell.wrap.appendChild(copyButton(() => answer));
         } else {
-          chat.sessionId = resp.result.sessionId || chat.sessionId;
-          answer = resp.result.answer;
+          bubble('assistant', answer, { animate });
         }
-        chat.history.push({ role: 'assistant', content: answer });
-        if (activeKey === chat.key) {
-          chat.thinkingEl?.remove();
-          bubble('assistant', answer, { animate: true });
-        }
-        renderSidebar();
-        resolve();
       }
-    );
+      renderSidebar();
+      try { port.disconnect(); } catch { /* already gone */ }
+      resolve();
+    };
+
+    port.onMessage.addListener((m) => {
+      if (m?.type === 'delta') {
+        acc += m.text;
+        scheduleRender();
+      } else if (m?.type === 'done') {
+        chat.sessionId = m.result?.sessionId || chat.sessionId;
+        // Prefer the authoritative full text; fall back to what we streamed.
+        // animate only when nothing streamed (e.g. the photo-request guard).
+        finish(m.result?.answer ?? acc, { animate: !acc });
+      } else if (m?.type === 'error') {
+        finish('Ошибка: ' + m.error);
+      }
+    });
+
+    // The service worker can be torn down; surface that instead of hanging.
+    port.onDisconnect.addListener(() => finish(acc || 'Ошибка: соединение прервано.'));
+
+    port.postMessage({
+      type: 'SOLVE',
+      payload: { subject: chat.subject, task: text, files, sessionId: chat.sessionId, history: prior, mode: answerMode }
+    });
   });
 }
 
@@ -175,10 +282,12 @@ async function startLesson(chat) {
   let files = [];
   try {
     const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
-    if (pendingUpload?.file && pendingUpload.subject === chat.subject &&
+    // Files come from the popup: manually attached OR auto-fetched from Mesh.
+    const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
+    if (pending.length && pendingUpload.subject === chat.subject &&
         (!pendingUpload.day || pendingUpload.day === chat.day)) {
-      files = [pendingUpload.file];
-      text += '\n\n📎 ' + (pendingUpload.file.name || 'файл');
+      files = pending;
+      text += '\n\nВложение: ' + pending.map((f) => f.name || 'файл').join(', ');
       await chrome.storage.local.remove('pendingUpload');
     }
   } catch (_e) { /* upload is best-effort */ }
@@ -214,9 +323,19 @@ function renderSidebar() {
     }
     const el = document.createElement('div');
     el.className = 'lesson' + (chat.key === activeKey ? ' active' : '');
-    const status = chat.pending ? '⏳ ' : chat.started ? '✓ ' : '';
     el.innerHTML = '<div class="subj"></div><div class="t"></div>';
-    el.querySelector('.subj').textContent = status + chat.subject;
+    const subj = el.querySelector('.subj');
+    if (chat.pending) {
+      const dot = document.createElement('span');
+      dot.className = 'spinner';
+      subj.appendChild(dot);
+    } else if (chat.started) {
+      const done = document.createElement('span');
+      done.className = 'donemark';
+      done.innerHTML = iconSvg('check', 11);
+      subj.appendChild(done);
+    }
+    subj.append(chat.subject);
     el.querySelector('.t').textContent = (chat.task || '').slice(0, 80);
     el.onclick = () => activateLesson(chat.key);
     weekEl.appendChild(el);
@@ -230,29 +349,49 @@ const fileInput = document.getElementById('file');
 const fileChip = document.getElementById('filechip');
 const fileNameEl = document.getElementById('filename');
 
+// Held as an already-inlined file so a pasted screenshot and a picked file
+// share one path (an <input type=file> can't be set programmatically).
+let pendingFile = null;
+
+function showAttachment(name) {
+  fileNameEl.textContent = name;
+  fileChip.hidden = false;
+}
 function clearAttachment() {
+  pendingFile = null;
   fileInput.value = '';
   fileChip.hidden = true;
 }
 
 document.getElementById('attach').onclick = () => fileInput.click();
-fileInput.onchange = () => {
-  if (fileInput.files[0]) {
-    fileNameEl.textContent = '📎 ' + fileInput.files[0].name;
-    fileChip.hidden = false;
-  }
+fileInput.onchange = async () => {
+  const f = fileInput.files[0];
+  if (f) { pendingFile = await fileToInline(f); showAttachment(f.name); }
 };
 document.getElementById('clearfile').onclick = clearAttachment;
 
+// Paste a screenshot / snipped image straight into the chat (Ctrl/⌘+V).
+document.addEventListener('paste', async (e) => {
+  const item = [...(e.clipboardData?.items || [])].find((it) => it.type.startsWith('image/'));
+  if (!item) return;
+  const blob = item.getAsFile();
+  if (!blob) return;
+  e.preventDefault();
+  const name = blob.name || `screenshot-${Date.now()}.png`;
+  pendingFile = await fileToInline(new File([blob], name, { type: blob.type || 'image/png' }));
+  showAttachment(name);
+});
+
 async function sendFromComposer() {
   const chat = activeChat();
-  if (!chat) return;
+  if (!chat || chat.pending) return; // ignore until the current answer lands
   const text = inputEl.value.trim();
-  const files = fileInput.files[0] ? [await fileToInline(fileInput.files[0])] : [];
+  const files = pendingFile ? [pendingFile] : [];
   if (!text && !files.length) return;
+  const fname = pendingFile?.name;
   inputEl.value = '';
   clearAttachment();
-  await sendToChat(chat, text || ('📎 ' + files[0].name), files);
+  await sendToChat(chat, text || ('Вложение: ' + fname), files);
 }
 
 document.getElementById('send').onclick = sendFromComposer;
@@ -265,6 +404,25 @@ inputEl.addEventListener('keydown', (e) => {
 
 document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
 document.getElementById('themeBtn').onclick = toggleTheme;
+
+/* ---------- Answer-mode toggle (Кратко / Объяснить) ---------- */
+
+const modeSeg = document.getElementById('modeSeg');
+function markMode(mode) {
+  answerMode = mode;
+  for (const b of modeSeg.querySelectorAll('button')) {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  }
+}
+modeSeg.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  markMode(b.dataset.mode);
+  chrome.storage.local.set({ answerMode: b.dataset.mode });
+});
+chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
+  if (saved === 'brief' || saved === 'explain') markMode(saved);
+});
 
 /* ---------- Init: load week from the last popup scan ---------- */
 

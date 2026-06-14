@@ -148,9 +148,11 @@ function collectCardsFromDom() {
     if (cardRoot === document.body) cardRoot = null;
 
     let task = '';
+    let href = '';
     if (cardRoot) {
       const link = cardRoot.querySelector(HOMEWORK_ANCHOR_SEL);
       if (link) {
+        href = link.getAttribute('href') || '';
         // Prefer the FIRST <p> inside the anchor (the visible task text).
         // Skip empty <p> wrappers Mesh sometimes emits around the text.
         const ps = link.querySelectorAll('p');
@@ -185,10 +187,18 @@ function collectCardsFromDom() {
     cards.push({
       h6,
       subject,
-      task: task || '(текст задания не виден — откройте задание или загрузите фото)'
+      task: task || '(текст задания не виден — откройте задание или загрузите фото)',
+      href,
+      homeworkId: homeworkIdFromHref(href)
     });
   }
   return cards;
+}
+
+/** Pull the numeric homework id out of a Mesh anchor href (".../homeworks/123_normal"). */
+function homeworkIdFromHref(href) {
+  const m = (href || '').match(/\/homeworks\/(\d+)/);
+  return m ? m[1] : null;
 }
 
 function scanFromDom() {
@@ -201,7 +211,9 @@ function scanFromDom() {
     const day = dayForNode(c.h6, dayHeaders) || null;
     const key = day || '__nodate__';
     if (!byDay.has(key)) byDay.set(key, { day, subjects: [] });
-    byDay.get(key).subjects.push({ subject: c.subject, task: c.task });
+    byDay.get(key).subjects.push({
+      subject: c.subject, task: c.task, href: c.href, homeworkId: c.homeworkId
+    });
   }
 
   // Preserve document order of day headers.
@@ -309,6 +321,78 @@ function scanFromText() {
   return { day: first.day, subjects: first.subjects, days };
 }
 
+/* ---------- Attachment discovery (logged-in Mesh session) ---------- */
+/**
+ * The most painful manual step is: read "сделать из прикреплённого файла",
+ * leave Mesh, download it, come back, upload it. We run INSIDE the user's
+ * authenticated school.mos.ru session, so we can find those materials.
+ *
+ * Division of labour (this matters for MV3):
+ *  - The content script only DISCOVERS the file URLs. Mesh is an SPA, so the
+ *    materials live behind its family API; we hit that API here because it is
+ *    SAME-ORIGIN (school.mos.ru) and so carries the page's auth cookies, plus
+ *    we can read the auth token from the page's localStorage for the header.
+ *  - The actual file DOWNLOADS happen in the service worker (see
+ *    DOWNLOAD_FILES), NOT here. In MV3 a content-script fetch is bound by the
+ *    page's CORS and does NOT get the extension's host_permissions, so a
+ *    cross-origin file (e.g. uchebnik.mos.ru) would be blocked here. The
+ *    service worker DOES get host_permissions and can fetch it.
+ * Everything is best-effort: any failure returns no URLs and the popup falls
+ * back to manual upload (unchanged behaviour).
+ *
+ * NOTE: HW_API is the one Mesh-specific assumption. If auto-fetch comes back
+ * empty on a card you KNOW has a file, confirm this endpoint against the real
+ * Network tab (DevTools → XHR while opening a homework) and adjust it here.
+ */
+const HW_API = (id) => `https://school.mos.ru/api/family/web/v1/homeworks/${id}`;
+const FILE_URL_RE = /https?:\/\/[^\s"'<>]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|gif|webp|txt|rtf)(?:\?[^\s"'<>]*)?/i;
+const MESH_FILE_HINT_RE = /(uchebnik\.mos\.ru|\/files?\/|\/storage\/|\/attachments?\/|file_id=)/i;
+
+/** Try to find Mesh's auth token in localStorage / cookies for the API header. */
+function findAuthToken() {
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i) || '';
+      if (/token|aupd|auth/i.test(k)) {
+        const v = localStorage.getItem(k) || '';
+        if (v.length > 20 && !/\s/.test(v)) return v.replace(/^"|"$/g, '');
+      }
+    }
+  } catch { /* storage blocked */ }
+  const m = document.cookie.match(/(?:aupd_token|auth_token)=([^;]+)/);
+  return m ? decodeURIComponent(m[1]) : null;
+}
+
+/** Recursively collect file-looking URLs from an arbitrary JSON value. */
+function collectFileUrls(node, out = new Set(), depth = 0) {
+  if (depth > 8 || out.size >= 8) return out;
+  if (typeof node === 'string') {
+    if (FILE_URL_RE.test(node) || (/^https?:\/\//.test(node) && MESH_FILE_HINT_RE.test(node))) out.add(node);
+  } else if (Array.isArray(node)) {
+    for (const v of node) collectFileUrls(v, out, depth + 1);
+  } else if (node && typeof node === 'object') {
+    for (const v of Object.values(node)) collectFileUrls(v, out, depth + 1);
+  }
+  return out;
+}
+
+/**
+ * Ask the same-origin family API for a homework and pull out file URLs.
+ * @returns {Promise<{ok:boolean, urls:string[], token:string|null}>}
+ */
+async function listMaterialUrls(homeworkId) {
+  const token = findAuthToken();
+  if (!homeworkId) return { ok: false, urls: [], token };
+  try {
+    const headers = { Accept: 'application/json' };
+    if (token) { headers['Auth-Token'] = token; headers['Authorization'] = 'Bearer ' + token; }
+    const res = await fetch(HW_API(homeworkId), { credentials: 'include', headers });
+    if (!res.ok) return { ok: false, urls: [], token };
+    const json = await res.json();
+    return { ok: true, urls: [...collectFileUrls(json)].slice(0, 5), token };
+  } catch { return { ok: false, urls: [], token }; }
+}
+
 /* ---------- Entry point ---------- */
 
 function scanHomeworks() {
@@ -352,6 +436,15 @@ if (!window.__meshscriptListenerAdded) {
       if (msg && msg.type === 'MESH_DEBUG') {
         sendResponse({ ok: true, debug: debugScan() });
         return false;
+      }
+      if (msg && msg.type === 'MESH_LIST_MATERIALS') {
+        // Async: keep the channel open until the API call resolves. Only
+        // discovers URLs — the service worker downloads them (see comment above
+        // listMaterialUrls for the MV3 CORS reason).
+        listMaterialUrls(msg.homeworkId)
+          .then((r) => sendResponse(r))
+          .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], token: null }));
+        return true;
       }
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
