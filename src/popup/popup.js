@@ -6,7 +6,7 @@
  */
 import { initTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
-import { classifyTask } from '../lib/task-classifier.js';
+import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
 
 initTheme();
@@ -122,7 +122,10 @@ async function tryAutoFetch(card) {
   const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId });
   if (!found?.ok || !found.urls?.length) { setDropKind(drop, 'attachment'); return; }
 
-  const dl = await sendToBackground({ type: 'DOWNLOAD_FILES', payload: { urls: found.urls, token: found.token } });
+  const dl = await sendToBackground({
+    type: 'DOWNLOAD_FILES',
+    payload: { urls: found.urls, headers: found.headers, token: found.token }
+  });
   if (dl?.ok && dl.files?.length) {
     uploads[upKey] = dl.files;
     setDropAttached(drop, dl.files);
@@ -179,6 +182,16 @@ function buildCard(day, item) {
   card.querySelector('.task').textContent = item.task;
   const row = card.querySelector('.row');
 
+  // Audio can NEVER be solved by this tool (no transcription). Warn up front so
+  // the student doesn't trust an invented listening answer — the solver guard
+  // refuses it too, this is just the visible heads-up.
+  if (needsAudio(item.task)) {
+    const note = document.createElement('div');
+    note.className = 'audionote';
+    note.textContent = '🎧 Аудирование не решается — пришлите текст/расшифровку записи. Остальное решу.';
+    card.querySelector('.task').after(note);
+  }
+
   const upKey = `${day || '?'}||${item.subject}`;
 
   const solveBtn = document.createElement('button');
@@ -209,7 +222,7 @@ function buildCard(day, item) {
   if (firstKind === 'attachment') tryAutoFetch(cardObj);
   const input = document.createElement('input');
   input.type = 'file';
-  input.accept = '.pdf,.doc,.docx,image/*';
+  input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*';
   input.style.display = 'none';
   const setFile = async (file) => {
     uploads[upKey] = [await fileToInline(file)];

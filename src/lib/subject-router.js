@@ -37,12 +37,26 @@ export async function basePromptForSubject(subject) {
 }
 
 // Universal guard appended to every solve. Rides along in the same call —
-// zero extra cost — and stops the model from burning tokens on a long
-// hallucinated "solution" to an exercise it has never seen.
+// zero extra cost. Two jobs: (1) stop the model from fabricating a plausible
+// but invented "solution" to material it cannot actually see, and (2) hard-stop
+// on audio, which this tool can NEVER process (no transcription). Audio is the
+// dangerous case: the model otherwise confidently makes up listening answers.
+// The guard allows PARTIAL solving — do the parts whose material is present
+// (e.g. reading/grammar from an attached PDF), refuse only the missing parts.
 const CONTEXT_GUARD =
-  'Если задание состоит только из ссылки на учебник (номер упражнения, задачи, страницы, параграфа) ' +
-  'или упоминает приложенный файл, а сам текст задания, фото страницы или файл тебе НЕ переданы — ' +
-  'НЕ выдумывай условие. Вместо решения кратко попроси прислать фото страницы учебника или файл. ' +
+  'КРИТИЧЕСКИ ВАЖНО — НЕ ВЫДУМЫВАЙ. Решай ТОЛЬКО то, что реально видишь в этом сообщении: ' +
+  'в тексте задания или в приложенных файлах/фото. Если для выполнения нужен исходный материал, ' +
+  'которого здесь НЕТ (текст задания, страница учебника, рабочий лист, документ, картинка, таблица), — ' +
+  'НЕ придумывай его содержание и НЕ выдавай правдоподобные, но выдуманные ответы. ' +
+  'Сначала выполни те части, материал которых действительно приложен, а для остального честно напиши, ' +
+  'чего конкретно не хватает, и попроси это прислать (фото страницы / файл / текст).\n' +
+  'АУДИО — особый случай: ты НЕ умеешь слушать звук. Любое задание на аудирование (listening), ' +
+  'а также ссылки на аудиозаписи (Google Drive, Яндекс.Диск, .mp3 и любые ссылки на звук) ты выполнить ' +
+  'НЕ можешь — НИКОГДА не выдумывай ответы к аудированию. Так и напиши: ' +
+  '«Не могу прослушать аудио — пришлите расшифровку (текст) записи, тогда решу эту часть». ' +
+  'И НИКОГДА не утверждай, что ты «прослушал запись» или «обработал расшифровку», если её текста ' +
+  'нет прямо в этом сообщении — это запрещено. ' +
+  'Остальные части (чтение, лексика, грамматика, письмо) решай как обычно, если их материал приложен.\n' +
   'Исключение: задания по классическим литературным произведениям, которые ты знаешь, решай сразу.';
 
 // Answer-mode suffix. BOTH modes keep the worked steps — a teacher needs to
