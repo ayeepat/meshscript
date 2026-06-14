@@ -434,6 +434,15 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
   return out;
 }
 
+// STRICT matcher for DOM links: only a real attachment, never an auth/SSO link.
+// (The looser MESH_FILE_HINT_RE matched things like ".../authenticate" and we
+// ended up downloading a login page.) Accept a true file extension, or a path
+// clearly under Mesh's attachment store.
+const DOM_FILE_RE = /(\/ej\/attachments?\/|uchebnik\.mos\.ru\/)/i;
+function looksLikeFileLink(s) {
+  return FILE_URL_RE.test(s) || DOM_FILE_RE.test(s);
+}
+
 /**
  * Scan the CURRENT page DOM for attachment-looking links. This is the reliable
  * path: when the user is on the homework page, the attachment is a real <a> (or
@@ -445,10 +454,8 @@ function scanPageForFileLinks() {
   const push = (raw) => {
     if (!raw) return;
     let s = String(raw).trim();
-    if (s[0] === '/' && MESH_FILE_HINT_RE.test(s)) s = 'https://school.mos.ru' + s;
-    if (FILE_URL_RE.test(s) || (/^https?:\/\//.test(s) && MESH_FILE_HINT_RE.test(s))) {
-      out.add(encodeURI(s));
-    }
+    if (s[0] === '/') s = location.origin + s; // absolutise relative paths
+    if (/^https?:\/\//.test(s) && looksLikeFileLink(s)) out.add(encodeURI(s));
   };
   for (const a of document.querySelectorAll('a[href]')) push(a.getAttribute('href'));
   // Mesh sometimes renders downloads as buttons carrying the URL in a data-attr.
@@ -459,44 +466,107 @@ function scanPageForFileLinks() {
   return [...out].slice(0, 8);
 }
 
+/** Last path segment of a URL, decoded — used as the attachment filename. */
+function fileNameFromUrl(url) {
+  try { return decodeURIComponent(new URL(url, location.href).pathname.split('/').pop()) || 'attachment'; }
+  catch { return 'attachment'; }
+}
+
+const isSameOrigin = (url) => {
+  try { return new URL(url, location.href).origin === location.origin; } catch { return false; }
+};
+
 /**
- * Ask the same-origin family API for a lesson item and pull out file URLs.
- * The service worker downloads them, so we also return the token + headers it
- * needs (same Bearer + X-mes-* set).
+ * Download a SAME-ORIGIN attachment from inside the page. The content script
+ * carries the user's real session cookies, so school.mos.ru/ej/attachments
+ * downloads succeed here without bouncing to the auth page — which is exactly
+ * what happened when the service worker fetched them. An HTML response means we
+ * still got an auth/login redirect, so we reject it instead of attaching junk.
+ */
+async function fetchInlineFile(url) {
+  try {
+    const res = await fetch(url, { credentials: 'include' });
+    if (!res.ok) { console.log('[meshscript] cs-download http', res.status, url); return null; }
+    const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
+    if (ct.includes('text/html') || ct.includes('text/xml')) {
+      console.log('[meshscript] cs-download got HTML (auth redirect?)', url);
+      return { __auth: true };
+    }
+    const blob = await res.blob();
+    if (!blob.size || blob.size > 12 * 1024 * 1024) return null;
+    const dataUrl = await new Promise((resolve, reject) => {
+      const r = new FileReader();
+      r.onload = () => resolve(r.result);
+      r.onerror = reject;
+      r.readAsDataURL(blob);
+    });
+    return {
+      mimeType: ct || blob.type || 'application/octet-stream',
+      dataBase64: String(dataUrl).split(',')[1],
+      name: fileNameFromUrl(url)
+    };
+  } catch (e) { console.log('[meshscript] cs-download exception', String(e), url); return null; }
+}
+
+/**
+ * Discover a homework's attachment(s) and download the SAME-ORIGIN ones right
+ * here (the content script carries the page's real session, so the download
+ * doesn't bounce to the auth page). Cross-origin URLs (e.g. uchebnik.mos.ru) are
+ * returned for the service worker to fetch with host_permissions.
  *
  * Returns a `stage` so failures are VISIBLE instead of silently falling back to
- * manual upload — this is a reverse-engineered private API, so when it breaks we
- * need to see exactly where (no token / API status / no file in the response).
- * @returns {Promise<{ok:boolean, urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
+ * manual upload. `files` are already-inlined same-origin attachments; `urls` are
+ * leftover cross-origin ones for the service worker.
+ * @returns {Promise<{ok:boolean, files:object[], urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
  */
 async function listMaterialUrls(lessonId) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => console.log('[meshscript] auto-fetch:', stage, extra ?? '');
-  // Reliable first try: an attachment link visible on the current page.
-  const domUrls = scanPageForFileLinks();
-  if (domUrls.length) { log('found_dom', domUrls); return { ok: true, urls: domUrls, token, headers, stage: 'found_dom' }; }
 
-  if (!lessonId) { log('no_lesson_id'); return { ok: false, urls: [], token, headers, stage: 'no_lesson_id' }; }
-  if (!token) { log('no_token'); return { ok: false, urls: [], token, headers, stage: 'no_token' }; }
-  try {
-    const personId = jwtPayload(token)?.msh || null;
-    const studentId = findStudentId();
-    const apiUrl = LESSON_API(lessonId, studentId, personId);
-    log('request', { lessonId, studentId, personId, apiUrl });
-    const res = await fetch(apiUrl, { credentials: 'include', headers });
-    if (!res.ok) {
-      log('api_error', res.status);
-      return { ok: false, urls: [], token, headers, stage: 'api_error', status: res.status };
+  // Resolve candidate URLs: first from the page DOM (reliable), then the API.
+  let urls = scanPageForFileLinks();
+  let stage = urls.length ? 'found_dom' : '';
+  if (!urls.length) {
+    if (!lessonId) { log('no_lesson_id'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_lesson_id' }; }
+    if (!token) { log('no_token'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_token' }; }
+    try {
+      const personId = jwtPayload(token)?.msh || null;
+      const studentId = findStudentId();
+      const apiUrl = LESSON_API(lessonId, studentId, personId);
+      log('request', { lessonId, studentId, personId, apiUrl });
+      const res = await fetch(apiUrl, { credentials: 'include', headers });
+      if (!res.ok) {
+        log('api_error', res.status);
+        return { ok: false, files: [], urls: [], token, headers, stage: 'api_error', status: res.status };
+      }
+      urls = [...collectFileUrls(await res.json())].slice(0, 5);
+      stage = urls.length ? 'found_api' : 'no_urls';
+    } catch (e) {
+      log('exception', String(e));
+      return { ok: false, files: [], urls: [], token, headers, stage: 'exception' };
     }
-    const json = await res.json();
-    const urls = [...collectFileUrls(json)].slice(0, 5);
-    log(urls.length ? 'found' : 'no_urls', urls.length ? urls : Object.keys(json || {}));
-    return { ok: urls.length > 0, urls, token, headers, stage: urls.length ? 'found' : 'no_urls' };
-  } catch (e) {
-    log('exception', String(e));
-    return { ok: false, urls: [], token, headers, stage: 'exception' };
   }
+  if (!urls.length) { log('no_urls'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_urls' }; }
+
+  // Download same-origin attachments inline (real cookies); leave cross-origin
+  // for the service worker. If a same-origin fetch comes back as HTML, it was an
+  // auth redirect — report that distinctly so we don't attach a login page.
+  const files = [];
+  const crossOrigin = [];
+  let sawAuth = false;
+  for (const u of urls) {
+    if (!isSameOrigin(u)) { crossOrigin.push(u); continue; }
+    const f = await fetchInlineFile(u);
+    if (f?.__auth) sawAuth = true;
+    else if (f) files.push(f);
+  }
+  if (!files.length && !crossOrigin.length) {
+    log(sawAuth ? 'auth_redirect' : 'download_failed', urls);
+    return { ok: false, files: [], urls: [], token, headers, stage: sawAuth ? 'auth_redirect' : 'download_failed' };
+  }
+  log('ok', { files: files.map((f) => f.name), crossOrigin });
+  return { ok: true, files, urls: crossOrigin, token, headers, stage };
 }
 
 /**

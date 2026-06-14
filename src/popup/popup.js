@@ -120,31 +120,35 @@ async function tryAutoFetch(card) {
   setDropLoading(drop, 'Ищу файл в МЭШ…');
 
   const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId });
-  if (!found?.ok || !found.urls?.length) {
-    // Surface WHY auto-fetch found nothing so it's debuggable, then fall back to
-    // manual upload (which always works). Stages come from listMaterialUrls.
-    const why = {
-      no_lesson_id: 'нет id задания',
-      no_token: 'нет входа в МЭШ',
-      api_error: 'МЭШ API ' + (found?.status || ''),
-      no_urls: 'файла нет в задании',
-      exception: 'ошибка запроса'
-    }[found?.stage] || 'не найдено';
-    setDropAttachFallback(drop, why);
+  // Same-origin attachments are already downloaded by the content script; any
+  // cross-origin URLs come back for the service worker to fetch.
+  let files = found?.files || [];
+  if (found?.urls?.length) {
+    const dl = await sendToBackground({
+      type: 'DOWNLOAD_FILES',
+      payload: { urls: found.urls, headers: found.headers, token: found.token }
+    });
+    if (dl?.ok && dl.files?.length) files = files.concat(dl.files);
+  }
+
+  if (files.length) {
+    uploads[upKey] = files;
+    setDropAttached(drop, files);
     return;
   }
 
-  const dl = await sendToBackground({
-    type: 'DOWNLOAD_FILES',
-    payload: { urls: found.urls, headers: found.headers, token: found.token }
-  });
-  if (dl?.ok && dl.files?.length) {
-    uploads[upKey] = dl.files;
-    setDropAttached(drop, dl.files);
-  } else {
-    // Found URLs but the download failed (auth/CORS/size) — manual upload works.
-    setDropAttachFallback(drop, 'не скачалось');
-  }
+  // Nothing usable — surface WHY so it's debuggable, then fall back to manual
+  // upload (which always works). Stages come from listMaterialUrls.
+  const why = {
+    no_lesson_id: 'нет id задания',
+    no_token: 'нет входа в МЭШ',
+    api_error: 'МЭШ API ' + (found?.status || ''),
+    no_urls: 'файла нет в задании',
+    auth_redirect: 'нужна авторизация',
+    download_failed: 'не скачалось',
+    exception: 'ошибка запроса'
+  }[found?.stage] || 'не найдено';
+  setDropAttachFallback(drop, why);
 }
 
 // Restore the manual upload prompt, but append the auto-fetch failure reason so

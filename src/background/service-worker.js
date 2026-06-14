@@ -182,6 +182,13 @@ async function downloadFile(url, headers) {
   try {
     const res = await fetch(url, { credentials: 'include', headers });
     if (!res.ok) { console.log('[meshscript] download http', res.status, url); return null; }
+    // An HTML response is an auth/login redirect, not the attachment — reject it
+    // so we never hand the model (or the chat chip) a fake "file".
+    const ct = (res.headers.get('content-type') || '').toLowerCase();
+    if (ct.includes('text/html') || ct.includes('text/xml')) {
+      console.log('[meshscript] download got HTML (auth redirect?)', url);
+      return null;
+    }
     const buf = await res.arrayBuffer();
     if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) {
       console.log('[meshscript] download size skip', buf.byteLength, url);
