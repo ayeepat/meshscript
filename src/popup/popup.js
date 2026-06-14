@@ -120,7 +120,19 @@ async function tryAutoFetch(card) {
   setDropLoading(drop, 'Ищу файл в МЭШ…');
 
   const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId });
-  if (!found?.ok || !found.urls?.length) { setDropKind(drop, 'attachment'); return; }
+  if (!found?.ok || !found.urls?.length) {
+    // Surface WHY auto-fetch found nothing so it's debuggable, then fall back to
+    // manual upload (which always works). Stages come from listMaterialUrls.
+    const why = {
+      no_lesson_id: 'нет id задания',
+      no_token: 'нет входа в МЭШ',
+      api_error: 'МЭШ API ' + (found?.status || ''),
+      no_urls: 'файла нет в задании',
+      exception: 'ошибка запроса'
+    }[found?.stage] || 'не найдено';
+    setDropAttachFallback(drop, why);
+    return;
+  }
 
   const dl = await sendToBackground({
     type: 'DOWNLOAD_FILES',
@@ -130,9 +142,16 @@ async function tryAutoFetch(card) {
     uploads[upKey] = dl.files;
     setDropAttached(drop, dl.files);
   } else {
-    // Nothing downloadable — restore the manual "attach a file" prompt.
-    setDropKind(drop, 'attachment');
+    // Found URLs but the download failed (auth/CORS/size) — manual upload works.
+    setDropAttachFallback(drop, 'не скачалось');
   }
+}
+
+// Restore the manual upload prompt, but append the auto-fetch failure reason so
+// the user (and we) can see why МЭШ didn't hand the file over automatically.
+function setDropAttachFallback(drop, why) {
+  setDropKind(drop, 'attachment');
+  if (why) drop.querySelector('.droplabel').textContent = `Прикрепите файл (${why})`;
 }
 
 function showMessage(html) {

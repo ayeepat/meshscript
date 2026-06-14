@@ -113,10 +113,34 @@ function copyButton(getText) {
   return b;
 }
 
-function bubble(role, text, { animate = false } = {}) {
+/** Chip shown on a user message when files were attached: green check + icon. */
+function attachChip(files) {
+  const chip = document.createElement('div');
+  chip.className = 'attachchip';
+  const icon = (files.length === 1 && (files[0].mimeType || '').startsWith('image/')) ? 'image' : 'file';
+  const label = files.length === 1
+    ? (files[0].name || 'файл')
+    : `${files.length} файла`;
+  chip.innerHTML =
+    `<span class="ac-check">${iconSvg('check', 13)}</span>` +
+    `<span class="ac-ico">${iconSvg(icon, 13)}</span>` +
+    `<span class="ac-name"></span>`;
+  chip.querySelector('.ac-name').textContent = label;
+  return chip;
+}
+
+function bubble(role, text, { animate = false, files = null, needsUpload = false } = {}) {
   const d = document.createElement('div');
   d.className = `msg ${role}`;
   if (role === 'assistant') {
+    // Gate refusals (no readable file) read as a clear "attach a file" prompt.
+    if (needsUpload) {
+      d.classList.add('needupload');
+      const head = document.createElement('div');
+      head.className = 'nu-head';
+      head.innerHTML = `${iconSvg('upload', 14)}<span>Нужен файл</span>`;
+      d.appendChild(head);
+    }
     const body = document.createElement('div');
     body.className = 'mdbody';
     if (animate) typewriter(body, text);
@@ -124,7 +148,11 @@ function bubble(role, text, { animate = false } = {}) {
     d.appendChild(body);
     d.appendChild(copyButton(() => text));
   } else {
-    d.textContent = text; // user text stays plain
+    const span = document.createElement('div');
+    span.className = 'usertext';
+    span.textContent = text; // user text stays plain
+    d.appendChild(span);
+    if (files?.length) d.appendChild(attachChip(files));
   }
   chatEl.appendChild(d);
   chatEl.scrollTop = chatEl.scrollHeight;
@@ -161,7 +189,7 @@ function renderChat(chat) {
     chatEl.innerHTML = '<p class="hintmsg">Выберите урок слева, чтобы получить решение.</p>';
     return;
   }
-  for (const m of chat.history) bubble(m.role, m.content);
+  for (const m of chat.history) bubble(m.role, m.content, { files: m.files, needsUpload: m.needsUpload });
   if (chat.pending) chat.thinkingEl = thinkingBubble();
 }
 
@@ -183,10 +211,13 @@ function fileToInline(file) {
  */
 function sendToChat(chat, text, files) {
   const prior = chat.history.slice(); // turns BEFORE this message
-  chat.history.push({ role: 'user', content: text });
+  // Store only file METADATA (name/mime, no base64) so the chip survives a
+  // re-render without bloating history with megabytes of attachment data.
+  const fileMeta = (files || []).map((f) => ({ name: f.name, mimeType: f.mimeType }));
+  chat.history.push({ role: 'user', content: text, files: fileMeta });
   chat.pending = true;
   if (activeKey === chat.key) {
-    bubble('user', text);
+    bubble('user', text, { files: fileMeta });
     chat.thinkingEl = thinkingBubble();
   }
   renderSidebar();
@@ -226,11 +257,11 @@ function sendToChat(chat, text, files) {
       requestAnimationFrame(flush);
     };
 
-    const finish = (answer, { animate = false } = {}) => {
+    const finish = (answer, { animate = false, needsUpload = false } = {}) => {
       if (settled) return;
       settled = true;
       chat.pending = false;
-      chat.history.push({ role: 'assistant', content: answer });
+      chat.history.push({ role: 'assistant', content: answer, needsUpload });
       if (activeKey === chat.key) {
         chat.thinkingEl?.remove();
         chat.thinkingEl = null;
@@ -238,7 +269,7 @@ function sendToChat(chat, text, files) {
           shell.body.innerHTML = mdToHtml(answer); // clean final render
           shell.wrap.appendChild(copyButton(() => answer));
         } else {
-          bubble('assistant', answer, { animate });
+          bubble('assistant', answer, { animate, needsUpload });
         }
       }
       renderSidebar();
@@ -254,7 +285,7 @@ function sendToChat(chat, text, files) {
         chat.sessionId = m.result?.sessionId || chat.sessionId;
         // Prefer the authoritative full text; fall back to what we streamed.
         // animate only when nothing streamed (e.g. the photo-request guard).
-        finish(m.result?.answer ?? acc, { animate: !acc });
+        finish(m.result?.answer ?? acc, { animate: !acc, needsUpload: !!m.result?.needsUpload });
       } else if (m?.type === 'error') {
         finish('Ошибка: ' + m.error);
       }
@@ -286,8 +317,7 @@ async function startLesson(chat) {
     const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
     if (pending.length && pendingUpload.subject === chat.subject &&
         (!pendingUpload.day || pendingUpload.day === chat.day)) {
-      files = pending;
-      text += '\n\nВложение: ' + pending.map((f) => f.name || 'файл').join(', ');
+      files = pending; // the attachment chip (added by bubble) shows the file
       await chrome.storage.local.remove('pendingUpload');
     }
   } catch (_e) { /* upload is best-effort */ }
@@ -388,10 +418,10 @@ async function sendFromComposer() {
   const text = inputEl.value.trim();
   const files = pendingFile ? [pendingFile] : [];
   if (!text && !files.length) return;
-  const fname = pendingFile?.name;
   inputEl.value = '';
   clearAttachment();
-  await sendToChat(chat, text || ('Вложение: ' + fname), files);
+  // Text may be empty when only a file is sent — the chip shows the attachment.
+  await sendToChat(chat, text, files);
 }
 
 document.getElementById('send').onclick = sendFromComposer;

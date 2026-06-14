@@ -181,12 +181,17 @@ function inferMime(name, contentType) {
 async function downloadFile(url, headers) {
   try {
     const res = await fetch(url, { credentials: 'include', headers });
-    if (!res.ok) return null;
+    if (!res.ok) { console.log('[meshscript] download http', res.status, url); return null; }
     const buf = await res.arrayBuffer();
-    if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) return null; // skip empty / >12MB
+    if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) {
+      console.log('[meshscript] download size skip', buf.byteLength, url);
+      return null;
+    }
     const name = nameFromUrl(url);
-    return { mimeType: inferMime(name, res.headers.get('content-type')), dataBase64: abToBase64(buf), name };
-  } catch { return null; }
+    const mimeType = inferMime(name, res.headers.get('content-type'));
+    console.log('[meshscript] downloaded', name, mimeType, buf.byteLength + 'b');
+    return { mimeType, dataBase64: abToBase64(buf), name };
+  } catch (e) { console.log('[meshscript] download exception', String(e), url); return null; }
 }
 
 // `headers` come straight from the content script's discovery (Bearer token +
