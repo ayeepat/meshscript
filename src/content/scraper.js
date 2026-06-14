@@ -647,10 +647,20 @@ async function debugFetch(lessonId) {
       out.httpStatus = res.status;
       if (res.ok) {
         const json = await res.json();
-        out.responseTopKeys = json && typeof json === 'object' ? Object.keys(json) : typeof json;
+        out.subjectName = json?.subject_name;
         apiUrls = [...collectFileUrls(json)];
         out.foundUrls = apiUrls;
-        out.jsonSample = JSON.stringify(json).slice(0, 1800);
+        // The attachment-bearing structures, pulled out explicitly so we can see
+        // exactly where a real uploaded file lives (vs digital-library bindings).
+        out.homeworks = (json?.lesson_homeworks || []).map((h) => ({
+          homework: (h.homework || '').slice(0, 80),
+          attachments: h.attachments,
+          additional_materials: (h.additional_materials || []).map((m) => ({
+            type: m.type, title: (m.title || '').slice(0, 40), urls: m.urls, id: m.id
+          }))
+        }));
+        out.kr_attachments = json?.kr_attachments;
+        out.details_content = json?.details?.content;
       } else {
         out.bodySample = (await res.text().catch(() => '')).slice(0, 600);
       }

@@ -164,20 +164,35 @@ function showMessage(html) {
 }
 
 /**
- * One-click diagnostic: run the full file auto-fetch against the first card that
- * has a Mesh homework id and dump the raw result into a copyable box. Saves the
- * user from digging through DevTools — they just copy this and send it over.
+ * One-click diagnostic: run the file auto-fetch against EVERY scanned homework
+ * (so a specific one like the OGE variant is always covered, not just the first
+ * card) and dump the results into a copyable box. Saves digging through DevTools.
  */
 async function runFetchDiag(btn) {
-  const card = cardDrops.find((c) => c.homeworkId) || cardDrops[0];
   const out = document.getElementById('diagOut');
   out.hidden = false;
   out.value = 'Запускаю диагностику…';
   const tab = await getActiveTab();
   if (!tab?.id) { out.value = 'Не удалось определить вкладку. Откройте страницу МЭШ.'; return; }
-  const resp = await sendToContent(tab.id, { type: 'MESH_DEBUG_FETCH', homeworkId: card?.homeworkId });
-  const info = resp?.ok ? resp.info : { error: resp?.error || 'нет ответа от страницы' };
-  out.value = JSON.stringify(info, null, 2);
+
+  const seen = new Set();
+  const results = [];
+  for (const c of cardDrops) {
+    if (!c.homeworkId || seen.has(c.homeworkId)) continue;
+    seen.add(c.homeworkId);
+    const resp = await sendToContent(tab.id, { type: 'MESH_DEBUG_FETCH', homeworkId: c.homeworkId });
+    results.push({
+      subject: c.subject,
+      task: (c.task || '').slice(0, 90),
+      info: resp?.ok ? resp.info : { error: resp?.error || 'нет ответа от страницы' }
+    });
+  }
+  if (!results.length) {
+    const resp = await sendToContent(tab.id, { type: 'MESH_DEBUG_FETCH' });
+    results.push({ info: resp?.ok ? resp.info : { error: resp?.error || 'нет карточек с id' } });
+  }
+
+  out.value = JSON.stringify(results, null, 2);
   btn.textContent = 'Скопировать результат';
   btn.onclick = async () => {
     try { await navigator.clipboard.writeText(out.value); btn.textContent = 'Скопировано ✓'; }
@@ -262,7 +277,7 @@ function buildCard(day, item) {
   drop.innerHTML = '<span class="dropicon"></span><span class="droplabel"></span>';
   const firstKind = classifyTask(item.task).kind;
   setDropKind(drop, firstKind);
-  const cardObj = { task: item.task, drop, homeworkId: item.homeworkId, upKey };
+  const cardObj = { task: item.task, subject: item.subject, drop, homeworkId: item.homeworkId, upKey };
   cardDrops.push(cardObj);
   // Attachment tasks: try to pull the file straight from Mesh right away.
   if (firstKind === 'attachment') tryAutoFetch(cardObj);
