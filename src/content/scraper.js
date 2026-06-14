@@ -438,22 +438,36 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
  * Ask the same-origin family API for a lesson item and pull out file URLs.
  * The service worker downloads them, so we also return the token + headers it
  * needs (same Bearer + X-mes-* set).
- * @returns {Promise<{ok:boolean, urls:string[], token:string|null, headers:object}>}
+ *
+ * Returns a `stage` so failures are VISIBLE instead of silently falling back to
+ * manual upload — this is a reverse-engineered private API, so when it breaks we
+ * need to see exactly where (no token / API status / no file in the response).
+ * @returns {Promise<{ok:boolean, urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
  */
 async function listMaterialUrls(lessonId) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
-  if (!lessonId) return { ok: false, urls: [], token, headers };
+  const log = (stage, extra) => console.log('[meshscript] auto-fetch:', stage, extra ?? '');
+  if (!lessonId) { log('no_lesson_id'); return { ok: false, urls: [], token, headers, stage: 'no_lesson_id' }; }
+  if (!token) { log('no_token'); return { ok: false, urls: [], token, headers, stage: 'no_token' }; }
   try {
     const personId = jwtPayload(token)?.msh || null;
     const studentId = findStudentId();
-    const res = await fetch(LESSON_API(lessonId, studentId, personId), {
-      credentials: 'include', headers
-    });
-    if (!res.ok) return { ok: false, urls: [], token, headers };
+    const apiUrl = LESSON_API(lessonId, studentId, personId);
+    log('request', { lessonId, studentId, personId, apiUrl });
+    const res = await fetch(apiUrl, { credentials: 'include', headers });
+    if (!res.ok) {
+      log('api_error', res.status);
+      return { ok: false, urls: [], token, headers, stage: 'api_error', status: res.status };
+    }
     const json = await res.json();
-    return { ok: true, urls: [...collectFileUrls(json)].slice(0, 5), token, headers };
-  } catch { return { ok: false, urls: [], token, headers }; }
+    const urls = [...collectFileUrls(json)].slice(0, 5);
+    log(urls.length ? 'found' : 'no_urls', urls.length ? urls : Object.keys(json || {}));
+    return { ok: urls.length > 0, urls, token, headers, stage: urls.length ? 'found' : 'no_urls' };
+  } catch (e) {
+    log('exception', String(e));
+    return { ok: false, urls: [], token, headers, stage: 'exception' };
+  }
 }
 
 /* ---------- Entry point ---------- */
