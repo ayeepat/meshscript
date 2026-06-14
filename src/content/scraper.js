@@ -435,6 +435,31 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
 }
 
 /**
+ * Scan the CURRENT page DOM for attachment-looking links. This is the reliable
+ * path: when the user is on the homework page, the attachment is a real <a> (or
+ * a download button) we can read directly — no private-API guessing. Also used
+ * as a fallback when the family API doesn't surface the file URL.
+ */
+function scanPageForFileLinks() {
+  const out = new Set();
+  const push = (raw) => {
+    if (!raw) return;
+    let s = String(raw).trim();
+    if (s[0] === '/' && MESH_FILE_HINT_RE.test(s)) s = 'https://school.mos.ru' + s;
+    if (FILE_URL_RE.test(s) || (/^https?:\/\//.test(s) && MESH_FILE_HINT_RE.test(s))) {
+      out.add(encodeURI(s));
+    }
+  };
+  for (const a of document.querySelectorAll('a[href]')) push(a.getAttribute('href'));
+  // Mesh sometimes renders downloads as buttons carrying the URL in a data-attr.
+  for (const el of document.querySelectorAll('[download],[data-href],[data-url],[data-file-url],[data-link]')) {
+    push(el.getAttribute('href') || el.getAttribute('data-href') ||
+         el.getAttribute('data-url') || el.getAttribute('data-file-url') || el.getAttribute('data-link'));
+  }
+  return [...out].slice(0, 8);
+}
+
+/**
  * Ask the same-origin family API for a lesson item and pull out file URLs.
  * The service worker downloads them, so we also return the token + headers it
  * needs (same Bearer + X-mes-* set).
@@ -448,6 +473,10 @@ async function listMaterialUrls(lessonId) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => console.log('[meshscript] auto-fetch:', stage, extra ?? '');
+  // Reliable first try: an attachment link visible on the current page.
+  const domUrls = scanPageForFileLinks();
+  if (domUrls.length) { log('found_dom', domUrls); return { ok: true, urls: domUrls, token, headers, stage: 'found_dom' }; }
+
   if (!lessonId) { log('no_lesson_id'); return { ok: false, urls: [], token, headers, stage: 'no_lesson_id' }; }
   if (!token) { log('no_token'); return { ok: false, urls: [], token, headers, stage: 'no_token' }; }
   try {
@@ -468,6 +497,43 @@ async function listMaterialUrls(lessonId) {
     log('exception', String(e));
     return { ok: false, urls: [], token, headers, stage: 'exception' };
   }
+}
+
+/**
+ * Full diagnostic for the file auto-fetch: token presence, ids, the exact API
+ * URL + HTTP status, the response's top-level keys and a JSON sample, plus any
+ * attachment links found in the page DOM. One copy-paste of this tells us
+ * exactly which layer is broken so the fetch can be fixed for real.
+ */
+async function debugFetch(lessonId) {
+  const token = findAuthToken();
+  const headers = meshHeaders(token);
+  const out = {
+    pageUrl: location.href,
+    lessonId: lessonId || null,
+    tokenFound: !!token,
+    personId: token ? (jwtPayload(token)?.msh || null) : null,
+    studentId: findStudentId(),
+    domFileLinks: scanPageForFileLinks(),
+    domAnchorCount: document.querySelectorAll('a[href]').length
+  };
+  if (lessonId && token) {
+    const apiUrl = LESSON_API(lessonId, out.studentId, out.personId);
+    out.apiUrl = apiUrl;
+    try {
+      const res = await fetch(apiUrl, { credentials: 'include', headers });
+      out.httpStatus = res.status;
+      if (res.ok) {
+        const json = await res.json();
+        out.responseTopKeys = json && typeof json === 'object' ? Object.keys(json) : typeof json;
+        out.foundUrls = [...collectFileUrls(json)];
+        out.jsonSample = JSON.stringify(json).slice(0, 1800);
+      } else {
+        out.bodySample = (await res.text().catch(() => '')).slice(0, 600);
+      }
+    } catch (e) { out.exception = String(e); }
+  }
+  return out;
 }
 
 /* ---------- Entry point ---------- */
@@ -513,6 +579,12 @@ if (!window.__meshscriptListenerAdded) {
       if (msg && msg.type === 'MESH_DEBUG') {
         sendResponse({ ok: true, debug: debugScan() });
         return false;
+      }
+      if (msg && msg.type === 'MESH_DEBUG_FETCH') {
+        debugFetch(msg.homeworkId)
+          .then((info) => sendResponse({ ok: true, info }))
+          .catch((e) => sendResponse({ ok: false, error: String(e) }));
+        return true;
       }
       if (msg && msg.type === 'MESH_LIST_MATERIALS') {
         // Async: keep the channel open until the API call resolves. Only

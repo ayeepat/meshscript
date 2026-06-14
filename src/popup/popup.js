@@ -159,6 +159,28 @@ function showMessage(html) {
 }
 
 /**
+ * One-click diagnostic: run the full file auto-fetch against the first card that
+ * has a Mesh homework id and dump the raw result into a copyable box. Saves the
+ * user from digging through DevTools — they just copy this and send it over.
+ */
+async function runFetchDiag(btn) {
+  const card = cardDrops.find((c) => c.homeworkId) || cardDrops[0];
+  const out = document.getElementById('diagOut');
+  out.hidden = false;
+  out.value = 'Запускаю диагностику…';
+  const tab = await getActiveTab();
+  if (!tab?.id) { out.value = 'Не удалось определить вкладку. Откройте страницу МЭШ.'; return; }
+  const resp = await sendToContent(tab.id, { type: 'MESH_DEBUG_FETCH', homeworkId: card?.homeworkId });
+  const info = resp?.ok ? resp.info : { error: resp?.error || 'нет ответа от страницы' };
+  out.value = JSON.stringify(info, null, 2);
+  btn.textContent = 'Скопировать результат';
+  btn.onclick = async () => {
+    try { await navigator.clipboard.writeText(out.value); btn.textContent = 'Скопировано ✓'; }
+    catch { out.select(); }
+  };
+}
+
+/**
  * Try to message an already-present content script. If that fails (script not
  * injected yet on this tab), programmatically inject it, then retry once.
  */
@@ -296,6 +318,15 @@ function render(data) {
     }
     listEl.appendChild(details);
   });
+
+  // Footer: a self-serve diagnostic for when files don't auto-load from Mesh.
+  const diag = document.createElement('div');
+  diag.className = 'diagbox';
+  diag.innerHTML =
+    '<button id="diagBtn" class="diagbtn" type="button">🔧 Файл не подгрузился? Диагностика</button>' +
+    '<textarea id="diagOut" class="diagout" hidden readonly></textarea>';
+  listEl.appendChild(diag);
+  diag.querySelector('#diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
 
   refineDropLabels();
 }
