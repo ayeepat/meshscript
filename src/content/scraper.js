@@ -587,6 +587,7 @@ async function debugFetch(lessonId) {
     domFileLinks: scanPageForFileLinks(),
     domAnchorCount: document.querySelectorAll('a[href]').length
   };
+  let apiUrls = [];
   if (lessonId && token) {
     const apiUrl = LESSON_API(lessonId, out.studentId, out.personId);
     out.apiUrl = apiUrl;
@@ -596,12 +597,31 @@ async function debugFetch(lessonId) {
       if (res.ok) {
         const json = await res.json();
         out.responseTopKeys = json && typeof json === 'object' ? Object.keys(json) : typeof json;
-        out.foundUrls = [...collectFileUrls(json)];
+        apiUrls = [...collectFileUrls(json)];
+        out.foundUrls = apiUrls;
         out.jsonSample = JSON.stringify(json).slice(0, 1800);
       } else {
         out.bodySample = (await res.text().catch(() => '')).slice(0, 600);
       }
     } catch (e) { out.exception = String(e); }
+  }
+
+  // Actually try to download each candidate so the diagnostic shows what comes
+  // back — a real file (PDF, size) vs an HTML auth redirect vs a 403. This one
+  // field usually reveals the fix without further round-trips.
+  const candidates = [...new Set([...out.domFileLinks, ...apiUrls])].slice(0, 6);
+  out.probes = [];
+  for (const url of candidates) {
+    const p = { url, sameOrigin: isSameOrigin(url) };
+    try {
+      const res = await fetch(url, { credentials: 'include' });
+      p.status = res.status;
+      p.contentType = (res.headers.get('content-type') || '').split(';')[0];
+      const blob = await res.blob();
+      p.sizeKB = Math.round(blob.size / 102.4) / 10;
+      p.looksHtml = (p.contentType || '').includes('html');
+    } catch (e) { p.error = String(e); }
+    out.probes.push(p);
   }
   return out;
 }
