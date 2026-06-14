@@ -323,15 +323,6 @@ function render(data) {
     listEl.appendChild(details);
   });
 
-  // Footer: a self-serve diagnostic for when files don't auto-load from Mesh.
-  const diag = document.createElement('div');
-  diag.className = 'diagbox';
-  diag.innerHTML =
-    '<button id="diagBtn" class="diagbtn" type="button">🔧 Файл не подгрузился? Диагностика</button>' +
-    '<textarea id="diagOut" class="diagout" hidden readonly></textarea>';
-  listEl.appendChild(diag);
-  diag.querySelector('#diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
-
   refineDropLabels();
 }
 
@@ -489,6 +480,7 @@ function init() {
   document.getElementById('tabHw').onclick = () => showTab('hw');
   document.getElementById('tabTest').onclick = () => showTab('test');
   document.getElementById('solveTest').onclick = solveTestOnScreen;
+  document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
   scanHomework();
 }
 
