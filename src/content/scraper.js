@@ -390,16 +390,46 @@ function jwtPayload(token) {
   } catch { return null; }
 }
 
-/** student_id isn't in the token — scan localStorage values for it. */
+/** student_id isn't in the token — scan localStorage/cookies values for it. */
 function findStudentId() {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const v = localStorage.getItem(localStorage.key(i)) || '';
-      const m = v.match(/"(?:student_id|studentId|profile_id|profileId)"\s*:\s*"?(\d{4,})"?/);
+      const m = v.match(/"(?:student_id|studentId|profile_id|profileId|contingent_guid)"\s*:\s*"?(\d{4,})"?/);
       if (m) return m[1];
     }
   } catch { /* storage blocked */ }
-  return null;
+  const c = document.cookie.match(/(?:student_id|profile_id|aupd_current_profile_id)=(\d{4,})/);
+  return c ? c[1] : null;
+}
+
+/**
+ * Resolve the numeric student_id the family API requires (it 400s without it).
+ * Local storage first; if absent, ask the family profile API — for a student
+ * login the profile's own `id` IS the student_id; for a parent it's a child id.
+ * @returns {Promise<{id:string|null, source:string, debug?:object}>}
+ */
+async function resolveStudentId(headers) {
+  const local = findStudentId();
+  if (local) return { id: local, source: 'storage' };
+  const tried = [];
+  for (const url of [
+    'https://school.mos.ru/api/family/web/v1/profile',
+    'https://school.mos.ru/api/family/web/v1/students',
+    'https://school.mos.ru/api/family/mobile/v1/profile'
+  ]) {
+    try {
+      const res = await fetch(url, { credentials: 'include', headers });
+      tried.push({ url, status: res.status });
+      if (!res.ok) continue;
+      const j = await res.json();
+      const id = j?.profile?.id ?? j?.children?.[0]?.id ?? (Array.isArray(j) ? j[0]?.id : j?.id) ??
+                 j?.students?.[0]?.id ?? j?.contingent_guid;
+      if (id != null) return { id: String(id), source: url };
+      tried[tried.length - 1].keys = j && typeof j === 'object' ? Object.keys(j) : typeof j;
+    } catch (e) { tried.push({ url, error: String(e) }); }
+  }
+  return { id: null, source: 'none', debug: tried };
 }
 
 /** Mesh family-web headers required by both the API and the file download. */
@@ -435,11 +465,14 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
 }
 
 // STRICT matcher for DOM links: only a real attachment, never an auth/SSO link.
-// (The looser MESH_FILE_HINT_RE matched things like ".../authenticate" and we
-// ended up downloading a login page.) Accept a true file extension, or a path
-// clearly under Mesh's attachment store.
-const DOM_FILE_RE = /(\/ej\/attachments?\/|uchebnik\.mos\.ru\/)/i;
+// The diagnostic proved a bare "uchebnik.mos.ru/" rule grabbed
+// ".../authenticate?aupd_url=..." (a login redirect, content-type text/html).
+// So: require a true file extension OR a path under Mesh's /ej/attachments
+// store, and explicitly reject auth links.
+const DOM_FILE_RE = /\/ej\/attachments?\//i;
+const AUTH_LINK_RE = /(authenticate|aupd_url|\/sso\b|\/oauth\b|\/login\b)/i;
 function looksLikeFileLink(s) {
+  if (AUTH_LINK_RE.test(s)) return false;
   return FILE_URL_RE.test(s) || DOM_FILE_RE.test(s);
 }
 
@@ -532,7 +565,8 @@ async function listMaterialUrls(lessonId) {
     if (!token) { log('no_token'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_token' }; }
     try {
       const personId = jwtPayload(token)?.msh || null;
-      const studentId = findStudentId();
+      const studentId = (await resolveStudentId(headers)).id;
+      if (!studentId) { log('no_student_id'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_student_id' }; }
       const apiUrl = LESSON_API(lessonId, studentId, personId);
       log('request', { lessonId, studentId, personId, apiUrl });
       const res = await fetch(apiUrl, { credentials: 'include', headers });
@@ -578,12 +612,29 @@ async function listMaterialUrls(lessonId) {
 async function debugFetch(lessonId) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
+  const sid = await resolveStudentId(headers);
   const out = {
     pageUrl: location.href,
     lessonId: lessonId || null,
     tokenFound: !!token,
     personId: token ? (jwtPayload(token)?.msh || null) : null,
-    studentId: findStudentId(),
+    studentId: sid.id,
+    studentIdSource: sid.source,
+    studentIdProbe: sid.debug || null,
+    // Numeric id-like fields in localStorage (no tokens) — a backstop for
+    // locating student_id if the profile API can't supply it.
+    storageHints: (() => {
+      const hints = [];
+      try {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i) || '';
+          const v = localStorage.getItem(k) || '';
+          const m = v.match(/"(student_id|studentId|profile_id|profileId|contingent_guid|id)"\s*:\s*"?(\d{4,})"?/);
+          if (m) hints.push({ key: k.slice(0, 40), field: m[1], val: m[2] });
+        }
+      } catch { /* blocked */ }
+      return hints.slice(0, 12);
+    })(),
     domFileLinks: scanPageForFileLinks(),
     domAnchorCount: document.querySelectorAll('a[href]').length
   };
