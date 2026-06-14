@@ -49,6 +49,10 @@ body.compact .answer { margin-top: 8px; padding: 9px 11px; font-size: 12.5px; li
 .card .subject { font-weight: 600; font-size: 15px; letter-spacing: -0.2px; }
 .card .task { font-size: 13px; color: var(--secondary); margin: 6px 0 12px; white-space: pre-wrap; line-height: 1.45; }
 .card .audionote { font-size: 12px; line-height: 1.4; color: var(--text); background: var(--input-bg); border-radius: 10px; padding: 7px 10px; margin: 0 0 12px; }
+.diagbox { padding: 4px 16px 14px; }
+.diagbtn { width: 100%; background: var(--input-bg); color: var(--secondary); border: none; border-radius: 12px; padding: 9px 12px; font-size: 12.5px; font-weight: 600; cursor: pointer; transition: background 0.15s ease, color 0.15s ease; }
+.diagbtn:hover { background: var(--hover); color: var(--text); }
+.diagout { width: 100%; box-sizing: border-box; margin-top: 8px; height: 150px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 10.5px; line-height: 1.4; color: var(--text); background: var(--card); border: 0.5px solid var(--separator); border-radius: 10px; padding: 8px; }
 .row { display: flex; gap: 8px; align-items: center; }
 .solve {
   background: var(--accent); color: var(--on-accent); border: none; border-radius: 980px;
