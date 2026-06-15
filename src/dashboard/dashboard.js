@@ -314,9 +314,12 @@ async function startLesson(chat) {
   try {
     const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
     // Files come from the popup: manually attached OR auto-fetched from Mesh.
+    // Match on subject + day + TASK: a subject can have several homeworks on one
+    // day, and matching on subject alone attached the wrong (or no) file.
     const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
     if (pending.length && pendingUpload.subject === chat.subject &&
-        (!pendingUpload.day || pendingUpload.day === chat.day)) {
+        (!pendingUpload.day || pendingUpload.day === chat.day) &&
+        (!pendingUpload.task || pendingUpload.task === chat.task)) {
       files = pending; // the attachment chip (added by bubble) shows the file
       await chrome.storage.local.remove('pendingUpload');
     }

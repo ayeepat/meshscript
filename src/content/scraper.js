@@ -472,6 +472,32 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
   return out;
 }
 
+/**
+ * Pull file URLs for the SPECIFIC homework the user is solving. One lesson can
+ * bundle several homeworks (e.g. a retelling «Charles Dickens.docx» AND an OGE
+ * «Вариант 10 … .pdf»); attaching the unrelated file confuses the solver and
+ * made results flaky. Match the homework whose text matches the card task and
+ * take ONLY its files; fall back to the whole lesson if nothing matches.
+ */
+function urlsForHomework(json, taskText) {
+  const homeworks = Array.isArray(json?.lesson_homeworks) ? json.lesson_homeworks : [];
+  const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const t = norm(taskText);
+  let scope = homeworks;
+  if (t && homeworks.length > 1) {
+    const match = homeworks.filter((h) => {
+      const hw = norm(h.homework);
+      return hw && (hw.includes(t.slice(0, 25)) || t.includes(hw.slice(0, 25)));
+    });
+    if (match.length) scope = match;
+  }
+  const out = new Set();
+  for (const h of scope) collectFileUrls(h, out);
+  // Matched homework had no file? Widen to the whole lesson (kr_attachments etc.).
+  if (!out.size) collectFileUrls(json, out);
+  return [...out];
+}
+
 // STRICT matcher for DOM links: only a real attachment, never an auth/SSO link.
 // The diagnostic proved a bare "uchebnik.mos.ru/" rule grabbed
 // ".../authenticate?aupd_url=..." (a login redirect, content-type text/html).
@@ -560,17 +586,17 @@ async function fetchInlineFile(url) {
  * leftover cross-origin ones for the service worker.
  * @returns {Promise<{ok:boolean, files:object[], urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
  */
-async function listMaterialUrls(lessonId) {
+async function listMaterialUrls(lessonId, taskText) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => console.log('[meshscript] auto-fetch:', stage, extra ?? '');
 
-  // Resolve candidate URLs: first from the page DOM (reliable), then the API.
-  let urls = scanPageForFileLinks();
-  let stage = urls.length ? 'found_dom' : '';
-  if (!urls.length) {
-    if (!lessonId) { log('no_lesson_id'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_lesson_id' }; }
-    if (!token) { log('no_token'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_token' }; }
+  // The API path is the precise one (it knows which homework owns which file), so
+  // prefer it whenever we have a lesson id. The DOM scan is only a fallback for
+  // when there's no id (it can't tell which of several files belongs to the task).
+  let urls = [];
+  let stage = '';
+  if (lessonId && token) {
     try {
       const personId = jwtPayload(token)?.msh || null;
       const studentId = (await resolveStudentId(headers)).id;
@@ -582,14 +608,26 @@ async function listMaterialUrls(lessonId) {
         log('api_error', res.status);
         return { ok: false, files: [], urls: [], token, headers, stage: 'api_error', status: res.status };
       }
-      urls = [...collectFileUrls(await res.json())].slice(0, 5);
+      urls = urlsForHomework(await res.json(), taskText).slice(0, 5);
       stage = urls.length ? 'found_api' : 'no_urls';
     } catch (e) {
       log('exception', String(e));
       return { ok: false, files: [], urls: [], token, headers, stage: 'exception' };
     }
   }
-  if (!urls.length) { log('no_urls'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_urls' }; }
+
+  // Fallback: scan the page DOM (works on the homework detail page even without
+  // a lesson id). It can't tell which homework a file belongs to, so it's the
+  // second choice — used only when the API surfaced nothing.
+  if (!urls.length) {
+    const domUrls = scanPageForFileLinks();
+    if (domUrls.length) { urls = domUrls; stage = 'found_dom'; }
+  }
+  if (!urls.length) {
+    const why = !lessonId ? 'no_lesson_id' : !token ? 'no_token' : 'no_urls';
+    log(why);
+    return { ok: false, files: [], urls: [], token, headers, stage: why };
+  }
 
   // Download same-origin attachments inline (real cookies); leave cross-origin
   // for the service worker. If a same-origin fetch comes back as HTML, it was an
@@ -749,7 +787,7 @@ if (!window.__meshscriptListenerAdded) {
         // Async: keep the channel open until the API call resolves. Only
         // discovers URLs — the service worker downloads them (see comment above
         // listMaterialUrls for the MV3 CORS reason).
-        listMaterialUrls(msg.homeworkId)
+        listMaterialUrls(msg.homeworkId, msg.task)
           .then((r) => sendResponse(r))
           .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], token: null }));
         return true;

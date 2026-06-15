@@ -55,10 +55,15 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
       });
     } else {
       // Office formats (Word/PowerPoint/Excel) aren't readable by this provider.
-      // Say so honestly — the guard forbids inventing their contents.
+      // Non-blocking wording: if there's other readable material (e.g. a PDF),
+      // the model must still solve from it and just ignore this file — otherwise
+      // a tag-along .docx made it refuse the whole task. Only ask for it if this
+      // file is genuinely required. Never invent its contents.
       content.push({
         type: 'text',
-        text: `[Приложен файл ${name || ''} (${mime}). Офисные файлы (Word/PowerPoint/Excel) я не читаю напрямую — пришлите PDF, фото или скриншот его содержимого. НЕ выдумывай содержимое этого файла.]`
+        text: `[Приложен файл ${name || ''} (${mime}). Офисные файлы (Word/PowerPoint/Excel) я не читаю напрямую. ` +
+          `Если для этого задания есть другой материал (PDF/фото/текст) — реши по нему, а этот файл просто проигнорируй. ` +
+          `Если же он действительно нужен — попроси прислать его как PDF/фото. Содержимое этого файла НЕ выдумывай.]`
       });
     }
   }

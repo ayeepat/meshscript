@@ -62,7 +62,7 @@ function refineDropLabels() {
         const card = drops[i];
         if (!card) return;
         setDropKind(card.drop, kind);
-        if (kind === 'attachment') tryAutoFetch(card);
+        if (kind === 'attachment') card.fetchPromise = card.fetchPromise || tryAutoFetch(card);
       });
     }
   );
@@ -119,7 +119,7 @@ async function tryAutoFetch(card) {
   if (!tab?.id) return;
   setDropLoading(drop, 'Ищу файл в МЭШ…');
 
-  const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId });
+  const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId, task: card.task });
   // Same-origin attachments are already downloaded by the content script; any
   // cross-origin URLs come back for the service worker to fetch.
   let files = found?.files || [];
@@ -253,15 +253,24 @@ function buildCard(day, item) {
     card.querySelector('.task').after(note);
   }
 
-  const upKey = `${day || '?'}||${item.subject}`;
+  // upKey MUST be unique per card: one subject can have several homeworks on the
+  // same day (e.g. «Пересказ» + «Вариант 10 ОГЭ»). Keying on day+subject alone
+  // made them share/overwrite each other's uploads — the source of the
+  // "sometimes the file is there, sometimes not" bug. Add the homework id (or
+  // task) so every card owns its own attachment slot.
+  const upKey = `${day || '?'}||${item.subject}||${item.homeworkId || (item.task || '').slice(0, 40)}`;
 
   const solveBtn = document.createElement('button');
   solveBtn.className = 'solve';
   solveBtn.textContent = 'Решить';
   solveBtn.onclick = async () => {
-    // Hand any attached files (manual or auto-fetched) to the dashboard.
+    // Wait for an in-flight auto-fetch so a quick click doesn't open the solve
+    // with no file attached (the other half of the intermittency).
+    if (cardObj.fetchPromise) { try { await cardObj.fetchPromise; } catch { /* manual fallback */ } }
+    // Hand any attached files (manual or auto-fetched) to the dashboard. Include
+    // the task so the dashboard matches THIS homework, not another same-subject one.
     if (uploads[upKey]?.length) {
-      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, files: uploads[upKey] } });
+      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, task: item.task, files: uploads[upKey] } });
     } else {
       await chrome.storage.local.remove('pendingUpload'); // drop stale leftovers
     }
@@ -277,10 +286,11 @@ function buildCard(day, item) {
   drop.innerHTML = '<span class="dropicon"></span><span class="droplabel"></span>';
   const firstKind = classifyTask(item.task).kind;
   setDropKind(drop, firstKind);
-  const cardObj = { task: item.task, subject: item.subject, drop, homeworkId: item.homeworkId, upKey };
+  const cardObj = { task: item.task, subject: item.subject, drop, homeworkId: item.homeworkId, upKey, fetchPromise: null };
   cardDrops.push(cardObj);
-  // Attachment tasks: try to pull the file straight from Mesh right away.
-  if (firstKind === 'attachment') tryAutoFetch(cardObj);
+  // Attachment tasks: try to pull the file straight from Mesh right away. Keep
+  // the promise so a Solve click can await it (see solveBtn.onclick).
+  if (firstKind === 'attachment') cardObj.fetchPromise = tryAutoFetch(cardObj);
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*';
