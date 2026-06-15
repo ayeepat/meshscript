@@ -10,6 +10,7 @@ import { createSession, addMessage, listSessions, listMessages } from '../lib/su
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
 import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
+import { getCatalog, searchBooks, resolveTask, fetchTaskImage } from '../lib/gdz-api.js';
 
 // Follow-ups re-send prior turns as context. Cap how many: full worked
 // solutions are long, and on a paid provider every re-sent turn is money.
@@ -57,7 +58,7 @@ function missingInputGate(category, task, files) {
     let msg = 'Не могу решить это задание без самого материала. ' +
       'Пришлите файл варианта/задания (PDF, фото или скриншот страницы), и я всё решу.';
     if (audio) {
-      msg += '\n\n🎧 Аудирование я прослушать не могу в принципе — для него пришлите ' +
+      msg += '\n\nАудирование я прослушать не могу в принципе — для него пришлите ' +
         'расшифровку (текст) записи, тогда решу и эту часть.';
     }
     return msg;
@@ -240,6 +241,53 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
         case 'LIST_MESSAGES':
           sendResponse({ ok: true, messages: await listMessages(msg.sessionId) });
           break;
+        // ---------- GDZ ----------
+        case 'GDZ_CATALOG': {
+          const catalog = await getCatalog({ force: !!msg.payload?.force });
+          // Return only what the picker needs in one shot; books are already trimmed.
+          sendResponse({ ok: true, catalog });
+          break;
+        }
+        case 'GDZ_SEARCH': {
+          const catalog = await getCatalog();
+          sendResponse({ ok: true, books: searchBooks(catalog, msg.payload || {}) });
+          break;
+        }
+        case 'GDZ_RESOLVE': {
+          // payload: { bookUrl, number }
+          const { bookUrl, number } = msg.payload || {};
+          if (!bookUrl || number == null) { sendResponse({ ok: false, error: 'bookUrl + number required' }); break; }
+          const result = await resolveTask(bookUrl, number);
+          if (!result) { sendResponse({ ok: false, error: 'not found' }); break; }
+          // Inline EVERY answer image as base64 — multi-page answers have more
+          // than one — so the chat can render them directly. Skip any that fail.
+          const inlined = [];
+          for (const url of result.images) {
+            try { inlined.push(await fetchTaskImage(url)); } catch { /* skip bad image */ }
+          }
+          if (!inlined.length) { sendResponse({ ok: false, error: 'images unavailable' }); break; }
+          sendResponse({ ok: true, result: { ...result, inlined } });
+          break;
+        }
+        case 'GDZ_SELFTEST': {
+          // End-to-end smoke test from the popup/devtools: search → resolve →
+          // image. If this returns ok:true, the DNR UA rule is firing and the
+          // whole chain works from inside the extension.
+          const catalog = await getCatalog();
+          const hits = searchBooks(catalog, { grade: 9, subjectId: 4, query: 'макарычев углубл' });
+          if (!hits.length) { sendResponse({ ok: false, error: 'catalog: book not found' }); break; }
+          const r = await resolveTask(hits[0].url, '25');
+          if (!r) { sendResponse({ ok: false, error: 'resolve: task not found' }); break; }
+          const img = await fetchTaskImage(r.images[0]);
+          sendResponse({
+            ok: true,
+            book: hits[0].title,
+            taskLink: r.link,
+            imageBytes: Math.round((img.dataBase64.length * 3) / 4),
+            mimeType: img.mimeType
+          });
+          break;
+        }
         default:
           sendResponse({ ok: false, error: 'Unknown message type' });
       }

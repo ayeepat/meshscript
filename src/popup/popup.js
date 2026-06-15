@@ -195,7 +195,7 @@ async function runFetchDiag(btn) {
   out.value = JSON.stringify(results, null, 2);
   btn.textContent = 'Скопировать результат';
   btn.onclick = async () => {
-    try { await navigator.clipboard.writeText(out.value); btn.textContent = 'Скопировано ✓'; }
+    try { await navigator.clipboard.writeText(out.value); btn.textContent = 'Скопировано'; }
     catch { out.select(); }
   };
 }
@@ -249,7 +249,8 @@ function buildCard(day, item) {
   if (needsAudio(item.task)) {
     const note = document.createElement('div');
     note.className = 'audionote';
-    note.textContent = '🎧 Аудирование не решается — пришлите текст/расшифровку записи. Остальное решу.';
+    note.innerHTML = iconSvg('headphones', 14);
+    note.append('Аудирование не решается — пришлите текст/расшифровку записи. Остальное решу.');
     card.querySelector('.task').after(note);
   }
 
@@ -385,14 +386,58 @@ function extractFinalAnswers(raw) {
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const numbered = lines.filter((l) => /^(?:№|#)?\s*\d+\s*[.):]/.test(l));
   if (numbered.length) return numbered.join('\n');
-  // (3) last non-empty line
-  return lines[lines.length - 1] || raw.trim();
+  // (3) last non-empty line — but NEVER hand back a raw JSON blob (that is the
+  // exact symptom we guard against: a truncated «{"reasoning":...» leaking to
+  // the user). Prefer the last readable, non-JSON-looking line instead.
+  const last = lines[lines.length - 1] || raw.trim();
+  if (/^[{}[\]"]/.test(last)) {
+    const readable = [...lines].reverse().find((l) => !/^[{}[\]"]/.test(l));
+    return readable || 'Не удалось разобрать ответ модели. Попробуйте решить ещё раз.';
+  }
+  return last;
+}
+
+/** Decode a JSON string literal's inner text (escapes -> chars). Falls back to
+ *  the raw slice if it isn't well-formed (e.g. a value truncated mid-escape). */
+function decodeJsonStr(inner) {
+  try { return JSON.parse('"' + inner + '"'); } catch { return inner; }
 }
 
 /**
- * Format the model's reply into «№N: ответ» lines. The test prompt now asks
- * for JSON ({reasoning, answers:[{n,a}]}), so parsing is deterministic; the
- * old text-scan stays only as a fallback if JSON ever comes back malformed.
+ * Pull {"n":…,"a":"…"} pairs straight out of the text. This rescues answers
+ * from JSON that JSON.parse rejects — most often a reply truncated by the
+ * model's token limit before the closing brace, where the whole-object parse
+ * fails but the answers that did arrive are still perfectly usable.
+ */
+function answersFromPartial(raw) {
+  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const n = (m[1] ?? m[2] ?? '').trim();
+    out.push(`№${n}: ${decodeJsonStr(m[3])}`);
+  }
+  return out.length ? out.join('\n') : null;
+}
+
+/**
+ * Reasoning-only rescue: when the model spent its whole token budget on the
+ * "reasoning" field and never reached "answers", show the decoded reasoning
+ * text rather than dumping «{"reasoning":"…» braces at the user. The closing
+ * quote is optional so a truncated reply still yields something readable.
+ */
+function reasoningFromPartial(raw) {
+  const m = raw.match(/"reasoning"\s*:\s*"((?:[^"\\]|\\.)*)/);
+  if (!m) return null;
+  const text = decodeJsonStr(m[1]).trim();
+  return text || null;
+}
+
+/**
+ * Format the model's reply into «№N: ответ» lines. The test prompt asks for
+ * JSON ({reasoning, answers:[{n,a}]}), so the happy path is a clean parse. The
+ * later tiers salvage partial/truncated replies so a cut-off response never
+ * surfaces as raw JSON to the user.
  */
 function formatTestAnswers(raw) {
   const fromObj = (obj) => {
@@ -402,10 +447,19 @@ function formatTestAnswers(raw) {
       .map((x) => `№${x.n}: ${x.a}`);
     return lines.length ? lines.join('\n') : null;
   };
+  // (1) Whole JSON — the happy path when the reply came back intact.
   try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
-  const m = raw.match(/\{[\s\S]*\}/); // JSON embedded in prose
+  // (2) JSON embedded in prose / code fences.
+  const m = raw.match(/\{[\s\S]*\}/);
   if (m) { try { const r = fromObj(JSON.parse(m[0])); if (r) return r; } catch { /* ignore */ } }
-  return extractFinalAnswers(raw); // legacy fallback
+  // (3) Partial/truncated JSON: salvage whatever answer pairs did arrive.
+  const partial = answersFromPartial(raw);
+  if (partial) return partial;
+  // (4) Reasoning-only reply: show the reasoning text, never the raw braces.
+  const reasoning = reasoningFromPartial(raw);
+  if (reasoning) return reasoning;
+  // (5) Free-text reply (no JSON at all): legacy marker/line scan.
+  return extractFinalAnswers(raw);
 }
 
 /** Minimal render: bold, line breaks, and LaTeX via tex.js. Returns the plain

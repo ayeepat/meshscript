@@ -4,119 +4,136 @@
   <meta charset="UTF-8" />
   <title>meshscript — настройки</title>
   <link rel="stylesheet" href="../common/theme.css" />
-  <style>
-    * { box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, sans-serif;
-      max-width: 720px; margin: 0 auto; padding: 32px 20px 60px;
-      background: var(--bg); color: var(--text);
-      -webkit-font-smoothing: antialiased;
-    }
-    h1 { font-size: 28px; font-weight: 700; letter-spacing: -0.4px; margin: 0 0 24px; }
-    h2 {
-      font-size: 13px; font-weight: 600; text-transform: uppercase;
-      letter-spacing: 0.5px; color: var(--secondary); margin: 28px 0 8px 16px;
-    }
-    .group { background: var(--card); border-radius: 18px; padding: 6px 16px; box-shadow: var(--shadow-card); }
-    label { display: block; font-size: 13px; margin: 14px 0 6px; font-weight: 600; }
-    input, textarea, select {
-      width: 100%; padding: 11px 14px; border: none; background: var(--input-bg);
-      border-radius: 12px; font: inherit; font-size: 14px; color: var(--text);
-      outline: none; transition: box-shadow 0.15s ease;
-    }
-    input:focus, textarea:focus, select:focus { box-shadow: 0 0 0 3px var(--focus-ring); }
-    textarea { min-height: 90px; resize: vertical; }
-    select { appearance: none; -webkit-appearance: none; cursor: pointer; }
-    .group > :last-child { margin-bottom: 14px; }
-    button {
-      background: var(--accent); color: var(--on-accent); border: none;
-      border-radius: 14px; padding: 13px 22px; cursor: pointer;
-      font: inherit; font-size: 15px; font-weight: 600;
-      transition: transform 0.1s ease, filter 0.15s ease;
-    }
-    button:hover { filter: brightness(1.08); }
-    button:active { transform: scale(0.97); }
-    .actions { margin-top: 18px; }
-    .ok { color: var(--green); font-size: 14px; font-weight: 600; margin-left: 12px; }
-    .session {
-      background: var(--card); border-radius: 14px; padding: 12px 16px;
-      margin: 8px 0; font-size: 13px; box-shadow: var(--shadow-card);
-    }
-    .hint { font-size: 12px; color: var(--secondary); margin: 6px 0 0; }
-    #history { margin-top: 8px; }
-    .secondary-btn { background: var(--card); color: var(--accent); box-shadow: var(--shadow-btn); }
-
-    /* iOS-style segmented control for the theme */
-    .seg {
-      display: flex; gap: 2px; margin: 14px 0;
-      background: var(--input-bg); border-radius: 12px; padding: 3px;
-    }
-    .seg button {
-      flex: 1; background: transparent; color: var(--secondary);
-      border-radius: 9px; padding: 8px 0; font-size: 13.5px; font-weight: 600;
-    }
-    .seg button:hover { filter: none; color: var(--text); }
-    .seg button.active {
-      background: var(--card); color: var(--text);
-      box-shadow: var(--shadow-btn);
-    }
-  </style>
+  <link rel="stylesheet" href="settings.css" />
 </head>
 <body>
-  <h1>Настройки</h1>
+  <header class="appbar">
+    <div class="brand">
+      <span class="brandmark">m</span>
+      <div class="brandtext">
+        <h1>meshscript</h1>
+        <span class="brandsub">Настройки · v0.4.0</span>
+      </div>
+    </div>
+  </header>
 
-  <h2>Оформление</h2>
-  <div class="group">
-    <div class="seg" id="themeSeg">
-      <button data-pref="system">Системная</button>
-      <button data-pref="light">Светлая</button>
-      <button data-pref="dark">Тёмная</button>
+  <main class="wrap">
+
+    <!-- Appearance -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r="1.3"/><circle cx="17.5" cy="10.5" r="1.3"/><circle cx="8.5" cy="7.5" r="1.3"/><circle cx="6.5" cy="12.5" r="1.3"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.65-.75 1.65-1.69 0-.43-.18-.83-.44-1.12-.29-.29-.44-.65-.44-1.13a1.64 1.64 0 0 1 1.67-1.67h2c3.05 0 5.55-2.5 5.55-5.55C21.96 6.01 17.46 2 12 2z"/></svg></span>
+        <div>
+          <h2>Оформление</h2>
+          <p>Тема интерфейса попапа, окна решений и настроек.</p>
+        </div>
+      </div>
+      <div class="seg" id="themeSeg">
+        <button data-pref="system"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Системная</button>
+        <button data-pref="light"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>Светлая</button>
+        <button data-pref="dark"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>Тёмная</button>
+      </div>
+    </section>
+
+    <!-- Provider -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span>
+        <div>
+          <h2>AI-провайдер</h2>
+          <p>Кто решает задания. OpenRouter точнее и читает PDF, Groq бесплатный.</p>
+        </div>
+      </div>
+      <div class="selectwrap">
+        <select id="aiProvider">
+          <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
+          <option value="groq">Groq — Llama (бесплатно, без карты)</option>
+        </select>
+        <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+      </div>
+      <div class="providerhints">
+        <a class="linkpill" href="https://openrouter.ai/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Получить ключ OpenRouter</a>
+        <a class="linkpill" href="https://console.groq.com/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Получить ключ Groq</a>
+      </div>
+    </section>
+
+    <!-- API keys -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3"/></svg></span>
+        <div>
+          <h2>Ключи API</h2>
+          <p>Хранятся локально в браузере и никогда не покидают расширение.</p>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="openrouterApiKey">OpenRouter API Key</label>
+        <div class="inputwrap">
+          <input id="openrouterApiKey" type="password" placeholder="sk-or-v1-…" autocomplete="off" spellcheck="false" />
+          <button class="reveal" type="button" data-reveal="openrouterApiKey" title="Показать / скрыть"></button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="groqApiKey">Groq API Key</label>
+        <div class="inputwrap">
+          <input id="groqApiKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
+          <button class="reveal" type="button" data-reveal="groqApiKey" title="Показать / скрыть"></button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="supabaseUrl">Supabase URL <span class="opt">необязательно</span></label>
+        <div class="inputwrap">
+          <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" autocomplete="off" spellcheck="false" />
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="supabaseAnonKey">Supabase anon key <span class="opt">необязательно</span></label>
+        <div class="inputwrap">
+          <input id="supabaseAnonKey" type="password" placeholder="eyJ…" autocomplete="off" spellcheck="false" />
+          <button class="reveal" type="button" data-reveal="supabaseAnonKey" title="Показать / скрыть"></button>
+        </div>
+      </div>
+
+      <p class="note"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Supabase нужен только для синхронизации истории решений между устройствами. Без него расширение работает локально.</p>
+    </section>
+
+    <!-- Prompts -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg></span>
+        <div>
+          <h2>Базовые промпты</h2>
+          <p>Как отвечать по каждой группе предметов. «Сброс» возвращает стандартный текст.</p>
+        </div>
+      </div>
+      <div id="promptList"></div>
+    </section>
+
+    <!-- History -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg></span>
+        <div>
+          <h2>История решений</h2>
+          <p>Последние 7 дней. Доступна, если подключён Supabase.</p>
+        </div>
+        <button id="reload" class="ghostbtn head-action" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Обновить</button>
+      </div>
+      <div id="history" class="history"></div>
+    </section>
+
+  </main>
+
+  <div class="savebar">
+    <div class="savebar-inner">
+      <span id="status" class="ok"></span>
+      <button id="save" type="button"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Сохранить изменения</button>
     </div>
   </div>
-
-  <h2>AI-провайдер</h2>
-  <div class="group">
-    <label>Провайдер</label>
-    <select id="aiProvider">
-      <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
-      <option value="groq">Groq (бесплатно, без карты)</option>
-    </select>
-    <p class="hint">OpenRouter: ключ на https://openrouter.ai/keys · Groq: https://console.groq.com/keys</p>
-  </div>
-
-  <h2>Ключи API</h2>
-  <div class="group">
-    <label>OpenRouter API Key</label>
-    <input id="openrouterApiKey" type="password" placeholder="sk-or-v1-..." />
-    <label>Groq API Key</label>
-    <input id="groqApiKey" type="password" placeholder="gsk_..." />
-    <label>Supabase URL</label>
-    <input id="supabaseUrl" type="text" placeholder="https://xxxx.supabase.co" />
-    <label>Supabase anon key</label>
-    <input id="supabaseAnonKey" type="password" placeholder="eyJ..." />
-  </div>
-
-  <h2>Базовые промпты (по категориям)</h2>
-  <div class="group">
-    <label>Точные науки (Алгебра/Геометрия/Физика/Химия)</label>
-    <textarea id="p_worked_solution"></textarea>
-    <label>Языки (Английский) — только ответы</label>
-    <textarea id="p_direct_answer"></textarea>
-    <label>Параграфы (История/Обществознание/География) — конспект</label>
-    <textarea id="p_paragraph_summary"></textarea>
-    <label>Русский язык — полное упражнение</label>
-    <textarea id="p_russian_full"></textarea>
-    <label>Литература — анализ произведений</label>
-    <textarea id="p_literature"></textarea>
-    <label>Тесты МЭШ — только номер и ответ</label>
-    <textarea id="p_test_answer"></textarea>
-  </div>
-
-  <div class="actions"><button id="save">Сохранить</button><span id="status" class="ok"></span></div>
-
-  <h2>История (последние 7 дней)</h2>
-  <button id="reload" class="secondary-btn">Обновить историю</button>
-  <div id="history"></div>
 
   <script type="module" src="settings.js"></script>
 </body>

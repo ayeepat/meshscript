@@ -1,0 +1,16 @@
+[
+  {
+    "id": 1,
+    "priority": 1,
+    "action": {
+      "type": "modifyHeaders",
+      "requestHeaders": [
+        { "header": "user-agent", "operation": "set", "value": "okhttp/4.9.1" }
+      ]
+    },
+    "condition": {
+      "urlFilter": "||gdz-ru.com/",
+      "resourceTypes": ["xmlhttprequest", "image", "media", "other"]
+    }
+  }
+]
