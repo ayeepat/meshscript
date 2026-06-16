@@ -8,8 +8,10 @@ body {
   background-attachment: fixed;
   color: var(--text);
   -webkit-font-smoothing: antialiased;
-  padding-bottom: 92px;
+  padding-bottom: 24px;
 }
+/* The save bar only applies to the AI/prompts tab — textbooks auto-save. */
+body.on-settings { padding-bottom: 92px; }
 
 /* ---------- App bar ---------- */
 .appbar {
@@ -20,7 +22,7 @@ body {
   border-bottom: 1px solid var(--separator);
 }
 .appbar .brand {
-  max-width: 760px; margin: 0 auto; padding: 14px 24px;
+  max-width: 760px; margin: 0 auto; padding: 14px 24px 10px;
   display: flex; align-items: center; gap: 12px;
 }
 .appbar .brandmark { width: 34px; height: 34px; font-size: 18px; border-radius: 10px; }
@@ -43,10 +45,32 @@ body {
 .theme-mini button:hover:not(.active) { color: var(--text); }
 .theme-mini button.active { color: var(--accent); background: var(--card); box-shadow: var(--shadow-btn); }
 
+/* ---------- Tab navigation ---------- */
+.tabs {
+  max-width: 760px; margin: 0 auto; padding: 0 24px;
+  display: flex; gap: 2px;
+}
+.tab {
+  position: relative; display: inline-flex; align-items: center; gap: 8px;
+  background: transparent; border: none; cursor: pointer;
+  color: var(--secondary); font: inherit; font-size: 13.5px; font-weight: 650;
+  padding: 11px 14px 13px; margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+.tab svg { color: currentColor; }
+.tab:hover:not(.active) { color: var(--text); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
 /* ---------- Layout ---------- */
 .wrap {
   max-width: 760px; margin: 0 auto; padding: 24px;
-  display: flex; flex-direction: column; gap: 18px;
+}
+.tabpanel { display: none; flex-direction: column; gap: 18px; }
+.tabpanel.active { display: flex; animation: tab-in 0.22s ease; }
+@keyframes tab-in {
+  from { opacity: 0; transform: translateY(5px); }
+  to   { opacity: 1; transform: none; }
 }
 
 .panel {
@@ -54,23 +78,8 @@ body {
   border-radius: var(--r-2xl); padding: 22px 24px;
   box-shadow: var(--shadow-card);
 }
-/* The grade/textbooks panel is the focus of this screen — give it an accent ring. */
-.panel.featured {
-  border-color: var(--accent-soft-strong);
-  box-shadow: var(--shadow-card), 0 0 0 1px var(--accent-soft) inset;
-}
 
-/* Labeled separator between the featured section and the rest of the settings. */
-.section-divider {
-  display: flex; align-items: center; gap: 14px;
-  margin: 4px 2px; color: var(--tertiary);
-  font-size: 11.5px; font-weight: 700; letter-spacing: 0.4px; text-transform: uppercase;
-}
-.section-divider::before, .section-divider::after {
-  content: ""; flex: 1; height: 1px; background: var(--separator);
-}
-
-/* Small section label inside a panel ("Мои учебники", "Каталог"). */
+/* Small section label inside a panel ("Мои учебники"). */
 .subhead {
   font-size: 12px; font-weight: 700; color: var(--tertiary);
   letter-spacing: 0.3px; text-transform: uppercase;
@@ -236,7 +245,9 @@ textarea {
   backdrop-filter: blur(20px) saturate(180%);
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   border-top: 1px solid var(--separator);
+  display: none;
 }
+body.on-settings .savebar { display: block; }
 .savebar-inner {
   max-width: 760px; margin: 0 auto; padding: 14px 24px;
   display: flex; align-items: center; justify-content: flex-end; gap: 14px;
@@ -297,8 +308,7 @@ textarea {
 .gdzrow .row-actions button:hover { color: var(--text); border-color: var(--border-strong); background: var(--hover); }
 
 /* ---------- Inline catalog browser ---------- */
-.browse-head { display: flex; align-items: center; gap: 8px; }
-.browse-count { font-weight: 600; text-transform: none; letter-spacing: 0; color: var(--tertiary); }
+.browse-count { font-size: 12px; font-weight: 600; color: var(--tertiary); white-space: nowrap; }
 .browse-controls { display: flex; flex-direction: column; gap: 10px; }
 .gdz-results {
   margin-top: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;

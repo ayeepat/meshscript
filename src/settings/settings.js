@@ -371,10 +371,30 @@ function wireGdz() {
   });
 }
 
+/* ---------- Tabs ---------- */
+
+function wireTabs() {
+  const tabs = [...document.querySelectorAll('.tab')];
+  const panels = [...document.querySelectorAll('.tabpanel')];
+  function show(name) {
+    for (const t of tabs) {
+      const on = t.dataset.tab === name;
+      t.classList.toggle('active', on);
+      t.setAttribute('aria-selected', on ? 'true' : 'false');
+    }
+    for (const p of panels) p.classList.toggle('active', p.dataset.panel === name);
+    // The save bar only matters on the AI/prompts tab — textbooks & grade auto-save.
+    document.body.classList.toggle('on-settings', name === 'settings');
+  }
+  for (const t of tabs) t.onclick = () => show(t.dataset.tab);
+  show('books');
+}
+
 /* ---------- Init ---------- */
 
 buildPromptEditors();
 wireReveals();
+wireTabs();
 wireGdz();
 document.getElementById('save').onclick = save;
 document.getElementById('reload').onclick = loadHistory;
