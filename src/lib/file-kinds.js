@@ -19,9 +19,20 @@ export const isTextFile = (f) =>
   /\.(txt|md|markdown|csv|tsv|rtf|log|json|xml|html?|tex)$/i.test(f?.name || '');
 
 /**
+ * Office Open XML / legacy office docs. We can't hand these to a model, but the
+ * modern (zip-based) ones can be text-extracted locally first — see extract.js.
+ * The regex also matches legacy binaries (.doc/.ppt/.xls); extraction returns
+ * null for those and the caller falls back to asking for a PDF/photo.
+ */
+export const isOfficeFile = (f) =>
+  /(officedocument|msword|ms-powerpoint|ms-excel)/.test(f?.mimeType || '') ||
+  /\.(docx?|pptx?|xlsx?)$/i.test(f?.name || '');
+
+/**
  * Can the SOLVER model actually read this file's CONTENT? Images (vision),
- * PDFs (Gemini native) and plain text (inlined) — yes. Office formats
- * (docx/pptx/xlsx) — no, neither provider reads them.
+ * PDFs (Gemini native) and plain text (inlined) — yes. Office files only after
+ * extract.js has converted them to text/plain (so a raw .docx is still false
+ * here, which is what the missing-input gate wants).
  */
 export const isReadableFile = (f) => isImageFile(f) || isPdfFile(f) || isTextFile(f);
 

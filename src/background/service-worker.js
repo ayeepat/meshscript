@@ -10,7 +10,9 @@ import { createSession, addMessage, listSessions, listMessages } from '../lib/su
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
 import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
-import { getCatalog, searchBooks, resolveTask, fetchTaskImage } from '../lib/gdz-api.js';
+import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } from '../lib/gdz-api.js';
+import { mapSubjectToId } from '../lib/gdz-match.js';
+import { prepareFiles } from '../lib/extract.js';
 
 // Follow-ups re-send prior turns as context. Cap how many: full worked
 // solutions are long, and on a paid provider every re-sent turn is money.
@@ -86,6 +88,11 @@ function missingInputGate(category, task, files) {
  */
 async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta) {
   const category = categoryForSubject(subject);
+
+  // Extract Office files (.docx/.pptx/.xlsx) to inline text RIGHT HERE, locally
+  // and for free — no API call. This both lets the model actually solve from
+  // them and lets the gate below see them as readable material.
+  files = await prepareFiles(files);
 
   // Hard refusal gate — runs in CODE, before any model call, only on the first
   // turn (later turns may carry a clarification or a just-attached file). A soft
@@ -267,6 +274,27 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           }
           if (!inlined.length) { sendResponse({ ok: false, error: 'images unavailable' }); break; }
           sendResponse({ ok: true, result: { ...result, inlined } });
+          break;
+        }
+        case 'GDZ_FOR_TASK': {
+          // payload: { subject, task } — the dashboard's per-lesson lookup.
+          const { subject, task } = msg.payload || {};
+          const sid = mapSubjectToId(subject);
+          const { gdzBooks = {} } = await chrome.storage.local.get('gdzBooks');
+          const book = sid != null ? gdzBooks[sid] : null;
+          if (!book) { sendResponse({ ok: true, configured: false }); break; }
+          const res = await resolveForTask(book, task || '');
+          // Inline images for the answers we found so the chat renders them directly.
+          for (const a of res.answers) {
+            if (!a.found) continue;
+            a.inlined = [];
+            for (const u of a.images) { try { a.inlined.push(await fetchTaskImage(u)); } catch { /* skip */ } }
+          }
+          sendResponse({
+            ok: true, configured: true, mode: res.mode,
+            book: { title: book.title, breadcrumb: book.breadcrumb, year: book.year, study_level: book.study_level },
+            answers: res.answers
+          });
           break;
         }
         case 'GDZ_SELFTEST': {

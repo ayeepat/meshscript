@@ -17,7 +17,8 @@
  */
 
 import { postJson, postStream } from './http.js';
-import { isImageFile } from './file-kinds.js';
+import { isImageFile, isTextFile } from './file-kinds.js';
+import { base64ToUtf8 } from './extract.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -52,6 +53,16 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
       userContent.push({
         type: 'image_url',
         image_url: { url: `data:${m};base64,${f.dataBase64}` }
+      });
+    } else if (isTextFile(f)) {
+      // Plain text and locally-extracted Office docs (see extract.js) — inline
+      // the contents so Groq actually reads them instead of refusing.
+      const text = base64ToUtf8(f.dataBase64);
+      userContent.push({
+        type: 'text',
+        text: text
+          ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
+          : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
       });
     } else {
       userContent.push({

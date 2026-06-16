@@ -189,8 +189,84 @@ function renderChat(chat) {
     chatEl.innerHTML = '<p class="hintmsg">Выберите урок слева, чтобы получить решение.</p>';
     return;
   }
+  const card = gdzCardEl(chat); // GDZ answers sit above the chat
+  if (card) chatEl.appendChild(card);
   for (const m of chat.history) bubble(m.role, m.content, { files: m.files, needsUpload: m.needsUpload });
   if (chat.pending) chat.thinkingEl = thinkingBubble();
+}
+
+/* ---------- GDZ answers (ready textbook solutions, no AI) ---------- */
+
+/** Build the GDZ answer card from a lesson's resolved data, or null. */
+function gdzCardEl(chat) {
+  const g = chat.gdz;
+  const found = (g?.answers || []).filter((a) => a.found && a.inlined?.length);
+  if (!found.length) return null;
+
+  const card = document.createElement('div');
+  card.className = 'gdzcard';
+  card.dataset.key = chat.key;
+
+  const head = document.createElement('div');
+  head.className = 'gh';
+  head.innerHTML = `${iconSvg('book', 14)}<span>Готовые ответы · ГДЗ</span>`;
+  card.appendChild(head);
+
+  const prov = [g.book?.breadcrumb || g.book?.title, g.book?.year].filter(Boolean).join(' · ');
+  if (prov) {
+    const sub = document.createElement('div');
+    sub.className = 'gsub';
+    sub.textContent = prov;
+    card.appendChild(sub);
+  }
+
+  for (const a of found) {
+    const block = document.createElement('div');
+    block.className = 'gdzanswer';
+    const label = document.createElement('div');
+    label.className = 'gnum';
+    label.textContent = g.mode === 'page' ? `Страница ${a.num}` : `№ ${a.num}`;
+    block.appendChild(label);
+    for (const img of a.inlined) {
+      const im = document.createElement('img');
+      im.src = `data:${img.mimeType};base64,${img.dataBase64}`;
+      im.alt = `ГДЗ ${a.num}`;
+      im.loading = 'lazy';
+      block.appendChild(im);
+    }
+    if (a.link) {
+      const link = document.createElement('a');
+      link.href = a.link;
+      link.target = '_blank';
+      link.rel = 'noopener';
+      link.textContent = 'Открыть на ГДЗ →';
+      block.appendChild(link);
+    }
+    card.appendChild(block);
+  }
+  return card;
+}
+
+/** Resolve textbook references for this lesson and show the answer card. Runs
+ *  in parallel with the AI solve; the card is prepended above the chat. */
+async function maybeShowGdz(chat) {
+  let resp;
+  try {
+    resp = await new Promise((resolve) => {
+      chrome.runtime.sendMessage(
+        { type: 'GDZ_FOR_TASK', payload: { subject: chat.subject, task: chat.task } },
+        (r) => resolve(chrome.runtime.lastError ? null : r)
+      );
+    });
+  } catch { return; }
+  if (!resp?.ok || !resp.configured) return;
+  const found = (resp.answers || []).filter((a) => a.found && a.inlined?.length);
+  if (!found.length) return;
+
+  chat.gdz = { book: resp.book, mode: resp.mode, answers: resp.answers };
+  if (activeKey !== chat.key) return;
+  if (chatEl.querySelector(`.gdzcard[data-key="${CSS.escape(chat.key)}"]`)) return;
+  chatEl.insertBefore(gdzCardEl(chat), chatEl.firstChild);
 }
 
 function fileToInline(file) {
@@ -309,6 +385,9 @@ function sendToChat(chat, text, files) {
  */
 async function startLesson(chat) {
   chat.started = true;
+  // Pull ready GDZ answers for any textbook references, in parallel with the AI
+  // solve. Free (no API), shown as a card above the chat. See maybeShowGdz.
+  maybeShowGdz(chat);
   let text = chat.task;
   let files = [];
   try {

@@ -17,6 +17,8 @@
  * tasks are cached per (bookUrl, n) so re-opens are free.
  */
 
+import { parseRefs } from './gdz-match.js';
+
 const BASE = 'https://gdz-ru.com';
 const CATALOG_PATH = '/full-book-list?country_id=1';
 
@@ -195,20 +197,20 @@ export async function listTasks(bookUrl) {
 }
 
 /**
- * Resolve a single exercise number against a book.
+ * Resolve a single number against a book.
  *
- * Match rules:
- *  - Prefer tasks under a section named like "упражнение/exercise" — that's
- *    what a teacher means by "Упр. N" 90 % of the time.
- *  - Otherwise take the first task whose num equals the requested number.
- *  - Return null if nothing matches (caller falls back to AI).
+ * mode:
+ *  - 'exercise' (default): "Упр. N" — prefer an exercises section over review
+ *    questions. Used by textbooks (algebra etc.).
+ *  - 'page': "с. N" — prefer a "страница" section. Used by page-structured
+ *    workbooks, whose answer image for a page covers all its exercises.
  *
- * The result includes a public link to gdz.ru (the human-facing website),
- * not gdz-ru.com, so the student can open the source in a real browser.
+ * Returns null if nothing matches (caller falls back to AI). The result carries
+ * a public gdz.ru link (the human site) so the student can open the source.
  */
-export async function resolveTask(bookUrl, number) {
+export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
   const num = String(number).trim();
-  const cacheKey = `${bookUrl}|${num}`;
+  const cacheKey = `${bookUrl}|${mode}|${num}`;
 
   const { [TASK_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(TASK_CACHE_KEY);
   if (cache[cacheKey]) return cache[cacheKey];
@@ -217,18 +219,18 @@ export async function resolveTask(bookUrl, number) {
   const exact = tasks.filter((t) => t.num === num);
   if (!exact.length) return null;
 
-  // Rank candidate sections: "Упр. N" means the exercises section first, then
-  // generic "номер/задание", then anything else, with review questions
-  // ("вопросы и задания") last so they never shadow the real exercises. Within
-  // one rank the earliest edition wins (sort is stable, exact keeps edition order).
-  const sectionRank = (s = '') => {
-    const x = s.toLowerCase();
-    if (/упраж|exercise/.test(x)) return 0;
-    if (/вопрос/.test(x)) return 3;
-    if (/номер|^№|задани/.test(x)) return 1;
-    return 2;
-  };
-  const match = exact.slice().sort((a, b) => sectionRank(a.section) - sectionRank(b.section))[0];
+  // Rank candidate sections so the right numbering wins, and within one rank the
+  // earliest edition wins (sort is stable, exact keeps edition order).
+  const rank = mode === 'page'
+    ? (s = '') => (/страниц/i.test(s) ? 0 : 1)
+    : (s = '') => {
+        const x = s.toLowerCase();
+        if (/упраж|exercise/.test(x)) return 0;          // real exercises first
+        if (/вопрос/.test(x)) return 3;                  // review questions last
+        if (/номер|^№|задани/.test(x)) return 1;
+        return 2;
+      };
+  const match = exact.slice().sort((a, b) => rank(a.section) - rank(b.section))[0];
 
   const taskData = await getJson(BASE + match.url);
   const editions = taskData.editions || [];
@@ -250,6 +252,45 @@ export async function resolveTask(bookUrl, number) {
   }
   await chrome.storage.local.set({ [TASK_CACHE_KEY]: cache });
   return result;
+}
+
+/**
+ * Resolve every reference in a homework task against a configured book.
+ * Detects the book's numbering (page- vs exercise-structured) from its own
+ * task sections, picks the matching context (workbook books read Р.т. refs,
+ * textbooks read the rest), and resolves each number.
+ *
+ * @returns {{mode:'page'|'exercise', ctx:'workbook'|'textbook', answers:Array}}
+ */
+export async function resolveForTask(book, taskText) {
+  const tasks = await listTasks(book.url);
+  const hasPage = tasks.some((t) => /страниц/i.test(t.section || ''));
+  const hasExercise = tasks.some((t) => /упраж|номер|задани/i.test(t.section || ''));
+  const isWorkbook = /тетрад|рабоч|workbook|activity/i.test(`${book.subtype || ''} ${book.title || ''}`);
+  // Resolve by page when the book is page-structured — for workbooks this holds
+  // even if a few exercise-named sections also exist; for everything else only
+  // when there are no exercise sections at all. Otherwise resolve by exercise.
+  const mode = hasPage && (isWorkbook || !hasExercise) ? 'page' : 'exercise';
+
+  const ctx = isWorkbook ? 'workbook' : 'textbook';
+  const refs = parseRefs(taskText);
+
+  // Resolve ONLY the book's own context. A configured workbook answers the Р.т.
+  // refs; a textbook answers the rest. We do NOT borrow the other context: a
+  // textbook page number ≠ the same workbook page number (different physical
+  // books), and the "Текст с. 112" reading pages must never resolve against a
+  // workbook. A miss here just falls through to the AI — far better than a
+  // confidently-wrong answer image.
+  const nums = [...new Set(mode === 'page' ? refs[ctx].pages : refs[ctx].exercises)].slice(0, 12);
+
+  const answers = [];
+  for (const n of nums) {
+    const r = await resolveTask(book.url, String(n), { mode });
+    answers.push(r
+      ? { num: n, found: true, link: r.link, images: r.images, section: r.section }
+      : { num: n, found: false });
+  }
+  return { mode, ctx, answers };
 }
 
 /** Download a resolved-task image as inline base64. The dashboard can render

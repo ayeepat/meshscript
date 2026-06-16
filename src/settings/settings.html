@@ -35,6 +35,31 @@
       </div>
     </section>
 
+    <!-- Grade & textbooks (GDZ) -->
+    <section class="panel">
+      <div class="panel-head">
+        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
+        <div>
+          <h2>Класс и учебники</h2>
+          <p>Готовые ответы из ГДЗ для заданий вида «упр. 25» или «Р.т. с. 74». Укажите класс и учебник по каждому предмету.</p>
+        </div>
+        <button id="gdzAddBtn" class="ghostbtn head-action" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Добавить</button>
+      </div>
+      <div class="field">
+        <label for="studentGrade">Класс</label>
+        <div class="selectwrap">
+          <select id="studentGrade">
+            <option value="">— выберите —</option>
+            <option>1</option><option>2</option><option>3</option><option>4</option>
+            <option>5</option><option>6</option><option>7</option><option>8</option>
+            <option>9</option><option>10</option><option>11</option>
+          </select>
+          <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+        </div>
+      </div>
+      <div id="gdzBooks" class="gdzbooks"></div>
+    </section>
+
     <!-- Provider -->
     <section class="panel">
       <div class="panel-head">
@@ -127,6 +152,28 @@
     </section>
 
   </main>
+
+  <!-- Textbook picker -->
+  <div id="gdzPicker" class="gdz-overlay" hidden>
+    <div class="gdz-modal">
+      <div class="gdz-modal-head">
+        <strong>Выбрать учебник</strong>
+        <button id="gdzPickClose" class="gdz-x" type="button" aria-label="Закрыть"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      </div>
+      <div class="gdz-controls">
+        <div class="selectwrap">
+          <select id="gdzPickSubject"></select>
+          <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+        </div>
+        <div class="seg" id="gdzPickType">
+          <button data-st="Учебник" class="active" type="button">Учебник</button>
+          <button data-st="Рабочая тетрадь" type="button">Раб. тетрадь</button>
+        </div>
+        <input id="gdzPickSearch" type="text" placeholder="Поиск: автор или название…" autocomplete="off" spellcheck="false" />
+      </div>
+      <div id="gdzPickResults" class="gdz-results"></div>
+    </div>
+  </div>
 
   <div class="savebar">
     <div class="savebar-inner">

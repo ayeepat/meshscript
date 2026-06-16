@@ -219,3 +219,94 @@ textarea {
   opacity: 0; transform: translateY(2px); transition: opacity 0.2s ease, transform 0.2s ease;
 }
 .ok.show { opacity: 1; transform: none; }
+
+/* ---------- Textbooks (GDZ) ---------- */
+.gdzbooks { display: flex; flex-direction: column; gap: 8px; margin-top: 14px; }
+.gdzbooks .empty {
+  font-size: 12.5px; color: var(--secondary); line-height: 1.5;
+  background: var(--surface-2); border: 1px dashed var(--border-strong);
+  border-radius: var(--r-md); padding: 14px;
+}
+.gdzrow {
+  display: flex; align-items: center; gap: 12px;
+  background: var(--surface-2); border: 1px solid var(--separator);
+  border-radius: var(--r-md); padding: 10px 12px;
+}
+.gdzrow .cover {
+  width: 38px; height: 50px; flex: none; border-radius: var(--r-xs);
+  object-fit: cover; background: var(--input-bg); border: 1px solid var(--separator);
+}
+.gdzrow .cover.ph { display: grid; place-items: center; color: var(--tertiary); }
+.gdzrow .meta { flex: 1; min-width: 0; }
+.gdzrow .meta .subj { font-size: 11.5px; color: var(--tertiary); }
+.gdzrow .meta .ttl {
+  font-size: 13.5px; font-weight: 650; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+.gdzrow .meta .det { font-size: 11.5px; color: var(--secondary); margin-top: 1px; }
+.gdzrow .badge {
+  font-size: 10.5px; font-weight: 700; color: var(--accent);
+  background: var(--accent-soft); padding: 2px 8px; border-radius: var(--r-pill); flex: none;
+}
+.gdzrow .row-actions { display: flex; gap: 4px; flex: none; }
+.gdzrow .row-actions button {
+  background: transparent; border: 1px solid var(--separator); color: var(--secondary);
+  border-radius: var(--r-sm); padding: 6px 11px; cursor: pointer;
+  font: inherit; font-size: 12px; font-weight: 600;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+.gdzrow .row-actions button:hover { color: var(--text); border-color: var(--border-strong); background: var(--hover); }
+
+/* ---------- Picker overlay ---------- */
+.gdz-overlay {
+  position: fixed; inset: 0; z-index: 50;
+  background: rgba(20, 20, 40, 0.45);
+  backdrop-filter: blur(3px); -webkit-backdrop-filter: blur(3px);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+}
+.gdz-overlay[hidden] { display: none; }
+.gdz-modal {
+  width: 100%; max-width: 540px; max-height: 82vh;
+  display: flex; flex-direction: column;
+  background: var(--card); border: 1px solid var(--separator);
+  border-radius: var(--r-2xl); padding: 20px; box-shadow: var(--shadow-pop);
+}
+.gdz-modal-head {
+  display: flex; align-items: center; justify-content: space-between; margin-bottom: 14px;
+}
+.gdz-modal-head strong { font-size: 16px; font-weight: 700; letter-spacing: -0.2px; }
+.gdz-x {
+  width: 32px; height: 32px; border-radius: var(--r-sm);
+  background: var(--input-bg); border: none; color: var(--secondary); cursor: pointer;
+  display: grid; place-items: center; transition: color 0.15s ease, background 0.15s ease;
+}
+.gdz-x:hover { color: var(--text); background: var(--hover); }
+.gdz-controls { display: flex; flex-direction: column; gap: 10px; }
+.gdz-results {
+  margin-top: 14px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px;
+  flex: 1; min-height: 120px;
+}
+.gdz-results .empty, .gdz-results .loading {
+  display: flex; align-items: center; justify-content: center; gap: 9px;
+  font-size: 13px; color: var(--secondary); padding: 24px 12px; text-align: center;
+}
+.gdz-result {
+  display: flex; align-items: center; gap: 11px; padding: 9px 10px;
+  border: 1px solid transparent; border-radius: var(--r-md); cursor: pointer;
+  transition: background 0.12s ease, border-color 0.12s ease;
+}
+.gdz-result:hover { background: var(--surface-2); border-color: var(--separator); }
+.gdz-result .cover {
+  width: 34px; height: 44px; flex: none; border-radius: var(--r-xs);
+  object-fit: cover; background: var(--input-bg); border: 1px solid var(--separator);
+}
+.gdz-result .cover.ph { display: grid; place-items: center; color: var(--tertiary); }
+.gdz-result .info { flex: 1; min-width: 0; }
+.gdz-result .info .ttl { font-size: 13.5px; font-weight: 650; line-height: 1.3; }
+.gdz-result .info .det { font-size: 11.5px; color: var(--secondary); margin-top: 2px; }
+.gdz-result .tag {
+  font-size: 10.5px; font-weight: 700; flex: none;
+  padding: 2px 8px; border-radius: var(--r-pill);
+  color: var(--accent); background: var(--accent-soft);
+}
+.gdz-result .tag.paid { color: var(--warn); background: var(--warn-soft); }
