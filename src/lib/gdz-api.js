@@ -30,6 +30,13 @@ const CATALOG_KEY = 'gdzCatalog';
 const TASK_CACHE_KEY = 'gdzTaskCache';
 const TASK_CACHE_MAX = 200; // LRU-ish cap on resolved tasks
 
+// The public human site. Its URL scheme differs entirely from the mobile API
+// (BASE), and the API never exposes a human link, so we derive one per book.
+const HUMAN = 'https://gdz.ru';
+const HUMAN_REF_KEY = 'gdzHumanRefs';                  // storage.local: bookUrl -> {base,suffix,at}
+const HUMAN_REF_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const humanRefCache = new Map();                        // in-mem: bookUrl -> {base,suffix}
+
 // In-flight catalog promise: dedupe concurrent cold loads so the 6.5 MB list
 // is fetched once even if the picker fires several searches at startup.
 let catalogInFlight = null;
@@ -214,6 +221,58 @@ export async function listTasks(bookUrl) {
   return tasks;
 }
 
+function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+/**
+ * Derive a human gdz.ru link template for a book. The mobile-API path scheme
+ * (BASE + "/po-algebre/…") is NOT the human scheme and carries no exercise: it
+ * 301-redirects to the book page, so a naive `HUMAN + task.url` only ever lands
+ * on the book. The human exercise URL is `{canonicalBook}{N}-{suffix}/`, where
+ * the suffix is per-book ("-task", "-nom", "-item"…). We fetch the book page
+ * once, take the canonical base from the redirect and the *dominant* one-number
+ * link suffix (= the book's main numbered exercises), and cache the pair so
+ * every exercise link is then a string concat.
+ *
+ * gdz.ru keeps the real browser UA (the DNR rule rewrites only gdz-ru.com),
+ * which is what passes DDoS-Guard for these SEO pages.
+ *
+ * @returns {Promise<{base:string|null, suffix:string|null}>} base may be set
+ *   without a suffix (link to the book); both null on network/challenge failure.
+ */
+async function resolveHumanRef(bookUrl) {
+  if (humanRefCache.has(bookUrl)) return humanRefCache.get(bookUrl);
+  const { [HUMAN_REF_KEY]: store = {} } = await chrome.storage.local.get(HUMAN_REF_KEY);
+  const cached = store[bookUrl];
+  if (cached && Date.now() - cached.at < HUMAN_REF_TTL_MS) {
+    const ref = { base: cached.base, suffix: cached.suffix };
+    humanRefCache.set(bookUrl, ref);
+    return ref;
+  }
+
+  const ref = { base: null, suffix: null };
+  try {
+    const res = await fetch(HUMAN + bookUrl, { credentials: 'omit', redirect: 'follow' });
+    if (res.ok) {
+      ref.base = res.url.endsWith('/') ? res.url : res.url + '/';   // canonical book page
+      const rel = ref.base.replace(HUMAN, '');
+      const html = await res.text();
+      // Tally `{base}{digits}-{letters}/` links; the most common suffix is the
+      // book's main exercise numbering (Виленкин "-nom", Макарычев "-task"…).
+      const re = new RegExp('href="' + escapeRe(rel) + '(\\d+)-([a-z]+)/"', 'gi');
+      const counts = new Map();
+      let m;
+      while ((m = re.exec(html))) counts.set(m[2], (counts.get(m[2]) || 0) + 1);
+      let best = 0;
+      for (const [s, c] of counts) if (c > best) { best = c; ref.suffix = s; }
+    }
+  } catch { /* network down or DDoS-Guard challenge — leave nulls, link to book */ }
+
+  humanRefCache.set(bookUrl, ref);
+  store[bookUrl] = { base: ref.base, suffix: ref.suffix, at: Date.now() };
+  await chrome.storage.local.set({ [HUMAN_REF_KEY]: store });
+  return ref;
+}
+
 /**
  * Resolve a single number against a book.
  *
@@ -228,7 +287,8 @@ export async function listTasks(bookUrl) {
  */
 export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
   const num = String(number).trim();
-  const cacheKey = `${bookUrl}|${mode}|${num}`;
+  // v2: link is now the exact-exercise URL, not the book — orphan v1 entries.
+  const cacheKey = `v2|${bookUrl}|${mode}|${num}`;
 
   const { [TASK_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(TASK_CACHE_KEY);
   if (cache[cacheKey]) return cache[cacheKey];
@@ -255,11 +315,24 @@ export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
   const images = editions.flatMap((e) => (e.images || []).map((i) => i.url)).filter(Boolean);
   if (!images.length) return null;
 
+  // Build a link to the exact exercise. For a plain numbered exercise we can
+  // construct `{canonicalBook}{N}-{suffix}/`; otherwise (page-numbered workbooks,
+  // §-questions, or a failed lookup) we link to the book — never worse than before.
+  const ref = await resolveHumanRef(bookUrl);
+  let link;
+  if (ref.base && ref.suffix && mode === 'exercise' && /^\d+$/.test(num)) {
+    link = `${ref.base}${num}-${ref.suffix}/`;
+  } else if (ref.base) {
+    link = ref.base;
+  } else {
+    link = HUMAN + match.url;   // last resort: mobile path (redirects to the book)
+  }
+
   const result = {
     taskUrl: match.url,
     section: match.section,
     images,
-    link: 'https://gdz.ru' + match.url
+    link
   };
 
   // LRU-ish cache: keep the most recent TASK_CACHE_MAX entries.

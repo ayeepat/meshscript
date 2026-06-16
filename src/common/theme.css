@@ -151,7 +151,7 @@
 * { box-sizing: border-box; }
 svg { flex: none; }
 
-::selection { background: var(--accent-soft-strong); }
+::selection { background: var(--focus-ring); color: var(--text); }
 
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb {

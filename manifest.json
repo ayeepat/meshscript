@@ -11,7 +11,8 @@
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
     "https://gdz-ru.com/*",
-    "https://*.gdz-ru.com/*"
+    "https://*.gdz-ru.com/*",
+    "https://gdz.ru/*"
   ],
   "declarative_net_request": {
     "rule_resources": [

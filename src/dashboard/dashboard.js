@@ -273,6 +273,7 @@ function gdzCardEl(chat) {
 
 /** Resolve textbook references for this lesson and show the answer card. Runs
  *  in parallel with the AI solve; the card is prepended above the chat. */
+/** @returns {Promise<boolean>} whether ready GDZ answers were found. */
 async function maybeShowGdz(chat) {
   let resp;
   try {
@@ -282,15 +283,16 @@ async function maybeShowGdz(chat) {
         (r) => resolve(chrome.runtime.lastError ? null : r)
       );
     });
-  } catch { return; }
-  if (!resp?.ok || !resp.configured) return;
+  } catch { return false; }
+  if (!resp?.ok || !resp.configured) return false;
   const found = (resp.answers || []).filter((a) => a.found && a.inlined?.length);
-  if (!found.length) return;
+  if (!found.length) return false;
 
   chat.gdz = { book: resp.book, mode: resp.mode, answers: resp.answers };
-  if (activeKey !== chat.key) return;
-  if (chatEl.querySelector(`.gdzcard[data-key="${CSS.escape(chat.key)}"]`)) return;
-  chatEl.insertBefore(gdzCardEl(chat), chatEl.firstChild);
+  if (activeKey === chat.key && !chatEl.querySelector(`.gdzcard[data-key="${CSS.escape(chat.key)}"]`)) {
+    chatEl.insertBefore(gdzCardEl(chat), chatEl.firstChild);
+  }
+  return true;
 }
 
 function fileToInline(file) {
@@ -412,10 +414,6 @@ function sendToChat(chat, text, files) {
  */
 async function startLesson(chat) {
   chat.started = true;
-  // Pull ready GDZ answers for any textbook references, in parallel with the AI
-  // solve. Free (no API), shown as a card above the chat. See maybeShowGdz.
-  maybeShowGdz(chat);
-  let text = chat.task;
   let files = [];
   try {
     const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
@@ -430,7 +428,15 @@ async function startLesson(chat) {
       await chrome.storage.local.remove('pendingUpload');
     }
   } catch (_e) { /* upload is best-effort */ }
-  await sendToChat(chat, text, files);
+
+  // Ready GDZ answers are free (no API), shown as a card above the chat. If we
+  // have them and the user didn't attach a file to solve, that's the whole
+  // answer: show ONLY the card — no auto AI turn, so no task echo and no
+  // "Нужен файл" nudge. The user can still ask follow-ups in the composer.
+  const hasGdz = await maybeShowGdz(chat);
+  if (hasGdz && !files.length) return;
+
+  await sendToChat(chat, chat.task, files);
 }
 
 async function activateLesson(key) {

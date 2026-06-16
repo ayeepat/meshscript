@@ -104,6 +104,9 @@ body {
 }
 .msg.user .usertext { white-space: pre-wrap; }
 .msg.user .usertext:empty { display: none; }
+/* On the accent-filled user bubble a teal selection is invisible; flip it to a
+   contrasting highlight (on-accent ground, accent text) so selection shows. */
+.msg.user ::selection { background: var(--on-accent); color: var(--accent); }
 .attachchip {
   display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
   margin-top: 9px; padding: 5px 11px 5px 8px;
