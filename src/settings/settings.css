@@ -17,8 +17,6 @@ body.on-settings { padding-bottom: 92px; }
 .appbar {
   position: sticky; top: 0; z-index: 20;
   background: var(--chrome);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
   border-bottom: 1px solid var(--separator);
 }
 .appbar .brand {
@@ -242,8 +240,6 @@ textarea {
 .savebar {
   position: fixed; left: 0; right: 0; bottom: 0; z-index: 30;
   background: var(--chrome);
-  backdrop-filter: blur(20px) saturate(180%);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
   border-top: 1px solid var(--separator);
   display: none;
 }
