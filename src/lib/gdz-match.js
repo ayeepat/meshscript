@@ -52,13 +52,16 @@ export const EXERCISE_SUBJECTS = [
   { id: 2, title: 'Английский язык' },
   { id: 8, title: 'Немецкий язык' },
   { id: 11, title: 'Французский язык' },
+  { id: 36, title: 'Испанский язык' },
+  { id: 38, title: 'Китайский язык' },
   { id: 6, title: 'Физика' },
   { id: 7, title: 'Химия' },
   { id: 12, title: 'Биология' },
   { id: 16, title: 'География' },
   { id: 13, title: 'История' },
   { id: 24, title: 'Обществознание' },
-  { id: 14, title: 'Информатика' }
+  { id: 14, title: 'Информатика' },
+  { id: 15, title: 'ОБЖ' }
 ];
 
 // Workbook signal — "Р.т.", "рабочая тетрадь", "р/т", English "workbook/activity book".

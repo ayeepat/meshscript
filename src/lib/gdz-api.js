@@ -151,10 +151,11 @@ export async function getCatalog({ force = false } = {}) {
 /* ---------- Search ---------- */
 
 /**
- * Filter the catalog. All inputs are optional except subjectId.
+ * Filter the catalog. All inputs are optional.
  * - grade: clamp to books that contain that grade (multi-grade books like
  *   Атанасян 7–9 match for 7, 8, AND 9 automatically).
- * - subtype: default to "Учебник"; pass null to skip the filter.
+ * - subjectId: a single subject; null/''/'all' browses every subject for the grade.
+ * - subtype: default to "Учебник"; pass null/'' to skip the filter (Учебник + тетради).
  * - query: space-separated tokens, all must appear in search_keywords (case-
  *   insensitive). Empty → returns everything that passes the other filters.
  *
@@ -165,13 +166,15 @@ export function searchBooks(catalog, { grade, subjectId, subtype = 'Учебни
   // `classes` are numbers — [9].includes("9") is false, so without this every
   // search would silently return nothing.
   const g = (grade == null || grade === '') ? null : Number(grade);
-  const sid = Number(subjectId);
+  // null / '' / 'all' → browse every subject for the grade (no subject filter).
+  const sid = (subjectId == null || subjectId === '' || subjectId === 'all') ? null : Number(subjectId);
+  const st = (subtype === '' ) ? null : subtype;
   const q = (query || '').toLowerCase().split(/\s+/).filter(Boolean);
   return (catalog.books || [])
     .filter((b) =>
-      b.subject_id === sid &&
+      (sid == null || Number.isNaN(sid) || b.subject_id === sid) &&
       (g == null || Number.isNaN(g) || (b.classes || []).includes(g)) &&
-      (subtype == null || b.subtype === subtype) &&
+      (st == null || b.subtype === st) &&
       q.every((tok) => (b.search_keywords || '').toLowerCase().includes(tok))
     )
     // Free books first — paid ones return NO answer images via the API (the

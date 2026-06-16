@@ -143,10 +143,21 @@ function loadHistory() {
 
 /* ---------- Textbooks (GDZ) ---------- */
 
-// gdzBooks: { [subjectId]: { url, title, breadcrumb, year, authors, study_level,
-//            subtype, cover_url, subjectId } }. Keyed by catalog subject_id so the
-// dashboard can look a book up from a Mesh subject via mapSubjectToId.
+// gdzBooks: { [subjectId]: [ { url, title, breadcrumb, year, authors, study_level,
+//            subtype, cover_url, subjectId, subject_id }, ... ] }. Keyed by catalog
+// subject_id (the dashboard looks a subject up via mapSubjectToId); the VALUE is an
+// array so one subject can hold both a textbook AND its workbook. Legacy installs
+// stored a single object per subject — `asBookArray` normalises that on read.
 let gdzBooks = {};
+
+// Inline catalog browser state. The full result set lives here; the DOM is filled
+// in batches as the user scrolls (the catalog can return hundreds of books).
+let browseResults = [];
+let browseShown = 0;
+const BROWSE_BATCH = 24;
+let pickerTimer = null;
+
+const asBookArray = (v) => (Array.isArray(v) ? v : (v ? [v] : []));
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const subjTitle = (id) => (EXERCISE_SUBJECTS.find((s) => String(s.id) === String(id))?.title) || `Предмет ${id}`;
@@ -170,16 +181,20 @@ function gdzSend(type, payload) {
   });
 }
 
+// Is this catalog book already pinned for its subject? (dedupe by url)
+const isAdded = (b) => asBookArray(gdzBooks[String(b.subject_id)]).some((x) => x.url === b.url);
+
+/** Render the student's pinned books — flattened across every subject. */
 function renderBooks() {
   const box = document.getElementById('gdzBooks');
-  const ids = Object.keys(gdzBooks);
-  if (!ids.length) {
-    box.innerHTML = '<div class="empty">Учебники не выбраны. Нажмите «Добавить», чтобы получать готовые ответы из ГДЗ вместо запроса фото.</div>';
+  const rows = [];
+  for (const id of Object.keys(gdzBooks)) for (const b of asBookArray(gdzBooks[id])) rows.push([id, b]);
+  if (!rows.length) {
+    box.innerHTML = '<div class="empty">Учебники ещё не выбраны. Найдите их в каталоге ниже — готовые ответы из ГДЗ будут подставляться автоматически вместо запроса фото.</div>';
     return;
   }
   box.innerHTML = '';
-  for (const id of ids) {
-    const b = gdzBooks[id];
+  for (const [id, b] of rows) {
     const row = document.createElement('div');
     row.className = 'gdzrow';
     row.innerHTML =
@@ -192,42 +207,38 @@ function renderBooks() {
       (b.is_paid ? '<span class="badge paid">платно</span>' : '') +
       (/углуб/i.test(b.study_level || '') ? '<span class="badge">Углубл.</span>' : '') +
       `<div class="row-actions">
-         <button data-edit="${esc(id)}" type="button">Изменить</button>
-         <button data-del="${esc(id)}" type="button">Убрать</button>
+         <button data-del-sid="${esc(id)}" data-del-url="${esc(b.url)}" type="button">Убрать</button>
        </div>`;
     box.appendChild(row);
   }
-  box.querySelectorAll('[data-edit]').forEach((btn) => { btn.onclick = () => openPicker(btn.dataset.edit); });
-  box.querySelectorAll('[data-del]').forEach((btn) => {
-    btn.onclick = async () => { delete gdzBooks[btn.dataset.del]; await chrome.storage.local.set({ gdzBooks }); renderBooks(); };
+  box.querySelectorAll('[data-del-url]').forEach((btn) => {
+    btn.onclick = () => removeBook(btn.dataset.delSid, btn.dataset.delUrl);
   });
 }
 
-let pickerTimer = null;
-
-function openPicker(subjectId) {
+/** Populate the catalog subject filter ("Все предметы" + curated subjects). */
+function buildSubjectFilter() {
   const sel = document.getElementById('gdzPickSubject');
-  sel.innerHTML = EXERCISE_SUBJECTS.map((s) => `<option value="${s.id}">${esc(s.title)}</option>`).join('');
-  if (subjectId != null) sel.value = String(subjectId);
-  document.getElementById('gdzPickSearch').value = '';
-  // When editing, pre-select the saved book's type so a workbook doesn't reset
-  // to the "Учебник" tab.
-  const savedType = (subjectId != null && gdzBooks[subjectId]?.subtype === 'Рабочая тетрадь') ? 'Рабочая тетрадь' : 'Учебник';
-  document.querySelectorAll('#gdzPickType button').forEach((b) => b.classList.toggle('active', b.dataset.st === savedType));
-  document.getElementById('gdzPicker').hidden = false;
-  runBookSearch();
+  sel.innerHTML =
+    `<option value="all">Все предметы</option>` +
+    EXERCISE_SUBJECTS.map((s) => `<option value="${s.id}">${esc(s.title)}</option>`).join('');
 }
-const closePicker = () => { document.getElementById('gdzPicker').hidden = true; };
 
+/** Query the catalog and reset the infinite-scroll buffer. */
 async function runBookSearch() {
   const results = document.getElementById('gdzPickResults');
+  const count = document.getElementById('gdzCount');
   const grade = document.getElementById('studentGrade').value;
-  const subjectId = document.getElementById('gdzPickSubject').value;
-  const subtype = document.querySelector('#gdzPickType button.active')?.dataset.st || 'Учебник';
+  const subjectId = document.getElementById('gdzPickSubject').value; // 'all' | id
+  const subtype = document.querySelector('#gdzPickType button.active')?.dataset.st || '';
   const query = document.getElementById('gdzPickSearch').value.trim();
+
+  browseResults = [];
+  browseShown = 0;
   // Grade is required: without it the list mixes every grade and the matcher
   // later can't trust the book either.
   if (!grade) {
+    count.textContent = '';
     results.innerHTML = `<div class="empty">${iconSvg('info', 15)}<span>Сначала выберите класс выше.</span></div>`;
     return;
   }
@@ -235,56 +246,112 @@ async function runBookSearch() {
 
   const resp = await gdzSend('GDZ_SEARCH', { grade, subjectId, subtype, query });
   if (!resp?.ok) {
+    count.textContent = '';
     results.innerHTML = `<div class="empty">${iconSvg('alert', 15)}<span>Не удалось загрузить каталог ГДЗ.</span></div>`;
     return;
   }
-  const books = (resp.books || []).slice(0, 50);
-  if (!books.length) {
+  // Only surface subjects the extension can map back from a Mesh lesson — pinning
+  // a book for an unmappable subject would never resolve. (No-op when a single
+  // subject is already selected; it's one of the allowed ids.)
+  const allowed = new Set(EXERCISE_SUBJECTS.map((s) => s.id));
+  browseResults = (resp.books || []).filter((b) => allowed.has(b.subject_id));
+  if (!browseResults.length) {
+    count.textContent = '';
     results.innerHTML = `<div class="empty">${iconSvg('search', 15)}<span>Ничего не найдено. Проверьте класс или измените запрос.</span></div>`;
     return;
   }
   results.innerHTML = '';
-  for (const b of books) {
-    const el = document.createElement('div');
-    el.className = 'gdz-result';
-    el.innerHTML =
-      coverHtml(b.cover_url, '') +
-      `<div class="info">
-         <div class="ttl">${esc(b.breadcrumb || b.title)}</div>
-         <div class="det">${esc([classesLabel(b.classes), b.study_level, b.year].filter(Boolean).join(' · '))}</div>
-       </div>` +
-      (b.is_paid ? '<span class="tag paid">платно · без картинок</span>' : '<span class="tag">выбрать</span>');
-    el.onclick = () => saveBook(subjectId, b);
-    results.appendChild(el);
-  }
+  renderResultBatch();
 }
 
-async function saveBook(subjectId, b) {
-  gdzBooks[subjectId] = {
+const subtypeLabel = (b) => /тетрад/i.test(b.subtype || '') ? 'Раб. тетрадь' : (b.subtype || 'Учебник');
+
+/** Append the next BROWSE_BATCH results to the list (infinite scroll). */
+function renderResultBatch() {
+  const results = document.getElementById('gdzPickResults');
+  const count = document.getElementById('gdzCount');
+  const slice = browseResults.slice(browseShown, browseShown + BROWSE_BATCH);
+  for (const b of slice) results.appendChild(resultRow(b));
+  browseShown += slice.length;
+  count.textContent = `найдено ${browseResults.length}` + (browseShown < browseResults.length ? ` · показано ${browseShown}` : '');
+}
+
+function resultRow(b) {
+  const el = document.createElement('div');
+  el.dataset.url = b.url;
+  paintResultRow(el, b);
+  return el;
+}
+
+// Fill a result row's content + handler for the book's CURRENT added state. Used
+// both on first render and to update one row in place after add/remove — mutating
+// a row's innerHTML (not the container's) keeps the scroll position intact.
+function paintResultRow(el, b) {
+  const added = isAdded(b);
+  el.className = 'gdz-result' + (added ? ' added' : '');
+  el.innerHTML =
+    coverHtml(b.cover_url, '') +
+    `<div class="info">
+       <div class="subj">${esc(subjTitle(b.subject_id))} · ${esc(subtypeLabel(b))}</div>
+       <div class="ttl">${esc(b.breadcrumb || b.title)}</div>
+       <div class="det">${esc([classesLabel(b.classes), b.study_level, b.year].filter(Boolean).join(' · '))}</div>
+     </div>` +
+    (b.is_paid ? '<span class="tag paid">платно · без картинок</span>' : '') +
+    (added
+      ? `<span class="tag added">${iconSvg('check', 12)}добавлено</span>`
+      : `<span class="tag">${iconSvg('plus', 12)}добавить</span>`);
+  el.onclick = () => (isAdded(b) ? removeBook(String(b.subject_id), b.url) : addBook(b));
+}
+
+async function addBook(b) {
+  const sid = String(b.subject_id);
+  const arr = (gdzBooks[sid] = asBookArray(gdzBooks[sid]));
+  if (arr.some((x) => x.url === b.url)) return;
+  arr.push({
     url: b.url, title: b.title, breadcrumb: b.breadcrumb, year: b.year, authors: b.authors,
     study_level: b.study_level, subtype: b.subtype, cover_url: b.cover_url,
-    classes: b.classes, is_paid: b.is_paid, subjectId: Number(subjectId)
-  };
+    classes: b.classes, is_paid: b.is_paid, subjectId: Number(sid), subject_id: Number(sid)
+  });
   await chrome.storage.local.set({ gdzBooks });
-  closePicker();
   renderBooks();
+  syncResultRow(b.url);
+}
+
+async function removeBook(sid, url) {
+  const arr = asBookArray(gdzBooks[sid]).filter((x) => x.url !== url);
+  if (arr.length) gdzBooks[sid] = arr; else delete gdzBooks[sid];
+  await chrome.storage.local.set({ gdzBooks });
+  renderBooks();
+  syncResultRow(url);
+}
+
+// Repaint the single catalog row for a url so its added/removed state reflects
+// storage — without rebuilding the list or disturbing scroll. A url is unique in
+// the catalog, so at most one row matches. Comparing dataset in JS sidesteps any
+// attribute-selector escaping of slash-bearing urls.
+function syncResultRow(url) {
+  const b = browseResults.find((x) => x.url === url);
+  if (!b) return;
+  for (const el of document.getElementById('gdzPickResults').children) {
+    if (el.dataset.url === url) { paintResultRow(el, b); return; }
+  }
 }
 
 async function loadGdz() {
   const { studentGrade = '', gdzBooks: stored = {} } = await chrome.storage.local.get(['studentGrade', 'gdzBooks']);
-  gdzBooks = stored;
+  gdzBooks = {};
+  for (const id of Object.keys(stored)) gdzBooks[id] = asBookArray(stored[id]);
   document.getElementById('studentGrade').value = studentGrade || '';
+  buildSubjectFilter();
   renderBooks();
+  runBookSearch();
 }
 
 function wireGdz() {
   document.getElementById('studentGrade').onchange = async (e) => {
     await chrome.storage.local.set({ studentGrade: e.target.value });
-    if (!document.getElementById('gdzPicker').hidden) runBookSearch();
+    runBookSearch();
   };
-  document.getElementById('gdzAddBtn').onclick = () => openPicker(null);
-  document.getElementById('gdzPickClose').onclick = closePicker;
-  document.getElementById('gdzPicker').onclick = (e) => { if (e.target.id === 'gdzPicker') closePicker(); };
   document.getElementById('gdzPickSubject').onchange = runBookSearch;
   document.getElementById('gdzPickSearch').oninput = () => { clearTimeout(pickerTimer); pickerTimer = setTimeout(runBookSearch, 300); };
   document.querySelectorAll('#gdzPickType button').forEach((btn) => {
@@ -293,6 +360,14 @@ function wireGdz() {
       btn.classList.add('active');
       runBookSearch();
     };
+  });
+  // Infinite scroll: load the next batch as the list nears its bottom.
+  const results = document.getElementById('gdzPickResults');
+  results.addEventListener('scroll', () => {
+    if (browseShown < browseResults.length &&
+        results.scrollTop + results.clientHeight >= results.scrollHeight - 80) {
+      renderResultBatch();
+    }
   });
 }
 

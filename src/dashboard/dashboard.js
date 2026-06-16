@@ -219,12 +219,19 @@ function gdzCardEl(chat) {
   head.innerHTML = `${iconSvg('book', 14)}<span>Готовые ответы · ГДЗ</span>`;
   card.appendChild(head);
 
-  const prov = [g.book?.breadcrumb || g.book?.title, g.book?.year].filter(Boolean).join(' · ');
-  if (prov) {
-    const sub = document.createElement('div');
-    sub.className = 'gsub';
-    sub.textContent = prov;
-    card.appendChild(sub);
+  const bookLabel = (bk) => [bk?.breadcrumb || bk?.title, bk?.year].filter(Boolean).join(' · ');
+  // When every answer comes from one book, show the source once in the header.
+  // With a textbook + workbook mixed, label each answer with its own source.
+  const sources = new Set(found.map((a) => bookLabel(a.book || g.book)).filter(Boolean));
+  const singleSource = sources.size <= 1;
+  if (singleSource) {
+    const prov = bookLabel(g.book) || [...sources][0];
+    if (prov) {
+      const sub = document.createElement('div');
+      sub.className = 'gsub';
+      sub.textContent = prov;
+      card.appendChild(sub);
+    }
   }
 
   for (const a of found) {
@@ -232,7 +239,17 @@ function gdzCardEl(chat) {
     block.className = 'gdzanswer';
     const label = document.createElement('div');
     label.className = 'gnum';
-    label.textContent = g.mode === 'page' ? `Страница ${a.num}` : `№ ${a.num}`;
+    const mode = a.mode || g.mode;
+    label.textContent = mode === 'page' ? `Страница ${a.num}` : `№ ${a.num}`;
+    if (!singleSource) {
+      const src = bookLabel(a.book);
+      if (src) {
+        const s = document.createElement('span');
+        s.className = 'gsrc';
+        s.textContent = src;
+        label.appendChild(s);
+      }
+    }
     block.appendChild(label);
     for (const img of a.inlined) {
       const im = document.createElement('img');

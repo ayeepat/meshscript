@@ -14,37 +14,26 @@
         <h1>meshscript</h1>
         <span class="brandsub">Настройки · v0.4.0</span>
       </div>
+      <div class="theme-mini" id="themeSeg" role="group" aria-label="Тема оформления">
+        <button data-pref="system" type="button" title="Системная" aria-label="Системная тема"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button>
+        <button data-pref="light" type="button" title="Светлая" aria-label="Светлая тема"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></button>
+        <button data-pref="dark" type="button" title="Тёмная" aria-label="Тёмная тема"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
+      </div>
     </div>
   </header>
 
   <main class="wrap">
 
-    <!-- Appearance -->
-    <section class="panel">
-      <div class="panel-head">
-        <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="13.5" cy="6.5" r="1.3"/><circle cx="17.5" cy="10.5" r="1.3"/><circle cx="8.5" cy="7.5" r="1.3"/><circle cx="6.5" cy="12.5" r="1.3"/><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10c.93 0 1.65-.75 1.65-1.69 0-.43-.18-.83-.44-1.12-.29-.29-.44-.65-.44-1.13a1.64 1.64 0 0 1 1.67-1.67h2c3.05 0 5.55-2.5 5.55-5.55C21.96 6.01 17.46 2 12 2z"/></svg></span>
-        <div>
-          <h2>Оформление</h2>
-          <p>Тема интерфейса попапа, окна решений и настроек.</p>
-        </div>
-      </div>
-      <div class="seg" id="themeSeg">
-        <button data-pref="system"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>Системная</button>
-        <button data-pref="light"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>Светлая</button>
-        <button data-pref="dark"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>Тёмная</button>
-      </div>
-    </section>
-
-    <!-- Grade & textbooks (GDZ) -->
-    <section class="panel">
+    <!-- Grade & textbooks (GDZ) — the featured section -->
+    <section class="panel featured">
       <div class="panel-head">
         <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg></span>
         <div>
-          <h2>Класс и учебники</h2>
-          <p>Готовые ответы из ГДЗ для заданий вида «упр. 25» или «Р.т. с. 74». Укажите класс и учебник по каждому предмету.</p>
+          <h2>Класс, учебники и тетради</h2>
+          <p>Укажите класс — и добавьте все нужные учебники и рабочие тетради по своим предметам. Готовые ответы из ГДЗ будут подставляться к заданиям вида «упр. 25» или «Р.т. с. 74».</p>
         </div>
-        <button id="gdzAddBtn" class="ghostbtn head-action" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>Добавить</button>
       </div>
+
       <div class="field">
         <label for="studentGrade">Класс</label>
         <div class="selectwrap">
@@ -57,8 +46,34 @@
           <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
         </div>
       </div>
+
+      <!-- Books the student has already pinned -->
+      <div class="subhead">Мои учебники</div>
       <div id="gdzBooks" class="gdzbooks"></div>
+
+      <!-- Inline browsable catalog -->
+      <div id="gdzBrowse" class="gdzbrowse">
+        <div class="subhead browse-head">
+          <span>Каталог</span>
+          <span id="gdzCount" class="browse-count"></span>
+        </div>
+        <div class="browse-controls">
+          <div class="selectwrap">
+            <select id="gdzPickSubject"></select>
+            <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+          </div>
+          <div class="seg small" id="gdzPickType">
+            <button data-st="" class="active" type="button">Все</button>
+            <button data-st="Учебник" type="button">Учебник</button>
+            <button data-st="Рабочая тетрадь" type="button">Раб. тетрадь</button>
+          </div>
+          <input id="gdzPickSearch" type="text" placeholder="Поиск: автор или название…" autocomplete="off" spellcheck="false" />
+        </div>
+        <div id="gdzPickResults" class="gdz-results inline"></div>
+      </div>
     </section>
+
+    <div class="section-divider"><span>Остальные настройки</span></div>
 
     <!-- Provider -->
     <section class="panel">
@@ -152,28 +167,6 @@
     </section>
 
   </main>
-
-  <!-- Textbook picker -->
-  <div id="gdzPicker" class="gdz-overlay" hidden>
-    <div class="gdz-modal">
-      <div class="gdz-modal-head">
-        <strong>Выбрать учебник</strong>
-        <button id="gdzPickClose" class="gdz-x" type="button" aria-label="Закрыть"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
-      </div>
-      <div class="gdz-controls">
-        <div class="selectwrap">
-          <select id="gdzPickSubject"></select>
-          <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
-        </div>
-        <div class="seg" id="gdzPickType">
-          <button data-st="Учебник" class="active" type="button">Учебник</button>
-          <button data-st="Рабочая тетрадь" type="button">Раб. тетрадь</button>
-        </div>
-        <input id="gdzPickSearch" type="text" placeholder="Поиск: автор или название…" autocomplete="off" spellcheck="false" />
-      </div>
-      <div id="gdzPickResults" class="gdz-results"></div>
-    </div>
-  </div>
 
   <div class="savebar">
     <div class="savebar-inner">

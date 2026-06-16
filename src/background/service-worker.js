@@ -310,19 +310,36 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const { subject, task } = msg.payload || {};
           const sid = mapSubjectToId(subject);
           const { gdzBooks = {} } = await chrome.storage.local.get('gdzBooks');
-          const book = sid != null ? gdzBooks[sid] : null;
-          if (!book) { sendResponse({ ok: true, configured: false }); break; }
-          const res = await resolveForTask(book, task || '');
-          // Inline images for the answers we found so the chat renders them directly.
-          for (const a of res.answers) {
-            if (!a.found) continue;
-            a.inlined = [];
-            for (const u of a.images) { try { a.inlined.push(await fetchTaskImage(u)); } catch { /* skip */ } }
+          // A subject may hold several books (textbook + workbook). Normalise the
+          // legacy single-object shape to an array so both resolve.
+          const raw = sid != null ? gdzBooks[sid] : null;
+          const books = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+          if (!books.length) { sendResponse({ ok: true, configured: false }); break; }
+
+          // Resolve every configured book and merge. Each answer carries its own
+          // book + mode so a page-structured workbook and an exercise-structured
+          // textbook are labelled correctly side by side in the same card.
+          const answers = [];
+          let primaryMode = null, primaryBook = null;
+          for (const book of books) {
+            const res = await resolveForTask(book, task || '');
+            const bookMeta = { title: book.title, breadcrumb: book.breadcrumb, year: book.year, study_level: book.study_level };
+            if (!primaryBook && res.answers.some((a) => a.found)) { primaryMode = res.mode; primaryBook = bookMeta; }
+            for (const a of res.answers) {
+              a.mode = res.mode;
+              a.book = bookMeta;
+              if (!a.found) continue;
+              a.inlined = [];
+              for (const u of a.images) { try { a.inlined.push(await fetchTaskImage(u)); } catch { /* skip */ } }
+            }
+            answers.push(...res.answers);
           }
+          const fallback = { title: books[0].title, breadcrumb: books[0].breadcrumb, year: books[0].year, study_level: books[0].study_level };
           sendResponse({
-            ok: true, configured: true, mode: res.mode,
-            book: { title: book.title, breadcrumb: book.breadcrumb, year: book.year, study_level: book.study_level },
-            answers: res.answers
+            ok: true, configured: true,
+            mode: primaryMode || 'exercise',
+            book: primaryBook || fallback,
+            answers
           });
           break;
         }

@@ -237,7 +237,9 @@ body {
 .gdzanswer:first-of-type { margin-top: 8px; }
 .gdzanswer .gnum {
   font-size: 13px; font-weight: 650; color: var(--text); margin-bottom: 7px;
+  display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
 }
+.gdzanswer .gnum .gsrc { font-size: 11.5px; font-weight: 500; color: var(--tertiary); }
 .gdzanswer img {
   display: block; max-width: 100%; height: auto; margin-bottom: 6px;
   border: 1px solid var(--separator); border-radius: var(--r-md); background: #fff;
