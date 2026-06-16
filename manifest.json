@@ -10,7 +10,8 @@
     "https://*.supabase.co/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
-    "https://gdz-ru.com/*"
+    "https://gdz-ru.com/*",
+    "https://*.gdz-ru.com/*"
   ],
   "declarative_net_request": {
     "rule_resources": [
@@ -43,7 +44,6 @@
   "content_scripts": [
     {
       "matches": [
-        "https://school.mos.ru/diary/homeworks/*",
         "https://school.mos.ru/diary/*"
       ],
       "js": ["src/content/scraper.js"],

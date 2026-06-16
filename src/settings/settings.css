@@ -248,6 +248,7 @@ textarea {
   font-size: 10.5px; font-weight: 700; color: var(--accent);
   background: var(--accent-soft); padding: 2px 8px; border-radius: var(--r-pill); flex: none;
 }
+.gdzrow .badge.paid { color: var(--warn); background: var(--warn-soft); }
 .gdzrow .row-actions { display: flex; gap: 4px; flex: none; }
 .gdzrow .row-actions button {
   background: transparent; border: 1px solid var(--separator); color: var(--secondary);

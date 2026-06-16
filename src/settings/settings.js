@@ -150,6 +150,14 @@ let gdzBooks = {};
 
 const esc = (s) => String(s ?? '').replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 const subjTitle = (id) => (EXERCISE_SUBJECTS.find((s) => String(s.id) === String(id))?.title) || `Предмет ${id}`;
+
+// "10 класс", "7–9 класс" (contiguous range), or "5, 7 класс".
+function classesLabel(classes) {
+  const c = [...new Set((classes || []).map(Number))].sort((a, b) => a - b);
+  if (!c.length) return '';
+  const contiguous = c.every((v, i) => i === 0 || v === c[i - 1] + 1);
+  return (c.length === 1 ? `${c[0]}` : contiguous ? `${c[0]}–${c[c.length - 1]}` : c.join(', ')) + ' класс';
+}
 // No inline onerror handler — MV3's page CSP blocks inline JS. A missing cover
 // just shows the empty framed box, which is fine.
 const coverHtml = (url, cls) => (url
@@ -179,8 +187,9 @@ function renderBooks() {
       `<div class="meta">
          <div class="subj">${esc(subjTitle(id))}</div>
          <div class="ttl">${esc(b.breadcrumb || b.title || '')}</div>
-         <div class="det">${esc([b.subtype, b.year].filter(Boolean).join(' · '))}</div>
+         <div class="det">${esc([classesLabel(b.classes), b.subtype, b.year].filter(Boolean).join(' · '))}</div>
        </div>` +
+      (b.is_paid ? '<span class="badge paid">платно</span>' : '') +
       (/углуб/i.test(b.study_level || '') ? '<span class="badge">Углубл.</span>' : '') +
       `<div class="row-actions">
          <button data-edit="${esc(id)}" type="button">Изменить</button>
@@ -242,9 +251,9 @@ async function runBookSearch() {
       coverHtml(b.cover_url, '') +
       `<div class="info">
          <div class="ttl">${esc(b.breadcrumb || b.title)}</div>
-         <div class="det">${esc([b.study_level, b.year].filter(Boolean).join(' · '))}</div>
+         <div class="det">${esc([classesLabel(b.classes), b.study_level, b.year].filter(Boolean).join(' · '))}</div>
        </div>` +
-      (b.is_paid ? '<span class="tag paid">платно</span>' : '<span class="tag">выбрать</span>');
+      (b.is_paid ? '<span class="tag paid">платно · без картинок</span>' : '<span class="tag">выбрать</span>');
     el.onclick = () => saveBook(subjectId, b);
     results.appendChild(el);
   }
@@ -253,7 +262,8 @@ async function runBookSearch() {
 async function saveBook(subjectId, b) {
   gdzBooks[subjectId] = {
     url: b.url, title: b.title, breadcrumb: b.breadcrumb, year: b.year, authors: b.authors,
-    study_level: b.study_level, subtype: b.subtype, cover_url: b.cover_url, subjectId: Number(subjectId)
+    study_level: b.study_level, subtype: b.subtype, cover_url: b.cover_url,
+    classes: b.classes, is_paid: b.is_paid, subjectId: Number(subjectId)
   };
   await chrome.storage.local.set({ gdzBooks });
   closePicker();

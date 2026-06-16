@@ -32,6 +32,13 @@ let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
 const keyFor = (day, subject, task) => `${day || '?'}||${subject}||${(task || '').slice(0, 40)}`;
 const activeChat = () => chats.get(activeKey);
 
+// The task string scraped into the week can differ from the one passed via the
+// Solve URL by whitespace or truncation. Compare on a normalized 40-char prefix
+// (same granularity as keyFor) so a file the user attached for THIS solve isn't
+// silently dropped over a trivial text mismatch, while still refusing to attach
+// it to an unrelated homework of the same subject.
+const normTask = (t) => (t || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+
 /* ---------- Minimal safe markdown renderer (no external libs) ---------- */
 
 function escapeHtml(s) {
@@ -286,7 +293,10 @@ function fileToInline(file) {
  * guards on `activeKey === chat.key`.
  */
 function sendToChat(chat, text, files) {
-  const prior = chat.history.slice(); // turns BEFORE this message
+  // Context BEFORE this message. Drop gate refusals (the "пришлите фото / нужен
+  // файл" prompts): they're UI nudges, not real conversation, and replaying
+  // them as assistant turns biases the next answer's tone.
+  const prior = chat.history.filter((m) => !m.needsUpload);
   // Store only file METADATA (name/mime, no base64) so the chip survives a
   // re-render without bloating history with megabytes of attachment data.
   const fileMeta = (files || []).map((f) => ({ name: f.name, mimeType: f.mimeType }));
@@ -398,7 +408,7 @@ async function startLesson(chat) {
     const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
     if (pending.length && pendingUpload.subject === chat.subject &&
         (!pendingUpload.day || pendingUpload.day === chat.day) &&
-        (!pendingUpload.task || pendingUpload.task === chat.task)) {
+        (!pendingUpload.task || normTask(pendingUpload.task) === normTask(chat.task))) {
       files = pending; // the attachment chip (added by bubble) shows the file
       await chrome.storage.local.remove('pendingUpload');
     }

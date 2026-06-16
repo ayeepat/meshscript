@@ -61,8 +61,20 @@ function nameFromUrl(url) {
 }
 
 async function getBlobAsBase64(url) {
-  const res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
-  if (!res.ok) throw new Error(`GDZ image ${res.status}`);
+  // Name the host on failure. Answer images may be served from a different
+  // gdz-ru.com host than the API; if that host is missing from host_permissions
+  // (network fail) or from the DNR UA rule (403), the error must say WHICH host
+  // so GDZ_SELFTEST points right at the manifest/rule fix instead of failing
+  // silently.
+  let host = url;
+  try { host = new URL(url).host; } catch { /* keep raw url */ }
+  let res;
+  try {
+    res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+  } catch (e) {
+    throw new Error(`GDZ image: network fail for ${host} (missing host permission or UA rule?) — ${e}`);
+  }
+  if (!res.ok) throw new Error(`GDZ image ${res.status} ${host}`);
   const buf = await res.arrayBuffer();
   // Shape matches the rest of the codebase's inline-file objects {mimeType,
   // dataBase64, name} so a resolved answer can be attached like any upload.
@@ -162,7 +174,10 @@ export function searchBooks(catalog, { grade, subjectId, subtype = 'Учебни
       (subtype == null || b.subtype === subtype) &&
       q.every((tok) => (b.search_keywords || '').toLowerCase().includes(tok))
     )
-    .sort((a, b) => (b.priority || 0) - (a.priority || 0));
+    // Free books first — paid ones return NO answer images via the API (the
+    // paywall is enforced server-side), so a paid pick can never show pictures.
+    // Then by the catalog's own popularity ranking.
+    .sort((a, b) => (a.is_paid ? 1 : 0) - (b.is_paid ? 1 : 0) || (b.priority || 0) - (a.priority || 0));
 }
 
 /* ---------- Resolve ---------- */

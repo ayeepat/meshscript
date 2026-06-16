@@ -14,10 +14,11 @@ import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } 
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 
-// Follow-ups re-send prior turns as context. Cap how many: full worked
-// solutions are long, and on a paid provider every re-sent turn is money.
-// The last few turns carry all the context that matters.
-const MAX_HISTORY_TURNS = 8;
+// Follow-ups re-send prior context. Cap how many MESSAGES we replay: full
+// worked solutions are long, and on a paid provider every re-sent message is
+// money. 8 messages ≈ 4 back-and-forth turns — enough recent context to follow
+// up without re-sending the whole chat. (Bump to 16 for ~8 full turns.)
+const MAX_HISTORY_MESSAGES = 8;
 
 // Open the full-window dashboard when the popup asks to "Solve".
 async function openDashboard(payload) {
@@ -108,9 +109,23 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // PDFs require a PDF-capable backend; force OpenRouter (Gemini reads PDFs
   // natively) even if the user picked Groq, which cannot read them at all.
   const provider = hasPdf(files) ? 'openrouter' : undefined;
+  // If a PDF forced OpenRouter but no OpenRouter key is set, explain WHY a key
+  // is suddenly needed (the user may have deliberately picked free Groq, which
+  // can't read PDFs) instead of surfacing a bare "key not set" error.
+  if (provider === 'openrouter') {
+    const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
+    if (!openrouterApiKey) {
+      return {
+        answer: 'В задании есть PDF, а его умеет читать только OpenRouter (модель Gemini). ' +
+          'Groq не читает PDF-файлы. Добавьте ключ OpenRouter в настройках расширения — ' +
+          'или пришлите это задание фотографиями страниц / текстом, и я решу через Groq.',
+        sessionId
+      };
+    }
+  }
   const answer = await askAI(
     systemPrompt, task || '(см. вложение)', files,
-    history.slice(-MAX_HISTORY_TURNS), { onDelta, provider }
+    history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider }
   );
 
   // Persist (non-fatal if Supabase not configured).
@@ -209,10 +224,24 @@ async function downloadFile(url, headers) {
   } catch (e) { console.log('[meshscript] download exception', String(e), url); return null; }
 }
 
+// Reconstruct Mesh's required family-web headers from a bare token. Mirrors the
+// content script's meshHeaders() so the backward-compat (token-only) download
+// path still carries the X-mes-* set the API and file store expect — Authorization
+// alone gets bounced to the auth page on some endpoints.
+function meshHeadersFromToken(token) {
+  return {
+    Accept: 'application/json, text/plain, */*',
+    'X-mes-subsystem': 'familyweb',
+    'X-Mes-Role': 'student',
+    'X-Mes-RoleId': '1',
+    Authorization: 'Bearer ' + token
+  };
+}
+
 // `headers` come straight from the content script's discovery (Bearer token +
 // Mesh's X-mes-* set). A bare `token` is still accepted for backward-compat.
 async function downloadFiles({ urls = [], headers = null, token = null }) {
-  const hdrs = headers || (token ? { Authorization: 'Bearer ' + token } : {});
+  const hdrs = headers || (token ? meshHeadersFromToken(token) : {});
   const files = [];
   for (const url of urls.slice(0, 5)) {
     const f = await downloadFile(url, hdrs);
