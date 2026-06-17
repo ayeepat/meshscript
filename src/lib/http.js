@@ -66,52 +66,72 @@ function httpError(label, status, bodyText) {
  * @param {number} [opts.timeoutMs]
  * @returns {Promise<object>}
  */
-export async function postJson(url, { headers = {}, body, label = 'AI', timeoutMs = DEFAULT_TIMEOUT_MS }) {
+export async function postJson(url, { headers = {}, body, label = 'AI', timeoutMs = DEFAULT_TIMEOUT_MS, signal = null }) {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+  // The caller's signal lives across all retry attempts; each attempt has its
+  // own internal controller (for the per-attempt timeout) whose .abort() is
+  // chained from `currentCtrl`. Registering the listener once avoids leaking
+  // a new handler per retry iteration.
+  let currentCtrl = null;
+  const onExternalAbort = () => { try { currentCtrl?.abort(); } catch { /* gone */ } };
+  if (signal) signal.addEventListener('abort', onExternalAbort);
+
   let lastErr;
-  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...headers },
-        body: JSON.stringify(body),
-        signal: ctrl.signal
-      });
-      clearTimeout(timer);
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      const ctrl = new AbortController();
+      currentCtrl = ctrl;
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', ...headers },
+          body: JSON.stringify(body),
+          signal: ctrl.signal
+        });
+        clearTimeout(timer);
 
-      if (res.ok) {
-        // Read then parse so a 200 with a malformed/empty body surfaces a clear
-        // error instead of a raw SyntaxError leaking out of the returned promise.
-        const ok = await res.text();
-        try { return JSON.parse(ok); }
-        catch { throw new Error(`${label}: некорректный ответ сервера (не JSON).`); }
-      }
+        if (res.ok) {
+          // Read then parse so a 200 with a malformed/empty body surfaces a clear
+          // error instead of a raw SyntaxError leaking out of the returned promise.
+          const ok = await res.text();
+          try { return JSON.parse(ok); }
+          catch { throw new Error(`${label}: некорректный ответ сервера (не JSON).`); }
+        }
 
-      const text = await res.text().catch(() => '');
-      // Retry only on rate-limit / transient server errors.
-      if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
-        lastErr = httpError(label, res.status, text);
-        await sleep(600 * 2 ** attempt);
-        continue;
+        const text = await res.text().catch(() => '');
+        // Retry only on rate-limit / transient server errors.
+        if ((res.status === 429 || res.status >= 500) && attempt < MAX_RETRIES) {
+          lastErr = httpError(label, res.status, text);
+          await sleep(600 * 2 ** attempt);
+          continue;
+        }
+        throw httpError(label, res.status, text);
+      } catch (e) {
+        clearTimeout(timer);
+        // Caller aborted (port disconnect): propagate AbortError so the service
+        // worker can swallow it silently instead of treating it as a timeout
+        // or retryable blip.
+        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+        if (e.name === 'AbortError') {
+          lastErr = new Error(`${label}: превышено время ожидания (${Math.round(timeoutMs / 1000)} с). Попробуйте ещё раз.`);
+        } else {
+          lastErr = e;
+        }
+        // Retry timeouts and network errors; surface everything else immediately.
+        if (attempt < MAX_RETRIES && (e.name === 'AbortError' || e.name === 'TypeError')) {
+          await sleep(600 * 2 ** attempt);
+          continue;
+        }
+        throw lastErr;
       }
-      throw httpError(label, res.status, text);
-    } catch (e) {
-      clearTimeout(timer);
-      if (e.name === 'AbortError') {
-        lastErr = new Error(`${label}: превышено время ожидания (${Math.round(timeoutMs / 1000)} с). Попробуйте ещё раз.`);
-      } else {
-        lastErr = e;
-      }
-      // Retry timeouts and network errors; surface everything else immediately.
-      if (attempt < MAX_RETRIES && (e.name === 'AbortError' || e.name === 'TypeError')) {
-        await sleep(600 * 2 ** attempt);
-        continue;
-      }
-      throw lastErr;
     }
+    throw lastErr; // exhausted retries
+  } finally {
+    if (signal) signal.removeEventListener('abort', onExternalAbort);
+    currentCtrl = null;
   }
-  throw lastErr; // exhausted retries
 }
 
 /**
@@ -132,11 +152,17 @@ export async function postJson(url, { headers = {}, body, label = 'AI', timeoutM
  * @param {number} [opts.timeoutMs] idle timeout between chunks
  * @returns {Promise<string>} full message text
  */
-export async function postStream(url, { headers = {}, body, label = 'AI', onDelta, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+export async function postStream(url, { headers = {}, body, label = 'AI', onDelta, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null }) {
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const ctrl = new AbortController();
   // Reset the idle timer on every chunk so long answers don't trip it.
   let timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const bump = () => { clearTimeout(timer); timer = setTimeout(() => ctrl.abort(), timeoutMs); };
+  // Link the caller's signal to our internal controller so a port disconnect
+  // tears down the SSE read loop immediately — otherwise the upstream provider
+  // keeps streaming (and charging) until idle timeout.
+  const onExternalAbort = () => ctrl.abort();
+  if (signal) signal.addEventListener('abort', onExternalAbort, { once: true });
 
   let res;
   try {
@@ -148,6 +174,8 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
     });
   } catch (e) {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     if (e.name === 'AbortError') {
       throw new Error(`${label}: превышено время ожидания. Попробуйте ещё раз.`);
     }
@@ -156,6 +184,7 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
 
   if (!res.ok) {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
     const text = await res.text().catch(() => '');
     throw httpError(label, res.status, text);
   }
@@ -187,8 +216,12 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
         } catch { /* keep partial frame for the next chunk */ }
       }
     }
+  } catch (e) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    throw e;
   } finally {
     clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
   }
   return full || '(пустой ответ)';
 }

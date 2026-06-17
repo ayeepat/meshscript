@@ -83,7 +83,7 @@ function historyToMessage(m) {
 }
 
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null } = opts;
+  const { onDelta = null, responseFormat = null, signal = null } = opts;
   const key = await getKey();
   // Charge the daily budget BEFORE the network round-trip so a runaway loop
   // can't drain credit; chargeOne throws a Russian-language error past the
@@ -111,9 +111,9 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
 
   // Stream only for free-form solves; JSON-mode replies are parsed whole.
   if (onDelta && responseFormat !== 'json_object') {
-    return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta });
+    return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, signal });
   }
 
-  const json = await postJson(ENDPOINT, { headers, body, label: 'OpenRouter' });
+  const json = await postJson(ENDPOINT, { headers, body, label: 'OpenRouter', signal });
   return json?.choices?.[0]?.message?.content || '(пустой ответ)';
 }

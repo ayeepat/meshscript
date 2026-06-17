@@ -21,6 +21,14 @@ import { prepareFiles } from '../lib/extract.js';
 // up without re-sending the whole chat. (Bump to 16 for ~8 full turns.)
 const MAX_HISTORY_MESSAGES = 8;
 
+// chrome.storage.session defaults to extension-only access; the floating
+// answer panel (content-script context) needs to remember its position and
+// minimized state across page interactions. Opening the access level is reset
+// on every SW restart, so we re-apply it at module top — cheap and idempotent.
+try {
+  chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
+} catch { /* old Chrome — content script falls back to defaults each time */ }
+
 // Open the full-window dashboard when the popup asks to "Solve".
 async function openDashboard(payload) {
   const url = chrome.runtime.getURL(
@@ -88,7 +96,7 @@ function missingInputGate(category, task, files) {
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
  * @param {(chunk:string)=>void} [onDelta] stream callback (token-by-token)
  */
-async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta) {
+async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta, signal) {
   // License gate. No-op while LICENSE_ENFORCED is off (preorder window).
   // Throws a Russian-language error the catch path surfaces verbatim.
   await ensureLicensed();
@@ -129,7 +137,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   }
   const answer = await askAI(
     systemPrompt, task || '(см. вложение)', files,
-    history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider }
+    history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider, signal }
   );
 
   // Persist to local history (non-fatal if storage write fails).
@@ -161,6 +169,62 @@ async function solveTest({ text, screenshot }) {
   // JSON mode: the model returns {reasoning, answers:[{n,a}]} — no fragile
   // marker parsing. The popup formats/displays it.
   return askAI(systemPrompt, userText, screenshot ? [screenshot] : [], [], { responseFormat: 'json_object' });
+}
+
+/**
+ * Map the model's {answers:[{n,a}]} reply to the panel's {index, text, answer}
+ * shape. Tiered like the popup's formatter so a truncated reply still surfaces
+ * what arrived: whole JSON → embedded JSON → loose "n"/"a" pair regex.
+ * The TEST_ANSWER prompt doesn't return per-question text, so `text` is "".
+ */
+function parseTestAnswers(raw) {
+  if (!raw || typeof raw !== 'string') return [];
+  const make = (n, a) => ({
+    index: typeof n === 'number' ? n : (String(n).trim() || ''),
+    text: '',
+    answer: String(a ?? '').trim()
+  });
+  const fromObj = (obj) => {
+    if (!obj || !Array.isArray(obj.answers)) return null;
+    const out = obj.answers
+      .filter((x) => x && x.a != null && x.n != null)
+      .map((x) => make(x.n, x.a));
+    return out.length ? out : null;
+  };
+  try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
+  const embedded = raw.match(/\{[\s\S]*\}/);
+  if (embedded) {
+    try { const r = fromObj(JSON.parse(embedded[0])); if (r) return r; } catch { /* embedded failed */ }
+  }
+  const out = [];
+  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const n = (m[1] ?? m[2] ?? '').trim();
+    let a = m[3];
+    try { a = JSON.parse('"' + a + '"'); } catch { /* keep raw escapes */ }
+    out.push(make(n, a));
+  }
+  return out;
+}
+
+/**
+ * Render the parsed answers as a floating panel on the test tab. The popup
+ * still shows them too — the panel just outlives the popup so the user can
+ * keep reading while they fill the form. Best-effort: a restricted page or
+ * an in-flight navigation just means no panel; the popup is the fallback.
+ */
+async function showAnswersInTab(tabId, questions) {
+  if (!tabId || !questions.length) return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ['src/content/answer-panel.js', 'src/content/scraper.js']
+    });
+  } catch { /* manifest may already have injected, or the page disallows scripting */ }
+  try {
+    await chrome.tabs.sendMessage(tabId, { type: 'SHOW_ANSWERS', payload: { questions } });
+  } catch { /* no receiver — content script blocked on this page */ }
 }
 
 /* ---------- Attachment downloads (cross-origin, host_permissions) ---------- */
@@ -273,9 +337,19 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           // Non-streaming fallback (popup / callers that don't open a port).
           sendResponse({ ok: true, result: await solve(msg.payload) });
           break;
-        case 'SOLVE_TEST':
-          sendResponse({ ok: true, answer: await solveTest(msg.payload) });
+        case 'SOLVE_TEST': {
+          const answer = await solveTest(msg.payload);
+          // Fire-and-forget: surfacing the panel must NOT delay the popup reply.
+          // The popup is also where errors get rendered, so a panel failure has
+          // no user-visible impact beyond "no on-page panel this time".
+          const tabId = msg.payload?.tabId;
+          if (tabId) {
+            const questions = parseTestAnswers(answer);
+            if (questions.length) showAnswersInTab(tabId, questions);
+          }
+          sendResponse({ ok: true, answer });
           break;
+        }
         case 'CLASSIFY_TASKS':
           sendResponse({ ok: true, kinds: await classifyTasksAI(msg.payload?.tasks || []) });
           break;
@@ -390,15 +464,29 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
 // for the duration of the (possibly long) streamed answer.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'solve') return;
+  // Abort the in-flight provider call if the dashboard tab is closed/reloaded
+  // mid-stream. Without this the upstream fetch keeps streaming (and getting
+  // charged) until the 60-s idle timeout, even though no UI is listening.
+  let activeCtrl = null;
+  port.onDisconnect.addListener(() => {
+    try { activeCtrl?.abort(); } catch { /* already aborted */ }
+    activeCtrl = null;
+  });
   port.onMessage.addListener(async (msg) => {
     if (msg?.type !== 'SOLVE') return;
+    const ctrl = new AbortController();
+    activeCtrl = ctrl;
+    const safePost = (m) => { try { port.postMessage(m); } catch { /* port closed */ } };
     try {
-      const result = await solve(msg.payload, (text) => {
-        try { port.postMessage({ type: 'delta', text }); } catch { /* port closed */ }
-      });
-      port.postMessage({ type: 'done', result });
+      const result = await solve(msg.payload, (text) => safePost({ type: 'delta', text }), ctrl.signal);
+      safePost({ type: 'done', result });
     } catch (e) {
-      port.postMessage({ type: 'error', error: String(e?.message || e) });
+      // Caller-initiated abort: the port is already gone, no point posting.
+      if (e?.name !== 'AbortError' && !ctrl.signal.aborted) {
+        safePost({ type: 'error', error: String(e?.message || e) });
+      }
+    } finally {
+      if (activeCtrl === ctrl) activeCtrl = null;
     }
   });
 });

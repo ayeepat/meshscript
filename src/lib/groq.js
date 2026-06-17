@@ -77,7 +77,7 @@ function historyToMessage(m) {
 }
 
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null } = opts;
+  const { onDelta = null, responseFormat = null, signal = null } = opts;
   const key = await getKey();
   // Charge the daily budget BEFORE the network round-trip — same reasoning as
   // openrouter.js. classify-ai imports askGroq directly, so charging here
@@ -115,9 +115,9 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
   const headers = { Authorization: `Bearer ${key}` };
 
   if (onDelta && responseFormat !== 'json_object') {
-    return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta });
+    return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, signal });
   }
 
-  const json = await postJson(ENDPOINT, { headers, body, label: 'Groq' });
+  const json = await postJson(ENDPOINT, { headers, body, label: 'Groq', signal });
   return json?.choices?.[0]?.message?.content || '(пустой ответ)';
 }

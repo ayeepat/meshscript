@@ -499,7 +499,10 @@ async function solveTestOnScreen() {
 
     setStatus(box, 'Решаю…');
     const resp = await new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot } }, (r) => {
+      // tabId lets the service worker drop the parsed answers into an in-page
+      // floating panel via chrome.scripting + chrome.tabs.sendMessage. The
+      // popup still renders them too — the panel just outlives the popup.
+      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId: tab.id } }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
         else resolve(r || { ok: false, error: 'нет ответа' });
       });

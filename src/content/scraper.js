@@ -794,6 +794,23 @@ if (!window.__smeshListenerAdded) {
           .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], token: null }));
         return true;
       }
+      if (msg && msg.type === 'SHOW_ANSWERS') {
+        // The floating panel lives in answer-panel.js (same isolated world).
+        // The service worker injects it before sending this message, so the
+        // entry point should already exist; guard anyway in case order slips.
+        if (window.__smeshPanel?.show) {
+          Promise.resolve(window.__smeshPanel.show(msg.payload)).catch(() => { /* show is best-effort */ });
+          sendResponse({ ok: true });
+        } else {
+          sendResponse({ ok: false, error: 'answer-panel not loaded' });
+        }
+        return false;
+      }
+      if (msg && msg.type === 'HIDE_ANSWERS') {
+        try { window.__smeshPanel?.hide(); } catch { /* nothing to clean up */ }
+        sendResponse({ ok: true });
+        return false;
+      }
     } catch (e) {
       sendResponse({ ok: false, error: String(e) });
       return false;
