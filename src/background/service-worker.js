@@ -166,9 +166,16 @@ async function solveTest({ text, screenshot }) {
     promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
   const userText = 'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
     (text || '(текст не извлечён, смотри скриншот)');
-  // JSON mode: the model returns {reasoning, answers:[{n,a}]} — no fragile
-  // marker parsing. The popup formats/displays it.
-  return askAI(systemPrompt, userText, screenshot ? [screenshot] : [], [], { responseFormat: 'json_object' });
+  // JSON mode: the model returns {answers:[{n,a}]} — no fragile marker parsing.
+  // `reasoning` turns on Gemini's NATIVE thinking channel: it reasons through
+  // every question fully (privately), but the visible content stays a tiny
+  // answers-only JSON. That reasoning streams on delta.reasoning, which
+  // postStream drops — so the user only ever sees the answers, never the steps,
+  // and the answers array can no longer be truncated by a long reasoning blob.
+  return askAI(systemPrompt, userText, screenshot ? [screenshot] : [], [], {
+    responseFormat: 'json_object',
+    reasoning: { effort: 'high' }
+  });
 }
 
 /**

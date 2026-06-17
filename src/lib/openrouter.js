@@ -83,7 +83,7 @@ function historyToMessage(m) {
 }
 
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, signal = null } = opts;
+  const { onDelta = null, responseFormat = null, reasoning = null, signal = null } = opts;
   const key = await getKey();
   // Charge the daily budget BEFORE the network round-trip so a runaway loop
   // can't drain credit; chargeOne throws a Russian-language error past the
@@ -102,6 +102,18 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
     temperature: 0.3
   };
   if (responseFormat === 'json_object') body.response_format = { type: 'json_object' };
+
+  // Native model reasoning (OpenRouter `reasoning` param). The test solver uses
+  // this so Gemini THINKS fully in its private reasoning channel, then emits a
+  // tiny answers-only JSON as the visible content. Two wins:
+  //  1. The full step-by-step solving no longer eats the output-token budget,
+  //     so the `answers` array can never get truncated (the old cause of the
+  //     panel not showing + raw reasoning leaking to the user).
+  //  2. Reasoning tokens arrive on `delta.reasoning`, which postStream ignores
+  //     for accumulation — so the user NEVER sees the reasoning, only answers.
+  // We do NOT set reasoning.exclude: letting the reasoning deltas stream keeps
+  // resetting postStream's idle timeout during long thinks (no silent stall).
+  if (reasoning) body.reasoning = reasoning;
 
   const headers = {
     Authorization: `Bearer ${key}`,
