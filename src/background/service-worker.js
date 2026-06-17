@@ -196,9 +196,15 @@ const EXT_MIME = {
 
 function inferMime(name, contentType) {
   const ct = (contentType || '').split(';')[0].trim().toLowerCase();
-  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return ct;
   const ext = (name.split('.').pop() || '').toLowerCase();
-  return EXT_MIME[ext] || ct || 'application/octet-stream';
+  // A known extension is the most reliable signal for Mesh attachments: the
+  // store serves a generic content-type often, and a mislabeled one sometimes
+  // (e.g. text/plain or application/download for a real .pdf). Downstream
+  // routing keys on the exact mime, so trust the extension whenever we know it
+  // and only fall back to a specific content-type for unrecognized extensions.
+  if (EXT_MIME[ext]) return EXT_MIME[ext];
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return ct;
+  return 'application/octet-stream';
 }
 
 async function downloadFile(url, headers) {

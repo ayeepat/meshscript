@@ -30,12 +30,12 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brandtext { display: flex; flex-direction: column; line-height: 1.05; min-width: 0; }
-.brandtext h1 { font-size: 16px; font-weight: 750; letter-spacing: -0.4px; margin: 0; }
+.brandtext h1 { font-family: var(--font-serif); font-size: 19px; font-weight: 700; letter-spacing: -0.2px; margin: 0; }
 .brandsub { font-size: 11px; font-weight: 500; color: var(--tertiary); margin-top: 2px; }
 
 .iconbtn {
   background: var(--card); border: 1px solid var(--separator); color: var(--secondary);
-  cursor: pointer; width: 34px; height: 34px; border-radius: 11px;
+  cursor: pointer; width: 34px; height: 34px; border-radius: var(--r-md);
   display: grid; place-items: center;
   box-shadow: var(--shadow-btn);
   transition: transform 0.1s ease, color 0.15s ease, border-color 0.15s ease;
@@ -81,7 +81,7 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
   transition: border-color 0.15s ease, transform 0.12s ease;
 }
 .card:hover { border-color: var(--border-strong); }
-.card .subject { font-weight: 650; font-size: 15px; letter-spacing: -0.2px; }
+.card .subject { font-family: var(--font-serif); font-weight: 700; font-size: 16.5px; letter-spacing: -0.1px; }
 .card .task {
   font-size: 12.5px; color: var(--secondary); margin: 5px 0 12px;
   white-space: pre-wrap; line-height: 1.5;
@@ -96,18 +96,18 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 
 .row { display: flex; gap: 8px; align-items: center; }
 .solve {
-  background: var(--accent-grad); color: var(--on-accent); border: none;
-  border-radius: var(--r-pill); padding: 9px 20px; cursor: pointer;
+  background: var(--accent); color: var(--on-accent); border: none;
+  border-radius: var(--r-sm); padding: 9px 20px; cursor: pointer;
   font: inherit; font-size: 13px; font-weight: 650;
   box-shadow: var(--shadow-accent);
-  transition: transform 0.1s ease, filter 0.15s ease;
+  transition: transform 0.1s ease, background 0.15s ease;
 }
-.solve:hover { filter: brightness(1.06); }
-.solve:active { transform: scale(0.96); }
+.solve:hover { background: var(--accent-hover); }
+.solve:active { transform: scale(0.96); background: var(--accent-press); }
 
 .drop {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  background: var(--input-bg); border: 1px solid transparent; border-radius: var(--r-pill);
+  background: var(--input-bg); border: 1px solid transparent; border-radius: var(--r-sm);
   padding: 8px 14px; font-size: 12.5px; font-weight: 550; color: var(--secondary);
   flex: 1; cursor: pointer; min-width: 0; white-space: nowrap;
   transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
@@ -173,15 +173,15 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 .testview { padding: 14px 16px 18px; }
 .testlede { margin: 0 0 12px; font-size: 12.5px; }
 .bigbtn {
-  width: 100%; background: var(--accent-grad); color: var(--on-accent);
-  border: none; border-radius: var(--r-lg); padding: 13px 16px; cursor: pointer;
+  width: 100%; background: var(--accent); color: var(--on-accent);
+  border: none; border-radius: var(--r-md); padding: 13px 16px; cursor: pointer;
   font: inherit; font-size: 14px; font-weight: 650;
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   box-shadow: var(--shadow-accent);
-  transition: transform 0.1s ease, filter 0.15s ease;
+  transition: transform 0.1s ease, background 0.15s ease;
 }
-.bigbtn:hover { filter: brightness(1.06); }
-.bigbtn:active { transform: scale(0.98); }
+.bigbtn:hover { background: var(--accent-hover); }
+.bigbtn:active { transform: scale(0.98); background: var(--accent-press); }
 .bigbtn:disabled { opacity: 0.55; cursor: default; transform: none; filter: none; }
 .answer {
   margin-top: 12px; background: var(--card);

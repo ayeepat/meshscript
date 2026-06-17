@@ -202,6 +202,58 @@ function renderChat(chat) {
   if (chat.pending) chat.thinkingEl = thinkingBubble();
 }
 
+/* ---------- Image lightbox (click a GDZ answer to enlarge) ---------- */
+
+// One overlay reused for every image. Built lazily so the dashboard pays for it
+// only if the user actually opens an answer scan.
+let lightboxEl = null;
+let lastFocused = null;
+
+function ensureLightbox() {
+  if (lightboxEl) return lightboxEl;
+  const ov = document.createElement('div');
+  ov.className = 'lightbox';
+  ov.hidden = true;
+  ov.innerHTML =
+    `<button class="lb-close" type="button" title="Закрыть (Esc)" aria-label="Закрыть">${iconSvg('close', 22)}</button>` +
+    `<div class="lb-stage"><img class="lb-img" alt="" /></div>`;
+  ov.querySelector('.lb-close').addEventListener('click', closeLightbox);
+  // Click on the dark backdrop (anywhere but the image itself) closes.
+  ov.addEventListener('click', (e) => { if (e.target !== ov.querySelector('.lb-img')) closeLightbox(); });
+  // Click the image to toggle fit-to-screen ↔ actual size (pan by scrolling).
+  const img = ov.querySelector('.lb-img');
+  img.addEventListener('click', (e) => { e.stopPropagation(); img.classList.toggle('zoomed'); });
+  document.body.appendChild(ov);
+  lightboxEl = ov;
+  return ov;
+}
+
+function openLightbox(src, alt) {
+  const ov = ensureLightbox();
+  const img = ov.querySelector('.lb-img');
+  img.classList.remove('zoomed');
+  img.src = src;
+  img.alt = alt || '';
+  ov.hidden = false;
+  document.body.classList.add('lb-open');
+  lastFocused = document.activeElement;
+  ov.querySelector('.lb-close').focus();
+}
+
+function closeLightbox() {
+  if (!lightboxEl || lightboxEl.hidden) return;
+  lightboxEl.hidden = true;
+  // Drop the (possibly multi-MB) data URL so it isn't pinned in memory.
+  lightboxEl.querySelector('.lb-img').src = '';
+  document.body.classList.remove('lb-open');
+  if (lastFocused?.isConnected) lastFocused.focus();
+  lastFocused = null;
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && lightboxEl && !lightboxEl.hidden) { e.preventDefault(); closeLightbox(); }
+});
+
 /* ---------- GDZ answers (ready textbook solutions, no AI) ---------- */
 
 /** Build the GDZ answer card from a lesson's resolved data, or null. */
@@ -254,8 +306,18 @@ function gdzCardEl(chat) {
     for (const img of a.inlined) {
       const im = document.createElement('img');
       im.src = `data:${img.mimeType};base64,${img.dataBase64}`;
-      im.alt = `ГДЗ ${a.num}`;
+      const alt = mode === 'page' ? `ГДЗ — страница ${a.num}` : `ГДЗ № ${a.num}`;
+      im.alt = alt;
       im.loading = 'lazy';
+      // Answer scans are small in the card but full of fine print — make them
+      // openable in a fullscreen lightbox to actually read them.
+      im.tabIndex = 0;
+      im.setAttribute('role', 'button');
+      im.title = 'Нажмите, чтобы увеличить';
+      im.addEventListener('click', () => openLightbox(im.src, alt));
+      im.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openLightbox(im.src, alt); }
+      });
       block.appendChild(im);
     }
     if (a.link) {

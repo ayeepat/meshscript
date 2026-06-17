@@ -65,10 +65,15 @@ export const EXERCISE_SUBJECTS = [
 ];
 
 // Workbook signal — "Р.т.", "рабочая тетрадь", "р/т", English "workbook/activity book".
-const WB_MARKER = /(р\.?\s*т\.?|рабоч\w*\s+тетрад\w*|р\/т|activity\s*book|workbook)/i;
-// Page refs: "с. 112", "стр 74", "страница 108-109" (с. has no period sometimes).
+// NOTE: \w is ASCII-only in JS and never matches Cyrillic — use [а-яё]* for the
+// spelled-out "рабочая тетрадь" / "рабочей тетради" forms (it's a workbook too).
+const WB_MARKER = /(р\.?\s*т\.?|рабоч[а-яё]*\s+тетрад[а-яё]*|р\/т|activity\s*book|workbook)/i;
+// Page refs: "с. 112", "стр 74", "страница 108-109". The single-letter "с" form
+// REQUIRES its period: bare "с" + number is the Russian preposition «с» ("начни
+// с 5 примера"), and matching that injects a wrong page → a confidently wrong
+// answer image. A miss falls back to AI, which is the safe failure here.
 // Cyrillic-aware left boundary — JS \b is ASCII-only and would miss "с".
-const PAGE_RE = /(?<![а-яёa-z])(?:стр|страниц[аеуы]?|с)\.?\s*(\d+)\s*(?:[-–—]\s*(\d+))?/gi;
+const PAGE_RE = /(?<![а-яёa-z])(?:(?:стр|страниц[аеуы]?)\.?|с\.)\s*(\d+)\s*(?:[-–—]\s*(\d+))?/gi;
 // Exercise refs: "упр. 2", "упражнение 5", "№ 25", "задание 3", "задача 5",
 // "номер 7", plus lists and ranges: "1, 2", "1-3", "1 и 2".
 const EX_RE = /(?:упр(?:ажнени[еяй])?|задани[еяй]|задач[аиу]|номер|№)\.?\s*№?\s*(\d+(?:\s*[-–—,\sи]+\s*\d+)*)/gi;
