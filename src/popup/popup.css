@@ -30,7 +30,7 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brandtext { display: flex; flex-direction: column; line-height: 1.05; min-width: 0; }
-.brandtext h1 { font-family: var(--font-serif); font-size: 19px; font-weight: 700; letter-spacing: -0.2px; margin: 0; }
+.brandtext h1 { font-family: var(--font-display); font-size: 17px; font-weight: 700; letter-spacing: -0.4px; margin: 0; }
 .brandsub { font-size: 11px; font-weight: 500; color: var(--tertiary); margin-top: 2px; }
 
 .iconbtn {
@@ -78,10 +78,13 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
   background: var(--card); border: 1px solid var(--separator); border-radius: var(--r-lg);
   padding: 14px 16px; margin-bottom: 10px;
   box-shadow: var(--shadow-card);
-  transition: border-color 0.15s ease, transform 0.12s ease;
+  transition: border-color 0.2s var(--ease), transform 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.card:hover { border-color: var(--border-strong); }
-.card .subject { font-family: var(--font-serif); font-weight: 700; font-size: 16.5px; letter-spacing: -0.1px; }
+.card:hover {
+  border-color: var(--border-strong); transform: translateY(-1px);
+  box-shadow: var(--shadow-card), 0 6px 18px -10px rgba(0, 0, 0, 0.18);
+}
+.card .subject { font-family: var(--font-display); font-weight: 650; font-size: 15px; letter-spacing: -0.3px; }
 .card .task {
   font-size: 12.5px; color: var(--secondary); margin: 5px 0 12px;
   white-space: pre-wrap; line-height: 1.5;
@@ -97,21 +100,22 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 .row { display: flex; gap: 8px; align-items: center; }
 .solve {
   background: var(--accent); color: var(--on-accent); border: none;
-  border-radius: var(--r-sm); padding: 9px 20px; cursor: pointer;
-  font: inherit; font-size: 13px; font-weight: 650;
+  border-radius: var(--r-pill); padding: 9px 20px; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 600;
   box-shadow: var(--shadow-accent);
-  transition: transform 0.1s ease, background 0.15s ease;
+  transition: transform 0.15s var(--ease), background 0.2s var(--ease);
 }
-.solve:hover { background: var(--accent-hover); }
+.solve:hover { background: var(--accent-hover); transform: translateY(-1px); }
 .solve:active { transform: scale(0.96); background: var(--accent-press); }
 
 .drop {
   display: inline-flex; align-items: center; justify-content: center; gap: 6px;
-  background: var(--input-bg); border: 1px solid transparent; border-radius: var(--r-sm);
+  background: var(--input-bg); border: 1px solid transparent; border-radius: var(--r-pill);
   padding: 8px 14px; font-size: 12.5px; font-weight: 550; color: var(--secondary);
   flex: 1; cursor: pointer; min-width: 0; white-space: nowrap;
-  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+  transition: background 0.18s var(--ease), color 0.18s var(--ease), box-shadow 0.18s var(--ease), transform 0.15s var(--ease);
 }
+.drop:active { transform: scale(0.97); }
 .drop .dropicon { display: inline-flex; flex: none; }
 .drop .droplabel { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .drop:hover { background: var(--hover); color: var(--text); }
@@ -174,13 +178,13 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 .testlede { margin: 0 0 12px; font-size: 12.5px; }
 .bigbtn {
   width: 100%; background: var(--accent); color: var(--on-accent);
-  border: none; border-radius: var(--r-md); padding: 13px 16px; cursor: pointer;
-  font: inherit; font-size: 14px; font-weight: 650;
+  border: none; border-radius: var(--r-pill); padding: 13px 16px; cursor: pointer;
+  font: inherit; font-size: 14px; font-weight: 600;
   display: inline-flex; align-items: center; justify-content: center; gap: 8px;
   box-shadow: var(--shadow-accent);
-  transition: transform 0.1s ease, background 0.15s ease;
+  transition: transform 0.15s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.bigbtn:hover { background: var(--accent-hover); }
+.bigbtn:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px rgba(0, 122, 255, 0.5); }
 .bigbtn:active { transform: scale(0.98); background: var(--accent-press); }
 .bigbtn:disabled { opacity: 0.55; cursor: default; transform: none; filter: none; }
 .answer {

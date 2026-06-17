@@ -20,7 +20,7 @@ body {
   border-bottom: 1px solid var(--separator);
 }
 .sidebar-head .brandtext { display: flex; flex-direction: column; line-height: 1.1; }
-.sidebar-head .brandname { font-family: var(--font-serif); font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
+.sidebar-head .brandname { font-family: var(--font-display); font-size: 15px; font-weight: 700; letter-spacing: -0.4px; }
 .sidebar-head .brandsub { font-size: 11px; color: var(--tertiary); margin-top: 1px; }
 .sidebar h2 {
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;
@@ -35,9 +35,9 @@ body {
 .week .lesson {
   position: relative; padding: 10px 12px; border-radius: var(--r-md);
   cursor: pointer; font-size: 13px; line-height: 1.4; color: var(--text);
-  transition: background 0.15s ease; margin-bottom: 2px;
+  transition: background 0.18s var(--ease), transform 0.18s var(--ease); margin-bottom: 2px;
 }
-.week .lesson:hover { background: var(--hover); }
+.week .lesson:hover { background: var(--hover); transform: translateX(2px); }
 .week .lesson.active {
   background: var(--accent-soft-strong);
   box-shadow: inset 3px 0 0 var(--accent);
@@ -61,7 +61,7 @@ body {
   background: var(--chrome);
   border-bottom: 1px solid var(--separator);
 }
-.head h1 { font-family: var(--font-serif); font-size: 20px; font-weight: 700; letter-spacing: -0.2px; margin: 0; }
+.head h1 { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.4px; margin: 0; }
 .head .actions { display: flex; align-items: center; gap: 8px; }
 
 .modeseg {
@@ -98,29 +98,26 @@ body {
   border-radius: var(--r-xl); line-height: 1.6; font-size: 14px;
 }
 .msg.user {
-  background: var(--accent-grad); color: var(--on-accent); margin-left: auto;
-  border-bottom-right-radius: 7px; box-shadow: var(--shadow-accent);
+  background: var(--bubble); color: var(--text); margin-left: auto;
+  border-bottom-right-radius: var(--r-xs);
   width: fit-content;
 }
 .msg.user .usertext { white-space: pre-wrap; }
 .msg.user .usertext:empty { display: none; }
-/* On the accent-filled user bubble a teal selection is invisible; flip it to a
-   contrasting highlight (on-accent ground, accent text) so selection shows. */
-.msg.user ::selection { background: var(--on-accent); color: var(--accent); }
 .attachchip {
   display: inline-flex; align-items: center; gap: 6px; max-width: 100%;
   margin-top: 9px; padding: 5px 11px 5px 8px;
-  background: var(--accent-soft-strong); border-radius: var(--r-pill);
+  background: var(--accent-soft); color: var(--accent); border-radius: var(--r-pill);
   font-size: 12.5px; font-weight: 600;
 }
 .msg.user .usertext:empty + .attachchip { margin-top: 0; }
-.attachchip .ac-check { display: inline-flex; color: var(--on-accent); }
+.attachchip .ac-check { display: inline-flex; color: var(--accent); }
 .attachchip .ac-ico { display: inline-flex; opacity: 0.9; }
 .attachchip .ac-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .msg.assistant {
   background: var(--card); border: 1px solid var(--separator); white-space: normal;
-  border-bottom-left-radius: 7px;
+  border-bottom-left-radius: var(--r-xs);
   box-shadow: var(--shadow-card);
   position: relative; padding-right: 44px; margin-right: auto;
   width: fit-content;
@@ -150,7 +147,7 @@ body {
 /* Rendered markdown */
 .msg p { margin: 0 0 9px; }
 .msg p:last-child { margin-bottom: 0; }
-.msg h4 { font-family: var(--font-serif); margin: 16px 0 7px; font-size: 15.5px; font-weight: 700; letter-spacing: -0.1px; }
+.msg h4 { font-family: var(--font-display); margin: 15px 0 7px; font-size: 14.5px; font-weight: 700; letter-spacing: -0.3px; }
 .msg h4:first-child { margin-top: 0; }
 .msg ul, .msg ol { margin: 5px 0 11px; padding-left: 22px; }
 .msg li { margin: 4px 0; }
@@ -211,9 +208,9 @@ body {
   width: 40px; height: 40px; cursor: pointer; flex: none;
   display: grid; place-items: center;
   box-shadow: var(--shadow-accent);
-  transition: transform 0.1s ease, background 0.15s ease;
+  transition: transform 0.15s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.send:hover { background: var(--accent-hover); }
+.send:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 16px -4px rgba(0, 122, 255, 0.5); }
 .send:active { transform: scale(0.92); background: var(--accent-press); }
 
 .week .lesson.active .spinner { border-color: var(--accent-soft); border-top-color: var(--accent); }
