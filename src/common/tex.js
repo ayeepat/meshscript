@@ -155,7 +155,10 @@ export function extractMath(md) {
     .replace(/\$\$([\s\S]+?)\$\$/g, (_, t) => put(t, true))
     .replace(/\\\[([\s\S]+?)\\\]/g, (_, t) => put(t, true))
     .replace(/\\\((.+?)\\\)/g, (_, t) => put(t, false))
-    .replace(/\$([^$\n]+?)\$/g, (_, t) => put(t, false));
+    // Negative lookahead `(?!\d)` keeps a price like "$5, а не $10" from being
+    // read as a math span: the closing `$` immediately before a digit is not a
+    // delimiter, so the pair never matches.
+    .replace(/\$([^$\n]+?)\$(?!\d)/g, (_, t) => put(t, false));
   return { text, chunks };
 }
 

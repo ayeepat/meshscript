@@ -28,51 +28,70 @@ async function getKey() {
   return openrouterApiKey;
 }
 
+// One file -> one OpenAI-style content part. Shared by the current message and
+// by replayed history turns, so a file attached on an earlier turn stays in
+// context on follow-ups instead of being dropped.
+function fileToContentPart(f) {
+  const mime = f.mimeType || 'application/octet-stream';
+  const name = f.name || '';
+  if (isImageFile(f)) {
+    const m = mime.startsWith('image/') ? mime : 'image/png';
+    return { type: 'image_url', image_url: { url: `data:${m};base64,${f.dataBase64}` } };
+  }
+  if (isPdfFile(f)) {
+    // Gemini 2.5 reads PDFs (incl. scanned pages) natively; OpenRouter routes
+    // the file to the model directly when no file-parser plugin is set.
+    return { type: 'file', file: { filename: name || 'file.pdf', file_data: `data:application/pdf;base64,${f.dataBase64}` } };
+  }
+  if (isTextFile(f)) {
+    // Plain-text files (.txt/.csv/.md/…) can't go as a "file" part, but we CAN
+    // read them — inline the contents so the model actually sees the task.
+    const text = b64ToUtf8(f.dataBase64);
+    return {
+      type: 'text',
+      text: text
+        ? `[Содержимое приложенного файла «${name || 'файл'}»]:\n${text.slice(0, 50000)}`
+        : `[Приложен файл ${name || mime}, не удалось прочитать его как текст.]`
+    };
+  }
+  // Office formats (Word/PowerPoint/Excel) aren't readable by this provider.
+  // Non-blocking wording: if there's other readable material (e.g. a PDF),
+  // the model must still solve from it and just ignore this file — otherwise
+  // a tag-along .docx made it refuse the whole task. Only ask for it if this
+  // file is genuinely required. Never invent its contents.
+  return {
+    type: 'text',
+    text: `[Приложен файл ${name || ''} (${mime}). Офисные файлы (Word/PowerPoint/Excel) я не читаю напрямую. ` +
+      `Если для этого задания есть другой материал (PDF/фото/текст) — реши по нему, а этот файл просто проигнорируй. ` +
+      `Если же он действительно нужен — попроси прислать его как PDF/фото. Содержимое этого файла НЕ выдумывай.]`
+  };
+}
+
+function buildContent(userText, files) {
+  const content = [{ type: 'text', text: userText }];
+  for (const f of files) content.push(fileToContentPart(f));
+  return content;
+}
+
+// Map a stored history turn to an API message. User turns that carried files are
+// rebuilt as multi-part content so the attachment survives into follow-ups.
+function historyToMessage(m) {
+  const role = m.role === 'assistant' ? 'assistant' : 'user';
+  if (role === 'user' && m.files?.length) return { role, content: buildContent(m.content || '', m.files) };
+  return { role, content: m.content };
+}
+
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
 
-  const content = [{ type: 'text', text: userText }];
-  for (const f of files) {
-    const mime = f.mimeType || 'application/octet-stream';
-    const name = f.name || '';
-    if (isImageFile(f)) {
-      const m = mime.startsWith('image/') ? mime : 'image/png';
-      content.push({ type: 'image_url', image_url: { url: `data:${m};base64,${f.dataBase64}` } });
-    } else if (isPdfFile(f)) {
-      // Gemini 2.5 reads PDFs (incl. scanned pages) natively; OpenRouter routes
-      // the file to the model directly when no file-parser plugin is set.
-      content.push({ type: 'file', file: { filename: name || 'file.pdf', file_data: `data:application/pdf;base64,${f.dataBase64}` } });
-    } else if (isTextFile(f)) {
-      // Plain-text files (.txt/.csv/.md/…) can't go as a "file" part, but we CAN
-      // read them — inline the contents so the model actually sees the task.
-      const text = b64ToUtf8(f.dataBase64);
-      content.push({
-        type: 'text',
-        text: text
-          ? `[Содержимое приложенного файла «${name || 'файл'}»]:\n${text.slice(0, 50000)}`
-          : `[Приложен файл ${name || mime}, не удалось прочитать его как текст.]`
-      });
-    } else {
-      // Office formats (Word/PowerPoint/Excel) aren't readable by this provider.
-      // Non-blocking wording: if there's other readable material (e.g. a PDF),
-      // the model must still solve from it and just ignore this file — otherwise
-      // a tag-along .docx made it refuse the whole task. Only ask for it if this
-      // file is genuinely required. Never invent its contents.
-      content.push({
-        type: 'text',
-        text: `[Приложен файл ${name || ''} (${mime}). Офисные файлы (Word/PowerPoint/Excel) я не читаю напрямую. ` +
-          `Если для этого задания есть другой материал (PDF/фото/текст) — реши по нему, а этот файл просто проигнорируй. ` +
-          `Если же он действительно нужен — попроси прислать его как PDF/фото. Содержимое этого файла НЕ выдумывай.]`
-      });
-    }
-  }
+  const content = buildContent(userText, files);
 
   const body = {
     model: MODEL,
     messages: [
       { role: 'system', content: systemPrompt },
-      ...history.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+      ...history.map(historyToMessage),
       { role: 'user', content: files.length ? content : userText }
     ],
     temperature: 0.3

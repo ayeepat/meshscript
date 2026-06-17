@@ -395,7 +395,9 @@ function findStudentId() {
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const v = localStorage.getItem(localStorage.key(i)) || '';
-      const m = v.match(/"(?:student_id|studentId|profile_id|profileId|contingent_guid)"\s*:\s*"?(\d{4,})"?/);
+      // Match a numeric id OR a GUID — `contingent_guid` is a GUID, so a digits-
+      // only pattern would silently skip it despite being listed here.
+      const m = v.match(/"(?:student_id|studentId|profile_id|profileId|contingent_guid)"\s*:\s*"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{4,})"?/i);
       if (m) return m[1];
     }
   } catch { /* storage blocked */ }

@@ -38,52 +38,74 @@ async function getKey() {
  * @param {{onDelta?:(c:string)=>void, responseFormat?:string}} [opts]
  * @returns {Promise<string>}
  */
+// One file -> one OpenAI-style content part. Groq has no native PDF path, so
+// non-image / non-text files are described in a note. Shared by the current
+// message and by replayed history turns so attachments survive follow-ups.
+function fileToContentPart(f) {
+  if (isImageFile(f)) {
+    const m = (f.mimeType || '').startsWith('image/') ? f.mimeType : 'image/png';
+    return { type: 'image_url', image_url: { url: `data:${m};base64,${f.dataBase64}` } };
+  }
+  if (isTextFile(f)) {
+    // Plain text and locally-extracted Office docs (see extract.js) — inline
+    // the contents so Groq actually reads them instead of refusing.
+    const text = base64ToUtf8(f.dataBase64);
+    return {
+      type: 'text',
+      text: text
+        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
+        : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
+    };
+  }
+  return {
+    type: 'text',
+    text: `[Приложен файл ${f.name || ''} (${f.mimeType}), который нельзя прочитать напрямую. Попросите фото/скриншот или PDF, если нужен текст. Не выдумывай его содержимое.]`
+  };
+}
+
+function buildUserContent(userText, files) {
+  const content = [{ type: 'text', text: userText }];
+  for (const f of files) content.push(fileToContentPart(f));
+  return content;
+}
+
+function historyToMessage(m) {
+  const role = m.role === 'assistant' ? 'assistant' : 'user';
+  if (role === 'user' && m.files?.length) return { role, content: buildUserContent(m.content || '', m.files) };
+  return { role, content: m.content };
+}
+
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
-  const hasImages = files.some(isImageFile);
+  // Pick the vision model if EITHER the current message OR a replayed history
+  // turn carries an image — otherwise a follow-up would route to the text model
+  // and lose the original photo.
+  const hasImages = files.some(isImageFile) ||
+    history.some((m) => m.role !== 'assistant' && m.files?.some(isImageFile));
   const model = hasImages ? VISION_MODEL : TEXT_MODEL;
 
   // Build OpenAI-style content. Images go as data URLs; non-image files
   // (e.g. PDF/Word) can't be read directly here, so we note them in text.
-  const userContent = [{ type: 'text', text: userText }];
-  for (const f of files) {
-    if (isImageFile(f)) {
-      const m = (f.mimeType || '').startsWith('image/') ? f.mimeType : 'image/png';
-      userContent.push({
-        type: 'image_url',
-        image_url: { url: `data:${m};base64,${f.dataBase64}` }
-      });
-    } else if (isTextFile(f)) {
-      // Plain text and locally-extracted Office docs (see extract.js) — inline
-      // the contents so Groq actually reads them instead of refusing.
-      const text = base64ToUtf8(f.dataBase64);
-      userContent.push({
-        type: 'text',
-        text: text
-          ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
-          : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
-      });
-    } else {
-      userContent.push({
-        type: 'text',
-        text: `[Приложен файл ${f.name || ''} (${f.mimeType}), который нельзя прочитать напрямую. Попросите фото/скриншот или PDF, если нужен текст. Не выдумывай его содержимое.]`
-      });
-    }
-  }
+  const userContent = buildUserContent(userText, files);
 
   const body = {
     model,
     messages: [
       { role: 'system', content: systemPrompt },
-      ...history.map((m) => ({ role: m.role === 'assistant' ? 'assistant' : 'user', content: m.content })),
+      ...history.map(historyToMessage),
       // files.length (not hasImages): a PDF/Word attachment still needs its
       // "can't read this directly" note delivered to the model.
       { role: 'user', content: files.length ? userContent : userText }
     ],
     temperature: 0.3
   };
-  if (responseFormat === 'json_object') body.response_format = { type: 'json_object' };
+  // Groq's vision model (llama-4-scout) does NOT reliably honour
+  // response_format:json_object — the call can hard-error or return non-JSON.
+  // So request JSON mode only on the TEXT model. The TEST_ANSWER prompt already
+  // mandates a JSON object, and the popup salvages partial/non-JSON replies
+  // (see formatTestAnswers), so dropping the flag here is safe on the vision path.
+  if (responseFormat === 'json_object' && !hasImages) body.response_format = { type: 'json_object' };
 
   const headers = { Authorization: `Bearer ${key}` };
 

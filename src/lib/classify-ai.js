@@ -38,6 +38,23 @@ const SYSTEM =
 
 const cacheKeyFor = (task) => (task || '').trim().toLowerCase().slice(0, 200);
 
+// Serialise cache writes (read-modify-write on one storage.local object) so
+// overlapping classify calls can't clobber each other's entries. Each write
+// re-reads the latest cache, merges the new entries and caps the size.
+let classCacheWrite = Promise.resolve();
+function mergeClassCache(entries) {
+  classCacheWrite = classCacheWrite.then(async () => {
+    const { [CACHE_KEY]: cache = {} } = await chrome.storage.local.get(CACHE_KEY);
+    Object.assign(cache, entries);
+    const keys = Object.keys(cache);
+    if (keys.length > CACHE_MAX) {
+      for (const k of keys.slice(0, keys.length - CACHE_MAX)) delete cache[k];
+    }
+    await chrome.storage.local.set({ [CACHE_KEY]: cache });
+  }).catch(() => { /* cache write is best-effort */ });
+  return classCacheWrite;
+}
+
 /**
  * @param {string[]} tasks homework texts in card order
  * @returns {Promise<Array<'attachment'|'textbook'|'none'>>} same order as input
@@ -63,18 +80,16 @@ export async function classifyTasksAI(tasks) {
     const raw = await askGroq(SYSTEM, list, [], []);
     const m = raw.match(/\[[\s\S]*?\]/);
     const arr = m ? JSON.parse(m[0]) : [];
+    const newEntries = {};
     pending.forEach((i, n) => {
       if (KINDS.has(arr[n])) {
         result[i] = arr[n];
-        cache[cacheKeyFor(tasks[i])] = arr[n];
+        newEntries[cacheKeyFor(tasks[i])] = arr[n];
       }
     });
-    // Cap the cache so it can't grow without bound over months of use.
-    const keys = Object.keys(cache);
-    if (keys.length > CACHE_MAX) {
-      for (const k of keys.slice(0, keys.length - CACHE_MAX)) delete cache[k];
-    }
-    await chrome.storage.local.set({ [CACHE_KEY]: cache });
+    // Persist via a serialised read-merge-write so concurrent calls don't
+    // clobber the cache; capping happens inside (see mergeClassCache).
+    await mergeClassCache(newEntries);
   } catch (_e) {
     // Groq down / malformed reply — the heuristic result stands.
   }

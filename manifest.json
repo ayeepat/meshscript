@@ -7,7 +7,6 @@
   "host_permissions": [
     "https://school.mos.ru/*",
     "https://*.mos.ru/*",
-    "https://*.supabase.co/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
     "https://gdz-ru.com/*",

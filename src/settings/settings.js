@@ -6,7 +6,7 @@ import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 
 initTheme();
 
-const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey', 'supabaseUrl', 'supabaseAnonKey'];
+const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 
 // Display metadata for each prompt category: an icon, a title and the subjects

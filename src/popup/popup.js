@@ -365,28 +365,19 @@ function escapeHtml(s) {
 }
 
 /**
- * Pull out only the final answers the model emits after solving with full
- * reasoning. Three-tier strategy because Flash skips formatting rules ~10%
- * of the time:
- *  1. Trust the `===ОТВЕТЫ===` separator the prompt mandates.
- *  2. If absent, scan for «№N: …» / «N) …» / «N. …» lines anywhere — the
- *     model almost always lists answers in that shape even when it ignores
- *     the marker, and we can pluck them out.
- *  3. As a last resort, return the last non-empty line (the model's final
- *     conclusion) so the user still sees something useful.
+ * Last-resort rescue for a FREE-TEXT reply (no JSON at all) — the TEST_ANSWER
+ * prompt mandates JSON, so this only runs when the model ignored it entirely.
+ *  1. Scan for «№N: …» / «N) …» / «N. …» lines anywhere — the model almost
+ *     always lists answers in that shape, and we can pluck them out.
+ *  2. Otherwise return the last non-empty line (the model's final conclusion)
+ *     so the user still sees something useful — never a raw JSON blob.
  */
 function extractFinalAnswers(raw) {
-  // (1) marker
-  const parts = raw.split(/={2,}\s*ОТВЕТЫ\s*={2,}/i);
-  if (parts.length >= 2) {
-    const tail = parts[parts.length - 1].trim();
-    if (tail) return tail;
-  }
-  // (2) numbered answer lines
+  // (1) numbered answer lines
   const lines = raw.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   const numbered = lines.filter((l) => /^(?:№|#)?\s*\d+\s*[.):]/.test(l));
   if (numbered.length) return numbered.join('\n');
-  // (3) last non-empty line — but NEVER hand back a raw JSON blob (that is the
+  // (2) last non-empty line — but NEVER hand back a raw JSON blob (that is the
   // exact symptom we guard against: a truncated «{"reasoning":...» leaking to
   // the user). Prefer the last readable, non-JSON-looking line instead.
   const last = lines[lines.length - 1] || raw.trim();
@@ -410,12 +401,19 @@ function decodeJsonStr(inner) {
  * fails but the answers that did arrive are still perfectly usable.
  */
 function answersFromPartial(raw) {
-  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
   const out = [];
   let m;
+  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
   while ((m = re.exec(raw)) !== null) {
     const n = (m[1] ?? m[2] ?? '').trim();
     out.push(`№${n}: ${decodeJsonStr(m[3])}`);
+  }
+  if (out.length) return out.join('\n');
+  // Fallback: some replies emit the keys in the other order ("a" before "n").
+  const re2 = /"a"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))/g;
+  while ((m = re2.exec(raw)) !== null) {
+    const n = (m[2] ?? m[3] ?? '').trim();
+    out.push(`№${n}: ${decodeJsonStr(m[1])}`);
   }
   return out.length ? out.join('\n') : null;
 }
@@ -458,7 +456,7 @@ function formatTestAnswers(raw) {
   // (4) Reasoning-only reply: show the reasoning text, never the raw braces.
   const reasoning = reasoningFromPartial(raw);
   if (reasoning) return reasoning;
-  // (5) Free-text reply (no JSON at all): legacy marker/line scan.
+  // (5) Free-text reply (no JSON at all): numbered-line / last-line scan.
   return extractFinalAnswers(raw);
 }
 

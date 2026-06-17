@@ -37,7 +37,7 @@ function friendlyMessage(label, status, providerMsg) {
   if (status === 401 || status === 403) {
     return `Неверный API-ключ ${label}. Проверьте ключ в настройках расширения.`;
   }
-  if (status === 402 || (status === 400 && credit) || credit) {
+  if (status === 402 || (status === 400 && credit)) {
     return `На счёте ${label} закончились средства. Пополните баланс или переключитесь на Groq (бесплатно) в настройках.`;
   }
   if (status === 429) {
@@ -80,7 +80,13 @@ export async function postJson(url, { headers = {}, body, label = 'AI', timeoutM
       });
       clearTimeout(timer);
 
-      if (res.ok) return res.json();
+      if (res.ok) {
+        // Read then parse so a 200 with a malformed/empty body surfaces a clear
+        // error instead of a raw SyntaxError leaking out of the returned promise.
+        const ok = await res.text();
+        try { return JSON.parse(ok); }
+        catch { throw new Error(`${label}: некорректный ответ сервера (не JSON).`); }
+      }
 
       const text = await res.text().catch(() => '');
       // Retry only on rate-limit / transient server errors.

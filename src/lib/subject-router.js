@@ -16,7 +16,7 @@ import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from './prompts.js';
 const ROUTES = [
   // NOTE: \w is ASCII-only in JS regex and silently never matches Cyrillic —
   // use [а-яё]* for Russian word endings.
-  { category: PROMPT_CATEGORIES.RUSSIAN_FULL,      test: (s) => /русск[а-яё]*\s+язык/.test(s) },
+  { category: PROMPT_CATEGORIES.RUSSIAN_FULL,      test: (s) => /русск[а-яё]*[)\s]+язык/.test(s) },
   { category: PROMPT_CATEGORIES.LITERATURE,        test: (s) => /литератур/.test(s) },
   { category: PROMPT_CATEGORIES.DIRECT_ANSWER,     test: (s) => /иностран|англ|немец|франц|испан|китайск|итальянск/.test(s) },
   { category: PROMPT_CATEGORIES.WORKED_SOLUTION,   test: (s) => /алгебр|геометр|матем|вероятн|статистик|физик|хими|информатик|астроном/.test(s) },

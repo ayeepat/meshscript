@@ -223,6 +223,24 @@ export async function listTasks(bookUrl) {
 
 function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
+// Serialise resolved-task cache writes. The cache is a single storage.local
+// object; two concurrent resolves doing read-modify-write would clobber each
+// other's entries. Chain every write behind the previous one and re-read the
+// latest cache inside the chain so merges never lose an entry.
+let taskCacheWrite = Promise.resolve();
+function updateTaskCache(cacheKey, result) {
+  taskCacheWrite = taskCacheWrite.then(async () => {
+    const { [TASK_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(TASK_CACHE_KEY);
+    cache[cacheKey] = result;
+    const keys = Object.keys(cache);
+    if (keys.length > TASK_CACHE_MAX) {
+      for (const k of keys.slice(0, keys.length - TASK_CACHE_MAX)) delete cache[k];
+    }
+    await chrome.storage.local.set({ [TASK_CACHE_KEY]: cache });
+  }).catch(() => { /* cache write is best-effort — never fail the resolve */ });
+  return taskCacheWrite;
+}
+
 /**
  * Derive a human gdz.ru link template for a book. The mobile-API path scheme
  * (BASE + "/po-algebre/…") is NOT the human scheme and carries no exercise: it
@@ -335,13 +353,10 @@ export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
     link
   };
 
-  // LRU-ish cache: keep the most recent TASK_CACHE_MAX entries.
-  cache[cacheKey] = result;
-  const keys = Object.keys(cache);
-  if (keys.length > TASK_CACHE_MAX) {
-    for (const k of keys.slice(0, keys.length - TASK_CACHE_MAX)) delete cache[k];
-  }
-  await chrome.storage.local.set({ [TASK_CACHE_KEY]: cache });
+  // LRU-ish cache: keep the most recent TASK_CACHE_MAX entries. Writes are
+  // serialised (and re-read the latest cache) so concurrent resolves don't
+  // clobber each other — see updateTaskCache.
+  await updateTaskCache(cacheKey, result);
   return result;
 }
 

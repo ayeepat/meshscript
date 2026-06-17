@@ -1,12 +1,12 @@
 /**
  * Background service worker (MV3, type: module).
- * Orchestrates the AI provider call and Supabase persistence.
+ * Orchestrates the AI provider call and local solve-history persistence.
  * All API keys live here / in storage, never in content scripts.
  */
 import { askAI } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
-import { createSession, addMessage, listSessions, listMessages } from '../lib/supabase.js';
+import { createSession, addMessage, listSessions, listMessages } from '../lib/history.js';
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
 import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
@@ -82,7 +82,7 @@ function missingInputGate(category, task, files) {
 }
 
 /**
- * Solve a task with the AI provider + chat history. Persist to Supabase.
+ * Solve a task with the AI provider + chat history. Persist to local history.
  * @param {object} p
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
  * @param {(chunk:string)=>void} [onDelta] stream callback (token-by-token)
@@ -128,7 +128,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
     history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider }
   );
 
-  // Persist (non-fatal if Supabase not configured).
+  // Persist to local history (non-fatal if storage write fails).
   try {
     let sid = sessionId;
     if (!sid) {

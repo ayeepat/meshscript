@@ -130,10 +130,55 @@ function slideToText(xml) {
   return tidy(xmlEntities(s));
 }
 
-function xlsxToText(xml) {
-  const parts = [];
-  xml.replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (_, t) => { parts.push(xmlEntities(t)); return ''; });
-  return tidy(parts.join('\n'));
+// sharedStrings.xml holds all TEXT cell values, one per <si> entry, indexed by
+// the position the worksheet's `t="s"` cells reference. An <si> can hold either
+// a single <t> or several <r><t> runs (rich text) — concatenate the runs.
+//
+// NOTE: an earlier version read ONLY sharedStrings (text cells) and so dropped
+// every numeric cell — a mostly-numeric sheet extracted to empty and the user
+// was wrongly told to "send it as a PDF/photo". We now parse the worksheets too.
+function parseSharedStrings(xml) {
+  if (!xml) return [];
+  const out = [];
+  xml.replace(/<si\b[^>]*>([\s\S]*?)<\/si>/g, (_, si) => {
+    let s = '';
+    si.replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (__, t) => { s += t; return ''; });
+    out.push(xmlEntities(s));
+    return '';
+  });
+  return out;
+}
+
+// A worksheet stores each cell as <c r="A1" t="..."><v>…</v></c> (or an inline
+// <is><t>…</t></is> for inline strings). Numbers are stored INLINE in <v> and
+// are NOT in sharedStrings, so reading sharedStrings alone drops every numeric
+// cell — the bug this fixes. Resolve `t="s"` refs against the shared strings and
+// take the literal <v> for everything else (numbers, booleans). Rows are newline-
+// separated, cells tab-separated, so the layout survives into the model prompt.
+function sheetToText(xml, shared) {
+  const rows = [];
+  xml.replace(/<row\b[^>]*>([\s\S]*?)<\/row>/g, (_, row) => {
+    const cells = [];
+    row.replace(/<c\b([^>]*)>([\s\S]*?)<\/c>/g, (__, attrs, body) => {
+      const type = (attrs.match(/\bt="([^"]+)"/) || [])[1];
+      let val = '';
+      if (type === 's') {
+        const v = (body.match(/<v\b[^>]*>([\s\S]*?)<\/v>/) || [])[1];
+        if (v != null) val = shared[+v] ?? '';
+      } else if (type === 'inlineStr') {
+        body.replace(/<t\b[^>]*>([\s\S]*?)<\/t>/g, (___, t) => { val += t; return ''; });
+        val = xmlEntities(val);
+      } else {
+        const v = (body.match(/<v\b[^>]*>([\s\S]*?)<\/v>/) || [])[1];
+        if (v != null) val = xmlEntities(v);
+      }
+      if (val !== '') cells.push(val);
+      return '';
+    });
+    if (cells.length) rows.push(cells.join('\t'));
+    return '';
+  });
+  return rows.join('\n');
 }
 
 /**
@@ -165,8 +210,25 @@ export async function extractOfficeText(file) {
     }
     text = chunks.join('\n\n');
   } else if (name.endsWith('.xlsx') || mime.includes('spreadsheetml')) {
-    const bytes = await readNamed(zip, 'xl/sharedStrings.xml');
-    if (bytes) text = xlsxToText(decodeBytes(bytes));
+    // Read shared strings (text cells) AND every worksheet (numbers live inline
+    // in the sheet, not in sharedStrings — see sheetToText). A purely-numeric
+    // spreadsheet has an empty/absent sharedStrings.xml, so worksheet parsing is
+    // what makes numeric data extractable at all.
+    const ssBytes = await readNamed(zip, 'xl/sharedStrings.xml');
+    const shared = parseSharedStrings(ssBytes ? decodeBytes(ssBytes) : '');
+    const sheets = zip.entries
+      .filter((e) => /^xl\/worksheets\/sheet\d+\.xml$/.test(e.name))
+      .sort((a, b) => (+a.name.match(/(\d+)/)[1]) - (+b.name.match(/(\d+)/)[1]));
+    const chunks = [];
+    for (let i = 0; i < sheets.length; i++) {
+      const bytes = await readEntry(zip, sheets[i]);
+      const t = bytes && sheetToText(decodeBytes(bytes), shared);
+      if (t) chunks.push(sheets.length > 1 ? `[Лист ${i + 1}]\n${t}` : t);
+    }
+    text = chunks.join('\n\n');
+    // Fallback: if worksheet parsing yielded nothing (unusual layout), at least
+    // surface the shared text strings so a text-only sheet still extracts.
+    if (!text && shared.length) text = tidy(shared.join('\n'));
   }
 
   text = (text || '').slice(0, 100000).trim();

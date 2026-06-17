@@ -378,13 +378,15 @@ function sendToChat(chat, text, files) {
   // файл" prompts): they're UI nudges, not real conversation, and replaying
   // them as assistant turns biases the next answer's tone.
   const prior = chat.history.filter((m) => !m.needsUpload);
-  // Store only file METADATA (name/mime, no base64) so the chip survives a
-  // re-render without bloating history with megabytes of attachment data.
-  const fileMeta = (files || []).map((f) => ({ name: f.name, mimeType: f.mimeType }));
-  chat.history.push({ role: 'user', content: text, files: fileMeta });
+  // Keep the FULL files (incl. base64) on the user turn. The chip only reads
+  // name/mime, but the service worker replays history attachments to the model
+  // so a follow-up question still "sees" the photo/PDF from an earlier turn.
+  // Bounded by MAX_HISTORY_MESSAGES in the service worker.
+  const turnFiles = files || [];
+  chat.history.push({ role: 'user', content: text, files: turnFiles });
   chat.pending = true;
   if (activeKey === chat.key) {
-    bubble('user', text, { files: fileMeta });
+    bubble('user', text, { files: turnFiles });
     chat.thinkingEl = thinkingBubble();
   }
   renderSidebar();
@@ -519,33 +521,40 @@ function renderSidebar() {
     weekEl.innerHTML = '<p class="hintmsg">Нет данных о неделе. Откройте попап на странице дневника, чтобы просканировать домашние задания.</p>';
     return;
   }
-  let lastDay = null;
+  // Group lessons by day (first-seen order) so a lesson added out of insertion
+  // order — e.g. an old Solve link appended at the end — still lands under its
+  // day instead of producing a second, duplicate day header further down.
+  const byDay = new Map();
   for (const chat of chats.values()) {
-    if (chat.day !== lastDay) {
-      lastDay = chat.day;
-      const hdr = document.createElement('div');
-      hdr.className = 'dayhdr';
-      hdr.textContent = chat.day || 'Без даты';
-      weekEl.appendChild(hdr);
+    const day = chat.day || null;
+    if (!byDay.has(day)) byDay.set(day, []);
+    byDay.get(day).push(chat);
+  }
+  for (const [day, dayChats] of byDay) {
+    const hdr = document.createElement('div');
+    hdr.className = 'dayhdr';
+    hdr.textContent = day || 'Без даты';
+    weekEl.appendChild(hdr);
+    for (const chat of dayChats) {
+      const el = document.createElement('div');
+      el.className = 'lesson' + (chat.key === activeKey ? ' active' : '');
+      el.innerHTML = '<div class="subj"></div><div class="t"></div>';
+      const subj = el.querySelector('.subj');
+      if (chat.pending) {
+        const dot = document.createElement('span');
+        dot.className = 'spinner';
+        subj.appendChild(dot);
+      } else if (chat.started) {
+        const done = document.createElement('span');
+        done.className = 'donemark';
+        done.innerHTML = iconSvg('check', 11);
+        subj.appendChild(done);
+      }
+      subj.append(chat.subject);
+      el.querySelector('.t').textContent = (chat.task || '').slice(0, 80);
+      el.onclick = () => activateLesson(chat.key);
+      weekEl.appendChild(el);
     }
-    const el = document.createElement('div');
-    el.className = 'lesson' + (chat.key === activeKey ? ' active' : '');
-    el.innerHTML = '<div class="subj"></div><div class="t"></div>';
-    const subj = el.querySelector('.subj');
-    if (chat.pending) {
-      const dot = document.createElement('span');
-      dot.className = 'spinner';
-      subj.appendChild(dot);
-    } else if (chat.started) {
-      const done = document.createElement('span');
-      done.className = 'donemark';
-      done.innerHTML = iconSvg('check', 11);
-      subj.appendChild(done);
-    }
-    subj.append(chat.subject);
-    el.querySelector('.t').textContent = (chat.task || '').slice(0, 80);
-    el.onclick = () => activateLesson(chat.key);
-    weekEl.appendChild(el);
   }
 }
 

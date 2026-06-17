@@ -5,10 +5,11 @@ Manifest V3 Chrome extension: a personal homework assistant for the Mesh
 robust DOM traversal (no hardcoded MUI class names), and solves tasks using
 subject-aware prompts. Two AI providers: **OpenRouter** (paid, Gemini 2.5 Flash
 — the main solver, answers stream token-by-token) and **Groq** (free — used for
-menial tasks like classification). Solve history is stored in Supabase with a
-7-day TTL. No login automation — it works inside your already logged-in browser
-session, which also lets it **auto-fetch homework attachments** straight from
-Mesh.
+menial tasks like classification). Solve history is stored locally in the
+browser (`chrome.storage.local`) with a 7-day TTL — no backend, no account, no
+shared keys. No login automation — it works inside your already logged-in
+browser session, which also lets it **auto-fetch homework attachments**
+straight from Mesh.
 
 ## File structure
 
@@ -19,9 +20,8 @@ src/
   popup/                      # week of homework (collapsible days) + Solve + file upload
   dashboard/                  # full-window solve view; sidebar = week's lessons
   settings/                   # keys, editable prompts, history viewer
-  background/service-worker.js# AI provider + Supabase orchestration (+ streaming port)
-  lib/                        # ai.js, openrouter.js, groq.js, http.js, supabase.js, prompts.js, subject-router.js
-supabase/schema.sql           # tables + pg_cron 7-day auto-delete
+  background/service-worker.js# AI provider orchestration (+ streaming port)
+  lib/                        # ai.js, openrouter.js, groq.js, http.js, history.js, prompts.js, subject-router.js
 assets/icons/                 # icon16/48/128.png (you add these)
 ```
 
@@ -31,37 +31,26 @@ assets/icons/                 # icon16/48/128.png (you add these)
 Put `icon16.png`, `icon48.png`, `icon128.png` in `assets/icons/`. Any square
 PNGs work. (Chrome refuses to load the extension if these are missing.)
 
-### 2. Create the Supabase project + run the schema
-1. Go to https://supabase.com, create a project (free tier is fine).
-2. Open **SQL Editor** and paste the entire contents of `supabase/schema.sql`,
-   then **Run**.
-3. `pg_cron` is supported on Supabase. If `create extension pg_cron` errors,
-   enable it under **Database → Extensions** (search `pg_cron`, toggle on),
-   then re-run only the `cron.schedule(...)` line.
-4. From **Project Settings → API**, copy the **Project URL** and the **anon
-   public** key. You will paste these into the extension Settings.
-
-### 3. Get the AI provider keys
+### 2. Get the AI provider keys
 - **OpenRouter** (main solver): https://openrouter.ai/keys → create a key
   (`sk-or-v1-…`). This is the paid provider — keep usage to actual solves.
 - **Groq** (free, no card): https://console.groq.com/keys → create a key
   (`gsk_…`). Used for cheap/menial tasks (task classification). Optional but
   recommended; without it those tasks fall back to local heuristics.
 
-### 4. Load the extension in Chrome
+### 3. Load the extension in Chrome
 1. Open `chrome://extensions`.
 2. Toggle **Developer mode** (top right).
 3. Click **Load unpacked** and select this project folder.
 
-### 5. Configure keys
+### 4. Configure keys
 1. Click the extension icon → the **⚙️ gear** (opens Settings), or right-click
    the icon → **Options**.
-2. Paste **OpenRouter API Key**, **Groq API Key**, **Supabase URL**,
-   **Supabase anon key**, and pick the provider.
+2. Paste **OpenRouter API Key** and **Groq API Key**, and pick the provider.
 3. (Optional) Edit the base prompt for any subject category.
 4. Click **Сохранить** (Save).
 
-### 6. Use it
+### 5. Use it
 1. Log into Mesh and open `school.mos.ru/diary/homeworks/homeworks`.
 2. Click the extension icon. It scans the whole visible week of homework;
    each day is a collapsible section (the nearest day starts expanded).
@@ -77,9 +66,9 @@ PNGs work. (Chrome refuses to load the extension if these are missing.)
    Settings, not in the sidebar.
 
 ## Notes & trade-offs
-- **No auth.** Rows are scoped by an anonymous `device_id`. With the anon key +
-  permissive RLS, anyone with the key could access data. Fine for a private
-  2–3 user tool; do not publish the anon key.
+- **Local-only history.** Solve history lives in `chrome.storage.local` with a
+  7-day TTL, scoped to this browser profile. No backend, no shared keys, no
+  account — clearing extension data or reinstalling wipes it.
 - **Auto-fetch attachments.** For tasks that reference a file ("сделать из
   прикреплённого файла"), the popup pulls the file straight from your logged-in
   Mesh session and attaches it automatically — no manual download. It falls
