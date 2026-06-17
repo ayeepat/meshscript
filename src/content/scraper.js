@@ -1,5 +1,5 @@
 /**
- * meshscript content scraper
+ * смэш content scraper
  * -------------------------------------------------------------
  * Mesh (school.mos.ru) is a React/MUI app with OBFUSCATED, randomly
  * generated class names. We never rely on class names. Two strategies:
@@ -555,10 +555,10 @@ const isSameOrigin = (url) => {
 async function fetchInlineFile(url) {
   try {
     const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) { console.log('[meshscript] cs-download http', res.status, url); return null; }
+    if (!res.ok) { console.log('[смэш] cs-download http', res.status, url); return null; }
     const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[meshscript] cs-download got HTML (auth redirect?)', url);
+      console.log('[смэш] cs-download got HTML (auth redirect?)', url);
       return { __auth: true };
     }
     const blob = await res.blob();
@@ -574,7 +574,7 @@ async function fetchInlineFile(url) {
       dataBase64: String(dataUrl).split(',')[1],
       name: fileNameFromUrl(url)
     };
-  } catch (e) { console.log('[meshscript] cs-download exception', String(e), url); return null; }
+  } catch (e) { console.log('[смэш] cs-download exception', String(e), url); return null; }
 }
 
 /**
@@ -591,7 +591,7 @@ async function fetchInlineFile(url) {
 async function listMaterialUrls(lessonId, taskText) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
-  const log = (stage, extra) => console.log('[meshscript] auto-fetch:', stage, extra ?? '');
+  const log = (stage, extra) => console.log('[смэш] auto-fetch:', stage, extra ?? '');
 
   // The API path is the precise one (it knows which homework owns which file), so
   // prefer it whenever we have a lesson id. The DOM scan is only a fallback for
@@ -764,8 +764,8 @@ function debugScan() {
 // Guard against duplicate listeners: the manifest auto-injects this script,
 // and popup.js falls back to chrome.scripting.executeScript on a race. Without
 // this guard both copies would respond to every MESH_SCAN.
-if (!window.__meshscriptListenerAdded) {
-  window.__meshscriptListenerAdded = true;
+if (!window.__smeshListenerAdded) {
+  window.__smeshListenerAdded = true;
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     // Handlers are synchronous — only return true (keep the channel open)
     // when we actually own this message type, otherwise the sender hangs on

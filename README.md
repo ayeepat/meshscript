@@ -1,4 +1,4 @@
-# meshscript
+# смэш
 
 Manifest V3 Chrome extension: a personal homework assistant for the Mesh
 (`school.mos.ru`) platform. Scans the homeworks page, detects subjects with

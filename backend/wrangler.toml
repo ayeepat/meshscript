@@ -1,0 +1,37 @@
+# Cloudflare Worker config for the смэш license backend.
+# Free tier handles 100k requests/day, which is plenty for preorders.
+#
+# Before `wrangler deploy`:
+#  1. `npx wrangler login`
+#  2. Create the KV namespace:
+#        npx wrangler kv namespace create LICENSES
+#     Wrangler prints an `id = "…"` — paste it below.
+#  3. Set the secrets (NOT in this file — see backend/README.md):
+#        npx wrangler secret put YOOKASSA_SECRET_KEY
+#        npx wrangler secret put ADMIN_SECRET
+#        npx wrangler secret put RESEND_API_KEY              # optional
+#        npx wrangler secret put TELEGRAM_BOT_TOKEN          # optional
+#        npx wrangler secret put OWNER_LICENSE_KEY           # optional dev-bypass key
+#  4. `npx wrangler deploy`
+#  5. Point your custom domain at the worker (Cloudflare → Workers → Triggers).
+
+name = "smesh-licenses"
+main = "src/worker.js"
+compatibility_date = "2025-01-15"
+
+# License rows. Keyed by license key string. Value is the JSON in licenses.js.
+[[kv_namespaces]]
+binding = "LICENSES"
+id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+
+# Non-secret config. Override in the Cloudflare dashboard for production.
+[vars]
+# Shop ID is public (YooKassa includes it in every notification). Safe to commit.
+YOOKASSA_SHOP_ID = ""
+# Email "from" address. Must be a verified sender in your Resend account.
+EMAIL_FROM = "смэш <license@smesh.app>"
+# Default product type issued by /webhook/yookassa for amounts under SUBSCRIPTION_MIN_RUB.
+# Tier B will flip this once we add subscription support — see worker.js.
+DEFAULT_LICENSE_TYPE = "lifetime"
+# Anti-abuse: hard cap on how many devices a single license can activate.
+DEVICE_LIMIT = "3"

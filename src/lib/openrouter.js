@@ -9,6 +9,7 @@
 
 import { postJson, postStream } from './http.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
+import { chargeOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const MODEL = 'google/gemini-2.5-flash';
@@ -84,6 +85,10 @@ function historyToMessage(m) {
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
+  // Charge the daily budget BEFORE the network round-trip so a runaway loop
+  // can't drain credit; chargeOne throws a Russian-language error past the
+  // cap which the existing error path surfaces verbatim to the UI.
+  await chargeOne('openrouter');
 
   const content = buildContent(userText, files);
 
@@ -101,7 +106,7 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   const headers = {
     Authorization: `Bearer ${key}`,
     'HTTP-Referer': 'https://gitlab.com/tes738882-group/meshscript',
-    'X-Title': 'meshscript'
+    'X-Title': 'смэш'
   };
 
   // Stream only for free-form solves; JSON-mode replies are parsed whole.

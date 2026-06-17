@@ -2,17 +2,17 @@
 <html lang="ru">
 <head>
   <meta charset="UTF-8" />
-  <title>meshscript — настройки</title>
+  <title>смэш — настройки</title>
   <link rel="stylesheet" href="../common/theme.css" />
   <link rel="stylesheet" href="settings.css" />
 </head>
 <body>
   <header class="appbar">
     <div class="brand">
-      <span class="brandmark">m</span>
+      <img class="brandmark" src="../../assets/icons/icon128.png" alt="" aria-hidden="true" />
       <div class="brandtext">
-        <h1>meshscript</h1>
-        <span class="brandsub">Настройки · v0.4.0</span>
+        <h1>смэш</h1>
+        <span class="brandsub">Настройки · v0.5.0</span>
       </div>
       <div class="theme-mini" id="themeSeg" role="group" aria-label="Тема оформления">
         <button data-pref="system" type="button" title="Системная" aria-label="Системная тема"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="14" rx="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg></button>
@@ -120,6 +120,25 @@
         </div>
       </section>
 
+      <!-- License -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 12l2 2 4-4"/><path d="M21 12c0 4.97-4.03 9-9 9s-9-4.03-9-9 4.03-9 9-9c1.66 0 3.22.45 4.56 1.23"/></svg></span>
+          <div>
+            <h2>Лицензия</h2>
+            <p>Ключ доступа выдаётся после оплаты на сайте. Привязывается до 3 устройств.</p>
+          </div>
+          <span class="licstatus" id="licStatus" data-state="idle">Проверка…</span>
+        </div>
+
+        <div class="field">
+          <label for="licenseKey">Ключ доступа</label>
+          <div class="inputwrap">
+            <input id="licenseKey" type="text" placeholder="SMESH-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" />
+          </div>
+        </div>
+      </section>
+
       <!-- API keys -->
       <section class="panel">
         <div class="panel-head">
@@ -146,6 +165,37 @@
           </div>
         </div>
 
+      </section>
+
+      <!-- Daily limits -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="10"/></svg></span>
+          <div>
+            <h2>Дневные лимиты</h2>
+            <p>Защита от случайного перерасхода. Счётчики сбрасываются каждый день.</p>
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="limitrow">
+            <label for="limitOpenrouter">OpenRouter — запросов в день</label>
+            <span class="usage" id="usageOpenrouter">…</span>
+          </div>
+          <div class="inputwrap">
+            <input id="limitOpenrouter" type="number" min="1" max="10000" step="1" placeholder="80" autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="limitrow">
+            <label for="limitGroq">Groq — запросов в день</label>
+            <span class="usage" id="usageGroq">…</span>
+          </div>
+          <div class="inputwrap">
+            <input id="limitGroq" type="number" min="1" max="10000" step="1" placeholder="300" autocomplete="off" />
+          </div>
+        </div>
       </section>
 
       <!-- Prompts -->

@@ -19,6 +19,7 @@
 import { postJson, postStream } from './http.js';
 import { isImageFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
+import { chargeOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -78,6 +79,10 @@ function historyToMessage(m) {
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null } = opts;
   const key = await getKey();
+  // Charge the daily budget BEFORE the network round-trip — same reasoning as
+  // openrouter.js. classify-ai imports askGroq directly, so charging here
+  // covers every Groq call path, not just the dispatcher's.
+  await chargeOne('groq');
   // Pick the vision model if EITHER the current message OR a replayed history
   // turn carries an image — otherwise a follow-up would route to the text model
   // and lose the original photo.

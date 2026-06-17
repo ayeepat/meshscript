@@ -1,0 +1,14 @@
+{
+  "name": "smesh-licenses",
+  "version": "0.1.0",
+  "private": true,
+  "description": "License issuance + verification backend for the смэш extension.",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.90.0"
+  }
+}

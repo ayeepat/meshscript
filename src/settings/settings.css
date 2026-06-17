@@ -1,4 +1,4 @@
-/* meshscript settings. Tokens come from ../common/theme.css */
+/* смэш settings. Tokens come from ../common/theme.css */
 
 body {
   margin: 0;
@@ -114,6 +114,28 @@ label .opt {
   background: var(--input-bg); padding: 2px 8px; border-radius: var(--r-pill);
 }
 label .sub { font-weight: 500; font-size: 11.5px; color: var(--tertiary); }
+
+/* Daily-limit row — label on the left, "X / Y сегодня" pill on the right. */
+.limitrow { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 7px; }
+.limitrow label { margin: 0; }
+.limitrow .usage {
+  font-size: 11px; font-weight: 600; color: var(--secondary);
+  background: var(--input-bg); padding: 3px 9px; border-radius: var(--r-pill);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+
+/* License-status pill, lives in the License panel's head row.
+   Colors via data-state so the JS can flip status without re-rendering. */
+.licstatus {
+  margin-left: auto; align-self: center;
+  font-size: 11px; font-weight: 600;
+  padding: 4px 10px; border-radius: var(--r-pill);
+  white-space: nowrap;
+  background: var(--input-bg); color: var(--secondary);
+}
+.licstatus[data-state="ok"]   { background: var(--success-soft); color: var(--success); }
+.licstatus[data-state="warn"] { background: var(--warn-soft); color: var(--warn); }
+.licstatus[data-state="err"]  { background: rgba(215, 0, 21, 0.12); color: var(--danger); }
 
 input, textarea, select {
   width: 100%; padding: 11px 14px;

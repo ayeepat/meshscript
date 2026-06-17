@@ -7,6 +7,7 @@ import { askAI } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/history.js';
+import { ensureLicensed } from '../lib/license.js';
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
 import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
@@ -88,6 +89,9 @@ function missingInputGate(category, task, files) {
  * @param {(chunk:string)=>void} [onDelta] stream callback (token-by-token)
  */
 async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta) {
+  // License gate. No-op while LICENSE_ENFORCED is off (preorder window).
+  // Throws a Russian-language error the catch path surfaces verbatim.
+  await ensureLicensed();
   const category = categoryForSubject(subject);
 
   // Extract Office files (.docx/.pptx/.xlsx) to inline text RIGHT HERE, locally
@@ -148,6 +152,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
  * Answers are concise («№N: ответ») and intentionally NOT persisted.
  */
 async function solveTest({ text, screenshot }) {
+  await ensureLicensed();
   const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
   const systemPrompt =
     promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
@@ -210,24 +215,24 @@ function inferMime(name, contentType) {
 async function downloadFile(url, headers) {
   try {
     const res = await fetch(url, { credentials: 'include', headers });
-    if (!res.ok) { console.log('[meshscript] download http', res.status, url); return null; }
+    if (!res.ok) { console.log('[смэш] download http', res.status, url); return null; }
     // An HTML response is an auth/login redirect, not the attachment — reject it
     // so we never hand the model (or the chat chip) a fake "file".
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[meshscript] download got HTML (auth redirect?)', url);
+      console.log('[смэш] download got HTML (auth redirect?)', url);
       return null;
     }
     const buf = await res.arrayBuffer();
     if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) {
-      console.log('[meshscript] download size skip', buf.byteLength, url);
+      console.log('[смэш] download size skip', buf.byteLength, url);
       return null;
     }
     const name = nameFromUrl(url);
     const mimeType = inferMime(name, res.headers.get('content-type'));
-    console.log('[meshscript] downloaded', name, mimeType, buf.byteLength + 'b');
+    console.log('[смэш] downloaded', name, mimeType, buf.byteLength + 'b');
     return { mimeType, dataBase64: abToBase64(buf), name };
-  } catch (e) { console.log('[meshscript] download exception', String(e), url); return null; }
+  } catch (e) { console.log('[смэш] download exception', String(e), url); return null; }
 }
 
 // Reconstruct Mesh's required family-web headers from a bare token. Mirrors the

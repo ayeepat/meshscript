@@ -1,8 +1,10 @@
-/** Settings: theme, API keys, provider, GDZ textbooks, prompts, 7-day history. */
+/** Settings: theme, API keys, provider, daily limits, GDZ textbooks, prompts, 7-day history. */
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
+import { DEFAULT_LIMITS, getUsage } from '../lib/rate-limit.js';
+import { setLicenseKey, getLicenseStatus, reasonMessage } from '../lib/license.js';
 
 initTheme();
 
@@ -77,21 +79,63 @@ function wireReveals() {
 /* ---------- Load / save ---------- */
 
 async function load() {
-  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides', 'aiProvider']);
+  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides', 'aiProvider', 'rateLimits']);
   for (const f of KEY_FIELDS) document.getElementById(f).value = stored[f] || '';
   document.getElementById('aiProvider').value = stored.aiProvider || 'openrouter';
+  const limits = stored.rateLimits || {};
+  document.getElementById('limitOpenrouter').value = limits.openrouter ?? DEFAULT_LIMITS.openrouter;
+  document.getElementById('limitGroq').value = limits.groq ?? DEFAULT_LIMITS.groq;
   const overrides = stored.promptOverrides || {};
   for (const cat of CATS) {
     const ta = document.getElementById('p_' + cat);
     ta.value = overrides[cat] || DEFAULT_PROMPTS[cat];
     ta._refresh?.();
   }
+  await refreshUsage();
+  await loadLicenseUi();
+}
+
+/* ---------- License key ---------- */
+
+async function loadLicenseUi() {
+  const status = await getLicenseStatus();
+  document.getElementById('licenseKey').value = status?.key || '';
+  renderLicenseStatus(status);
+}
+
+function renderLicenseStatus(status) {
+  const pill = document.getElementById('licStatus');
+  if (!status || !status.key) {
+    pill.textContent = 'Не активирована';
+    pill.dataset.state = 'idle';
+    return;
+  }
+  if (status.ok) {
+    const label = status.owner
+      ? 'Активна · доступ владельца'
+      : (status.type === 'subscription' ? 'Активна · подписка' : 'Активна');
+    pill.textContent = label;
+    pill.dataset.state = 'ok';
+    return;
+  }
+  pill.textContent = reasonMessage(status.reason);
+  pill.dataset.state = status.reason === 'network' ? 'warn' : 'err';
+}
+
+async function refreshUsage() {
+  const usage = await getUsage();
+  const fmt = (u) => `${u.used} / ${u.limit} сегодня`;
+  document.getElementById('usageOpenrouter').textContent = fmt(usage.openrouter);
+  document.getElementById('usageGroq').textContent = fmt(usage.groq);
 }
 
 async function save() {
   const data = {};
   for (const f of KEY_FIELDS) data[f] = document.getElementById(f).value.trim();
   data.aiProvider = document.getElementById('aiProvider').value;
+  const orLimit = Math.max(1, parseInt(document.getElementById('limitOpenrouter').value, 10) || DEFAULT_LIMITS.openrouter);
+  const groqLimit = Math.max(1, parseInt(document.getElementById('limitGroq').value, 10) || DEFAULT_LIMITS.groq);
+  data.rateLimits = { openrouter: orLimit, groq: groqLimit };
   const promptOverrides = {};
   for (const cat of CATS) {
     const v = document.getElementById('p_' + cat).value.trim();
@@ -99,6 +143,15 @@ async function save() {
   }
   data.promptOverrides = promptOverrides;
   await chrome.storage.local.set(data);
+  await refreshUsage();
+  // Verify license against the backend ONLY when the key changed — saves a
+  // network round-trip when the user is just editing prompts or limits.
+  const newKey = document.getElementById('licenseKey').value.trim().toUpperCase();
+  const priorStatus = await getLicenseStatus();
+  if ((priorStatus?.key || '') !== newKey) {
+    const fresh = await setLicenseKey(newKey);
+    renderLicenseStatus(fresh);
+  }
   const s = document.getElementById('status');
   s.innerHTML = `${iconSvg('check', 14)}Сохранено`;
   s.classList.add('show');

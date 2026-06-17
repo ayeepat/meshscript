@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
-  "name": "meshscript",
-  "version": "0.4.0",
+  "name": "смэш",
+  "version": "0.5.0",
   "description": "Personal homework assistant for the Mesh (school.mos.ru) platform.",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest"],
   "host_permissions": [
@@ -28,7 +28,7 @@
   },
   "action": {
     "default_popup": "src/popup/popup.html",
-    "default_title": "meshscript",
+    "default_title": "смэш",
     "default_icon": {
       "16": "assets/icons/icon16.png",
       "48": "assets/icons/icon48.png",
