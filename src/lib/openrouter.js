@@ -106,7 +106,7 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   const headers = {
     Authorization: `Bearer ${key}`,
     'HTTP-Referer': 'https://gitlab.com/tes738882-group/meshscript',
-    'X-Title': 'смэш'
+    'X-Title': 'smesh'
   };
 
   // Stream only for free-form solves; JSON-mode replies are parsed whole.
