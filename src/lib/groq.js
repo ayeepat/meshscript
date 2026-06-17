@@ -16,7 +16,7 @@
  * for structured replies. (json_object disables streaming — parsed whole.)
  */
 
-import { postJson, postStream } from './http.js';
+import { postStream } from './http.js';
 import { isImageFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
 import { chargeOne } from './rate-limit.js';
@@ -114,10 +114,11 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
 
   const headers = { Authorization: `Bearer ${key}` };
 
-  if (onDelta && responseFormat !== 'json_object') {
-    return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, signal });
-  }
-
-  const json = await postJson(ENDPOINT, { headers, body, label: 'Groq', signal });
-  return json?.choices?.[0]?.message?.content || '(пустой ответ)';
+  // ALWAYS stream, same as openrouter.js: the idle-timeout-per-chunk behaviour
+  // keeps a slow vision reply from tripping the hard timeout that made the test
+  // solver hang. onDelta may be null in JSON mode — postStream accumulates and
+  // returns the full text. (On the vision path response_format is intentionally
+  // dropped above, so the streamed text may be plain prose; the popup's tiered
+  // parser salvages it.)
+  return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, signal });
 }

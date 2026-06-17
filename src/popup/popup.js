@@ -472,6 +472,23 @@ function renderAnswer(el, raw) {
   return plain;
 }
 
+/**
+ * Hard safety net so the test solver can NEVER spin on «Решаю…» forever.
+ * Races a promise against a timer: if the underlying step (screenshot, or the
+ * background round-trip) doesn't settle in time — e.g. the MV3 service worker
+ * was recycled mid-request and its reply was dropped, or the network stalled —
+ * we reject with a clear, actionable Russian message instead of hanging. The
+ * background work may still finish (and the on-page answer panel may appear);
+ * this just guarantees the popup always gives the user feedback.
+ */
+function withTimeout(promise, ms, message) {
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
+}
+
 async function solveTestOnScreen() {
   const btn = document.getElementById('solveTest');
   const box = document.getElementById('testAnswer');
@@ -488,25 +505,37 @@ async function solveTestOnScreen() {
     // the user waits for the slower of the two, not their sum. Page text is
     // best-effort: some pages forbid injection — the screenshot (PNG, lossless
     // so small numbers/formulas stay crisp) is usually enough on its own.
-    const [pageText, dataUrl] = await Promise.all([
-      chrome.scripting
-        .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
-        .then(([inj]) => inj?.result || '')
-        .catch(() => ''),
-      chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
-    ]);
-    const screenshot = { mimeType: 'image/png', dataBase64: dataUrl.split(',')[1], name: 'screen.png' };
+    const [pageText, dataUrl] = await withTimeout(
+      Promise.all([
+        chrome.scripting
+          .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
+          .then(([inj]) => inj?.result || '')
+          .catch(() => ''),
+        chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
+      ]),
+      20000,
+      'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
+    );
+    // Guard against a missing/empty capture so we surface a clear message
+    // instead of throwing on dataUrl.split (which read as a cryptic error).
+    const b64 = (dataUrl || '').split(',')[1];
+    if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
+    const screenshot = { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' };
 
     setStatus(box, 'Решаю…');
-    const resp = await new Promise((resolve) => {
-      // tabId lets the service worker drop the parsed answers into an in-page
-      // floating panel via chrome.scripting + chrome.tabs.sendMessage. The
-      // popup still renders them too — the panel just outlives the popup.
-      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId: tab.id } }, (r) => {
-        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-        else resolve(r || { ok: false, error: 'нет ответа' });
-      });
-    });
+    const resp = await withTimeout(
+      new Promise((resolve) => {
+        // tabId lets the service worker drop the parsed answers into an in-page
+        // floating panel via chrome.scripting + chrome.tabs.sendMessage. The
+        // popup still renders them too — the panel just outlives the popup.
+        chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId: tab.id } }, (r) => {
+          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+          else resolve(r || { ok: false, error: 'нет ответа' });
+        });
+      }),
+      120000,
+      'Модель слишком долго не отвечает. Проверьте интернет и API-ключ в настройках, затем попробуйте ещё раз.'
+    );
     if (!resp.ok) throw new Error(resp.error || 'нет ответа');
     const plain = renderAnswer(box, resp.answer);
     const copyLabel = document.getElementById('copyTestLabel');

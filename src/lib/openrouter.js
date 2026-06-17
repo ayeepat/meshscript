@@ -7,7 +7,7 @@
  * Set opts.responseFormat = 'json_object' for structured replies (test solver).
  */
 
-import { postJson, postStream } from './http.js';
+import { postStream } from './http.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { chargeOne } from './rate-limit.js';
 
@@ -109,11 +109,22 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
     'X-Title': 'smesh'
   };
 
-  // Stream only for free-form solves; JSON-mode replies are parsed whole.
-  if (onDelta && responseFormat !== 'json_object') {
-    return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, signal });
-  }
-
-  const json = await postJson(ENDPOINT, { headers, body, label: 'OpenRouter', signal });
-  return json?.choices?.[0]?.message?.content || '(пустой ответ)';
+  // ALWAYS stream — including JSON-mode replies (the test solver). This is the
+  // fix for the test feature hanging forever on «Решаю…».
+  //
+  // The old code sent JSON-mode calls through postJson, whose timeout is a HARD
+  // 60-s cap on the whole round-trip. google/gemini-2.5-flash is a reasoning
+  // model: with a screenshot + JSON output it routinely spends >60 s "thinking"
+  // before the first content token, so the request was aborted at 60 s, then
+  // silently retried twice more (re-uploading the screenshot each time) — ~3
+  // minutes of a frozen spinner that looked like an infinite hang, then a bare
+  // timeout error.
+  //
+  // postStream instead uses an IDLE timeout that resets on every byte received
+  // (reasoning deltas / keep-alives included), so a slow-but-progressing answer
+  // completes normally and never trips the timeout. onDelta may be null in JSON
+  // mode — postStream just accumulates and returns the full text, which is
+  // exactly what solveTest/the popup parse. response_format stays in the body,
+  // so the streamed content is still a JSON object.
+  return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, signal });
 }
