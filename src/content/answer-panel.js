@@ -20,7 +20,36 @@
   let lastPayload = null;
   let state = { x: null, y: null, minimized: false };
 
+  // Theme follows the user's extension preference ('system' | 'light' | 'dark'),
+  // stored in chrome.storage.local by src/common/theme.js. The panel lives in a
+  // Shadow DOM on the host page, so it can't inherit the extension's CSS tokens —
+  // we resolve the theme here and paint the panel to match.
+  let themePref = 'system';
+  const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
+
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  const resolveTheme = () =>
+    themePref === 'light' || themePref === 'dark'
+      ? themePref
+      : (darkMedia.matches ? 'dark' : 'light');
+
+  function loadTheme() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get('theme', (v) => {
+          if (!chrome.runtime.lastError && v?.theme) themePref = v.theme;
+          resolve();
+        });
+      } catch { resolve(); }
+    });
+  }
+
+  function applyTheme() {
+    if (!shadow) return;
+    const panel = shadow.querySelector('.panel');
+    if (panel) panel.dataset.theme = resolveTheme();
+  }
 
   function loadState() {
     return new Promise((resolve) => {
@@ -74,15 +103,49 @@
     shadow.innerHTML = `
       <style>
         :host, * { box-sizing: border-box; }
+
+        /* Theme tokens — toggled live via .panel[data-theme]. Defaults to dark
+           so the panel never flashes unstyled before the preference resolves. */
+        .panel[data-theme="dark"] {
+          --p-bg: rgba(22, 24, 30, 0.94);
+          --p-text: #f3f4f8;
+          --p-border: rgba(255, 255, 255, 0.08);
+          --p-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+          --p-titlebar: rgba(255, 255, 255, 0.04);
+          --p-muted: #8a92a3;
+          --p-btn-border: rgba(255, 255, 255, 0.14);
+          --p-btn-hover: rgba(255, 255, 255, 0.10);
+          --p-btn-active: rgba(255, 255, 255, 0.16);
+          --p-li-border: rgba(255, 255, 255, 0.05);
+          --p-q: #cbd0d8;
+          --p-answer: #82e2b6;
+          --p-arrow: #6c7280;
+        }
+        .panel[data-theme="light"] {
+          --p-bg: rgba(255, 255, 255, 0.96);
+          --p-text: #0d0d0d;
+          --p-border: rgba(0, 0, 0, 0.10);
+          --p-shadow: 0 14px 40px rgba(0, 0, 0, 0.16);
+          --p-titlebar: rgba(0, 0, 0, 0.035);
+          --p-muted: #6b6b73;
+          --p-btn-border: rgba(0, 0, 0, 0.16);
+          --p-btn-hover: rgba(0, 0, 0, 0.05);
+          --p-btn-active: rgba(0, 0, 0, 0.09);
+          --p-li-border: rgba(0, 0, 0, 0.06);
+          --p-q: #3a3a42;
+          --p-answer: #1a7f37;
+          --p-arrow: #9b9ba4;
+        }
+
         .panel {
           position: fixed;
           width: ${DEFAULT_W}px;
           max-height: 70vh;
-          background: rgba(22, 24, 30, 0.94);
-          color: #f3f4f8;
-          border: 1px solid rgba(255, 255, 255, 0.08);
+          background: var(--p-bg);
+          color: var(--p-text);
+          border: 1px solid var(--p-border);
           border-radius: 12px;
-          box-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
+          box-shadow: var(--p-shadow);
           font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
           font-size: 13px;
           backdrop-filter: blur(10px);
@@ -98,16 +161,16 @@
           gap: 6px;
           padding: 8px 10px;
           cursor: grab;
-          background: rgba(255, 255, 255, 0.04);
+          background: var(--p-titlebar);
           user-select: none;
         }
         .titlebar.dragging { cursor: grabbing; }
         .title { flex: 1; font-weight: 600; font-size: 12px; letter-spacing: 0.2px; }
-        .count { color: #8a92a3; font-weight: 500; margin-left: 4px; }
+        .count { color: var(--p-muted); font-weight: 500; margin-left: 4px; }
         button {
           background: transparent;
           color: inherit;
-          border: 1px solid rgba(255, 255, 255, 0.14);
+          border: 1px solid var(--p-btn-border);
           border-radius: 6px;
           padding: 3px 7px;
           font-size: 12px;
@@ -116,8 +179,8 @@
           font-family: inherit;
           min-width: 24px;
         }
-        button:hover { background: rgba(255, 255, 255, 0.1); }
-        button:active { background: rgba(255, 255, 255, 0.16); }
+        button:hover { background: var(--p-btn-hover); }
+        button:active { background: var(--p-btn-active); }
         .btn-copy { font-weight: 600; }
         .body {
           overflow-y: auto;
@@ -131,24 +194,24 @@
         li {
           padding: 6px 0;
           line-height: 1.45;
-          border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+          border-bottom: 1px solid var(--p-li-border);
         }
         li:last-child { border-bottom: none; }
-        .num { color: #8a92a3; margin-right: 6px; font-variant-numeric: tabular-nums; }
-        .q { color: #cbd0d8; }
+        .num { color: var(--p-muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
+        .q { color: var(--p-q); }
         .a {
-          color: #82e2b6;
+          color: var(--p-answer);
           font-weight: 600;
           margin-left: 6px;
           word-break: break-word;
         }
-        li .q + .a::before { content: " → "; color: #6c7280; font-weight: normal; margin-right: 4px; }
-        .empty { color: #8a92a3; font-style: italic; padding: 6px 0; }
+        li .q + .a::before { content: " → "; color: var(--p-arrow); font-weight: normal; margin-right: 4px; }
+        .empty { color: var(--p-muted); font-style: italic; padding: 6px 0; }
         .panel.minimized .body { display: none; }
         .panel.minimized { max-height: none; }
-        .copied { color: #82e2b6; border-color: #82e2b6; }
+        .copied { color: var(--p-answer); border-color: var(--p-answer); }
       </style>
-      <div class="panel${state.minimized ? ' minimized' : ''}">
+      <div class="panel${state.minimized ? ' minimized' : ''}" data-theme="${resolveTheme()}">
         <div class="titlebar" data-drag>
           <div class="title">Ответы на тест<span class="count"> · ${questions.length}</span></div>
           <button class="btn-copy" title="Скопировать все ответы" aria-label="Скопировать">Copy</button>
@@ -253,7 +316,7 @@
   }
 
   async function show(payload) {
-    await loadState();
+    await Promise.all([loadState(), loadTheme()]);
     ensureHost();
     buildPanel(payload);
   }
@@ -272,6 +335,21 @@
     if (panel && state.x != null && state.y != null) positionPanel(panel);
   });
 
+  // Live-sync with the user's theme choice from any extension page (settings,
+  // dashboard, popup). An open panel repaints instantly, no re-solve needed.
+  try {
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes.theme) {
+        themePref = changes.theme.newValue || 'system';
+        applyTheme();
+      }
+    });
+  } catch { /* storage events unavailable in this context */ }
+
+  // When the preference is 'system', follow the OS scheme as it flips.
+  darkMedia.addEventListener('change', () => { if (themePref === 'system') applyTheme(); });
+
   // Tear down on full navigation (SPA route changes won't fire — user closes manually).
   window.addEventListener('pagehide', hide);
 })();
+
