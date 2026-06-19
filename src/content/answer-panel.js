@@ -86,14 +86,21 @@
     ));
   }
 
+  // The id must match what scraper.js's fillTestAnswers reports back in its
+  // {filled, skipped} summary, so the ✓ / ⚠ markers land on the right line.
+  function questionId(q, i) {
+    return (q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+  }
+
   function questionLine(q, i) {
     const num = q.index != null ? q.index : i + 1;
+    const qid = escapeHtml(questionId(q, i));
     const text = (q.text || '').trim();
     const ans = escapeHtml(q.answer ?? '');
     if (text) {
-      return `<li><span class="num">${escapeHtml(num)}.</span> <span class="q">${escapeHtml(text)}</span><span class="a">${ans}</span></li>`;
+      return `<li data-qid="${qid}"><span class="num">${escapeHtml(num)}.</span> <span class="q">${escapeHtml(text)}</span><span class="a">${ans}</span></li>`;
     }
-    return `<li><span class="num">№${escapeHtml(num)}</span><span class="a">${ans}</span></li>`;
+    return `<li data-qid="${qid}"><span class="num">№${escapeHtml(num)}</span><span class="a">${ans}</span></li>`;
   }
 
   function buildPanel(payload) {
@@ -210,10 +217,17 @@
         .panel.minimized .body { display: none; }
         .panel.minimized { max-height: none; }
         .copied { color: var(--p-answer); border-color: var(--p-answer); }
+        .failed { color: #e5534b; border-color: #e5534b; }
+        .btn-fill { font-weight: 600; }
+        /* Per-line fill markers, set after "Заполнить" runs. */
+        .mark { font-variant-numeric: tabular-nums; margin-right: 4px; }
+        .mark.ok { color: var(--p-answer); }
+        .mark.warn { color: #d9a300; }
       </style>
       <div class="panel${state.minimized ? ' minimized' : ''}" data-theme="${resolveTheme()}">
         <div class="titlebar" data-drag>
           <div class="title">Ответы на тест<span class="count"> · ${questions.length}</span></div>
+          <button class="btn-fill" title="Заполнить форму теста ответами" aria-label="Заполнить">Заполнить</button>
           <button class="btn-copy" title="Скопировать все ответы" aria-label="Скопировать">Copy</button>
           <button class="btn-toggle" title="Свернуть / развернуть" aria-label="Свернуть">${state.minimized ? '▢' : '–'}</button>
           <button class="btn-close" title="Закрыть" aria-label="Закрыть">×</button>
@@ -285,12 +299,55 @@
     window.addEventListener('mouseup', onUp, true);
   }
 
+  // Paint the ✓ / ⚠ markers from a fill summary onto the matching lines.
+  function markFillResults(summary) {
+    if (!shadow) return;
+    const filled = new Set((summary?.filled || []).map(String));
+    const skipped = new Set((summary?.skipped || []).map(String));
+    shadow.querySelectorAll('li[data-qid]').forEach((li) => {
+      const id = li.getAttribute('data-qid');
+      let mark = li.querySelector('.mark');
+      if (!mark) {
+        mark = document.createElement('span');
+        mark.className = 'mark';
+        li.insertBefore(mark, li.firstChild);
+      }
+      if (filled.has(id)) { mark.className = 'mark ok'; mark.textContent = '✓ '; }
+      else if (skipped.has(id)) { mark.className = 'mark warn'; mark.textContent = '⚠ '; }
+      else { mark.className = 'mark'; mark.textContent = ''; }
+    });
+  }
+
   function wireButtons(panel, questions) {
     const closeBtn = panel.querySelector('.btn-close');
     const toggleBtn = panel.querySelector('.btn-toggle');
     const copyBtn = panel.querySelector('.btn-copy');
+    const fillBtn = panel.querySelector('.btn-fill');
 
     closeBtn.addEventListener('click', hide);
+
+    fillBtn.addEventListener('click', () => {
+      const qs = (lastPayload && lastPayload.questions) || questions || [];
+      const orig = fillBtn.textContent;
+      // fillTestAnswers lives in scraper.js, exposed on the shared isolated-world
+      // window. The service worker injects scraper.js alongside this panel, so it
+      // should be present; if not, fail visibly and leave copy-paste as the path.
+      let summary = null;
+      try {
+        if (typeof window.__smeshFill === 'function') summary = window.__smeshFill(qs);
+      } catch { summary = null; }
+      if (!summary) {
+        fillBtn.textContent = 'Ошибка';
+        fillBtn.classList.add('failed');
+        setTimeout(() => { fillBtn.textContent = orig; fillBtn.classList.remove('failed'); }, 1600);
+        return;
+      }
+      markFillResults(summary);
+      const n = (summary.filled || []).length;
+      fillBtn.textContent = `✓ ${n}`;
+      fillBtn.classList.add('copied');
+      setTimeout(() => { fillBtn.textContent = orig; fillBtn.classList.remove('copied'); }, 1600);
+    });
 
     toggleBtn.addEventListener('click', () => {
       state.minimized = !state.minimized;

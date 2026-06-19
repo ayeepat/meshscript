@@ -761,6 +761,396 @@ function debugScan() {
   };
 }
 
+/* =================================================================
+ * TEST AUTO-FILL
+ * -----------------------------------------------------------------
+ * Given the model's answers ([{ index, answer, choice? }]), discover the
+ * test's form controls by DOM traversal — NO hardcoded class names, same as
+ * the homework scanner — and fill them in. The Mesh test page is a React/MUI
+ * app, so every write goes through the native value setter + bubbling input/
+ * change events (text), or a real click() (radio/checkbox), so React's
+ * controlled state actually updates.
+ *
+ * Conservative by design: a control is filled only when the match clears a
+ * confidence threshold AND beats the runner-up; anything ambiguous, detached,
+ * or unmatched is reported as "skipped" so the copy-paste panel stays the
+ * reliable fallback. The form is NEVER submitted.
+ * ================================================================= */
+
+// MUI hides the real <input> (opacity:0) behind a styled control, so we can't
+// judge a form control by opacity the way isVisible() does. Decide by the
+// rendered box of the input OR its label, plus a display/visibility walk.
+function isFillable(el) {
+  if (!el || el.disabled || el.readOnly) return false;
+  let n = el;
+  while (n && n.nodeType === 1) {
+    const st = window.getComputedStyle(n);
+    if (st.display === 'none' || st.visibility === 'hidden') return false;
+    n = n.parentElement;
+  }
+  const box = el.getBoundingClientRect();
+  if (box.width > 0 && box.height > 0) return true;
+  const ref = el.closest('label') || el.parentElement;
+  if (ref) {
+    const rb = ref.getBoundingClientRect();
+    if (rb.width > 0 && rb.height > 0) return true;
+  }
+  return false;
+}
+
+function pickControls(sel) {
+  return Array.from(document.querySelectorAll(sel)).filter(isFillable);
+}
+
+// Stable per-element key so we can group controls in a Map without classes.
+let __smeshUid = 0;
+const __smeshUidMap = new WeakMap();
+function elUid(el) {
+  if (!el) return 'null';
+  let v = __smeshUidMap.get(el);
+  if (!v) { v = 'e' + (++__smeshUid); __smeshUidMap.set(el, v); }
+  return v;
+}
+
+function nearestCommonAncestor(a, b) {
+  const seen = new Set();
+  for (let n = a; n; n = n.parentElement) seen.add(n);
+  for (let n = b; n; n = n.parentElement) if (seen.has(n)) return n;
+  return null;
+}
+
+function commonAncestor(els) {
+  if (!els.length) return null;
+  let a = els[0];
+  for (let i = 1; i < els.length; i++) {
+    a = nearestCommonAncestor(a, els[i]);
+    if (!a) return null;
+  }
+  return a;
+}
+
+function domOrderCompare(a, b) {
+  if (a === b) return 0;
+  const pos = a.compareDocumentPosition(b);
+  if (pos & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+  if (pos & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+  return 0;
+}
+
+// Extract a question number from the prompt text that PRECEDES the first form
+// control inside `node`. Anchored at the start so option text ("4 года") can't
+// masquerade as a question number. Returns null when no leading number is seen.
+function leadingQuestionNumber(node) {
+  const ctrl = node.querySelector('input, textarea, select');
+  let text = '';
+  if (ctrl) {
+    const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+    let t;
+    while ((t = walker.nextNode())) {
+      if (ctrl.compareDocumentPosition(t) & Node.DOCUMENT_POSITION_PRECEDING) {
+        text += ' ' + t.nodeValue;
+      } else break;
+    }
+  } else {
+    text = node.textContent;
+  }
+  const norm = normalize(text);
+  const m = norm.match(/^\s*(?:вопрос|задание)\s*[№#]?\s*(\d{1,3})\b/i)
+    || norm.match(/^\s*[№#]\s*(\d{1,3})\b/)
+    || norm.match(/^\s*(\d{1,3})\s*[.)]/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Climb from a control's container looking for the enclosing question block and
+// its number. Falls back to (base, null) — positional matching takes over then.
+function questionInfo(base) {
+  let node = base;
+  for (let i = 0; i < 6 && node && node !== document.body; i++, node = node.parentElement) {
+    const num = leadingQuestionNumber(node);
+    if (num != null) return { container: node, number: num };
+  }
+  return { container: base, number: null };
+}
+
+// Smallest ancestor that groups this checkbox with its siblings but no controls
+// of another question. MUI checkboxes in a FormGroup rarely share a name, so we
+// group by container instead. Stops as soon as climbing would pull in a radio /
+// text control (a different question type) or a numbered question boundary.
+function checkboxGroupContainer(cb) {
+  let best = cb.parentElement || cb;
+  let node = cb.parentElement;
+  while (node && node !== document.body) {
+    const mixers = node.querySelectorAll('input[type=radio], input[type=text], input[type=number], input:not([type]), textarea');
+    if (mixers.length) break;
+    best = node;
+    if (leadingQuestionNumber(node) != null) break;
+    node = node.parentElement;
+  }
+  return best;
+}
+
+function makeUnit(type, inputs, providedContainer) {
+  const base = providedContainer || commonAncestor(inputs) || inputs[0].parentElement || inputs[0];
+  const info = questionInfo(base);
+  return { type, inputs, anchor: inputs[0], number: info.number };
+}
+
+// Discover every fillable question on the page as a list of units, in document
+// order. Radios group by their shared `name` (MUI RadioGroup) or RadioGroup
+// container; checkboxes by container; text/number/textarea are one-per-unit.
+function collectUnits() {
+  const units = [];
+  const consumed = new Set();
+
+  // --- radio groups ---
+  const radioByKey = new Map();
+  for (const r of pickControls('input[type=radio]')) {
+    const key = r.name ? 'name:' + r.name : 'grp:' + elUid(r.closest('[role=radiogroup]') || r.parentElement);
+    if (!radioByKey.has(key)) radioByKey.set(key, []);
+    radioByKey.get(key).push(r);
+    consumed.add(r);
+  }
+  for (const inputs of radioByKey.values()) units.push(makeUnit('radio', inputs));
+
+  // --- checkbox groups ---
+  const cbByKey = new Map();
+  for (const c of pickControls('input[type=checkbox]')) {
+    if (consumed.has(c)) continue;
+    const container = checkboxGroupContainer(c);
+    const key = 'cb:' + elUid(container);
+    if (!cbByKey.has(key)) cbByKey.set(key, { container, inputs: [] });
+    cbByKey.get(key).inputs.push(c);
+  }
+  for (const { container, inputs } of cbByKey.values()) units.push(makeUnit('checkbox', inputs, container));
+
+  // --- free text ---
+  for (const t of pickControls('input[type=text], input[type=number], input:not([type]), textarea')) {
+    if (consumed.has(t)) continue;
+    units.push(makeUnit('text', [t]));
+  }
+
+  units.sort((a, b) => domOrderCompare(a.anchor, b.anchor));
+  return units;
+}
+
+// Resolve the visible label text for an option control. Tries, in order:
+// associated <label>, wrapping <label> (MUI FormControlLabel), aria-label /
+// aria-labelledby, then a text-bearing sibling that holds no nested input.
+function controlLabelText(input) {
+  try {
+    if (input.labels && input.labels.length) {
+      const t = normalize(Array.from(input.labels).map((l) => l.textContent).join(' '));
+      if (t) return t;
+    }
+  } catch { /* .labels can throw on detached nodes */ }
+  const lab = input.closest('label');
+  if (lab) { const t = normalize(lab.textContent); if (t) return t; }
+  const al = input.getAttribute('aria-label');
+  if (al && normalize(al)) return normalize(al);
+  const lb = input.getAttribute('aria-labelledby');
+  if (lb) {
+    const t = normalize(lb.split(/\s+/).map((id) => document.getElementById(id)?.textContent || '').join(' '));
+    if (t) return t;
+  }
+  let node = input.parentElement;
+  for (let i = 0; i < 4 && node; i++, node = node.parentElement) {
+    const siblings = node.parentElement ? node.parentElement.children : [];
+    for (const sib of siblings) {
+      if (sib === node || (sib.querySelector && sib.querySelector('input'))) continue;
+      const t = normalize(sib.textContent);
+      if (t) return t;
+    }
+    const own = normalize(node.textContent);
+    if (own) return own;
+  }
+  return '';
+}
+
+// Normalize an answer / option label for fuzzy comparison: lowercase, ё→е,
+// strip a leading enumerator ("Б)", "2."), drop punctuation, collapse spaces.
+function normalizeForMatch(s) {
+  return normalize(s)
+    .toLowerCase()
+    .replace(/ё/g, 'е')
+    .replace(/^[a-zа-я0-9]{1,2}\s*[).:\-–—]\s*/i, '')
+    .replace(/[«»"'’.,;:!?()\[\]]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+// Cyrillic option lettering as Mesh uses it (а, б, в, …; ё and й skipped).
+const OPTION_LETTERS = 'абвгдежзиклмнопрстуф';
+
+// Interpret a bare letter ("Б"), latin letter, or number ("2") as a 0-based
+// option index. Returns -1 when the string isn't a pure positional reference.
+function asOptionIndex(s) {
+  const t = normalize(s).toLowerCase().replace(/ё/g, 'е').replace(/[).:\-–—]/g, '').trim();
+  if (/^[а-я]$/.test(t)) { const i = OPTION_LETTERS.indexOf(t); return i >= 0 ? i : -1; }
+  if (/^[a-z]$/.test(t)) return t.charCodeAt(0) - 97;
+  if (/^\d{1,2}$/.test(t)) return parseInt(t, 10) - 1;
+  return -1;
+}
+
+// Similarity in [0,1]: exact normalized match → 1, containment → high, else a
+// token Jaccard capped below containment so a partial word overlap can't pose
+// as a strong match.
+function similarity(aNorm, bNorm) {
+  if (!aNorm || !bNorm) return 0;
+  if (aNorm === bNorm) return 1;
+  if (bNorm.includes(aNorm) || aNorm.includes(bNorm)) {
+    const lo = Math.min(aNorm.length, bNorm.length);
+    const hi = Math.max(aNorm.length, bNorm.length);
+    return 0.6 + 0.39 * (lo / hi);
+  }
+  const A = new Set(aNorm.split(' ').filter(Boolean));
+  const B = new Set(bNorm.split(' ').filter(Boolean));
+  if (!A.size || !B.size) return 0;
+  let inter = 0;
+  for (const x of A) if (B.has(x)) inter++;
+  return (inter / (A.size + B.size - inter)) * 0.8;
+}
+
+const MATCH_MIN = 0.5;   // floor: below this we never select
+const MATCH_MARGIN = 0.08; // best must beat runner-up by this much
+
+// Pick the single best option for one answer string. Text similarity is the
+// primary signal; a bare letter/number in the answer (or an explicit `choice`
+// hint from the model) is used only as a fallback when text doesn't decide.
+function bestOption(answerStr, options, choice) {
+  const aNorm = normalizeForMatch(answerStr);
+  let best = null;
+  let second = null;
+  for (const o of options) {
+    const s = similarity(aNorm, o.labelNorm);
+    if (!best || s > best.s) { second = best; best = { opt: o, s }; }
+    else if (!second || s > second.s) second = { opt: o, s };
+  }
+  if (best && best.s >= MATCH_MIN && (!second || best.s - second.s >= MATCH_MARGIN)) return best.opt;
+  let idx = asOptionIndex(answerStr);
+  if (idx < 0 && choice != null) idx = asOptionIndex(String(choice));
+  if (idx >= 0 && idx < options.length) return options[idx];
+  return null;
+}
+
+// --- React-aware writers ---
+
+function setNativeValue(el, value) {
+  const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) desc.set.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
+function selectRadio(input) {
+  if (!input.checked) input.click(); // real click → React's onChange fires
+  if (!input.checked) { // belt-and-braces for non-standard handlers
+    input.checked = true;
+    input.dispatchEvent(new Event('click', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+function setCheckbox(input, desired) {
+  if (input.checked !== desired) input.click();
+  if (input.checked !== desired) {
+    input.checked = desired;
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+}
+
+// Don't act on a "not visible, scroll" sentinel or an empty answer.
+function isUnfillableAnswer(ans) {
+  return !ans || /не\s*видно|прокрут/i.test(ans);
+}
+
+// Fill one discovered unit from one question. Returns true only on a real edit.
+function fillUnit(unit, question) {
+  const ans = String(question.answer ?? '').trim();
+  if (isUnfillableAnswer(ans)) return false;
+
+  if (unit.type === 'text') {
+    const input = unit.inputs[0];
+    if (!input || !document.documentElement.contains(input)) return false;
+    setNativeValue(input, ans);
+    return true;
+  }
+
+  const options = unit.inputs
+    .filter((input) => document.documentElement.contains(input))
+    .map((input) => ({ input, labelNorm: normalizeForMatch(controlLabelText(input)) }));
+  if (!options.length) return false;
+
+  if (unit.type === 'checkbox') {
+    const parts = ans.split(/\s*(?:,|;|\bи\b|\/|\n)\s*/i).map((p) => p.trim()).filter(Boolean);
+    const targets = new Set();
+    for (const part of (parts.length ? parts : [ans])) {
+      const m = bestOption(part, options);
+      if (m) targets.add(m.input);
+    }
+    if (!targets.size) return false;
+    for (const o of options) if (targets.has(o.input)) setCheckbox(o.input, true);
+    return true;
+  }
+
+  // radio (single choice)
+  const m = bestOption(ans, options, question.choice);
+  if (!m) return false;
+  selectRadio(m.input);
+  return true;
+}
+
+/**
+ * Fill the Mesh test form from the model's answers. Matches each question to a
+ * discovered unit by its number first, then by position. Never guesses past the
+ * confidence threshold and never submits. Returns { filled, skipped } as lists
+ * of question identifiers (the `index` field, or 1-based position when absent).
+ */
+function fillTestAnswers(questions) {
+  const summary = { filled: [], skipped: [] };
+  if (!Array.isArray(questions) || !questions.length) return summary;
+
+  const idFor = (q, i) =>
+    (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+
+  let units = [];
+  try { units = collectUnits(); } catch { units = []; }
+  if (!units.length) {
+    questions.forEach((q, i) => summary.skipped.push(idFor(q, i)));
+    return summary;
+  }
+
+  const byNumber = new Map();
+  units.forEach((u) => { if (u.number != null && !byNumber.has(String(u.number))) byNumber.set(String(u.number), u); });
+  const used = new Set();
+
+  questions.forEach((q, qi) => {
+    const id = idFor(q, qi);
+    let unit = byNumber.get(String(id));
+    if (!unit || used.has(unit)) {
+      // Positional fallback: numeric ids map to 1-based order, else array order.
+      const posIdx = /^\d+$/.test(String(id)) ? parseInt(id, 10) - 1 : qi;
+      unit = (units[posIdx] && !used.has(units[posIdx])) ? units[posIdx]
+        : (units[qi] && !used.has(units[qi])) ? units[qi] : null;
+    }
+    if (!unit || used.has(unit)) { summary.skipped.push(id); return; }
+
+    let ok = false;
+    try { ok = fillUnit(unit, q); } catch { ok = false; }
+    if (ok) { used.add(unit); summary.filled.push(id); }
+    else summary.skipped.push(id);
+  });
+
+  return summary;
+}
+
+// Shared isolated-world entry point: answer-panel.js (same content-script world,
+// so it sees this global) calls it directly — chrome.runtime messaging can't
+// reach a sibling content script in the same tab.
+window.__smeshFill = fillTestAnswers;
+
 // Guard against duplicate listeners: the manifest auto-injects this script,
 // and popup.js falls back to chrome.scripting.executeScript on a race. Without
 // this guard both copies would respond to every MESH_SCAN.
@@ -809,6 +1199,19 @@ if (!window.__smeshListenerAdded) {
       if (msg && msg.type === 'HIDE_ANSWERS') {
         try { window.__smeshPanel?.hide(); } catch { /* nothing to clean up */ }
         sendResponse({ ok: true });
+        return false;
+      }
+      if (msg && msg.type === 'FILL_ANSWERS') {
+        // Auto-fill the test form. The in-page panel button calls fillTestAnswers
+        // directly (same world); this message is for any external trigger
+        // (service worker / popup). Always degrades to a skipped summary.
+        let summary = { filled: [], skipped: [] };
+        try {
+          summary = fillTestAnswers(msg.payload?.questions || []);
+          sendResponse({ ok: true, summary });
+        } catch (e) {
+          sendResponse({ ok: false, error: String(e), summary });
+        }
         return false;
       }
     } catch (e) {

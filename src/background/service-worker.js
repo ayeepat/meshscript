@@ -186,16 +186,23 @@ async function solveTest({ text, screenshot }) {
  */
 function parseTestAnswers(raw) {
   if (!raw || typeof raw !== 'string') return [];
-  const make = (n, a) => ({
-    index: typeof n === 'number' ? n : (String(n).trim() || ''),
-    text: '',
-    answer: String(a ?? '').trim()
-  });
+  const make = (n, a, c) => {
+    const q = {
+      index: typeof n === 'number' ? n : (String(n).trim() || ''),
+      text: '',
+      answer: String(a ?? '').trim()
+    };
+    // Optional option letter/number for choice questions — a fill-only hint the
+    // matcher (scraper.js) uses to break ties when option text is ambiguous.
+    // Absent in the legacy {n,a} shape; panel/copy never read it.
+    if (c != null && String(c).trim() !== '') q.choice = String(c).trim();
+    return q;
+  };
   const fromObj = (obj) => {
     if (!obj || !Array.isArray(obj.answers)) return null;
     const out = obj.answers
       .filter((x) => x && x.a != null && x.n != null)
-      .map((x) => make(x.n, x.a));
+      .map((x) => make(x.n, x.a, x.c));
     return out.length ? out : null;
   };
   try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
