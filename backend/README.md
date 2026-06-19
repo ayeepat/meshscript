@@ -1,4 +1,4 @@
-# смэш — license backend
+# СМЭШ AI — license backend
 
 Cloudflare Worker that takes a YooKassa webhook, mints a license key, and
 delivers it via email (Resend) and/or Telegram bot. The extension's `/verify`
@@ -102,7 +102,7 @@ const payment = await yookassa.createPayment({
   amount: { value: '990.00', currency: 'RUB' },
   capture: true,
   confirmation: { type: 'redirect', return_url: 'https://smesh.app/thanks' },
-  description: 'смэш — лицензия (предзаказ)',
+  description: 'СМЭШ AI — лицензия (предзаказ)',
   metadata: {
     email: buyerEmail,                    // collected on the order form
     telegram_user_id: buyerTgId || null   // if they connected Telegram first

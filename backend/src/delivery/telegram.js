@@ -21,7 +21,7 @@ export async function sendLicenseTelegram(env, { user_id, key, isPreorder }) {
 
   const text =
     '*Спасибо за поддержку\\!* 🙌\n\n' +
-    'Ваш ключ доступа к *смэш*:\n\n' +
+    'Ваш ключ доступа к *СМЭШ AI*:\n\n' +
     `\`${escapeMd(key)}\`\n\n` +
     `${escapeMd(launchNote)}\n\n` +
     '_Ключ работает на трёх устройствах\\. Если что — напишите прямо в этот чат\\._';

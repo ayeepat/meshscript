@@ -1,5 +1,5 @@
 /**
- * смэш content scraper
+ * СМЭШ AI content scraper
  * -------------------------------------------------------------
  * Mesh (school.mos.ru) is a React/MUI app with OBFUSCATED, randomly
  * generated class names. We never rely on class names. Two strategies:
@@ -555,10 +555,10 @@ const isSameOrigin = (url) => {
 async function fetchInlineFile(url) {
   try {
     const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) { console.log('[смэш] cs-download http', res.status, url); return null; }
+    if (!res.ok) { console.log('[СМЭШ AI] cs-download http', res.status, url); return null; }
     const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[смэш] cs-download got HTML (auth redirect?)', url);
+      console.log('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
       return { __auth: true };
     }
     const blob = await res.blob();
@@ -574,7 +574,7 @@ async function fetchInlineFile(url) {
       dataBase64: String(dataUrl).split(',')[1],
       name: fileNameFromUrl(url)
     };
-  } catch (e) { console.log('[смэш] cs-download exception', String(e), url); return null; }
+  } catch (e) { console.log('[СМЭШ AI] cs-download exception', String(e), url); return null; }
 }
 
 /**
@@ -591,7 +591,7 @@ async function fetchInlineFile(url) {
 async function listMaterialUrls(lessonId, taskText) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
-  const log = (stage, extra) => console.log('[смэш] auto-fetch:', stage, extra ?? '');
+  const log = (stage, extra) => console.log('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
 
   // The API path is the precise one (it knows which homework owns which file), so
   // prefer it whenever we have a lesson id. The DOM scan is only a fallback for

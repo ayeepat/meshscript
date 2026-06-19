@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "смэш",
+  "name": "СМЭШ AI",
   "version": "0.5.0",
   "description": "Personal homework assistant for the Mesh (school.mos.ru) platform.",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest"],
@@ -28,7 +28,7 @@
   },
   "action": {
     "default_popup": "src/popup/popup.html",
-    "default_title": "смэш",
+    "default_title": "СМЭШ AI",
     "default_icon": {
       "16": "assets/icons/icon16.png",
       "48": "assets/icons/icon48.png",

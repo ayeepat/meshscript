@@ -1,5 +1,5 @@
 /**
- * смэш license backend.
+ * СМЭШ AI license backend.
  *
  * Routes:
  *   POST /webhook/yookassa   YooKassa notification, auto-issues a license

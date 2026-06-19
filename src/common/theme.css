@@ -1,5 +1,5 @@
 /* ============================================================================
-   смэш — shared design tokens. "Warm" theme.
+   СМЭШ AI — shared design tokens. "Warm" theme.
    Soft cream paper + a calm teal accent in light mode; deep teal-ink with a
    brighter mint accent in dark mode. Flat surfaces, hairline separators, soft
    squircles, no gradients. Type is Manrope (bundled locally, full Cyrillic).
@@ -212,7 +212,7 @@ svg[fill="none"] { stroke-width: 1.75; }
 
 :focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
 
-/* The смэш logomark — a teal squircle holding the "с" monogram. Cohesive in
+/* The СМЭШ AI logomark — a teal squircle holding the "с" monogram. Cohesive in
    both themes (cream glyph on teal in light; dark glyph on mint in dark). */
 .brandmark {
   display: grid; place-items: center; flex: none;

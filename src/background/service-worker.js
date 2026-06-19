@@ -293,24 +293,24 @@ function inferMime(name, contentType) {
 async function downloadFile(url, headers) {
   try {
     const res = await fetch(url, { credentials: 'include', headers });
-    if (!res.ok) { console.log('[смэш] download http', res.status, url); return null; }
+    if (!res.ok) { console.log('[СМЭШ AI] download http', res.status, url); return null; }
     // An HTML response is an auth/login redirect, not the attachment — reject it
     // so we never hand the model (or the chat chip) a fake "file".
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[смэш] download got HTML (auth redirect?)', url);
+      console.log('[СМЭШ AI] download got HTML (auth redirect?)', url);
       return null;
     }
     const buf = await res.arrayBuffer();
     if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) {
-      console.log('[смэш] download size skip', buf.byteLength, url);
+      console.log('[СМЭШ AI] download size skip', buf.byteLength, url);
       return null;
     }
     const name = nameFromUrl(url);
     const mimeType = inferMime(name, res.headers.get('content-type'));
-    console.log('[смэш] downloaded', name, mimeType, buf.byteLength + 'b');
+    console.log('[СМЭШ AI] downloaded', name, mimeType, buf.byteLength + 'b');
     return { mimeType, dataBase64: abToBase64(buf), name };
-  } catch (e) { console.log('[смэш] download exception', String(e), url); return null; }
+  } catch (e) { console.log('[СМЭШ AI] download exception', String(e), url); return null; }
 }
 
 // Reconstruct Mesh's required family-web headers from a bare token. Mirrors the

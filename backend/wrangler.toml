@@ -1,4 +1,4 @@
-# Cloudflare Worker config for the смэш license backend.
+# Cloudflare Worker config for the СМЭШ AI license backend.
 # Free tier handles 100k requests/day, which is plenty for preorders.
 #
 # Before `wrangler deploy`:
@@ -29,7 +29,7 @@ id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
 # Shop ID is public (YooKassa includes it in every notification). Safe to commit.
 YOOKASSA_SHOP_ID = ""
 # Email "from" address. Must be a verified sender in your Resend account.
-EMAIL_FROM = "смэш <license@smesh.app>"
+EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 # Default product type issued by /webhook/yookassa for amounts under SUBSCRIPTION_MIN_RUB.
 # Tier B will flip this once we add subscription support — see worker.js.
 DEFAULT_LICENSE_TYPE = "lifetime"
