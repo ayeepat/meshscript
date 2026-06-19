@@ -352,7 +352,58 @@ async function downloadFiles({ urls = [], headers = null, token = null }) {
   return files;
 }
 
-chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+/**
+ * Fill the test form across EVERY frame of the tab. The Mesh test player is
+ * sometimes embedded in an iframe (a different *.mos.ru origin), so a fill that
+ * only touches the top frame finds no controls and skips everything. We inject
+ * the fill logic into all accessible frames, run it in each, then merge: a
+ * question counts as filled if ANY frame filled it. Frames the extension can't
+ * script (foreign-origin embeds) are skipped silently. Never submits the form.
+ */
+async function fillAllFrames(tabId, questions) {
+  if (!tabId || !Array.isArray(questions) || !questions.length) {
+    return { filled: [], skipped: [] };
+  }
+  const idFor = (q, i) =>
+    (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+
+  // Make sure the fill logic (window.__smeshFill) exists in every frame.
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ['src/content/scraper.js']
+    });
+  } catch { /* some frames disallow injection; the ones that allow it still run */ }
+
+  let results = [];
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: (qs) => {
+        try { return (typeof window.__smeshFill === 'function') ? window.__smeshFill(qs) : null; }
+        catch { return null; }
+      },
+      args: [questions]
+    });
+  } catch (e) {
+    return { filled: [], skipped: questions.map(idFor), error: String(e) };
+  }
+
+  const filled = new Set();
+  for (const r of (results || [])) {
+    const s = r && r.result;
+    if (s && Array.isArray(s.filled)) s.filled.forEach((id) => filled.add(String(id)));
+  }
+  const filledIds = [];
+  const skipped = [];
+  questions.forEach((q, i) => {
+    const id = idFor(q, i);
+    (filled.has(String(id)) ? filledIds : skipped).push(id);
+  });
+  return { filled: filledIds, skipped };
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
       switch (msg?.type) {
@@ -375,6 +426,16 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
             if (questions.length) showAnswersInTab(tabId, questions);
           }
           sendResponse({ ok: true, answer });
+          break;
+        }
+        case 'FILL_ANSWERS_ALL': {
+          // The in-page panel's «Заполнить» button routes here so the fill can
+          // reach forms inside iframes (the panel's own frame can't). sender.tab
+          // is the tab the panel lives in.
+          const tabId = sender?.tab?.id;
+          const questions = msg.payload?.questions || [];
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          sendResponse({ ok: true, summary: await fillAllFrames(tabId, questions) });
           break;
         }
         case 'CLASSIFY_TASKS':

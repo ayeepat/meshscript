@@ -991,6 +991,21 @@ function asOptionIndex(s) {
   return -1;
 }
 
+// Parse the model's positional hint (the `choice`/`c` field) into a list of
+// 0-based option indices. Accepts a single token ("б", "2") or several
+// separated by comma / semicolon / "и" / slash ("1, 3", "а и в"). Out-of-range
+// or unparseable tokens are dropped. Used as a reliable fallback when fuzzy
+// text matching of the option labels is ambiguous or fails.
+function parseChoiceIndices(choice, optionCount) {
+  if (choice == null) return [];
+  const out = [];
+  for (const tok of String(choice).split(/\s*(?:,|;|\bи\b|\/|\|)\s*/i)) {
+    const idx = asOptionIndex(tok);
+    if (idx >= 0 && idx < optionCount && !out.includes(idx)) out.push(idx);
+  }
+  return out;
+}
+
 // Similarity in [0,1]: exact normalized match → 1, containment → high, else a
 // token Jaccard capped below containment so a partial word overlap can't pose
 // as a strong match.
@@ -1089,6 +1104,11 @@ function fillUnit(unit, question) {
     for (const part of (parts.length ? parts : [ans])) {
       const m = bestOption(part, options);
       if (m) targets.add(m.input);
+    }
+    // Positional fallback/augment: the model's `choice` hint ("1,3" / "а,в")
+    // points straight at the right boxes when the label text is hard to match.
+    for (const idx of parseChoiceIndices(question.choice, options.length)) {
+      if (options[idx]) targets.add(options[idx].input);
     }
     if (!targets.size) return false;
     for (const o of options) if (targets.has(o.input)) setCheckbox(o.input, true);

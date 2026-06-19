@@ -318,6 +318,42 @@
     });
   }
 
+  // Fill just THIS frame's form via scraper.js (same isolated world). Used as a
+  // fallback when the service worker can't be reached.
+  function localFill(qs) {
+    try {
+      return (typeof window.__smeshFill === 'function') ? window.__smeshFill(qs) : null;
+    } catch { return null; }
+  }
+
+  // Fill the test form. The form often lives inside an iframe (Mesh embeds some
+  // test players), which the panel's own frame can't reach — so ask the service
+  // worker to run the fill in EVERY frame of the tab and merge the result. If
+  // the worker is unreachable, fall back to filling this frame directly.
+  function requestFill(qs) {
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (s) => { if (!settled) { settled = true; resolve(s); } };
+      // Safety net: never let the button hang if no reply ever comes.
+      const t = setTimeout(() => finish(localFill(qs)), 8000);
+      try {
+        chrome.runtime.sendMessage({ type: 'FILL_ANSWERS_ALL', payload: { questions: qs } }, (resp) => {
+          clearTimeout(t);
+          if (chrome.runtime.lastError || !resp || !resp.ok || !resp.summary) {
+            // Worker error / no receiver → fill this frame only.
+            const local = localFill(qs);
+            finish(local || (resp && resp.summary) || null);
+          } else {
+            finish(resp.summary);
+          }
+        });
+      } catch {
+        clearTimeout(t);
+        finish(localFill(qs));
+      }
+    });
+  }
+
   function wireButtons(panel, questions) {
     const closeBtn = panel.querySelector('.btn-close');
     const toggleBtn = panel.querySelector('.btn-toggle');
@@ -326,16 +362,15 @@
 
     closeBtn.addEventListener('click', hide);
 
-    fillBtn.addEventListener('click', () => {
+    fillBtn.addEventListener('click', async () => {
       const qs = (lastPayload && lastPayload.questions) || questions || [];
       const orig = fillBtn.textContent;
-      // fillTestAnswers lives in scraper.js, exposed on the shared isolated-world
-      // window. The service worker injects scraper.js alongside this panel, so it
-      // should be present; if not, fail visibly and leave copy-paste as the path.
+      fillBtn.disabled = true;
       let summary = null;
       try {
-        if (typeof window.__smeshFill === 'function') summary = window.__smeshFill(qs);
+        summary = await requestFill(qs);
       } catch { summary = null; }
+      fillBtn.disabled = false;
       if (!summary) {
         fillBtn.textContent = 'Ошибка';
         fillBtn.classList.add('failed');
