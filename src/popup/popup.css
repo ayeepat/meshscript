@@ -187,6 +187,21 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 .bigbtn:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px var(--accent-glow); }
 .bigbtn:active { transform: scale(0.98); background: var(--accent-press); }
 .bigbtn:disabled { opacity: 0.55; cursor: default; transform: none; filter: none; }
+
+/* Secondary action: solve every page of a multi-page test in sequence. */
+.secbtn {
+  width: 100%; margin-top: 8px;
+  background: var(--card); color: var(--accent);
+  border: 1px solid var(--separator); box-shadow: var(--shadow-btn);
+  border-radius: var(--r-pill); padding: 11px 16px; cursor: pointer;
+  font: inherit; font-size: 13px; font-weight: 650;
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s var(--ease);
+}
+.secbtn:hover { background: var(--hover); border-color: var(--border-strong); }
+.secbtn:active { transform: scale(0.98); }
+.secbtn:disabled { opacity: 0.55; cursor: default; transform: none; }
+body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
 .answer {
   margin-top: 12px; background: var(--card);
   border: 1px solid var(--separator); border-radius: var(--r-lg);

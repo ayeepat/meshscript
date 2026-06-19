@@ -403,6 +403,52 @@ async function fillAllFrames(tabId, questions) {
   return { filled: filledIds, skipped };
 }
 
+/* ---------- Multi-page test pagination ---------- */
+// Drive a scraper.js global (e.g. __smeshPageSig / __smeshNext) in EVERY frame
+// and collect the non-null results. Mirrors fillAllFrames: the test player is
+// often inside an iframe, so per-frame is the only thing that reaches it. Frames
+// that disallow scripting are skipped silently.
+async function runInAllFrames(tabId, fnName, arg = null) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
+  } catch { /* some frames disallow injection; the rest still run */ }
+  let results = [];
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: (name, a) => {
+        try { return (typeof window[name] === 'function') ? window[name](a) : null; }
+        catch { return null; }
+      },
+      args: [fnName, arg]
+    });
+  } catch { return []; }
+  return (results || []).map((r) => r && r.result).filter((v) => v != null);
+}
+
+// Combined signature of the visible test page across all frames — lets the
+// popup detect whether clicking «Далее» actually advanced the page.
+async function testPageSig(tabId) {
+  if (!tabId) return '';
+  const sigs = await runInAllFrames(tabId, '__smeshPageSig');
+  return sigs.join('||');
+}
+
+// Click the forward control wherever it lives (top frame or an iframe) and merge
+// the per-frame results: any frame that advanced wins; else any frame that saw
+// ONLY a finish/submit control reports 'finish' (so the popup stops without ever
+// submitting the test); else 'none'.
+async function testNextPage(tabId) {
+  if (!tabId) return 'none';
+  const res = await runInAllFrames(tabId, '__smeshNext');
+  let clicked = false, finish = false;
+  for (const r of res) {
+    if (r?.status === 'clicked') clicked = true;
+    else if (r?.status === 'finish') finish = true;
+  }
+  return clicked ? 'clicked' : (finish ? 'finish' : 'none');
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
@@ -417,15 +463,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         case 'SOLVE_TEST': {
           const answer = await solveTest(msg.payload);
+          // Parse once: the panel needs it now, and the popup's «Решить все
+          // страницы» loop needs the structured questions to auto-fill the page.
+          const questions = parseTestAnswers(answer);
           // Fire-and-forget: surfacing the panel must NOT delay the popup reply.
           // The popup is also where errors get rendered, so a panel failure has
           // no user-visible impact beyond "no on-page panel this time".
           const tabId = msg.payload?.tabId;
-          if (tabId) {
-            const questions = parseTestAnswers(answer);
-            if (questions.length) showAnswersInTab(tabId, questions);
-          }
-          sendResponse({ ok: true, answer });
+          if (tabId && questions.length) showAnswersInTab(tabId, questions);
+          sendResponse({ ok: true, answer, questions });
           break;
         }
         case 'FILL_ANSWERS_ALL': {
@@ -436,6 +482,26 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const questions = msg.payload?.questions || [];
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
           sendResponse({ ok: true, summary: await fillAllFrames(tabId, questions) });
+          break;
+        }
+        case 'FILL_ANSWERS_TAB': {
+          // Same fill, but driven by the POPUP (no sender.tab) for the multi-page
+          // loop — the tab id is passed explicitly.
+          const { tabId, questions } = msg.payload || {};
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          sendResponse({ ok: true, summary: await fillAllFrames(tabId, questions || []) });
+          break;
+        }
+        case 'TEST_PAGE_SIG': {
+          const { tabId } = msg.payload || {};
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          sendResponse({ ok: true, sig: await testPageSig(tabId) });
+          break;
+        }
+        case 'TEST_NEXT_PAGE': {
+          const { tabId } = msg.payload || {};
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          sendResponse({ ok: true, status: await testNextPage(tabId) });
           break;
         }
         case 'CLASSIFY_TASKS':

@@ -234,3 +234,7 @@ svg[fill="none"] { stroke-width: 1.75; }
   animation: ms-spin 0.7s linear infinite;
 }
 @keyframes ms-spin { to { transform: rotate(360deg); } }
+
+/* Live "thinking" status verb + elapsed counter (see common/thinking.js).
+   Tabular numerals keep the seconds counter from jiggling the layout. */
+.thinkverb { font-variant-numeric: tabular-nums; }

@@ -7,6 +7,7 @@
 import { initTheme, toggleTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
 import { iconSvg } from '../common/icons.js';
+import { startThinking } from '../common/thinking.js';
 
 // Keep the theme button icon in sync with the resolved theme.
 document.addEventListener('themechange', (e) => {
@@ -178,15 +179,27 @@ function assistantShell() {
   return { wrap: d, body };
 }
 
-/** Transient status bubble shown while the answer is being generated. */
+/**
+ * Transient status bubble shown while the answer is being generated. The verb
+ * shifts and an elapsed-seconds counter ticks (see common/thinking.js), so a
+ * long solve never looks frozen — same feedback as the test tab.
+ */
 function thinkingBubble() {
   const d = document.createElement('div');
   d.className = 'msg assistant thinking';
-  d.innerHTML = '<span class="spinner" aria-hidden="true"></span>';
-  d.append('Думаю…');
-  chatEl.appendChild(d);
+  chatEl.appendChild(d); // append BEFORE animating so the ticker sees it connected
+  d.__ticker = startThinking(d);
   chatEl.scrollTop = chatEl.scrollHeight;
   return d;
+}
+
+// Stop a chat's thinking ticker and remove its bubble. Always pair the two so a
+// removed bubble never leaks its interval.
+function stopThinking(chat) {
+  if (!chat.thinkingEl) return;
+  chat.thinkingEl.__ticker?.stop();
+  chat.thinkingEl.remove();
+  chat.thinkingEl = null;
 }
 
 /** Re-render the whole chat from a lesson's stored history (no animation). */
@@ -416,8 +429,7 @@ function sendToChat(chat, text, files) {
     const ensureShell = () => {
       if (activeKey !== chat.key) return;
       if (shell && shell.wrap.isConnected) return;
-      chat.thinkingEl?.remove();
-      chat.thinkingEl = null;
+      stopThinking(chat);
       shell = assistantShell();
       shell.body.innerHTML = mdToHtml(acc);
     };
@@ -451,8 +463,7 @@ function sendToChat(chat, text, files) {
       chat.pending = false;
       chat.history.push({ role: 'assistant', content: answer, needsUpload });
       if (activeKey === chat.key) {
-        chat.thinkingEl?.remove();
-        chat.thinkingEl = null;
+        stopThinking(chat);
         if (shell && shell.wrap.isConnected) {
           shell.body.innerHTML = mdToHtml(answer); // clean final render
           shell.wrap.appendChild(copyButton(() => answer));

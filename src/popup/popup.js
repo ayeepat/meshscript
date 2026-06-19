@@ -8,6 +8,9 @@ import { initTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
 import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
+import { startThinking } from '../common/thinking.js';
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 initTheme();
 
@@ -489,53 +492,73 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
+/**
+ * Capture the visible test page: top-frame text + a PNG screenshot. Page text is
+ * best-effort (some pages/iframes forbid injection); the screenshot is lossless
+ * so small numbers/formulas stay crisp and usually carries the question alone.
+ * @returns {Promise<{pageText:string, screenshot:object}>}
+ */
+async function capturePage(tabId) {
+  const [pageText, dataUrl] = await withTimeout(
+    Promise.all([
+      chrome.scripting
+        .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
+        .then(([inj]) => inj?.result || '')
+        .catch(() => ''),
+      chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
+    ]),
+    20000,
+    'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
+  );
+  // Guard against a missing/empty capture so we surface a clear message instead
+  // of throwing on dataUrl.split (which read as a cryptic error).
+  const b64 = (dataUrl || '').split(',')[1];
+  if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
+  return { pageText, screenshot: { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' } };
+}
+
+/**
+ * Ask the service worker to solve one captured page. tabId lets it also drop the
+ * answers into the in-page floating panel. The 120-s cap guarantees the popup
+ * never spins forever — its message is deliberately actionable (key/credits).
+ * @returns {Promise<{ok:boolean, answer?:string, questions?:object[], error?:string}>}
+ */
+function requestSolve(tabId, screenshot, pageText) {
+  return withTimeout(
+    new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId } }, (r) => {
+        if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
+        else resolve(r || { ok: false, error: 'нет ответа' });
+      });
+    }),
+    120000,
+    'Не удалось получить ответ за 2 минуты. Проверьте интернет, а также API-ключ и баланс OpenRouter в настройках расширения, затем попробуйте ещё раз.'
+  );
+}
+
 async function solveTestOnScreen() {
   const btn = document.getElementById('solveTest');
+  const allBtn = document.getElementById('solveAllPages');
   const box = document.getElementById('testAnswer');
   const copyBtn = document.getElementById('copyTest');
   btn.disabled = true;
+  if (allBtn) allBtn.disabled = true;
   copyBtn.hidden = true;
   box.hidden = false;
   setStatus(box, 'Читаю страницу…');
+  let ticker = null;
   try {
     const tab = await getActiveTab();
     if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
 
-    // Text extraction and screenshot are independent — run them together so
-    // the user waits for the slower of the two, not their sum. Page text is
-    // best-effort: some pages forbid injection — the screenshot (PNG, lossless
-    // so small numbers/formulas stay crisp) is usually enough on its own.
-    const [pageText, dataUrl] = await withTimeout(
-      Promise.all([
-        chrome.scripting
-          .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
-          .then(([inj]) => inj?.result || '')
-          .catch(() => ''),
-        chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
-      ]),
-      20000,
-      'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
-    );
-    // Guard against a missing/empty capture so we surface a clear message
-    // instead of throwing on dataUrl.split (which read as a cryptic error).
-    const b64 = (dataUrl || '').split(',')[1];
-    if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
-    const screenshot = { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' };
+    const { pageText, screenshot } = await capturePage(tab.id);
 
-    setStatus(box, 'Решаю…');
-    const resp = await withTimeout(
-      new Promise((resolve) => {
-        // tabId lets the service worker drop the parsed answers into an in-page
-        // floating panel via chrome.scripting + chrome.tabs.sendMessage. The
-        // popup still renders them too — the panel just outlives the popup.
-        chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId: tab.id } }, (r) => {
-          if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
-          else resolve(r || { ok: false, error: 'нет ответа' });
-        });
-      }),
-      120000,
-      'Модель слишком долго не отвечает. Проверьте интернет и API-ключ в настройках, затем попробуйте ещё раз.'
-    );
+    // Live status: a shifting verb + elapsed seconds so a long reasoning pass
+    // never looks frozen. Stopped the moment the answer lands or an error fires.
+    ticker = startThinking(box);
+    const resp = await requestSolve(tab.id, screenshot, pageText);
+    ticker.stop();
+    ticker = null;
     if (!resp.ok) throw new Error(resp.error || 'нет ответа');
     const plain = renderAnswer(box, resp.answer);
     const copyLabel = document.getElementById('copyTestLabel');
@@ -549,10 +572,147 @@ async function solveTestOnScreen() {
       } catch (_e) { /* clipboard blocked — ignore */ }
     };
   } catch (e) {
+    // ALWAYS render a clear message instead of a stuck spinner.
     box.textContent = 'Ошибка: ' + (e?.message || e);
   } finally {
+    if (ticker) ticker.stop();
     btn.disabled = false;
+    if (allBtn) allBtn.disabled = false;
   }
+}
+
+/* ---------- Тест tab: multi-page auto-pagination ---------- */
+
+// Signature of the current page (across all frames) so we can tell whether a
+// «Далее» click actually advanced it. Empty string on failure.
+async function pageSignature(tabId) {
+  const r = await sendToBackground({ type: 'TEST_PAGE_SIG', payload: { tabId } });
+  return r?.sig || '';
+}
+
+// Poll the page signature until it differs from `beforeSig` (page changed) or
+// the budget runs out. A short initial settle gives the new page time to render.
+async function waitForChange(tabId, beforeSig, timeout) {
+  const start = Date.now();
+  await sleep(600);
+  while (Date.now() - start < timeout) {
+    const sig = await pageSignature(tabId);
+    if (sig && sig !== beforeSig) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+/**
+ * Try to advance to the next page. Clicks «Далее», then waits for the content to
+ * actually change. One short retry if the first click doesn't take. Returns:
+ *   'ok'     — advanced to a new page
+ *   'finish' — only a submit/finish control remains (NOT clicked — user's call)
+ *   'none'   — no forward control found at all
+ *   'stuck'  — clicked but the page never changed
+ */
+async function advancePage(tabId, beforeSig) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const r = await sendToBackground({ type: 'TEST_NEXT_PAGE', payload: { tabId } });
+    const status = r?.status || 'none';
+    if (status === 'finish') return 'finish';
+    if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
+    // status === 'clicked': wait for the new page. Be generous on the first try
+    // (slow loads), then re-click once before giving up.
+    if (await waitForChange(tabId, beforeSig, attempt === 0 ? 8000 : 4000)) return 'ok';
+  }
+  return 'stuck';
+}
+
+function renderPaginationSummary(box, outcome, solved) {
+  const pages = `Решено страниц: ${solved}.`;
+  let msg;
+  switch (outcome) {
+    case 'finish':
+      msg = `${pages} Дошёл до конца теста — отправку не нажимаю, проверь и отправь сам.`;
+      break;
+    case 'none':
+      msg = `${pages} Не нашёл кнопку «Дальше» — похоже, это последняя страница. Проверь и отправь сам.`;
+      break;
+    case 'stuck':
+      msg = `${pages} Страница не сменилась после нажатия «Дальше» — остановился. Проверь оставшиеся вопросы вручную.`;
+      break;
+    case 'max':
+      msg = `${pages} Достигнут предел в 30 страниц — остановился. Проверь и отправь сам.`;
+      break;
+    default:
+      msg = `Готово. ${pages}`;
+  }
+  box.textContent = msg;
+}
+
+const MAX_PAGES = 30;
+
+/**
+ * Solve a multi-page test: for each page — solve, fill, then click «Далее» and
+ * wait for the next page — repeating until the end. NEVER clicks a submit/finish
+ * control: at the end it stops and tells the user to submit themselves. Fully
+ * optional; the single-page «Решить тест» flow is unchanged.
+ */
+async function solveAllPages() {
+  const btn = document.getElementById('solveTest');
+  const allBtn = document.getElementById('solveAllPages');
+  const box = document.getElementById('testAnswer');
+  const copyBtn = document.getElementById('copyTest');
+  btn.disabled = true;
+  allBtn.disabled = true;
+  copyBtn.hidden = true;
+  box.hidden = false;
+  setStatus(box, 'Запускаю…');
+  let ticker = null;
+  let solved = 0;
+  let outcome = 'done';
+  try {
+    const tab = await getActiveTab();
+    if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
+
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      // Solve the visible page. Progress reads «Страница N · Решаю… 12s».
+      ticker = startThinking(box, { prefix: `Страница ${page}` });
+      const { pageText, screenshot } = await capturePage(tab.id);
+      const resp = await requestSolve(tab.id, screenshot, pageText);
+      if (!resp.ok) throw new Error(resp.error || 'нет ответа');
+      ticker.stop();
+      ticker = null;
+
+      // Fill this page's answers into the form (across all frames).
+      const questions = resp.questions || [];
+      if (questions.length) {
+        await sendToBackground({ type: 'FILL_ANSWERS_TAB', payload: { tabId: tab.id, questions } });
+        solved++;
+      }
+      // Let the fill's React re-render settle so the page signature captures the
+      // current (filled) state — otherwise a late repaint could look like a
+      // navigation and fool the change detector below.
+      await sleep(700);
+
+      // Advance to the next page.
+      setStatus(box, `Страница ${page} готова. Открываю следующую…`);
+      const beforeSig = await pageSignature(tab.id);
+      const nav = await advancePage(tab.id, beforeSig);
+      if (nav === 'finish') { outcome = 'finish'; break; }
+      if (nav === 'none') { outcome = 'none'; break; }
+      if (nav === 'stuck') { outcome = 'stuck'; break; }
+      if (page === MAX_PAGES) { outcome = 'max'; break; }
+      await sleep(500); // small settle before solving the new page
+    }
+  } catch (e) {
+    if (ticker) { ticker.stop(); ticker = null; }
+    box.textContent = 'Ошибка: ' + (e?.message || e);
+    btn.disabled = false;
+    allBtn.disabled = false;
+    return;
+  } finally {
+    if (ticker) ticker.stop();
+  }
+  renderPaginationSummary(box, outcome, solved);
+  btn.disabled = false;
+  allBtn.disabled = false;
 }
 
 /* ---------- Tabs + init ---------- */
@@ -590,6 +750,7 @@ function init() {
   document.getElementById('tabHw').onclick = () => showTab('hw');
   document.getElementById('tabTest').onclick = () => showTab('test');
   document.getElementById('solveTest').onclick = solveTestOnScreen;
+  document.getElementById('solveAllPages').onclick = solveAllPages;
   document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
   scanHomework();
 }

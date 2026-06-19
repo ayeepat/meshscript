@@ -1171,6 +1171,116 @@ function fillTestAnswers(questions) {
 // reach a sibling content script in the same tab.
 window.__smeshFill = fillTestAnswers;
 
+/* =====================================================================
+ * MULTI-PAGE TEST PAGINATION (per-frame)
+ * ---------------------------------------------------------------------
+ * Some Mesh tests show one question per page: answer, press «Далее», repeat.
+ * The orchestrator (popup) drives that loop and reaches every frame the same
+ * way the auto-fill does (the test player is often inside an iframe), running
+ * these two globals in each frame:
+ *   __smeshPageSig — a signature of THIS frame's current question, so the loop
+ *                    can tell whether a click actually advanced the page;
+ *   __smeshNext    — finds and clicks a forward control, and NEVER a submit /
+ *                    finish one (that's the user's call, not ours).
+ * ===================================================================== */
+
+// Forward ("next") vs finish ("submit the whole test"). Matched against text
+// that's already lowercased with ё→е, so the patterns stay ё-agnostic.
+const NEXT_CTRL_RE = /дал(ее|ьше)|следующ|вперед|next/i;
+const FINISH_CTRL_RE = /заверш|готов|отправ|сдат|finish|submit|результат/i;
+
+// Visible, actionable text of a control: its label plus aria-label/title/value,
+// normalised for matching (lowercase, ё→е).
+function navControlText(el) {
+  const parts = [el.textContent, el.getAttribute && el.getAttribute('aria-label'),
+    el.getAttribute && el.getAttribute('title'), el.value];
+  return normalize(parts.filter(Boolean).join(' ')).toLowerCase().replace(/ё/g, 'е');
+}
+
+// Attribute "metadata" for icon-only buttons that carry no readable text.
+function navControlMeta(el) {
+  if (!el.getAttribute) return '';
+  return [el.getAttribute('aria-label'), el.getAttribute('title'),
+    el.getAttribute('class'), el.getAttribute('data-action'),
+    el.getAttribute('data-testid'), el.getAttribute('name'), el.id]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+
+function isNavClickable(el) {
+  if (!el || el.disabled) return false;
+  if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return false;
+  return isVisible(el);
+}
+
+// Classify a candidate as 'finish' | 'next' | null. Finish is checked FIRST, so
+// a control carrying BOTH a forward word and a submit word is treated as a
+// finish and never clicked — fail safe: we'd rather stop than submit the test.
+function classifyNavControl(el) {
+  const t = navControlText(el);
+  if (FINISH_CTRL_RE.test(t)) return 'finish';
+  if (NEXT_CTRL_RE.test(t)) return 'next';
+  const meta = navControlMeta(el);
+  if (FINISH_CTRL_RE.test(meta)) return 'finish';
+  if (/next|forward|arrow.?right|chevron.?right|вперед|вправо/.test(meta)) return 'next';
+  // Icon-only arrow glyph, but only when there's no alphabetic text (so a real
+  // word always wins and an «»-in-prose button can't masquerade as next).
+  if (!/[a-zа-я]/i.test(t) && /[→▶›»]/.test(el.textContent || '')) return 'next';
+  return null;
+}
+
+/**
+ * Signature of THIS frame's visible question + controls. Built from the prompt
+ * text and the kind/count/labels of the form controls — deliberately NOT their
+ * values, so filling the answers doesn't change it. Enough to differ between
+ * two distinct questions while staying stable across a re-render of one.
+ * @returns {string}
+ */
+function pageSignature() {
+  let text = '';
+  try { text = normalize(document.body ? document.body.innerText : '').slice(0, 4000); } catch { /* */ }
+  let ctrlSig = '';
+  try {
+    ctrlSig = collectUnits().map((u) =>
+      u.type + ':' + u.inputs.length + ':' +
+      (u.type === 'text' ? '' : u.inputs.map((i) => normalizeForMatch(controlLabelText(i)).slice(0, 16)).join('|'))
+    ).join(';');
+  } catch { /* controls unreadable in this frame */ }
+  const s = text + '##' + ctrlSig;
+  let h = 0;
+  for (let i = 0; i < s.length; i++) h = (Math.imul(h, 31) + s.charCodeAt(i)) | 0;
+  return h.toString(36) + ':' + s.length;
+}
+
+/**
+ * Find and click a forward control in THIS frame. Returns:
+ *   { status: 'clicked' } — a «Далее»-style control was clicked (page advances)
+ *   { status: 'finish'  } — only a submit/finish control is present; NOT clicked
+ *   { status: 'none'    } — no forward control in this frame
+ * Never clicks a finish/submit control.
+ */
+function paginateNext() {
+  const sel = 'button, a[href], [role="button"], input[type="button"], input[type="submit"], [tabindex]';
+  let candidates = [];
+  try { candidates = Array.from(document.querySelectorAll(sel)); } catch { return { status: 'none' }; }
+  let nextEl = null;
+  let sawFinish = false;
+  for (const el of candidates) {
+    if (!isNavClickable(el)) continue;
+    const c = classifyNavControl(el);
+    if (c === 'finish') sawFinish = true;
+    else if (c === 'next' && !nextEl) nextEl = el; // first forward control in DOM order
+  }
+  if (nextEl) {
+    try { nextEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch { /* */ }
+    try { nextEl.click(); } catch { return { status: 'none' }; }
+    return { status: 'clicked' };
+  }
+  return { status: sawFinish ? 'finish' : 'none' };
+}
+
+window.__smeshPageSig = pageSignature;
+window.__smeshNext = paginateNext;
+
 // Guard against duplicate listeners: the manifest auto-injects this script,
 // and popup.js falls back to chrome.scripting.executeScript on a race. Without
 // this guard both copies would respond to every MESH_SCAN.
