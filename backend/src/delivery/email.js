@@ -20,7 +20,7 @@ export async function sendLicenseEmail(env, { to, key, isPreorder }) {
 
   const html = `
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#0d0d0d;">
-      <p style="font-size:14px;color:#5d5d66;margin:0 0 8px;">смэш — помощник МЭШ</p>
+      <p style="font-size:14px;color:#5d5d66;margin:0 0 8px;">смэш — Помощник для электронных журналов</p>
       <h1 style="font-size:20px;font-weight:700;margin:0 0 16px;">Спасибо! Ваш ключ доступа</h1>
       <div style="background:#f4f4f5;border-radius:12px;padding:18px;margin:0 0 20px;font-family:ui-monospace,'SF Mono',Menlo,monospace;font-size:18px;letter-spacing:0.5px;text-align:center;">
         ${escapeHtml(key)}
