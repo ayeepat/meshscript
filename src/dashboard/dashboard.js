@@ -333,16 +333,29 @@ function gdzCardEl(chat) {
   return card;
 }
 
-/** Resolve textbook references for this lesson and show the answer card. Runs
- *  in parallel with the AI solve; the card is prepended above the chat. */
+/** Resolve textbook references for this lesson and show the answer card BEFORE
+ *  the AI solve — when ready GDZ answers exist they replace the AI call, so the
+ *  lookup intentionally gates the solve. The card is prepended above the chat. */
 /** @returns {Promise<boolean>} whether ready GDZ answers were found. */
+
+// Hard ceiling on the GDZ lookup. The resolve hits gdz-ru.com (book structure +
+// answer images) and the MV3 service worker can be recycled mid-request — either
+// could otherwise leave the lesson awaiting a reply that never comes, stranding
+// the user on a blank chat. On timeout we give up on GDZ and fall through to the
+// AI solve. Generous enough that a normal resolve (now parallelised) finishes
+// well within it, so we don't trigger a wasted AI call on the happy path.
+const GDZ_LOOKUP_TIMEOUT_MS = 25000;
+
 async function maybeShowGdz(chat) {
   let resp;
   try {
     resp = await new Promise((resolve) => {
+      let done = false;
+      const finish = (v) => { if (!done) { done = true; resolve(v); } };
+      const timer = setTimeout(() => finish(null), GDZ_LOOKUP_TIMEOUT_MS);
       chrome.runtime.sendMessage(
         { type: 'GDZ_FOR_TASK', payload: { subject: chat.subject, task: chat.task } },
-        (r) => resolve(chrome.runtime.lastError ? null : r)
+        (r) => { clearTimeout(timer); finish(chrome.runtime.lastError ? null : r); }
       );
     });
   } catch { return false; }
@@ -410,11 +423,16 @@ function sendToChat(chat, text, files) {
     };
 
     // Re-parsing the full markdown on every token is O(n²) and janks on long
-    // answers. Coalesce: deltas just append to `acc`; the DOM re-renders at
-    // most once per animation frame.
+    // answers. Coalesce AND throttle: deltas just append to `acc`; the DOM
+    // re-parses at most once per RENDER_THROTTLE_MS (not once per frame), which
+    // keeps the work bounded as the answer grows. `finish()` does the final
+    // clean render, so throttling never affects the result the user ends on.
+    const RENDER_THROTTLE_MS = 90;
     let renderPending = false;
-    const flush = () => {
+    let lastRender = 0;
+    const doFlush = () => {
       renderPending = false;
+      lastRender = performance.now();
       if (settled || activeKey !== chat.key) return;
       ensureShell();
       shell.body.innerHTML = mdToHtml(acc);
@@ -423,7 +441,8 @@ function sendToChat(chat, text, files) {
     const scheduleRender = () => {
       if (renderPending || activeKey !== chat.key) return;
       renderPending = true;
-      requestAnimationFrame(flush);
+      const wait = Math.max(0, RENDER_THROTTLE_MS - (performance.now() - lastRender));
+      setTimeout(() => requestAnimationFrame(doFlush), wait);
     };
 
     const finish = (answer, { animate = false, needsUpload = false } = {}) => {

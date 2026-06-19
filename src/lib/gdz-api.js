@@ -48,10 +48,26 @@ const TASK_LIST_TTL_MS = 30 * 60 * 1000;
 
 /* ---------- HTTP ---------- */
 
+// gdz-ru.com sits behind DDoS-Guard and can stall a connection open without
+// ever responding. A bare fetch() then hangs forever — and because the GDZ
+// lookup gates the dashboard's AI solve, that hang would strand the user on a
+// blank chat. Abort every GDZ request after a fixed ceiling so a wedged
+// connection surfaces as a throw (caller falls back to the AI / skips the image).
+const FETCH_TIMEOUT_MS = 15000;
+async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...opts, signal: ctrl.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // All requests rely on the DNR rule to rewrite User-Agent. We don't set it
 // here (and can't — it's a forbidden header).
 async function getJson(url) {
-  const res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+  const res = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' });
   if (!res.ok) throw new Error(`GDZ ${res.status} ${url}`);
   try {
     return await res.json();
@@ -77,7 +93,7 @@ async function getBlobAsBase64(url) {
   try { host = new URL(url).host; } catch { /* keep raw url */ }
   let res;
   try {
-    res = await fetch(url, { credentials: 'omit', cache: 'no-store' });
+    res = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' });
   } catch (e) {
     throw new Error(`GDZ image: network fail for ${host} (missing host permission or UA rule?) — ${e}`);
   }
@@ -269,7 +285,7 @@ async function resolveHumanRef(bookUrl) {
 
   const ref = { base: null, suffix: null };
   try {
-    const res = await fetch(HUMAN + bookUrl, { credentials: 'omit', redirect: 'follow' });
+    const res = await fetchWithTimeout(HUMAN + bookUrl, { credentials: 'omit', redirect: 'follow' });
     if (res.ok) {
       ref.base = res.url.endsWith('/') ? res.url : res.url + '/';   // canonical book page
       const rel = ref.base.replace(HUMAN, '');

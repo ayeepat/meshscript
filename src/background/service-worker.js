@@ -320,13 +320,26 @@ function meshHeadersFromToken(token) {
   };
 }
 
+// The Mesh auth set (Bearer token + X-mes-*) is sensitive — it's the user's
+// live session credential. It may ride along ONLY to a *.mos.ru host. A
+// homework page is Mesh-controlled, but a stray non-Mesh link in its DOM (a
+// teacher's comment, an embed) would otherwise have the user's Mesh token
+// fetched straight to a third-party server. Gate the header set on the host.
+function isMeshHost(url) {
+  try {
+    const h = new URL(url).hostname.toLowerCase();
+    return h === 'mos.ru' || h.endsWith('.mos.ru');
+  } catch { return false; }
+}
+
 // `headers` come straight from the content script's discovery (Bearer token +
 // Mesh's X-mes-* set). A bare `token` is still accepted for backward-compat.
 async function downloadFiles({ urls = [], headers = null, token = null }) {
   const hdrs = headers || (token ? meshHeadersFromToken(token) : {});
   const files = [];
   for (const url of urls.slice(0, 5)) {
-    const f = await downloadFile(url, hdrs);
+    // Never hand the Mesh credential to a non-Mesh host (see isMeshHost).
+    const f = await downloadFile(url, isMeshHost(url) ? hdrs : {});
     if (f) files.push(f);
   }
   return files;
@@ -388,11 +401,13 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
           const result = await resolveTask(bookUrl, number);
           if (!result) { sendResponse({ ok: false, error: 'not found' }); break; }
           // Inline EVERY answer image as base64 — multi-page answers have more
-          // than one — so the chat can render them directly. Skip any that fail.
-          const inlined = [];
-          for (const url of result.images) {
-            try { inlined.push(await fetchTaskImage(url)); } catch { /* skip bad image */ }
-          }
+          // than one — so the chat can render them directly. Fetch them in
+          // parallel (independent network calls) and drop any that fail, keeping
+          // source order.
+          const settled = await Promise.all(
+            result.images.map((url) => fetchTaskImage(url).catch(() => null))
+          );
+          const inlined = settled.filter(Boolean);
           if (!inlined.length) { sendResponse({ ok: false, error: 'images unavailable' }); break; }
           sendResponse({ ok: true, result: { ...result, inlined } });
           break;
@@ -421,8 +436,11 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
               a.mode = res.mode;
               a.book = bookMeta;
               if (!a.found) continue;
-              a.inlined = [];
-              for (const u of a.images) { try { a.inlined.push(await fetchTaskImage(u)); } catch { /* skip */ } }
+              // Parallel image fetches (independent network calls), source order kept.
+              const settled = await Promise.all(
+                (a.images || []).map((u) => fetchTaskImage(u).catch(() => null))
+              );
+              a.inlined = settled.filter(Boolean);
             }
             answers.push(...res.answers);
           }
