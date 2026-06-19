@@ -212,20 +212,17 @@ svg[fill="none"] { stroke-width: 1.75; }
 
 :focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
 
-/* The СМЭШ AI logomark — a teal squircle holding the "с" monogram. Cohesive in
-   both themes (cream glyph on teal in light; dark glyph on mint in dark). */
+/* The СМЭШ AI logomark — the teal "C" brand mark, served as a transparent PNG
+   so it sits cleanly on any surface in both light and dark themes. */
 .brandmark {
-  display: grid; place-items: center; flex: none;
-  width: 30px; height: 30px; border-radius: var(--r-sm);
-  background: var(--accent);
-  color: var(--on-accent);
-  font-family: var(--font-display);
-  font-weight: 800; font-size: 17px; line-height: 1; letter-spacing: -0.5px;
+  display: block; flex: none;
+  width: 30px; height: 30px;
+  object-fit: contain;
   border: none;
-  box-shadow: var(--shadow-accent);
+  background: none;
   transition: transform 0.18s var(--ease);
-  overflow: hidden;
   user-select: none;
+  -webkit-user-drag: none;
 }
 
 /* Shared spinner. */
