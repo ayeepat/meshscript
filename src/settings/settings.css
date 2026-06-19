@@ -135,7 +135,7 @@ label .sub { font-weight: 500; font-size: 11.5px; color: var(--tertiary); }
 }
 .licstatus[data-state="ok"]   { background: var(--success-soft); color: var(--success); }
 .licstatus[data-state="warn"] { background: var(--warn-soft); color: var(--warn); }
-.licstatus[data-state="err"]  { background: rgba(215, 0, 21, 0.12); color: var(--danger); }
+.licstatus[data-state="err"]  { background: var(--danger-soft); color: var(--danger); }
 
 input, textarea, select {
   width: 100%; padding: 11px 14px;
@@ -281,7 +281,7 @@ body.on-settings .savebar { display: block; }
   box-shadow: var(--shadow-accent);
   transition: transform 0.15s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-#save:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px rgba(0, 122, 255, 0.5); }
+#save:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px var(--accent-glow); }
 #save:active { transform: scale(0.97); background: var(--accent-press); }
 .ok {
   display: inline-flex; align-items: center; gap: 6px;

@@ -1,59 +1,88 @@
 /* ============================================================================
-   смэш — shared design tokens. "Clean" theme.
-   Apple/ChatGPT sensibility: black on white, system (SF) type, soft squircles,
-   diffuse low shadows, no gradients, a single blue accent as the colour splash.
+   смэш — shared design tokens. "Warm" theme.
+   Soft cream paper + a calm teal accent in light mode; deep teal-ink with a
+   brighter mint accent in dark mode. Flat surfaces, hairline separators, soft
+   squircles, no gradients. Type is Manrope (bundled locally, full Cyrillic).
    `data-theme` on <html> is set by src/common/theme.js. A matching block lives
    under prefers-color-scheme so dark mode never flashes light before JS runs.
    ========================================================================== */
 
+/* Manrope — variable weight, bundled so it loads instantly and offline and
+   never trips the extension CSP. One file per script subset. ---------------- */
+@font-face {
+  font-family: "Manrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+  src: url("../../assets/fonts/manrope-cyrillic.woff2") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Manrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+  src: url("../../assets/fonts/manrope-cyrillic-ext.woff2") format("woff2");
+  unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F;
+}
+@font-face {
+  font-family: "Manrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+  src: url("../../assets/fonts/manrope-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Manrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+  src: url("../../assets/fonts/manrope-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+    U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+    U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
 :root {
   color-scheme: light;
 
-  /* Typography — system stack; SF on Apple, Segoe/Roboto elsewhere. --------- */
-  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+  /* Typography — Manrope first, system stack as the graceful fallback. ------ */
+  --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI",
     Roboto, system-ui, Helvetica, Arial, sans-serif;
-  --font-display: "SF Pro Display", -apple-system, BlinkMacSystemFont,
-    "Segoe UI", Roboto, system-ui, sans-serif;
+  --font-display: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI",
+    Roboto, system-ui, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  /* Surfaces -------------------------------------------------------------- */
-  --bg: #ffffff;
+  /* Surfaces — warm cream paper. ------------------------------------------ */
+  --bg: #faf6ec;
   --bg-tint: none;
-  --card: #ffffff;
-  --surface-2: #f7f7f8;
-  --sidebar-bg: #f9f9f9;
-  --chrome: rgba(255, 255, 255, 0.78);
-  --input-bg: #f4f4f5;
-  --code-bg: rgba(0, 0, 0, 0.05);
-  --bubble: #f4f4f5;            /* neutral user-message bubble (ChatGPT-style) */
+  --card: #fffdf8;
+  --surface-2: #f3ecdb;
+  --sidebar-bg: #f4eedd;
+  --chrome: rgba(250, 246, 236, 0.82);
+  --input-bg: #f1ead8;
+  --code-bg: rgba(60, 50, 30, 0.06);
+  --bubble: #f1ead8;            /* neutral user-message bubble */
 
-  /* Text ------------------------------------------------------------------ */
-  --text: #0d0d0d;
-  --secondary: #5d5d66;
-  --tertiary: #9b9ba4;
+  /* Text — warm near-black, never pure #000. ------------------------------ */
+  --text: #2a2620;
+  --secondary: #6b6354;
+  --tertiary: #9a917f;
 
   /* Lines & states -------------------------------------------------------- */
-  --separator: rgba(0, 0, 0, 0.08);
-  --border-strong: rgba(0, 0, 0, 0.16);
-  --hover: rgba(0, 0, 0, 0.045);
+  --separator: rgba(42, 38, 32, 0.10);
+  --border-strong: rgba(42, 38, 32, 0.18);
+  --hover: rgba(42, 38, 32, 0.045);
 
-  /* Brand — a single blue splash ------------------------------------------ */
-  --accent: #007aff;
-  --accent-hover: #0069d9;
-  --accent-press: #005ec4;
-  --accent-soft: rgba(0, 122, 255, 0.10);
-  --accent-soft-strong: rgba(0, 122, 255, 0.16);
+  /* Brand — a calm, slightly muted teal. ---------------------------------- */
+  --accent: #1f8f8b;
+  --accent-hover: #1a7c78;
+  --accent-press: #166b68;
+  --accent-soft: rgba(31, 143, 139, 0.10);
+  --accent-soft-strong: rgba(31, 143, 139, 0.16);
   --accent-grad: var(--accent);
-  --on-accent: #ffffff;
-  --focus-ring: rgba(0, 122, 255, 0.32);
+  --accent-glow: rgba(31, 143, 139, 0.42);
+  --on-accent: #fcfaf3;
+  --focus-ring: rgba(31, 143, 139, 0.32);
 
-  /* Status ---------------------------------------------------------------- */
-  --green: #248a3d;
-  --success: #248a3d;
-  --success-soft: rgba(36, 138, 61, 0.12);
-  --warn: #b25e00;
-  --warn-soft: rgba(178, 94, 0, 0.12);
-  --danger: #d70015;
+  /* Status — harmonised with the warm palette. ---------------------------- */
+  --green: #2c8a5a;
+  --success: #2c8a5a;
+  --success-soft: rgba(44, 138, 90, 0.13);
+  --warn: #b5751a;
+  --warn-soft: rgba(181, 117, 26, 0.14);
+  --danger: #c7382e;
+  --danger-soft: rgba(199, 56, 46, 0.12);
 
   /* Radii — soft squircles ------------------------------------------------ */
   --r-xs: 8px;
@@ -64,11 +93,11 @@
   --r-2xl: 20px;
   --r-pill: 999px;
 
-  /* Elevation — soft and diffuse, never heavy ----------------------------- */
-  --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.06);
-  --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.04), 0 10px 28px -14px rgba(0, 0, 0, 0.12);
-  --shadow-pop: 0 12px 40px -8px rgba(0, 0, 0, 0.18);
-  --shadow-accent: 0 2px 10px -3px rgba(0, 122, 255, 0.40);
+  /* Elevation — soft, warm, never heavy. ---------------------------------- */
+  --shadow-btn: 0 1px 2px rgba(60, 50, 30, 0.06);
+  --shadow-card: 0 1px 2px rgba(60, 50, 30, 0.05), 0 10px 28px -14px rgba(60, 50, 30, 0.14);
+  --shadow-pop: 0 12px 40px -8px rgba(40, 33, 20, 0.20);
+  --shadow-accent: 0 2px 10px -3px rgba(31, 143, 139, 0.36);
 
   /* Standard easing for hover/press micro-interactions. */
   --ease: cubic-bezier(0.22, 0.61, 0.36, 1);
@@ -77,89 +106,99 @@
 :root[data-theme="dark"] {
   color-scheme: dark;
 
-  --bg: #1e1e20;
+  --bg: #15201f;
   --bg-tint: none;
-  --card: #2c2c2e;
-  --surface-2: #2a2a2c;
-  --sidebar-bg: #171719;
-  --chrome: rgba(30, 30, 32, 0.80);
-  --input-bg: #2f2f31;
-  --code-bg: rgba(255, 255, 255, 0.08);
-  --bubble: #323234;
+  --card: #243331;
+  --surface-2: #1b2827;
+  --sidebar-bg: #101918;
+  --chrome: rgba(21, 32, 31, 0.82);
+  --input-bg: #1b2827;
+  --code-bg: rgba(255, 255, 255, 0.07);
+  --bubble: #2b3a37;
 
-  --text: #ececee;
-  --secondary: #b4b4bb;
-  --tertiary: #8a8a92;
+  --text: #e8e4d8;
+  --secondary: #a6b0ad;
+  --tertiary: #76817e;
 
-  --separator: rgba(255, 255, 255, 0.10);
-  --border-strong: rgba(255, 255, 255, 0.20);
+  --separator: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.18);
   --hover: rgba(255, 255, 255, 0.06);
 
-  --accent: #0a84ff;
-  --accent-hover: #3a9bff;
-  --accent-press: #0060df;
-  --accent-soft: rgba(10, 132, 255, 0.18);
-  --accent-soft-strong: rgba(10, 132, 255, 0.26);
+  --accent: #4fd1c5;
+  --accent-hover: #6bdcd1;
+  --accent-press: #3dbcb0;
+  --accent-soft: rgba(79, 209, 197, 0.16);
+  --accent-soft-strong: rgba(79, 209, 197, 0.24);
   --accent-grad: var(--accent);
-  --on-accent: #ffffff;
-  --focus-ring: rgba(10, 132, 255, 0.45);
+  --accent-glow: rgba(79, 209, 197, 0.40);
+  --on-accent: #0e1716;
+  --focus-ring: rgba(79, 209, 197, 0.40);
 
-  --green: #30d158;
-  --success: #30d158;
-  --success-soft: rgba(48, 209, 88, 0.18);
-  --warn: #ffb340;
-  --warn-soft: rgba(255, 179, 64, 0.18);
-  --danger: #ff453a;
+  --green: #5bd07a;
+  --success: #5bd07a;
+  --success-soft: rgba(91, 208, 122, 0.18);
+  --warn: #e8b05a;
+  --warn-soft: rgba(232, 176, 90, 0.18);
+  --danger: #ff6b5e;
+  --danger-soft: rgba(255, 107, 94, 0.18);
 
   --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.5);
   --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px -14px rgba(0, 0, 0, 0.7);
   --shadow-pop: 0 18px 50px -12px rgba(0, 0, 0, 0.75);
-  --shadow-accent: 0 2px 12px -3px rgba(10, 132, 255, 0.55);
+  --shadow-accent: 0 2px 12px -3px rgba(79, 209, 197, 0.5);
 }
 
 /* No-flash dark: mirror the dark tokens before theme.js has resolved. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
     color-scheme: dark;
-    --bg: #1e1e20;
+    --bg: #15201f;
     --bg-tint: none;
-    --card: #2c2c2e;
-    --surface-2: #2a2a2c;
-    --sidebar-bg: #171719;
-    --chrome: rgba(30, 30, 32, 0.80);
-    --input-bg: #2f2f31;
-    --code-bg: rgba(255, 255, 255, 0.08);
-    --bubble: #323234;
-    --text: #ececee;
-    --secondary: #b4b4bb;
-    --tertiary: #8a8a92;
-    --separator: rgba(255, 255, 255, 0.10);
-    --border-strong: rgba(255, 255, 255, 0.20);
+    --card: #243331;
+    --surface-2: #1b2827;
+    --sidebar-bg: #101918;
+    --chrome: rgba(21, 32, 31, 0.82);
+    --input-bg: #1b2827;
+    --code-bg: rgba(255, 255, 255, 0.07);
+    --bubble: #2b3a37;
+    --text: #e8e4d8;
+    --secondary: #a6b0ad;
+    --tertiary: #76817e;
+    --separator: rgba(255, 255, 255, 0.09);
+    --border-strong: rgba(255, 255, 255, 0.18);
     --hover: rgba(255, 255, 255, 0.06);
-    --accent: #0a84ff;
-    --accent-hover: #3a9bff;
-    --accent-press: #0060df;
-    --accent-soft: rgba(10, 132, 255, 0.18);
-    --accent-soft-strong: rgba(10, 132, 255, 0.26);
+    --accent: #4fd1c5;
+    --accent-hover: #6bdcd1;
+    --accent-press: #3dbcb0;
+    --accent-soft: rgba(79, 209, 197, 0.16);
+    --accent-soft-strong: rgba(79, 209, 197, 0.24);
     --accent-grad: var(--accent);
-    --on-accent: #ffffff;
-    --focus-ring: rgba(10, 132, 255, 0.45);
-    --green: #30d158;
-    --success: #30d158;
-    --success-soft: rgba(48, 209, 88, 0.18);
-    --warn: #ffb340;
-    --warn-soft: rgba(255, 179, 64, 0.18);
-    --danger: #ff453a;
+    --accent-glow: rgba(79, 209, 197, 0.40);
+    --on-accent: #0e1716;
+    --focus-ring: rgba(79, 209, 197, 0.40);
+    --green: #5bd07a;
+    --success: #5bd07a;
+    --success-soft: rgba(91, 208, 122, 0.18);
+    --warn: #e8b05a;
+    --warn-soft: rgba(232, 176, 90, 0.18);
+    --danger: #ff6b5e;
+    --danger-soft: rgba(255, 107, 94, 0.18);
     --shadow-btn: 0 1px 2px rgba(0, 0, 0, 0.5);
     --shadow-card: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px -14px rgba(0, 0, 0, 0.7);
     --shadow-pop: 0 18px 50px -12px rgba(0, 0, 0, 0.75);
-    --shadow-accent: 0 2px 12px -3px rgba(10, 132, 255, 0.55);
+    --shadow-accent: 0 2px 12px -3px rgba(79, 209, 197, 0.5);
   }
 }
 
 /* Shared primitives reused across every extension page. -------------------- */
 * { box-sizing: border-box; }
 svg { flex: none; }
+
+/* Refine every line icon (Lucide-style, drawn with fill="none") to a lighter,
+   more considered stroke. CSS beats the SVG presentation attribute, so this
+   re-weights both inline and JS-injected icons at once. Math is rendered as
+   plain HTML, so nothing else is affected. */
+svg[fill="none"] { stroke-width: 1.75; }
 
 ::selection { background: var(--accent-soft-strong); color: var(--text); }
 
@@ -173,21 +212,20 @@ svg { flex: none; }
 
 :focus-visible { outline: none; box-shadow: 0 0 0 3px var(--focus-ring); }
 
-/* The смэш logo — the PNG icon clipped to a soft squircle.
-   A hairline border keeps the black icon from disappearing in dark mode;
-   the subtle drop-shadow lifts it off the page in light mode. */
+/* The смэш logomark — a teal squircle holding the "с" monogram. Cohesive in
+   both themes (cream glyph on teal in light; dark glyph on mint in dark). */
 .brandmark {
   display: grid; place-items: center; flex: none;
   width: 30px; height: 30px; border-radius: var(--r-sm);
-  background: #000;
-  color: #fff;
+  background: var(--accent);
+  color: var(--on-accent);
   font-family: var(--font-display);
-  font-weight: 700; font-size: 17px; line-height: 1; letter-spacing: -0.5px;
-  border: 1px solid var(--border-strong);
-  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.18);
+  font-weight: 800; font-size: 17px; line-height: 1; letter-spacing: -0.5px;
+  border: none;
+  box-shadow: var(--shadow-accent);
   transition: transform 0.18s var(--ease);
   overflow: hidden;
-  object-fit: cover;
+  user-select: none;
 }
 
 /* Shared spinner. */

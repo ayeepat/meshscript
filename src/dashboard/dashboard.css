@@ -210,7 +210,7 @@ body {
   box-shadow: var(--shadow-accent);
   transition: transform 0.15s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.send:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 16px -4px rgba(0, 122, 255, 0.5); }
+.send:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 16px -4px var(--accent-glow); }
 .send:active { transform: scale(0.92); background: var(--accent-press); }
 
 .week .lesson.active .spinner { border-color: var(--accent-soft); border-top-color: var(--accent); }

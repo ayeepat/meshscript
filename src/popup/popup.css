@@ -184,7 +184,7 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
   box-shadow: var(--shadow-accent);
   transition: transform 0.15s var(--ease), background 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
-.bigbtn:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px rgba(0, 122, 255, 0.5); }
+.bigbtn:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px -4px var(--accent-glow); }
 .bigbtn:active { transform: scale(0.98); background: var(--accent-press); }
 .bigbtn:disabled { opacity: 0.55; cursor: default; transform: none; filter: none; }
 .answer {
