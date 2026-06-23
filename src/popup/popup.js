@@ -9,10 +9,17 @@ import { extractMath, restoreMath } from '../common/tex.js';
 import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
+import { hasConsent, setConsent } from '../lib/consent.js';
+import { isVersionBelow } from '../lib/remote-config.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 initTheme();
+
+// Remote hot-fix config (scrape selectors / vocabulary / update notice), pulled
+// once per popup open from the service worker. Null until loaded; every consumer
+// tolerates null and falls back to the values built into this release.
+let runtimeConfig = null;
 
 const uploads = {}; // `${day}||${subject}` -> [{mimeType, dataBase64, name}, ...]
 const autoFetched = new Set(); // upKeys we've already auto-pulled from Mesh
@@ -208,8 +215,11 @@ async function runFetchDiag(btn) {
  * injected yet on this tab), programmatically inject it, then retry once.
  */
 function sendScan(tabId) {
+  // Pass the remote hot-fix config along so the scraper can apply any overridden
+  // subject vocabulary / homework selector for this scan (best-effort, nullable).
+  const scanMsg = { type: 'MESH_SCAN', config: runtimeConfig };
   return new Promise((resolve) => {
-    chrome.tabs.sendMessage(tabId, { type: 'MESH_SCAN' }, (resp) => {
+    chrome.tabs.sendMessage(tabId, scanMsg, (resp) => {
       if (chrome.runtime.lastError || !resp) {
         // Not injected yet -> inject and retry.
         chrome.scripting.executeScript(
@@ -219,7 +229,7 @@ function sendScan(tabId) {
               resolve({ ok: false, error: chrome.runtime.lastError.message });
               return;
             }
-            chrome.tabs.sendMessage(tabId, { type: 'MESH_SCAN' }, (resp2) => {
+            chrome.tabs.sendMessage(tabId, scanMsg, (resp2) => {
               if (chrome.runtime.lastError || !resp2) {
                 resolve({ ok: false, error: chrome.runtime.lastError?.message || 'no response' });
               } else {
@@ -745,14 +755,128 @@ async function scanHomework() {
   render(resp.data);
 }
 
-function init() {
+/* ---------- First-run onboarding (consent + a working AI key) ---------- */
+
+const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey' };
+const PROVIDER_KEY_LINK = {
+  groq: { url: 'https://console.groq.com/keys', label: 'Получить бесплатный ключ →', placeholder: 'gsk_…' },
+  openrouter: { url: 'https://openrouter.ai/keys', label: 'Получить ключ OpenRouter →', placeholder: 'sk-or-v1-…' }
+};
+let obProvider = 'groq';
+
+function setObProvider(p) {
+  obProvider = (p === 'openrouter') ? 'openrouter' : 'groq';
+  const meta = PROVIDER_KEY_LINK[obProvider];
+  for (const b of document.querySelectorAll('#obProvider button')) {
+    b.classList.toggle('active', b.dataset.p === obProvider);
+  }
+  const link = document.getElementById('obKeyLink');
+  link.href = meta.url;
+  link.textContent = meta.label;
+  document.getElementById('obKey').placeholder = meta.placeholder;
+}
+
+function showObError(text) {
+  const err = document.getElementById('obError');
+  err.textContent = text;
+  err.hidden = !text;
+}
+
+// Toggle the onboarding view vs. the normal tabbed UI.
+function showOnboarding(show) {
+  document.getElementById('onboardView').hidden = !show;
+  document.querySelector('nav.tabs').hidden = show;
+  if (show) {
+    document.getElementById('hwView').hidden = true;
+    document.getElementById('testView').hidden = true;
+  } else {
+    showTab('hw');
+  }
+}
+
+async function finishOnboarding() {
+  const consent = document.getElementById('obConsent').checked;
+  const typed = document.getElementById('obKey').value.trim();
+  if (!consent) { showObError('Поставьте галочку согласия, чтобы продолжить.'); return; }
+  const field = PROVIDER_KEY_FIELD[obProvider];
+  // Re-pasting isn't required if a key for the chosen provider is already stored
+  // (e.g. set earlier in Settings) — consent alone is enough to proceed then.
+  const { [field]: existing } = await chrome.storage.local.get(field);
+  if (!typed && !existing) { showObError('Вставьте API-ключ выбранного сервиса.'); return; }
+  showObError('');
+  const data = { aiProvider: obProvider };
+  if (typed) data[field] = typed;
+  await chrome.storage.local.set(data);
+  await setConsent(true);
+  showOnboarding(false);
+  scanHomework();
+}
+
+function wireOnboarding() {
+  document.getElementById('obProvider').addEventListener('click', (e) => {
+    const b = e.target.closest('button');
+    if (b) setObProvider(b.dataset.p);
+  });
+  document.getElementById('obStart').onclick = finishOnboarding;
+  document.getElementById('obSettings').onclick = () => chrome.runtime.openOptionsPage();
+}
+
+// Ready = consent given AND the selected provider has a key. Otherwise show
+// onboarding so the very first "Решить" can never dead-end on a bare key error.
+async function isReadyToSolve() {
+  if (!(await hasConsent())) return false;
+  const { aiProvider = 'openrouter', openrouterApiKey, groqApiKey } =
+    await chrome.storage.local.get(['aiProvider', 'openrouterApiKey', 'groqApiKey']);
+  return aiProvider === 'groq' ? !!groqApiKey : !!openrouterApiKey;
+}
+
+/* ---------- Runtime-config notice (update required / operator message) ---------- */
+
+async function loadRuntimeConfig() {
+  const r = await sendToBackground({ type: 'GET_RUNTIME_CONFIG' });
+  runtimeConfig = r?.ok ? r.config : null;
+  return runtimeConfig;
+}
+
+function renderNotice(config) {
+  const el = document.getElementById('notice');
+  if (!config) { el.hidden = true; return; }
+  const version = chrome.runtime.getManifest().version;
+  let text = '';
+  let url = null;
+  if (config.minExtensionVersion && isVersionBelow(version, config.minExtensionVersion)) {
+    text = 'Вышло важное обновление расширения — обновите его, чтобы всё работало корректно.';
+    url = config.notice?.url || null;
+  } else if (config.notice?.text) {
+    text = config.notice.text;
+    url = config.notice.url || null;
+  }
+  if (!text) { el.hidden = true; return; }
+  el.innerHTML = escapeHtml(text) +
+    (url ? ` <a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">Подробнее →</a>` : '');
+  el.hidden = false;
+}
+
+async function init() {
   document.getElementById('settingsBtn').onclick = () => chrome.runtime.openOptionsPage();
   document.getElementById('tabHw').onclick = () => showTab('hw');
   document.getElementById('tabTest').onclick = () => showTab('test');
   document.getElementById('solveTest').onclick = solveTestOnScreen;
   document.getElementById('solveAllPages').onclick = solveAllPages;
   document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
-  scanHomework();
+  wireOnboarding();
+
+  // Runtime config first (drives both the update banner and the scrape overrides),
+  // then decide between onboarding and the normal flow.
+  renderNotice(await loadRuntimeConfig());
+
+  if (await isReadyToSolve()) {
+    scanHomework();
+  } else {
+    const { aiProvider } = await chrome.storage.local.get('aiProvider');
+    setObProvider(aiProvider || 'groq'); // prefer free Groq for brand-new users
+    showOnboarding(true);
+  }
 }
 
 init();

@@ -19,6 +19,17 @@ export const isTextFile = (f) =>
   /\.(txt|md|markdown|csv|tsv|rtf|log|json|xml|html?|tex)$/i.test(f?.name || '');
 
 /**
+ * Audio files (listening / аудирование material). The solver model can't hear
+ * sound, so these are deliberately NOT "readable" below — they must be
+ * transcribed to text first (Groq Whisper, see lib/transcribe.js) before the
+ * solve path can use them. Mesh serves attachments as octet-stream a lot, so
+ * the extension check matters as much as the mime.
+ */
+export const isAudioFile = (f) =>
+  /^audio\//.test(f?.mimeType || '') ||
+  /\.(mp3|mpga|mpeg|m4a|wav|flac|ogg|oga|opus|aac|weba)$/i.test(f?.name || '');
+
+/**
  * Office Open XML / legacy office docs. We can't hand these to a model, but the
  * modern (zip-based) ones can be text-extracted locally first — see extract.js.
  * The regex also matches legacy binaries (.doc/.ppt/.xls); extraction returns

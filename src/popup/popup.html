@@ -21,6 +21,37 @@
     </button>
   </header>
 
+  <div id="notice" class="notice" hidden></div>
+
+  <section id="onboardView" class="onboard" hidden>
+    <h2 class="ob-title">Добро пожаловать в СМЭШ AI</h2>
+    <p class="ob-lede">Решаю домашку и тесты из электронного дневника МЭШ. Нужен один бесплатный ключ ИИ — и можно начинать.</p>
+
+    <div class="ob-step">
+      <div class="ob-h">1 · Подключите ИИ</div>
+      <div class="seg" id="obProvider" role="group" aria-label="Сервис ИИ">
+        <button data-p="groq" class="active" type="button">Groq · бесплатно</button>
+        <button data-p="openrouter" type="button">OpenRouter</button>
+      </div>
+      <a id="obKeyLink" class="ob-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Получить бесплатный ключ →</a>
+      <input id="obKey" class="ob-input" type="text" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
+    </div>
+
+    <div class="ob-step">
+      <div class="ob-h">2 · Согласие</div>
+      <label class="ob-consent">
+        <input id="obConsent" type="checkbox" />
+        <span>Понимаю, что текст заданий, скриншоты и прикреплённые файлы отправляются выбранному ИИ-сервису для получения ответа. Принимаю
+          <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a> и
+          <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия</a>.</span>
+      </label>
+    </div>
+
+    <div id="obError" class="ob-error" hidden></div>
+    <button id="obStart" class="bigbtn" type="button"><span>Начать</span></button>
+    <button id="obSettings" class="ob-ghost" type="button">Открыть полные настройки</button>
+  </section>
+
   <nav class="tabs" role="tablist">
     <button id="tabHw" class="tab active" role="tab">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
@@ -62,6 +93,12 @@
       <span id="copyTestLabel">Скопировать ответы</span>
     </button>
   </div>
+
+  <footer class="legal">
+    <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Конфиденциальность</a>
+    <span class="legal-dot">·</span>
+    <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия</a>
+  </footer>
 
   <script type="module" src="popup.js"></script>
 </body>

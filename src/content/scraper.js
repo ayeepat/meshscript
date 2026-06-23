@@ -21,7 +21,10 @@
  * A MESH_DEBUG message returns diagnostics for tuning against the real DOM.
  */
 
-const SUBJECT_VOCABULARY = [
+// `let`, not `const`: the remote runtime config (lib/remote-config.js, passed in
+// on the MESH_SCAN message) can override this to add a subject Mesh renamed,
+// without a store re-publish. The built-in list below is always the fallback.
+let SUBJECT_VOCABULARY = [
   'Алгебра', 'Геометрия', 'Математика', 'Физика', 'Химия',
   'Биология', 'История', 'Обществознание', 'География',
   'Русский язык', 'Литература', 'Английский язык', 'Иностранный язык',
@@ -56,10 +59,31 @@ const NOISE_RE = new RegExp(
   ')$', 'i'
 );
 
-const HOMEWORK_ANCHOR_SEL = 'a[href*="/diary/homeworks/homeworks/"]';
+// `let` for the same reason as SUBJECT_VOCABULARY: if Mesh changes the homework
+// URL shape, the remote config can ship a new selector same-day. Built-in is the
+// fallback, and any override is validated before it reaches this script.
+let HOMEWORK_ANCHOR_SEL = 'a[href*="/diary/homeworks/homeworks/"]';
 
 function normalize(text) {
   return (text || '').replace(/\s+/g, ' ').trim();
+}
+
+// Apply remote runtime-config overrides (subject vocabulary, homework anchor
+// selector) sent by the popup on MESH_SCAN. Best-effort and defensive: a junk
+// value is ignored and the built-in default stays in force. The selector is
+// only ever used in querySelector, never executed.
+function applyScanConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return;
+  if (Array.isArray(cfg.subjectVocabulary) && cfg.subjectVocabulary.length) {
+    const list = cfg.subjectVocabulary.filter((s) => typeof s === 'string' && s.trim());
+    if (list.length) SUBJECT_VOCABULARY = list;
+  }
+  if (typeof cfg.homeworkAnchorSelector === 'string' && cfg.homeworkAnchorSelector.trim()) {
+    try {
+      document.querySelector(cfg.homeworkAnchorSelector); // throws on an invalid selector
+      HOMEWORK_ANCHOR_SEL = cfg.homeworkAnchorSelector;
+    } catch { /* invalid selector — keep the built-in */ }
+  }
 }
 
 function isNoise(text) {
@@ -1292,6 +1316,7 @@ if (!window.__smeshListenerAdded) {
     // "channel closed before response".
     try {
       if (msg && msg.type === 'MESH_SCAN') {
+        applyScanConfig(msg.config); // remote hot-fix overrides (best-effort)
         sendResponse({ ok: true, data: scanHomeworks() });
         return false;
       }

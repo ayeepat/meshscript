@@ -115,10 +115,12 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   // resetting postStream's idle timeout during long thinks (no silent stall).
   if (reasoning) body.reasoning = reasoning;
 
+  // OpenRouter shows these on its apps leaderboard. Keep the value ASCII —
+  // fetch() throws on a non-Latin-1 header value (so no Cyrillic in X-Title).
   const headers = {
     Authorization: `Bearer ${key}`,
-    'HTTP-Referer': 'https://gitlab.com/tes738882-group/meshscript',
-    'X-Title': 'smesh'
+    'HTTP-Referer': 'https://www.smeshai.xyz',
+    'X-Title': 'SMESH AI'
   };
 
   // ALWAYS stream — including JSON-mode replies (the test solver). This is the

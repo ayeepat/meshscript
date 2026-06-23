@@ -8,12 +8,15 @@ import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js'
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/history.js';
 import { ensureLicensed } from '../lib/license.js';
+import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
+import { getRuntimeConfig } from '../lib/remote-config.js';
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
-import { isReadableFile, hasPdf } from '../lib/file-kinds.js';
+import { isReadableFile, hasPdf, isAudioFile } from '../lib/file-kinds.js';
 import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } from '../lib/gdz-api.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
+import { transcribeAudioFiles } from '../lib/transcribe.js';
 
 // Follow-ups re-send prior context. Cap how many MESSAGES we replay: full
 // worked solutions are long, and on a paid provider every re-sent message is
@@ -28,6 +31,11 @@ const MAX_HISTORY_MESSAGES = 8;
 try {
   chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
 } catch { /* old Chrome — content script falls back to defaults each time */ }
+
+// Warm the remote runtime config on every SW spin-up (cheap: a single cached
+// fetch at most once per TTL). Fire-and-forget — a failure is a silent no-op and
+// the extension uses its built-in defaults. See lib/remote-config.js.
+getRuntimeConfig().catch(() => { /* offline / not hosted — defaults apply */ });
 
 // Open the full-window dashboard when the popup asks to "Solve".
 async function openDashboard(payload) {
@@ -66,19 +74,30 @@ function missingInputGate(category, task, files) {
   const cls = classifyTask(task);
   const audio = needsAudio(task);
 
+  // An audio file IS attached but still isn't readable — a successful
+  // transcription would have replaced it with a text/plain file (see
+  // transcribeAudioFiles). So it's here means Whisper didn't run or returned
+  // nothing. Point at the likely cause instead of telling the user to attach a
+  // file they already attached.
+  if (files.some(isAudioFile) && !hasReadable) {
+    return 'Не удалось расшифровать аудиозапись. Проверьте, что в настройках указан ключ Groq ' +
+      '(бесплатный — он нужен для распознавания речи) и не исчерпан его дневной лимит, ' +
+      'затем попробуйте ещё раз. Либо пришлите готовую расшифровку (текст) записи.';
+  }
+
   if (cls.kind === 'attachment' && !hasReadable) {
     let msg = 'Не могу решить это задание без самого материала. ' +
       'Пришлите файл варианта/задания (PDF, фото или скриншот страницы), и я всё решу.';
     if (audio) {
-      msg += '\n\nАудирование я прослушать не могу в принципе — для него пришлите ' +
-        'расшифровку (текст) записи, тогда решу и эту часть.';
+      msg += '\n\nДля аудирования прикрепите сам аудиофайл (mp3, m4a, wav…) — я его ' +
+        'расшифрую и решу эту часть. Либо пришлите готовую расшифровку (текст) записи.';
     }
     return msg;
   }
 
   if (audio && !hasReadable) {
-    return 'В этом задании нужно аудирование, а звук я прослушать не могу. ' +
-      'Пришлите расшифровку (текст) записи или фото/скан заданий — тогда решу.';
+    return 'В этом задании нужно аудирование. Прикрепите аудиофайл записи (mp3, m4a, wav…) — ' +
+      'я расшифрую его и решу. Либо пришлите готовую расшифровку (текст) или фото/скан заданий.';
   }
 
   if ((category === PROMPT_CATEGORIES.RUSSIAN_FULL || cls.kind === 'textbook') &&
@@ -100,12 +119,24 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // License gate. No-op while LICENSE_ENFORCED is off (preorder window).
   // Throws a Russian-language error the catch path surfaces verbatim.
   await ensureLicensed();
+  // Privacy backstop: never send homework to a provider without consent. The
+  // popup onboarding collects this up front, so this only fires for an edge
+  // path (e.g. a stale dashboard tab). Surfaced as a normal assistant message.
+  if (!(await hasConsent())) return { answer: CONSENT_REQUIRED_MESSAGE, needsConsent: true, sessionId };
   const category = categoryForSubject(subject);
 
   // Extract Office files (.docx/.pptx/.xlsx) to inline text RIGHT HERE, locally
   // and for free — no API call. This both lets the model actually solve from
   // them and lets the gate below see them as readable material.
   files = await prepareFiles(files);
+
+  // Listening (аудирование) clips can't be read by the solver model, so
+  // transcribe any attached audio to text via Groq Whisper FIRST. After this an
+  // audio attachment counts as readable material, so the gate below stops
+  // refusing it and the normal solve path answers the listening task. On any
+  // failure (no Groq key, daily cap, bad codec) the audio passes through
+  // unchanged and the gate's "send a transcript" refusal still applies.
+  files = await transcribeAudioFiles(files);
 
   // Hard refusal gate — runs in CODE, before any model call, only on the first
   // turn (later turns may carry a clarification or a just-attached file). A soft
@@ -161,6 +192,9 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
  */
 async function solveTest({ text, screenshot }) {
   await ensureLicensed();
+  // Same privacy backstop as solve(): no consent → no provider call. Thrown so
+  // the popup's requestSolve surfaces it as a clear error instead of a "result".
+  if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
   const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
   const systemPrompt =
     promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
@@ -269,6 +303,8 @@ const EXT_MIME = {
   pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
   gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
   txt: 'text/plain', csv: 'text/csv', rtf: 'application/rtf', md: 'text/markdown',
+  mp3: 'audio/mpeg', mpga: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav',
+  ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/opus', flac: 'audio/flac', aac: 'audio/aac',
   doc: 'application/msword',
   docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   ppt: 'application/vnd.ms-powerpoint',
@@ -302,12 +338,15 @@ async function downloadFile(url, headers) {
       return null;
     }
     const buf = await res.arrayBuffer();
-    if (!buf.byteLength || buf.byteLength > 12 * 1024 * 1024) {
+    const name = nameFromUrl(url);
+    const mimeType = inferMime(name, res.headers.get('content-type'));
+    // Audio (listening clips) gets a higher cap — Whisper accepts up to ~25 MB —
+    // while other attachments stay at 12 MB to bound memory / storage.
+    const maxBytes = isAudioFile({ name, mimeType }) ? 25 * 1024 * 1024 : 12 * 1024 * 1024;
+    if (!buf.byteLength || buf.byteLength > maxBytes) {
       console.log('[СМЭШ AI] download size skip', buf.byteLength, url);
       return null;
     }
-    const name = nameFromUrl(url);
-    const mimeType = inferMime(name, res.headers.get('content-type'));
     console.log('[СМЭШ AI] downloaded', name, mimeType, buf.byteLength + 'b');
     return { mimeType, dataBase64: abToBase64(buf), name };
   } catch (e) { console.log('[СМЭШ AI] download exception', String(e), url); return null; }
@@ -504,6 +543,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, status: await testNextPage(tabId) });
           break;
         }
+        case 'GET_RUNTIME_CONFIG':
+          // Remote hot-fix config (scrape selectors / vocabulary / update notice)
+          // with built-in fallback. Never throws; cached for RUNTIME_CONFIG_TTL_MS.
+          sendResponse({ ok: true, config: await getRuntimeConfig({ force: !!msg.payload?.force }) });
+          break;
         case 'CLASSIFY_TASKS':
           sendResponse({ ok: true, kinds: await classifyTasksAI(msg.payload?.tasks || []) });
           break;

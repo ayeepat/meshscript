@@ -50,7 +50,7 @@ function friendlyMessage(label, status, providerMsg) {
 }
 
 /** Build the friendly Error for a non-OK response (shared by both helpers). */
-function httpError(label, status, bodyText) {
+export function httpError(label, status, bodyText) {
   return new Error(friendlyMessage(label, status, extractError(bodyText)));
 }
 
@@ -189,6 +189,14 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
     throw httpError(label, res.status, text);
   }
 
+  // A 200 with no readable body stream can't be consumed — surface it as a
+  // clear error instead of throwing a raw TypeError on getReader().
+  if (!res.body) {
+    clearTimeout(timer);
+    signal?.removeEventListener('abort', onExternalAbort);
+    throw new Error(`${label}: пустой ответ сервера (нет потока данных).`);
+  }
+
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
@@ -209,11 +217,22 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
         if (!line.startsWith('data:')) continue;
         const data = line.slice(5).trim();
         if (data === '[DONE]') continue;
-        try {
-          const json = JSON.parse(data);
-          const delta = json?.choices?.[0]?.delta?.content;
-          if (delta) { full += delta; onDelta?.(delta); }
-        } catch { /* keep partial frame for the next chunk */ }
+        let json;
+        try { json = JSON.parse(data); }
+        catch { continue; } // incomplete / non-JSON frame — ignore, never fatal
+        // A 200 OK can still carry a provider error MID-STREAM: a rate limit hit
+        // while generating, a moderation block, or an upstream model drop. The
+        // old code only read delta.content, so such a frame was silently dropped
+        // and the user got "(пустой ответ)" / a truncated answer with no reason.
+        // Surface it as the same friendly error a pre-stream failure would.
+        if (json?.error) {
+          const code = Number(json.error.code) || Number(json.error.status) || 0;
+          throw code
+            ? httpError(label, code, JSON.stringify(json))
+            : new Error(`${label}: ${json.error.message || 'провайдер прервал ответ ошибкой. Попробуйте ещё раз.'}`);
+        }
+        const delta = json?.choices?.[0]?.delta?.content;
+        if (delta) { full += delta; onDelta?.(delta); }
       }
     }
   } catch (e) {

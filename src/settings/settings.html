@@ -120,6 +120,25 @@
         </div>
       </section>
 
+      <!-- Privacy & consent -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
+          <div>
+            <h2>Конфиденциальность и данные</h2>
+            <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы выбранному ИИ-сервису (OpenRouter или Groq). История хранится только локально и не дольше 7 дней.</p>
+          </div>
+          <span class="licstatus" id="consentStatus" data-state="idle">…</span>
+        </div>
+        <label class="consent-row">
+          <input id="consentToggle" type="checkbox" />
+          <span>Я согласен на обработку данных, как описано выше, и принимаю
+            <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a> и
+            <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a>.
+            Без согласия задания не отправляются и не решаются.</span>
+        </label>
+      </section>
+
       <!-- License -->
       <section class="panel">
         <div class="panel-head">
@@ -224,6 +243,14 @@
       </section>
 
     </div>
+
+    <footer class="legal">
+      <span>СМЭШ AI · v0.5.0</span>
+      <span class="legal-dot">·</span>
+      <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Политика конфиденциальности</a>
+      <span class="legal-dot">·</span>
+      <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия использования</a>
+    </footer>
 
   </main>
 

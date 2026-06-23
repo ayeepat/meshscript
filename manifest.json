@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "СМЭШ AI",
   "version": "0.5.0",
-  "description": "Personal homework assistant for the Mesh (school.mos.ru) platform.",
+  "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest"],
   "host_permissions": [
     "https://school.mos.ru/*",
@@ -11,7 +11,8 @@
     "https://openrouter.ai/*",
     "https://gdz-ru.com/*",
     "https://*.gdz-ru.com/*",
-    "https://gdz.ru/*"
+    "https://gdz.ru/*",
+    "https://*.smeshai.xyz/*"
   ],
   "declarative_net_request": {
     "rule_resources": [

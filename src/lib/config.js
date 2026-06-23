@@ -20,3 +20,15 @@ export const LICENSE_ENFORCED = false;
 // enough to absorb backend hiccups, short enough that revocations propagate
 // within a day.
 export const VERIFY_CACHE_MS = 24 * 60 * 60 * 1000;
+
+// Remote runtime config (see lib/remote-config.js). A small JSON file you host
+// yourself, fetched + cached so you can hot-fix a Mesh DOM change (the subject
+// vocabulary, the homework-anchor selector) or push an "update required" notice
+// WITHOUT shipping a new build through store review. Everything has a built-in
+// fallback, so a 404 / unreachable host changes nothing. Point this at a static
+// file on your site; the expected shape is documented in remote-config.js.
+export const RUNTIME_CONFIG_URL = 'https://www.smeshai.xyz/extension-config.json';
+
+// Refresh the cached runtime config at most this often (6h). Long enough to be
+// nearly free, short enough that a hot-fix reaches users the same day.
+export const RUNTIME_CONFIG_TTL_MS = 6 * 60 * 60 * 1000;

@@ -5,6 +5,7 @@ import { iconSvg } from '../common/icons.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 import { DEFAULT_LIMITS, getUsage } from '../lib/rate-limit.js';
 import { setLicenseKey, getLicenseStatus, reasonMessage } from '../lib/license.js';
+import { hasConsent, setConsent } from '../lib/consent.js';
 
 initTheme();
 
@@ -93,6 +94,7 @@ async function load() {
   }
   await refreshUsage();
   await loadLicenseUi();
+  await loadConsentUi();
 }
 
 /* ---------- License key ---------- */
@@ -120,6 +122,27 @@ function renderLicenseStatus(status) {
   }
   pill.textContent = reasonMessage(status.reason);
   pill.dataset.state = status.reason === 'network' ? 'warn' : 'err';
+}
+
+/* ---------- Privacy consent ---------- */
+
+function renderConsentStatus(accepted) {
+  const pill = document.getElementById('consentStatus');
+  pill.textContent = accepted ? 'Согласие дано' : 'Не подтверждено';
+  pill.dataset.state = accepted ? 'ok' : 'warn';
+}
+
+async function loadConsentUi() {
+  const accepted = await hasConsent();
+  document.getElementById('consentToggle').checked = accepted;
+  renderConsentStatus(accepted);
+}
+
+function wireConsent() {
+  document.getElementById('consentToggle').onchange = async (e) => {
+    await setConsent(e.target.checked);
+    renderConsentStatus(e.target.checked);
+  };
 }
 
 async function refreshUsage() {
@@ -449,6 +472,7 @@ buildPromptEditors();
 wireReveals();
 wireTabs();
 wireGdz();
+wireConsent();
 document.getElementById('save').onclick = save;
 document.getElementById('reload').onclick = loadHistory;
 load();

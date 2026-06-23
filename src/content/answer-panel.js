@@ -260,8 +260,28 @@
 
   function wireDrag(panel) {
     const bar = panel.querySelector('[data-drag]');
-    let dragging = false;
     let startX = 0, startY = 0, panelX = 0, panelY = 0;
+
+    // The global mousemove/mouseup listeners exist ONLY for the duration of an
+    // active drag, then remove themselves. Earlier they were attached to window
+    // on every wireDrag() call and never removed — each panel rebuild (every
+    // test solve, every page of a multi-page run) leaked another pair, piling up
+    // dozens of dead listeners that pinned detached panel DOM in memory.
+    const onMove = (e) => {
+      const w = panel.offsetWidth;
+      const x = clamp(panelX + (e.clientX - startX), 0, Math.max(0, innerWidth - w));
+      const y = clamp(panelY + (e.clientY - startY), 0, Math.max(0, innerHeight - 40));
+      panel.style.left = x + 'px';
+      panel.style.top = y + 'px';
+    };
+    const onUp = () => {
+      window.removeEventListener('mousemove', onMove, true);
+      window.removeEventListener('mouseup', onUp, true);
+      bar.classList.remove('dragging');
+      state.x = parseFloat(panel.style.left) || 0;
+      state.y = parseFloat(panel.style.top) || 0;
+      saveState();
+    };
 
     bar.addEventListener('mousedown', (e) => {
       if (e.target.closest('button')) return;
@@ -274,29 +294,11 @@
       panelY = rect.top;
       startX = e.clientX;
       startY = e.clientY;
-      dragging = true;
       bar.classList.add('dragging');
+      window.addEventListener('mousemove', onMove, true);
+      window.addEventListener('mouseup', onUp, true);
       e.preventDefault();
     });
-
-    const onMove = (e) => {
-      if (!dragging) return;
-      const w = panel.offsetWidth;
-      const x = clamp(panelX + (e.clientX - startX), 0, Math.max(0, innerWidth - w));
-      const y = clamp(panelY + (e.clientY - startY), 0, Math.max(0, innerHeight - 40));
-      panel.style.left = x + 'px';
-      panel.style.top = y + 'px';
-    };
-    const onUp = () => {
-      if (!dragging) return;
-      dragging = false;
-      bar.classList.remove('dragging');
-      state.x = parseFloat(panel.style.left) || 0;
-      state.y = parseFloat(panel.style.top) || 0;
-      saveState();
-    };
-    window.addEventListener('mousemove', onMove, true);
-    window.addEventListener('mouseup', onUp, true);
   }
 
   // Paint the ✓ / ⚠ markers from a fill summary onto the matching lines.

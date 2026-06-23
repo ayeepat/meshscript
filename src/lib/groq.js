@@ -16,14 +16,20 @@
  * for structured replies. (json_object disables streaming — parsed whole.)
  */
 
-import { postStream } from './http.js';
+import { postStream, httpError } from './http.js';
 import { isImageFile, isTextFile } from './file-kinds.js';
-import { base64ToUtf8 } from './extract.js';
+import { base64ToUtf8, base64ToBytes } from './extract.js';
 import { chargeOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
 const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+
+// Whisper on Groq (free tier) — turns a listening (аудирование) clip into text
+// so the normal solver can answer it. Multipart endpoint, NOT chat completions.
+const TRANSCRIBE_ENDPOINT = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const WHISPER_MODEL = 'whisper-large-v3';
+const TRANSCRIBE_TIMEOUT_MS = 90000; // a few-MB clip can take a while to process
 
 async function getKey() {
   const { groqApiKey } = await chrome.storage.local.get('groqApiKey');
@@ -121,4 +127,58 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
   // dropped above, so the streamed text may be plain prose; the popup's tiered
   // parser salvages it.)
   return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, signal });
+}
+
+/**
+ * Transcribe an audio file with Groq Whisper. Listening homework ships as an
+ * audio clip the solver model can't hear; turning it into text here lets the
+ * normal solve path answer it. Returns the transcript (possibly empty).
+ *
+ * Uses the multipart transcriptions endpoint (NOT chat), so we fetch directly
+ * instead of going through postStream/postJson — but non-OK responses still get
+ * the shared friendly-Russian error mapping via httpError.
+ *
+ * @param {{mimeType?:string, dataBase64:string, name?:string}} file
+ * @param {{language?:string, prompt?:string, signal?:AbortSignal}} [opts]
+ * @returns {Promise<string>}
+ */
+export async function transcribeAudio(file, opts = {}) {
+  const { language = null, prompt = null, signal = null } = opts;
+  const key = await getKey();
+  // Charge BEFORE the round-trip, same as askGroq — a transcription is a real
+  // Groq call and counts against the daily cap.
+  await chargeOne('groq');
+
+  const bytes = base64ToBytes(file.dataBase64 || '');
+  const blob = new Blob([bytes], { type: file.mimeType || 'audio/mpeg' });
+  const form = new FormData();
+  // The filename's extension is how Groq infers the codec, so keep a real one.
+  form.append('file', blob, file.name || 'audio.mp3');
+  form.append('model', WHISPER_MODEL);
+  form.append('response_format', 'json');
+  if (language) form.append('language', language);
+  if (prompt) form.append('prompt', prompt);
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), TRANSCRIBE_TIMEOUT_MS);
+  const onAbort = () => ctrl.abort();
+  if (signal) signal.addEventListener('abort', onAbort, { once: true });
+  try {
+    const res = await fetch(TRANSCRIBE_ENDPOINT, {
+      method: 'POST',
+      // Authorization only — let fetch set the multipart Content-Type boundary.
+      headers: { Authorization: `Bearer ${key}` },
+      body: form,
+      signal: ctrl.signal
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw httpError('Groq (расшифровка аудио)', res.status, text);
+    }
+    const json = await res.json().catch(() => null);
+    return (json && typeof json.text === 'string') ? json.text.trim() : '';
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onAbort);
+  }
 }

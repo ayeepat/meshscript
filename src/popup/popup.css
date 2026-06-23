@@ -219,3 +219,75 @@ body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
   transition: background 0.15s ease, border-color 0.15s ease;
 }
 .copybtn-lg:hover { background: var(--hover); border-color: var(--border-strong); }
+
+/* ---------- Runtime-config notice banner ---------- */
+.notice {
+  margin: 10px 16px 0; padding: 10px 12px;
+  font-size: 12px; line-height: 1.45; color: var(--text);
+  background: var(--warn-soft); border: 1px solid var(--warn-soft);
+  border-radius: var(--r-md);
+}
+.notice a { color: var(--warn); font-weight: 600; text-decoration: none; white-space: nowrap; }
+.notice a:hover { text-decoration: underline; }
+
+/* ---------- First-run onboarding ---------- */
+.onboard { padding: 16px; }
+.ob-title { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.4px; margin: 4px 0 4px; }
+.ob-lede { margin: 0 0 14px; font-size: 12.5px; line-height: 1.5; color: var(--secondary); }
+.ob-step {
+  background: var(--card); border: 1px solid var(--separator); border-radius: var(--r-lg);
+  padding: 13px 14px; margin-bottom: 10px; box-shadow: var(--shadow-card);
+}
+.ob-h { font-size: 11px; font-weight: 700; color: var(--tertiary); text-transform: uppercase; letter-spacing: 0.6px; margin-bottom: 9px; }
+.seg {
+  display: flex; gap: 3px; background: var(--input-bg); border-radius: var(--r-md); padding: 3px;
+}
+.seg button {
+  flex: 1; background: transparent; color: var(--secondary); border: none;
+  border-radius: var(--r-sm); padding: 8px 0; cursor: pointer;
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
+}
+.seg button:hover:not(.active) { color: var(--text); }
+.seg button.active { background: var(--card); color: var(--accent); box-shadow: var(--shadow-btn); }
+.ob-link {
+  display: inline-block; margin: 10px 0 8px;
+  font-size: 12px; font-weight: 600; color: var(--accent); text-decoration: none;
+}
+.ob-link:hover { text-decoration: underline; }
+.ob-input {
+  width: 100%; font: inherit; font-size: 13px; color: var(--text);
+  background: var(--input-bg); border: 1px solid var(--separator); border-radius: var(--r-md);
+  padding: 10px 12px; outline: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}
+.ob-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--focus-ring); }
+.ob-consent { display: flex; gap: 9px; align-items: flex-start; cursor: pointer; }
+.ob-consent input { margin: 2px 0 0; flex: none; width: 15px; height: 15px; accent-color: var(--accent); cursor: pointer; }
+.ob-consent span { font-size: 12px; line-height: 1.5; color: var(--secondary); }
+.ob-consent a { color: var(--accent); text-decoration: none; }
+.ob-consent a:hover { text-decoration: underline; }
+.ob-error {
+  margin: 0 0 10px; padding: 9px 11px; font-size: 12px; line-height: 1.4;
+  color: var(--danger); background: var(--danger-soft); border-radius: var(--r-md);
+}
+.onboard .bigbtn { margin-top: 4px; }
+.ob-ghost {
+  width: 100%; margin-top: 8px; background: transparent; color: var(--secondary);
+  border: none; border-radius: var(--r-md); padding: 9px; cursor: pointer;
+  font: inherit; font-size: 12.5px; font-weight: 600;
+  transition: color 0.15s ease;
+}
+.ob-ghost:hover { color: var(--text); }
+
+/* ---------- Legal footer ---------- */
+.legal {
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 10px 16px 13px;
+  font-size: 11px; color: var(--tertiary);
+  border-top: 1px solid var(--separator);
+}
+.legal a { color: var(--tertiary); text-decoration: none; transition: color 0.15s ease; }
+.legal a:hover { color: var(--accent); }
+.legal .legal-dot { opacity: 0.5; }
+body.compact .legal { padding: 8px 12px 11px; font-size: 10.5px; }

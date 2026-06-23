@@ -184,11 +184,11 @@ function assistantShell() {
  * shifts and an elapsed-seconds counter ticks (see common/thinking.js), so a
  * long solve never looks frozen — same feedback as the test tab.
  */
-function thinkingBubble() {
+function thinkingBubble(opts) {
   const d = document.createElement('div');
   d.className = 'msg assistant thinking';
   chatEl.appendChild(d); // append BEFORE animating so the ticker sees it connected
-  d.__ticker = startThinking(d);
+  d.__ticker = startThinking(d, opts);
   chatEl.scrollTop = chatEl.scrollHeight;
   return d;
 }
@@ -523,11 +523,15 @@ async function startLesson(chat) {
     }
   } catch (_e) { /* upload is best-effort */ }
 
-  // Ready GDZ answers are free (no API), shown as a card above the chat. If we
-  // have them and the user didn't attach a file to solve, that's the whole
-  // answer: show ONLY the card — no auto AI turn, so no task echo and no
-  // "Нужен файл" nudge. The user can still ask follow-ups in the composer.
+  // Ready GDZ answers are free (no API), shown as a card above the chat. The
+  // lookup hits gdz-ru.com and can take a few seconds, so show a transient
+  // status instead of a blank chat while it resolves. If we have them and the
+  // user didn't attach a file to solve, that's the whole answer: show ONLY the
+  // card — no auto AI turn, so no task echo and no "Нужен файл" nudge. The user
+  // can still ask follow-ups in the composer.
+  if (activeKey === chat.key) chat.thinkingEl = thinkingBubble({ words: ['Ищу готовые ответы'] });
   const hasGdz = await maybeShowGdz(chat);
+  stopThinking(chat);
   if (hasGdz && !files.length) return;
 
   await sendToChat(chat, chat.task, files);
