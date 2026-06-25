@@ -515,6 +515,10 @@
     }
 
     q.answer = r.answer;
+    // Carry fresh per-field values for a multi-box question (x & y, x₁ & x₂) so
+    // the re-fill below spreads them across every box, not just the first. The
+    // worker omits `parts` for single-box questions — clear stale ones then.
+    if ('parts' in r) q.parts = r.parts || undefined;
     aEl.textContent = r.answer;
     // Best-effort: push only this answer into the form and re-mark the line.
     // Pin `index` to the line's qid so scraper.js targets this exact question

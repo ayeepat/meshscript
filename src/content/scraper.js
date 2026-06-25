@@ -885,6 +885,16 @@ function leadingQuestionNumber(node) {
   return m ? parseInt(m[1], 10) : null;
 }
 
+// Count «ЗАДАНИЕ №N» / «Вопрос N» markers inside a node. Used to bound text-field
+// grouping: a container that spans more than one marker holds more than one
+// question, so its answer boxes must NOT be merged into a single multi-field unit.
+const QUESTION_MARKER_RE = /(?:вопрос|задани[ея])\s*[№#]?\s*\d{1,3}/gi;
+function countQuestionMarkers(node) {
+  if (!node) return 0;
+  const m = (node.textContent || '').match(QUESTION_MARKER_RE);
+  return m ? m.length : 0;
+}
+
 // Climb from a control's container looking for the enclosing question block and
 // its number. Falls back to (base, null) — positional matching takes over then.
 function questionInfo(base) {
@@ -913,6 +923,23 @@ function checkboxGroupContainer(cb) {
   return best;
 }
 
+// Largest ancestor that still belongs to ONE question — used to group the
+// several answer boxes of a single task (a system's x & y, a quadratic's x₁ & x₂,
+// several blanks) into one multi-field unit. Climbs until it would pull in a
+// control of a DIFFERENT question type (radio/checkbox/select) or span a second
+// «ЗАДАНИЕ №N» marker (a different question). Mirrors checkboxGroupContainer.
+function textFieldGroupContainer(input) {
+  let best = input.parentElement || input;
+  let node = input.parentElement;
+  while (node && node !== document.body) {
+    if (node.querySelector('input[type=radio], input[type=checkbox], select')) break;
+    if (countQuestionMarkers(node) > 1) break;
+    best = node;
+    node = node.parentElement;
+  }
+  return best;
+}
+
 function makeUnit(type, inputs, providedContainer) {
   const base = providedContainer || commonAncestor(inputs) || inputs[0].parentElement || inputs[0];
   const info = questionInfo(base);
@@ -921,7 +948,8 @@ function makeUnit(type, inputs, providedContainer) {
 
 // Discover every fillable question on the page as a list of units, in document
 // order. Radios group by their shared `name` (MUI RadioGroup) or RadioGroup
-// container; checkboxes by container; text/number/textarea are one-per-unit.
+// container; checkboxes by container; text/number/textarea group by question
+// card so one task's several answer boxes (x & y, x₁ & x₂) form a single unit.
 function collectUnits() {
   const units = [];
   const consumed = new Set();
@@ -947,11 +975,26 @@ function collectUnits() {
   }
   for (const { container, inputs } of cbByKey.values()) units.push(makeUnit('checkbox', inputs, container));
 
-  // --- free text ---
-  for (const t of pickControls('input[type=text], input[type=number], input:not([type]), textarea')) {
-    if (consumed.has(t)) continue;
-    units.push(makeUnit('text', [t]));
+  // --- free text / number / textarea ---
+  // Group the boxes that belong to the SAME question (a system's x & y, a
+  // quadratic's x₁ & x₂, several blanks) into ONE multi-field unit, so a single
+  // answer carrying several values fills every box instead of dumping the whole
+  // string into the first box or shifting into the next question. Grouping is
+  // bounded by «ЗАДАНИЕ №N» card markers (textFieldGroupContainer), so two
+  // distinct questions are never merged. On a page with no markers at all we
+  // can't find card boundaries, so we don't group — each box is its own unit
+  // (legacy behavior; safe for ordinary single-box tests).
+  const textCtrls = pickControls('input[type=text], input[type=number], input:not([type]), textarea')
+    .filter((t) => !consumed.has(t));
+  const allowGroup = countQuestionMarkers(document.body) >= 1;
+  const textGroups = new Map();
+  const textOrder = [];
+  for (const t of textCtrls) {
+    const key = allowGroup ? 'tf:' + elUid(textFieldGroupContainer(t)) : 'tf:' + elUid(t);
+    if (!textGroups.has(key)) { textGroups.set(key, []); textOrder.push(key); }
+    textGroups.get(key).push(t);
   }
+  for (const key of textOrder) units.push(makeUnit('text', textGroups.get(key)));
 
   units.sort((a, b) => domOrderCompare(a.anchor, b.anchor));
   return units;
@@ -1071,6 +1114,114 @@ function bestOption(answerStr, options, choice) {
   return null;
 }
 
+/* ---- Multi-field answers (one question, several answer boxes) ---- */
+// Some Mesh tasks need SEVERAL values typed into SEPARATE boxes: a system of
+// equations (x and y), a quadratic's two roots (x₁, x₂), several blanks. The
+// model returns those as `parts` ([{label,value}]) alongside the combined `a`
+// string; we map each part to the right box by its variable label, falling back
+// to screen order. That is what makes «x=4; y=-6» land as 4 in x and -6 in y
+// instead of the whole string in one box (or, worse, shifted into the next
+// question).
+
+const SUBSCRIPT_DIGITS = { '₀': '0', '₁': '1', '₂': '2', '₃': '3', '₄': '4', '₅': '5', '₆': '6', '₇': '7', '₈': '8', '₉': '9' };
+function asciiSubscripts(s) { return String(s ?? '').replace(/[₀-₉]/g, (c) => SUBSCRIPT_DIGITS[c] || c); }
+
+// Short key for a field's variable name: lowercase, subscripts→digits, ё→е, drop
+// a trailing «=»/«:», strip punctuation/spaces. «x ₁ =» → «x1», «Y:» → «y».
+// Returns '' for anything longer than a short label (e.g. a prompt sentence), so
+// a messy capture never poses as a variable name.
+function normalizeFieldLabel(s) {
+  let t = asciiSubscripts(normalize(s)).toLowerCase().replace(/ё/g, 'е');
+  t = t.replace(/\s*[=:]\s*$/, '').trim();
+  t = t.replace(/[«»"'’`().,;]/g, '').replace(/\s+/g, '');
+  return t.length && t.length <= 6 ? t : '';
+}
+
+// Closest short text just before a text input — its on-screen variable name
+// («x =», «y =»). Walks previous siblings then climbs a few levels; stops at any
+// control so it never reads across into another field's label.
+function precedingFieldText(input) {
+  let node = input;
+  for (let depth = 0; depth < 4 && node && node !== document.body; depth++) {
+    let sib = node.previousSibling;
+    while (sib) {
+      if (sib.nodeType === 1) {
+        if (/^(INPUT|TEXTAREA|SELECT)$/.test(sib.tagName)) return '';
+        if (sib.querySelector && sib.querySelector('input, textarea, select')) return '';
+      }
+      const tx = normalize(sib.nodeType === 3 ? sib.nodeValue : sib.textContent);
+      if (tx) return tx.slice(-24);
+      sib = sib.previousSibling;
+    }
+    node = node.parentElement;
+  }
+  return '';
+}
+
+// Resolve a text input's variable label — explicit associations first, then the
+// visible text right before it.
+function fieldLabel(input) {
+  let t = '';
+  try { if (input.labels && input.labels.length) t = normalize(Array.from(input.labels).map((l) => l.textContent).join(' ')); }
+  catch { /* .labels can throw on detached nodes */ }
+  if (!t) t = normalize(input.getAttribute('aria-label') || '');
+  if (!t) t = normalize(input.getAttribute('placeholder') || '');
+  if (!t) t = normalize(input.getAttribute('name') || '');
+  if (!t) t = precedingFieldText(input);
+  return normalizeFieldLabel(t);
+}
+
+// The list of {label,value} a question must spread across its boxes. Prefers the
+// model's structured `parts`; otherwise splits the combined answer into
+// «var = value» pieces — but only when EVERY piece is clearly labelled, so a
+// single value like «(2; 3)» is never shredded by its inner punctuation.
+function questionParts(question) {
+  if (Array.isArray(question.parts) && question.parts.length) {
+    return question.parts
+      .map((p) => ({ label: String(p.label ?? '').trim(), value: String(p.value ?? '').trim() }))
+      .filter((p) => p.value !== '' || p.label !== '');
+  }
+  const ans = String(question.answer ?? '').trim();
+  if (!ans) return [];
+  const trySplit = (sep) => {
+    const pieces = ans.split(sep).map((s) => s.trim()).filter(Boolean);
+    if (pieces.length < 2) return null;
+    const parsed = pieces.map((piece) => {
+      const m = piece.match(/^([a-zа-я][a-zа-я0-9₀-₉]{0,3})\s*[=:]\s*(.+)$/i);
+      return m ? { label: m[1], value: m[2].trim() } : { label: '', value: piece };
+    });
+    return parsed.every((p) => p.label) ? parsed : null;
+  };
+  return trySplit(/[;\n]+/) || trySplit(/,/) || [{ label: '', value: ans }];
+}
+
+// Align a question's values to its input boxes: match by variable label, then
+// fill any leftover boxes in screen order. Returns an array parallel to `inputs`.
+function distributeFieldValues(question, inputs) {
+  const values = new Array(inputs.length).fill('');
+  const parts = questionParts(question);
+  if (!parts.length) return values;
+  const labels = inputs.map(fieldLabel);
+  const usedPart = new Set();
+  // 1) label match — only when both sides have a real short variable name.
+  inputs.forEach((_, k) => {
+    const lbl = labels[k];
+    if (!lbl) return;
+    for (let p = 0; p < parts.length; p++) {
+      if (usedPart.has(p)) continue;
+      if (normalizeFieldLabel(parts[p].label) === lbl) { values[k] = parts[p].value; usedPart.add(p); break; }
+    }
+  });
+  // 2) fill remaining boxes positionally from remaining parts (screen order).
+  let pp = 0;
+  for (let k = 0; k < inputs.length; k++) {
+    if (values[k] !== '') continue;
+    while (pp < parts.length && usedPart.has(pp)) pp++;
+    if (pp < parts.length) { values[k] = parts[pp].value; usedPart.add(pp); pp++; }
+  }
+  return values;
+}
+
 // --- React-aware writers ---
 
 function setNativeValue(el, value) {
@@ -1111,9 +1262,20 @@ function fillUnit(unit, question) {
   if (isUnfillableAnswer(ans)) return false;
 
   if (unit.type === 'text') {
-    const input = unit.inputs[0];
-    if (!input || !document.documentElement.contains(input)) return false;
-    setNativeValue(input, ans);
+    const inputs = unit.inputs.filter((i) => i && document.documentElement.contains(i));
+    if (!inputs.length) return false;
+    // One box — the whole answer goes in (unchanged behavior).
+    if (inputs.length === 1) { setNativeValue(inputs[0], ans); return true; }
+    // Several boxes for ONE question (system, multiple roots, several blanks):
+    // spread the per-field values across them by label, then screen order.
+    const values = distributeFieldValues(question, inputs);
+    let any = false;
+    inputs.forEach((inp, k) => {
+      if (values[k] != null && values[k] !== '') { setNativeValue(inp, values[k]); any = true; }
+    });
+    // Couldn't split (no parts, unparseable) → put the full answer in the first
+    // box so something still lands, matching the legacy single-box fallback.
+    if (!any) setNativeValue(inputs[0], ans);
     return true;
   }
 

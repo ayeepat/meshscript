@@ -233,7 +233,8 @@ async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, question
     `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (текст страницы ниже + скриншот).` +
     (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
     (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
-    ` Верни JSON {"answers":[{"n":"${n}","a":"…"}]} ровно с одним элементом для этого вопроса.\n\n` +
+    ` Верни JSON {"answers":[{"n":"${n}","a":"…"}]} ровно с одним элементом для этого вопроса` +
+    ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).\n\n' +
     'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
     (pageText || '(текст не извлечён, смотри скриншот)');
   const answer = await askAI(systemPrompt, focus, screenshot ? [screenshot] : [], [], {
@@ -242,7 +243,33 @@ async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, question
   });
   const parsed = parseTestAnswers(answer);
   const match = parsed.find((q) => String(q.index) === n) || parsed[0];
-  return match ? match.answer : '';
+  // Return parts too so a re-solved multi-field question (x & y, x₁ & x₂) still
+  // fills every box, not just the first.
+  return match ? { answer: match.answer, parts: match.parts || null } : { answer: '', parts: null };
+}
+
+/**
+ * Normalise the model's optional per-field `p` array into [{label, value}].
+ * Accepts {l,v} (the prompt's shape), {label,value}, or a bare string. Used for
+ * questions that need several separate values typed into separate boxes. Junk
+ * (non-array, empty entries) collapses to [] so callers can treat it as absent.
+ */
+function normalizeParts(p) {
+  if (!Array.isArray(p)) return [];
+  const out = [];
+  for (const it of p) {
+    if (it == null) continue;
+    if (typeof it === 'string') {
+      const v = it.trim();
+      if (v) out.push({ label: '', value: v });
+      continue;
+    }
+    if (typeof it !== 'object') continue;
+    const label = String(it.l ?? it.label ?? '').trim();
+    const value = String(it.v ?? it.value ?? it.a ?? '').trim();
+    if (value !== '' || label !== '') out.push({ label, value });
+  }
+  return out;
 }
 
 /**
@@ -253,7 +280,7 @@ async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, question
  */
 function parseTestAnswers(raw) {
   if (!raw || typeof raw !== 'string') return [];
-  const make = (n, a, c) => {
+  const make = (n, a, c, p) => {
     const q = {
       index: typeof n === 'number' ? n : (String(n).trim() || ''),
       text: '',
@@ -263,13 +290,19 @@ function parseTestAnswers(raw) {
     // matcher (scraper.js) uses to break ties when option text is ambiguous.
     // Absent in the legacy {n,a} shape; panel/copy never read it.
     if (c != null && String(c).trim() !== '') q.choice = String(c).trim();
+    // Optional per-field values for a question with SEVERAL answer boxes (a
+    // system's x & y, a quadratic's x₁ & x₂, several blanks). The model returns
+    // `p:[{l,v}]`; scraper.js spreads them across the boxes. `answer` still
+    // carries the combined human-readable string for the panel/copy.
+    const parts = normalizeParts(p);
+    if (parts.length) q.parts = parts;
     return q;
   };
   const fromObj = (obj) => {
     if (!obj || !Array.isArray(obj.answers)) return null;
     const out = obj.answers
       .filter((x) => x && x.a != null && x.n != null)
-      .map((x) => make(x.n, x.a, x.c));
+      .map((x) => make(x.n, x.a, x.c, x.p));
     return out.length ? out : null;
   };
   try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
@@ -707,8 +740,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const answer = await resolveOneQuestion(tabId, windowId, msg.payload || {});
-          sendResponse({ ok: true, answer });
+          const resolved = await resolveOneQuestion(tabId, windowId, msg.payload || {});
+          sendResponse({ ok: true, answer: resolved.answer, parts: resolved.parts });
           break;
         }
         case 'GET_RUNTIME_CONFIG':
