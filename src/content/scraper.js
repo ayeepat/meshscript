@@ -813,9 +813,18 @@ function isFillable(el) {
     n = n.parentElement;
   }
   const box = el.getBoundingClientRect();
+  // Off-screen capture inputs (e.g. a math editor's hidden <textarea> parked at
+  // left:-9999px to grab keystrokes) are not real answer boxes — reject them so
+  // they never become phantom units that shift the question→box mapping.
+  if (box.right < 0 || box.bottom < 0) return false;
   if (box.width > 0 && box.height > 0) return true;
-  const ref = el.closest('label') || el.parentElement;
-  if (ref) {
+  // A zero-sized control can still be a real answer box when a NEAR ancestor —
+  // the styled math-input widget (МЭШ renders «x₁ =» boxes this way) — has the
+  // visible rectangle. Climb a few levels before giving up, so these boxes get
+  // collected as units instead of being dropped (which left the question with no
+  // unit and let the next question's boxes absorb its answer).
+  let ref = el.closest('label') || el.parentElement;
+  for (let i = 0; i < 3 && ref; i++, ref = ref.parentElement) {
     const rb = ref.getBoundingClientRect();
     if (rb.width > 0 && rb.height > 0) return true;
   }
@@ -879,9 +888,14 @@ function leadingQuestionNumber(node) {
     text = node.textContent;
   }
   const norm = normalize(text);
-  const m = norm.match(/^\s*(?:вопрос|задание)\s*[№#]?\s*(\d{1,3})\b/i)
-    || norm.match(/^\s*[№#]\s*(\d{1,3})\b/)
-    || norm.match(/^\s*(\d{1,3})\s*[.)]/);
+  // FIRST «Вопрос/Задание №N» ANYWHERE in the heading text — robust to a task-id
+  // badge, icon alt-text, or stray whitespace rendered before the heading (which
+  // otherwise defeated an anchored ^ match and left the box unnumbered → the
+  // positional fallback then shifted answers onto the wrong question's boxes).
+  let m = norm.match(/(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i);
+  if (m) return parseInt(m[1], 10);
+  // Otherwise require a number at the very start («№3», «3.» / «3)»).
+  m = norm.match(/^\s*[№#]\s*(\d{1,3})\b/) || norm.match(/^\s*(\d{1,3})\s*[.)]/);
   return m ? parseInt(m[1], 10) : null;
 }
 
@@ -1330,16 +1344,33 @@ function fillTestAnswers(questions) {
 
   const byNumber = new Map();
   units.forEach((u) => { if (u.number != null && !byNumber.has(String(u.number))) byNumber.set(String(u.number), u); });
+
+  // Does the page label its questions «ЗАДАНИЕ №N» at all? If so, we trust those
+  // on-screen numbers ABSOLUTELY: a NUMBERED unit may only be filled by the
+  // question carrying its own number — never positionally by another question.
+  // That cross-assignment is exactly what shifted every answer down by one when
+  // a question's boxes weren't detected (its neighbour's boxes absorbed the
+  // answer). UNNUMBERED units stay positionally fillable either way; only when
+  // the page numbers NOTHING do we fall back to pure positional for everything.
+  // Keyed on the page (not on this call's question set) so a single-question
+  // re-fill can't slip a question onto the wrong numbered boxes either.
+  const pageHasNumbers = units.some((u) => u.number != null);
+
   const used = new Set();
+  // A positional candidate is acceptable only if free AND (the page numbers
+  // nothing, OR the unit is unnumbered, OR its number equals this question's id).
+  const acceptable = (u, id) =>
+    u && !used.has(u) && (!pageHasNumbers || u.number == null || String(u.number) === String(id));
 
   questions.forEach((q, qi) => {
     const id = idFor(q, qi);
     let unit = byNumber.get(String(id));
     if (!unit || used.has(unit)) {
-      // Positional fallback: numeric ids map to 1-based order, else array order.
+      // Positional fallback: numeric ids map to 1-based order, else array order —
+      // but guarded so we never overwrite a differently-numbered question's boxes.
       const posIdx = /^\d+$/.test(String(id)) ? parseInt(id, 10) - 1 : qi;
-      unit = (units[posIdx] && !used.has(units[posIdx])) ? units[posIdx]
-        : (units[qi] && !used.has(units[qi])) ? units[qi] : null;
+      unit = acceptable(units[posIdx], id) ? units[posIdx]
+        : acceptable(units[qi], id) ? units[qi] : null;
     }
     if (!unit || used.has(unit)) { summary.skipped.push(id); return; }
 
@@ -1356,6 +1387,24 @@ function fillTestAnswers(questions) {
 // so it sees this global) calls it directly — chrome.runtime messaging can't
 // reach a sibling content script in the same tab.
 window.__smeshFill = fillTestAnswers;
+
+// Diagnostic: what units does THIS page yield? Run `__smeshDebugUnits()` in the
+// test tab's console to verify every «ЗАДАНИЕ №N» got a unit with the right box
+// count and number — the fastest way to spot a question whose boxes weren't
+// detected (which is what lets a neighbour absorb its answer).
+function debugUnits() {
+  let units = [];
+  try { units = collectUnits(); } catch (e) { return { error: String(e) }; }
+  return units.map((u, i) => ({
+    pos: i,
+    type: u.type,
+    number: u.number,
+    boxes: u.inputs.length,
+    labels: u.inputs.slice(0, 8).map((inp) =>
+      u.type === 'text' ? fieldLabel(inp) : normalizeForMatch(controlLabelText(inp)).slice(0, 24))
+  }));
+}
+window.__smeshDebugUnits = debugUnits;
 
 /* =====================================================================
  * MULTI-PAGE TEST PAGINATION (per-frame)
