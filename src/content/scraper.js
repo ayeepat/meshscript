@@ -813,18 +813,19 @@ function isFillable(el) {
     n = n.parentElement;
   }
   const box = el.getBoundingClientRect();
-  // Off-screen capture inputs (e.g. a math editor's hidden <textarea> parked at
-  // left:-9999px to grab keystrokes) are not real answer boxes — reject them so
-  // they never become phantom units that shift the question→box mapping.
-  if (box.right < 0 || box.bottom < 0) return false;
+  // Reject ONLY inputs parked far off-screen to the side (e.g. a math editor's
+  // hidden capture <textarea> at left:-9999px). Do NOT reject by top/bottom — a
+  // perfectly valid box scrolled above the viewport has a negative bottom, and
+  // rejecting it dropped real answer boxes (the bug where a question got no unit
+  // and its neighbour absorbed the answer).
+  if (box.right < -2000 || box.left > (window.innerWidth || 0) + 2000) return false;
   if (box.width > 0 && box.height > 0) return true;
   // A zero-sized control can still be a real answer box when a NEAR ancestor —
-  // the styled math-input widget (МЭШ renders «x₁ =» boxes this way) — has the
-  // visible rectangle. Climb a few levels before giving up, so these boxes get
-  // collected as units instead of being dropped (which left the question with no
-  // unit and let the next question's boxes absorb its answer).
+  // the styled math-input widget (МЭШ renders «x₁ =» boxes this way) — carries
+  // the visible rectangle. Climb a few levels before giving up, so these boxes
+  // get collected as units instead of being dropped.
   let ref = el.closest('label') || el.parentElement;
-  for (let i = 0; i < 3 && ref; i++, ref = ref.parentElement) {
+  for (let i = 0; i < 4 && ref; i++, ref = ref.parentElement) {
     const rb = ref.getBoundingClientRect();
     if (rb.width > 0 && rb.height > 0) return true;
   }
@@ -899,14 +900,52 @@ function leadingQuestionNumber(node) {
   return m ? parseInt(m[1], 10) : null;
 }
 
-// Count «ЗАДАНИЕ №N» / «Вопрос N» markers inside a node. Used to bound text-field
-// grouping: a container that spans more than one marker holds more than one
-// question, so its answer boxes must NOT be merged into a single multi-field unit.
-const QUESTION_MARKER_RE = /(?:вопрос|задани[ея])\s*[№#]?\s*\d{1,3}/gi;
-function countQuestionMarkers(node) {
-  if (!node) return 0;
-  const m = (node.textContent || '').match(QUESTION_MARKER_RE);
-  return m ? m.length : 0;
+// Collect every «ЗАДАНИЕ №N» / «Вопрос N» heading on the page as {number, node}
+// in document order. This is the RELIABLE way to number a question's answer
+// boxes: instead of climbing the DOM tree from each box (which the МЭШ layout
+// defeats — the heading can sit far above the inputs), we read the headings once
+// and, for each box, take the nearest heading that precedes it (numberForNode).
+// Mirrors the homework scanner's day-header pairing.
+const QNUM_TEXT_RE = /(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i;
+function collectQuestionMarkers() {
+  const out = [];
+  let els;
+  // Scan ELEMENTS (querySelectorAll is document-ordered) rather than raw text
+  // nodes, so a heading split across styled spans («<b>ЗАДАНИЕ</b> <span>№1</span>»)
+  // is still caught via the parent element's combined text. A few duplicate
+  // markers (a heading span AND its wrapper) are harmless — numberForNode just
+  // takes the nearest preceding one.
+  try {
+    els = document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,b,strong,em,legend,label,th,td,li,a,button');
+  } catch { return out; }
+  for (const el of els) {
+    const s = normalize(el.textContent);
+    if (!s) continue;
+    const m = s.match(QNUM_TEXT_RE);
+    if (!m) continue;
+    // A real «ЗАДАНИЕ №N» heading is either a short element OR leads its text
+    // (a task-id badge may sit just before it). A deep mention buried in a long
+    // prose/equation block is not a heading — skip it.
+    if (s.length > 40 && m.index > 20) continue;
+    out.push({ number: parseInt(m[1], 10), node: el });
+  }
+  return out;
+}
+
+// The question number for a node = the nearest «ЗАДАНИЕ №N» heading that PRECEDES
+// it in document order. Markers are already in document order.
+function numberForNode(node, markers) {
+  if (!node || !markers || !markers.length) return null;
+  let num = null;
+  for (const m of markers) {
+    if (m.node === node) { num = m.number; continue; }
+    const pos = m.node.compareDocumentPosition(node);
+    // node comes after (or is inside) the marker → marker is a candidate.
+    if (pos & (Node.DOCUMENT_POSITION_FOLLOWING | Node.DOCUMENT_POSITION_CONTAINED_BY)) num = m.number;
+    // node comes before the marker → all later markers are also after it; stop.
+    else if (pos & Node.DOCUMENT_POSITION_PRECEDING) break;
+  }
+  return num;
 }
 
 // Climb from a control's container looking for the enclosing question block and
@@ -937,27 +976,15 @@ function checkboxGroupContainer(cb) {
   return best;
 }
 
-// Largest ancestor that still belongs to ONE question — used to group the
-// several answer boxes of a single task (a system's x & y, a quadratic's x₁ & x₂,
-// several blanks) into one multi-field unit. Climbs until it would pull in a
-// control of a DIFFERENT question type (radio/checkbox/select) or span a second
-// «ЗАДАНИЕ №N» marker (a different question). Mirrors checkboxGroupContainer.
-function textFieldGroupContainer(input) {
-  let best = input.parentElement || input;
-  let node = input.parentElement;
-  while (node && node !== document.body) {
-    if (node.querySelector('input[type=radio], input[type=checkbox], select')) break;
-    if (countQuestionMarkers(node) > 1) break;
-    best = node;
-    node = node.parentElement;
+function makeUnit(type, inputs, providedContainer, number) {
+  // Prefer the document-order question number (number, passed in by collectUnits);
+  // fall back to climbing the container tree when the page has no headings.
+  let num = number;
+  if (num == null) {
+    const base = providedContainer || commonAncestor(inputs) || inputs[0].parentElement || inputs[0];
+    num = questionInfo(base).number;
   }
-  return best;
-}
-
-function makeUnit(type, inputs, providedContainer) {
-  const base = providedContainer || commonAncestor(inputs) || inputs[0].parentElement || inputs[0];
-  const info = questionInfo(base);
-  return { type, inputs, anchor: inputs[0], number: info.number };
+  return { type, inputs, anchor: inputs[0], number: num != null ? num : null };
 }
 
 // Discover every fillable question on the page as a list of units, in document
@@ -968,6 +995,12 @@ function collectUnits() {
   const units = [];
   const consumed = new Set();
 
+  // Read the «ЗАДАНИЕ №N» headings once; every control is numbered by the nearest
+  // heading that precedes it (numberForNode). This is the reliable association on
+  // Mesh's layout, where the heading sits far above the answer boxes.
+  const markers = collectQuestionMarkers();
+  const numFor = (el) => numberForNode(el, markers);
+
   // --- radio groups ---
   const radioByKey = new Map();
   for (const r of pickControls('input[type=radio]')) {
@@ -976,7 +1009,7 @@ function collectUnits() {
     radioByKey.get(key).push(r);
     consumed.add(r);
   }
-  for (const inputs of radioByKey.values()) units.push(makeUnit('radio', inputs));
+  for (const inputs of radioByKey.values()) units.push(makeUnit('radio', inputs, null, numFor(inputs[0])));
 
   // --- checkbox groups ---
   const cbByKey = new Map();
@@ -987,28 +1020,39 @@ function collectUnits() {
     if (!cbByKey.has(key)) cbByKey.set(key, { container, inputs: [] });
     cbByKey.get(key).inputs.push(c);
   }
-  for (const { container, inputs } of cbByKey.values()) units.push(makeUnit('checkbox', inputs, container));
+  for (const { container, inputs } of cbByKey.values()) units.push(makeUnit('checkbox', inputs, container, numFor(inputs[0])));
 
   // --- free text / number / textarea ---
   // Group the boxes that belong to the SAME question (a system's x & y, a
   // quadratic's x₁ & x₂, several blanks) into ONE multi-field unit, so a single
   // answer carrying several values fills every box instead of dumping the whole
-  // string into the first box or shifting into the next question. Grouping is
-  // bounded by «ЗАДАНИЕ №N» card markers (textFieldGroupContainer), so two
-  // distinct questions are never merged. On a page with no markers at all we
-  // can't find card boundaries, so we don't group — each box is its own unit
-  // (legacy behavior; safe for ordinary single-box tests).
+  // string into the first box or shifting onto the next question. When the page
+  // has «ЗАДАНИЕ №N» headings, boxes are grouped by their associated number —
+  // robust regardless of how deeply the boxes are nested. With no headings we
+  // can't tell questions apart, so each box stays its own unit (legacy behavior,
+  // safe for ordinary single-box tests).
   const textCtrls = pickControls('input[type=text], input[type=number], input:not([type]), textarea')
     .filter((t) => !consumed.has(t));
-  const allowGroup = countQuestionMarkers(document.body) >= 1;
-  const textGroups = new Map();
-  const textOrder = [];
-  for (const t of textCtrls) {
-    const key = allowGroup ? 'tf:' + elUid(textFieldGroupContainer(t)) : 'tf:' + elUid(t);
-    if (!textGroups.has(key)) { textGroups.set(key, []); textOrder.push(key); }
-    textGroups.get(key).push(t);
+  if (markers.length) {
+    const byNum = new Map();
+    const order = [];
+    const unnumbered = [];
+    for (const t of textCtrls) {
+      const n = numFor(t);
+      if (n == null) { unnumbered.push(t); continue; }
+      const key = 'n:' + n;
+      if (!byNum.has(key)) { byNum.set(key, { num: n, inputs: [] }); order.push(key); }
+      byNum.get(key).inputs.push(t);
+    }
+    for (const key of order) {
+      const g = byNum.get(key);
+      units.push(makeUnit('text', g.inputs, null, g.num));
+    }
+    // Boxes that sit before any heading → fall back to the container heuristic.
+    for (const t of unnumbered) units.push(makeUnit('text', [t], null, null));
+  } else {
+    for (const t of textCtrls) units.push(makeUnit('text', [t], null, null));
   }
-  for (const key of textOrder) units.push(makeUnit('text', textGroups.get(key)));
 
   units.sort((a, b) => domOrderCompare(a.anchor, b.anchor));
   return units;
@@ -1337,6 +1381,13 @@ function fillTestAnswers(questions) {
 
   let units = [];
   try { units = collectUnits(); } catch { units = []; }
+  // One-line picture of what the page exposed, so a mis-fill can be diagnosed
+  // from the test tab's console (filter on «СМЭШ AI fill») without guesswork.
+  try {
+    console.log('[СМЭШ AI fill] units:', units.map((u) => ({
+      type: u.type, number: u.number, boxes: u.inputs.length
+    })), 'questions:', questions.map((q, i) => ({ id: idFor(q, i), parts: q.parts ? q.parts.length : 0 })));
+  } catch { /* console unavailable */ }
   if (!units.length) {
     questions.forEach((q, i) => summary.skipped.push(idFor(q, i)));
     return summary;
@@ -1380,6 +1431,7 @@ function fillTestAnswers(questions) {
     else summary.skipped.push(id);
   });
 
+  try { console.log('[СМЭШ AI fill] result:', summary); } catch { /* */ }
   return summary;
 }
 
