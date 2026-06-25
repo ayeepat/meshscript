@@ -63,7 +63,7 @@
     return false;
   }
 
-  const STORAGE_KEY = 'smeshTestPill';
+  const STORAGE_KEY = 'smeshTestPill2'; // bumped: reset stale positions to the new top-right default
   const HOST_ID = '__smesh-test-pill-host';
 
   // Mark loaded immediately so a re-inject is a no-op even if the page isn't a
@@ -202,6 +202,7 @@
           --p-shadow: 0 8px 28px -10px rgba(0, 0, 0, 0.7);
           --p-muted: #8a948f;
           --p-accent: #4fd1c5;
+          --p-on-accent: #08110f;
           --p-btn-border: rgba(255, 255, 255, 0.16);
           --p-btn-hover: rgba(255, 255, 255, 0.07);
           --p-danger: #ff6b5e;
@@ -214,6 +215,7 @@
           --p-shadow: 0 8px 26px -10px rgba(40, 33, 20, 0.28);
           --p-muted: #756d5e;
           --p-accent: #1f8f8b;
+          --p-on-accent: #ffffff;
           --p-btn-border: rgba(42, 38, 32, 0.16);
           --p-btn-hover: rgba(42, 38, 32, 0.06);
           --p-danger: #c7382e;
@@ -231,17 +233,15 @@
           color: var(--p-text);
           border: none;
           border-radius: 999px;
-          box-shadow: 0 0 0 1px var(--p-border), var(--p-shadow);
-          font-family: "SmeshManrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          font-size: 12.5px;
+          /* Teal ring so the pill reads as branded and is easy to spot. */
+          box-shadow: 0 0 0 1.5px var(--p-accent), var(--p-shadow);
+          font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          font-size: 12px;
           backdrop-filter: blur(7px);
           -webkit-backdrop-filter: blur(7px);
           pointer-events: auto;
-          opacity: 0.82;
-          transition: opacity 0.18s ease;
           user-select: none;
         }
-        .pill:hover { opacity: 1; }
 
         /* Drag handle: the brand logomark. */
         .grip {
@@ -262,28 +262,33 @@
         .grip img.broken + .mark-fallback { display: flex; }
 
         button {
-          font-family: "SmeshManrope", -apple-system, sans-serif;
+          font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, sans-serif;
           background: transparent;
           color: inherit;
           border: 1px solid var(--p-btn-border);
           border-radius: 999px;
-          padding: 4px 11px;
-          font-size: 12.5px;
-          font-weight: 600;
+          padding: 5px 12px;
+          font-size: 11px;
+          font-weight: 700;
+          letter-spacing: -0.02em;
           line-height: 1;
           cursor: pointer;
           white-space: nowrap;
-          transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease;
+          transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease, filter 0.15s ease;
         }
-        button:hover { background: var(--p-btn-hover); }
         button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--p-accent); }
         button[disabled] { opacity: 0.5; cursor: default; }
 
-        /* Primary action — accent-tinted, like the panel's «Заполнить». */
-        .act-page { color: var(--p-accent); border-color: var(--p-accent); }
-        /* Secondary — quieter, reads as the optional autopilot. */
-        .act-all { color: var(--p-muted); padding: 4px 9px; font-weight: 500; font-size: 11.5px; }
-        .act-all:hover { color: var(--p-text); }
+        /* Primary action — SOLID teal so it's unmistakable. */
+        .act-page {
+          color: var(--p-on-accent);
+          background: var(--p-accent);
+          border-color: var(--p-accent);
+        }
+        .act-page:hover { filter: brightness(1.08); }
+        /* Secondary — teal text, quieter, reads as the optional autopilot. */
+        .act-all { color: var(--p-accent); border-color: transparent; font-size: 10px; padding: 5px 9px; }
+        .act-all:hover { background: var(--p-btn-hover); }
 
         .close {
           flex: none; width: 22px; height: 22px; padding: 0;
@@ -297,6 +302,8 @@
         /* Status area replaces the actions while solving. */
         .status { display: none; align-items: center; gap: 7px; padding-right: 4px; min-width: 150px; }
         .status .stext {
+          font-family: "SmeshManrope", -apple-system, sans-serif;
+          font-weight: 600;
           font-variant-numeric: tabular-nums;
           color: var(--p-text);
           max-width: 240px;
@@ -360,12 +367,11 @@
       pill.style.right = 'auto';
       pill.style.bottom = 'auto';
     } else {
-      // Default to bottom-LEFT so it doesn't sit under the answer panel
-      // (which defaults to bottom-right).
-      pill.style.left = '20px';
-      pill.style.bottom = '20px';
-      pill.style.right = 'auto';
-      pill.style.top = 'auto';
+      // Default to the TOP-RIGHT corner.
+      pill.style.top = '16px';
+      pill.style.right = '16px';
+      pill.style.left = 'auto';
+      pill.style.bottom = 'auto';
     }
   }
 
