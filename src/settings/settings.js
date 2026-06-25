@@ -3,11 +3,16 @@ import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
-import { DEFAULT_LIMITS, getUsage } from '../lib/rate-limit.js';
+import { DEFAULT_LIMITS, getUsage, getUsageHistory } from '../lib/rate-limit.js';
 import { setLicenseKey, getLicenseStatus, reasonMessage } from '../lib/license.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
+import { SUPPORT_BOT_URL } from '../lib/config.js';
 
 initTheme();
+
+// Point the «Поддержка» card at the support bot (single source of truth in config.js).
+const supportLink = document.getElementById('supportLink');
+if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 
 const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
@@ -93,6 +98,7 @@ async function load() {
     ta._refresh?.();
   }
   await refreshUsage();
+  refreshUsageDashboard(); // async, not awaited — the credits fetch shouldn't block the form
   await loadLicenseUi();
   await loadConsentUi();
 }
@@ -152,6 +158,137 @@ async function refreshUsage() {
   document.getElementById('usageGroq').textContent = fmt(usage.groq);
 }
 
+/* ---------- Usage & spend dashboard ---------- */
+
+// Loaded by refreshUsageDashboard(), read by renderChart().
+let reqHistory = [];   // [{ day, openrouter, groq }]
+let spendHistory = []; // [{ day, spend }]  (OpenRouter $/day, from snapshots)
+let chartMode = 'req'; // 'req' | 'usd'
+
+const fmtUsd = (n) =>
+  '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+// 'YYYY-MM-DD' → 'D.M'
+const shortDay = (iso) => { const [, m, d] = iso.split('-'); return `${Number(d)}.${Number(m)}`; };
+
+// OpenRouter balance via the service worker (keeps the network call + key in the
+// worker, and records the daily spend snapshot as a side effect).
+function fetchCredits() {
+  return new Promise((resolve) => {
+    chrome.runtime.sendMessage({ type: 'OPENROUTER_CREDITS' }, (r) => resolve(chrome.runtime.lastError ? null : r));
+  });
+}
+
+function renderSpend(c) {
+  const spent = document.getElementById('orSpent');
+  const remain = document.getElementById('orRemain');
+  const bar = document.getElementById('balanceBar');
+  const fill = document.getElementById('balanceFill');
+  const note = document.getElementById('spendNote');
+  if (c && c.ok) {
+    spent.textContent = fmtUsd(c.usage);
+    remain.textContent = fmtUsd(c.remaining);
+    if (c.total > 0) {
+      bar.hidden = false;
+      fill.style.width = Math.min(100, Math.max(0, (c.usage / c.total) * 100)).toFixed(1) + '%';
+    } else { bar.hidden = true; }
+    note.textContent = '';
+  } else {
+    spent.textContent = '—';
+    remain.textContent = '—';
+    bar.hidden = true;
+    note.textContent = c?.reason === 'no_key'
+      ? 'Добавьте ключ OpenRouter выше, чтобы видеть баланс и траты.'
+      : 'Не удалось получить баланс OpenRouter — проверьте ключ и интернет.';
+  }
+}
+
+// Compact responsive bar chart (inline SVG). Requests mode = grouped OR+Groq
+// bars; dollars mode = single OpenRouter spend bar. Exact values ride on each
+// bar's <title> for hover.
+function chartSvg(mode) {
+  const W = 340, H = 110, padT = 10, padB = 18, padX = 6;
+  const plotW = W - padX * 2, plotH = H - padT - padB;
+  const days = (mode === 'usd' ? spendHistory : reqHistory).map((d) => d.day);
+  const n = days.length || 1;
+  const colW = plotW / n;
+  const baselineY = padT + plotH;
+
+  let max = 0;
+  if (mode === 'usd') for (const d of spendHistory) max = Math.max(max, d.spend);
+  else for (const d of reqHistory) max = Math.max(max, d.openrouter, d.groq);
+  if (max <= 0) max = 1;
+
+  const bars = [];
+  for (let i = 0; i < n; i++) {
+    const cx = padX + i * colW;
+    if (mode === 'usd') {
+      const v = spendHistory[i].spend;
+      const h = (v / max) * plotH;
+      const bw = Math.max(3, colW * 0.6);
+      bars.push(`<rect class="bar bar-usd" x="${(cx + (colW - bw) / 2).toFixed(1)}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${fmtUsd(v)}</title></rect>`);
+    } else {
+      const o = reqHistory[i].openrouter, g = reqHistory[i].groq;
+      const bw = Math.max(2, colW * 0.3), gap = colW * 0.08;
+      const bx = cx + (colW - (bw * 2 + gap)) / 2;
+      const ho = (o / max) * plotH, hg = (g / max) * plotH;
+      bars.push(`<rect class="bar bar-or" x="${bx.toFixed(1)}" y="${(baselineY - ho).toFixed(1)}" width="${bw.toFixed(1)}" height="${ho.toFixed(1)}" rx="1.5"><title>${shortDay(days[i])}: OpenRouter ${o}</title></rect>`);
+      bars.push(`<rect class="bar bar-groq" x="${(bx + bw + gap).toFixed(1)}" y="${(baselineY - hg).toFixed(1)}" width="${bw.toFixed(1)}" height="${hg.toFixed(1)}" rx="1.5"><title>${shortDay(days[i])}: Groq ${g}</title></rect>`);
+    }
+  }
+
+  const labelIdx = new Set([0, Math.floor(n / 2), n - 1]);
+  const labels = [];
+  for (let i = 0; i < n; i++) {
+    if (!labelIdx.has(i)) continue;
+    labels.push(`<text class="xlab" x="${(padX + i * colW + colW / 2).toFixed(1)}" y="${H - 5}" text-anchor="middle">${shortDay(days[i])}</text>`);
+  }
+  const base = `<line class="axis" x1="${padX}" y1="${baselineY}" x2="${W - padX}" y2="${baselineY}"/>`;
+  return `<svg viewBox="0 0 ${W} ${H}" xmlns="http://www.w3.org/2000/svg">${base}${bars.join('')}${labels.join('')}</svg>`;
+}
+
+function renderLegend(mode) {
+  const legend = document.getElementById('chartLegend');
+  legend.innerHTML = mode === 'usd'
+    ? '<span class="lg"><i class="sw or"></i>Траты OpenRouter, $/день</span>'
+    : '<span class="lg"><i class="sw or"></i>OpenRouter</span><span class="lg"><i class="sw groq"></i>Groq · бесплатно</span>';
+}
+
+function renderChart(mode) {
+  const host = document.getElementById('usageChart');
+  const hasReq = reqHistory.some((d) => d.openrouter + d.groq > 0);
+  const hasUsd = spendHistory.some((d) => d.spend > 0);
+  if (mode === 'usd' && !hasUsd) {
+    host.innerHTML = '<div class="chartempty">Данные о тратах по дням ещё копятся — загляните завтра. Общий расход — в плитке «Потрачено».</div>';
+  } else if (mode !== 'usd' && !hasReq) {
+    host.innerHTML = '<div class="chartempty">Пока нет запросов за этот период.</div>';
+  } else {
+    host.innerHTML = chartSvg(mode);
+  }
+  renderLegend(mode);
+}
+
+async function refreshUsageDashboard() {
+  const [usage, hist] = await Promise.all([getUsage(), getUsageHistory(14)]);
+  reqHistory = hist;
+  document.getElementById('orToday').textContent = `${usage.openrouter.used} / ${usage.openrouter.limit}`;
+  const credits = await fetchCredits();
+  spendHistory = (credits && credits.spendHistory) || [];
+  renderSpend(credits);
+  renderChart(chartMode);
+}
+
+function wireUsageDashboard() {
+  document.getElementById('usageReload').onclick = () => refreshUsageDashboard();
+  document.querySelectorAll('#chartMode button').forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll('#chartMode button').forEach((x) => x.classList.remove('active'));
+      b.classList.add('active');
+      chartMode = b.dataset.mode;
+      renderChart(chartMode);
+    };
+  });
+}
+
 async function save() {
   const data = {};
   for (const f of KEY_FIELDS) data[f] = document.getElementById(f).value.trim();
@@ -167,6 +304,7 @@ async function save() {
   data.promptOverrides = promptOverrides;
   await chrome.storage.local.set(data);
   await refreshUsage();
+  refreshUsageDashboard(); // reflect the new limit in the «Сегодня · N / лимит» tile
   // Verify license against the backend ONLY when the key changed — saves a
   // network round-trip when the user is just editing prompts or limits.
   const newKey = document.getElementById('licenseKey').value.trim().toUpperCase();
@@ -473,6 +611,7 @@ wireReveals();
 wireTabs();
 wireGdz();
 wireConsent();
+wireUsageDashboard();
 document.getElementById('save').onclick = save;
 document.getElementById('reload').onclick = loadHistory;
 load();

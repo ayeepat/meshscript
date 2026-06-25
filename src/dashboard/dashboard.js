@@ -608,9 +608,16 @@ function showAttachment(name) {
   fileChip.hidden = false;
 }
 function clearAttachment() {
+  // If a recording is live, the chip's × means "stop and throw it away".
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    discardRec = true;
+    try { mediaRecorder.stop(); } catch { /* already stopping */ }
+    return;
+  }
   pendingFile = null;
   fileInput.value = '';
   fileChip.hidden = true;
+  fileChip.classList.remove('recording');
 }
 
 document.getElementById('attach').onclick = () => fileInput.click();
@@ -632,12 +639,132 @@ document.addEventListener('paste', async (e) => {
   showAttachment(name);
 });
 
+/* ---------- Microphone capture → Whisper transcription ---------- */
+// For listening (аудирование) tasks whose audio isn't a downloadable file —
+// play the track (browser player, phone speaker…) and record it here. The clip
+// is attached like any file; the service worker runs Groq Whisper on it
+// (transcribeAudioFiles) and the normal solve path answers from the transcript.
+const micBtn = document.getElementById('mic');
+let mediaRecorder = null;
+let recChunks = [];
+let recStream = null;
+let recTimer = null;
+let recStart = 0;
+let discardRec = false;
+
+// Prefer a codec Groq Whisper accepts; fall back to the browser default.
+function pickRecMime() {
+  const prefs = ['audio/webm;codecs=opus', 'audio/webm', 'audio/ogg;codecs=opus', 'audio/mp4'];
+  for (const m of prefs) { if (window.MediaRecorder?.isTypeSupported?.(m)) return m; }
+  return '';
+}
+const REC_EXT = { 'audio/webm': 'webm', 'audio/ogg': 'ogg', 'audio/mp4': 'm4a' };
+
+function fmtTime(ms) {
+  const s = Math.floor(ms / 1000);
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function tickRecording() {
+  fileChip.classList.add('recording');
+  fileChip.hidden = false;
+  fileNameEl.textContent = `● Запись… ${fmtTime(Date.now() - recStart)}`;
+}
+
+function resetMicUi() {
+  if (recTimer) { clearInterval(recTimer); recTimer = null; }
+  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
+  micBtn.classList.remove('recording');
+  micBtn.title = 'Записать аудио с микрофона и расшифровать (для аудирования)';
+}
+
+// Briefly show an error in the chip, then clear it if nothing got attached.
+function flashChipError(text) {
+  fileChip.classList.remove('recording');
+  showAttachment(text);
+  setTimeout(() => { if (!pendingFile) { fileChip.hidden = true; } }, 2800);
+}
+
+async function onRecordingStop() {
+  const baseMime = ((mediaRecorder && mediaRecorder.mimeType) || 'audio/webm').split(';')[0];
+  resetMicUi();
+  const chunks = recChunks;
+  recChunks = [];
+  if (discardRec || !chunks.length) {
+    discardRec = false;
+    pendingFile = null;
+    fileInput.value = '';
+    fileChip.hidden = true;
+    fileChip.classList.remove('recording');
+    return;
+  }
+  const blob = new Blob(chunks, { type: baseMime });
+  const name = `Запись с микрофона.${REC_EXT[baseMime] || 'webm'}`;
+  pendingFile = await fileToInline(new File([blob], name, { type: baseMime }));
+  fileChip.classList.remove('recording');
+  showAttachment(name);
+}
+
+async function startRecording() {
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+    flashChipError('Запись с микрофона не поддерживается в этом браузере.');
+    return;
+  }
+  try {
+    // CRITICAL: turn OFF echo cancellation / noise suppression / auto-gain.
+    // With the browser defaults (all ON), the mic stream actively REMOVES sound
+    // coming from the device's own speakers — it treats it as echo — so audio
+    // you play out loud to record (a listening track) comes back near-silent and
+    // Whisper hallucinates filler ("Hush!", "Thank you."). We want the raw signal.
+    recStream = await navigator.mediaDevices.getUserMedia({
+      audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+    });
+  } catch (e) {
+    const denied = e?.name === 'NotAllowedError' || e?.name === 'SecurityError';
+    flashChipError(denied
+      ? 'Нет доступа к микрофону — разрешите его для расширения.'
+      : 'Микрофон недоступен.');
+    return;
+  }
+  const mimeType = pickRecMime();
+  recChunks = [];
+  discardRec = false;
+  try {
+    mediaRecorder = mimeType ? new MediaRecorder(recStream, { mimeType }) : new MediaRecorder(recStream);
+  } catch {
+    mediaRecorder = new MediaRecorder(recStream);
+  }
+  mediaRecorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) recChunks.push(ev.data); };
+  mediaRecorder.onstop = onRecordingStop;
+  mediaRecorder.start();
+  recStart = Date.now();
+  micBtn.classList.add('recording');
+  micBtn.title = 'Остановить запись';
+  tickRecording();
+  recTimer = setInterval(tickRecording, 1000);
+}
+
+micBtn.onclick = () => {
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop(); // onRecordingStop builds + attaches the clip
+  } else {
+    startRecording();
+  }
+};
+
 async function sendFromComposer() {
   const chat = activeChat();
   if (!chat || chat.pending) return; // ignore until the current answer lands
-  const text = inputEl.value.trim();
+  if (mediaRecorder && mediaRecorder.state === 'recording') return; // stop the recording first
+  let text = inputEl.value.trim();
   const files = pendingFile ? [pendingFile] : [];
   if (!text && !files.length) return;
+  // A recording sent with no note: tell the model explicitly to SOLVE the
+  // listening task from the transcript, not just echo it back.
+  if (!text && files.some((f) => (f.mimeType || '').startsWith('audio/'))) {
+    text = 'Это аудиозапись к заданию по аудированию. Расшифруй её и выполни задание ' +
+      '(ответь на вопросы / заполни пропуски по записи).';
+  }
   inputEl.value = '';
   clearAttachment();
   // Text may be empty when only a file is sent — the chip shows the attachment.

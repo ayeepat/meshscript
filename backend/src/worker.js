@@ -7,6 +7,7 @@
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
  *   GET  /admin/license      Inspect one license by key
+ *   POST /telegram/webhook   Support bot: user tickets → owner, replies → user
  *   GET  /health             Liveness ping
  *
  * Everything else 404s. CORS is wide-open for /verify only (the extension
@@ -17,6 +18,7 @@ import { issueLicense, verifyLicense, getLicense, putLicense, normalizeKey } fro
 import { isYookassaIp, checkBasicAuth, parseNotification } from './gateways/yookassa.js';
 import { sendLicenseEmail } from './delivery/email.js';
 import { sendLicenseTelegram } from './delivery/telegram.js';
+import { processSupportUpdate } from './delivery/support.js';
 
 const VERIFY_CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -50,6 +52,12 @@ export default {
       if (path === '/admin/revoke' && method === 'POST') return await handleAdminRevoke(request, env);
       if (path === '/admin/license' && method === 'GET') return await handleAdminLicense(request, env);
 
+      if (path === '/telegram/webhook' && method === 'POST') return await handleTelegramWebhook(request, env, ctx);
+      if (path === '/telegram/setup' && method === 'GET') return await handleTelegramSetup(request, env);
+      if (path === '/telegram/info' && method === 'GET') return await handleTelegramInfo(request, env);
+      if (path === '/telegram/test' && method === 'GET') return await handleTelegramTest(request, env);
+      if (path === '/telegram/debug' && method === 'GET') return await handleTelegramDebug(request, env);
+
       return error(404, 'not_found');
     } catch (e) {
       // Don't leak internals back to the caller; logs land in `wrangler tail`.
@@ -67,6 +75,129 @@ async function handleVerify(request, env) {
   const deviceId = url.searchParams.get('device_id') || '';
   const result = await verifyLicense(env, key, deviceId);
   return json(result, { headers: VERIFY_CORS });
+}
+
+/* ------------------------- /telegram/webhook ------------------------- */
+
+async function handleTelegramWebhook(request, env, ctx) {
+  // Telegram authenticates itself with the secret token registered at
+  // setWebhook time (sent back in this header). Reject anything else so a
+  // leaked URL can't be used to puppet the bot.
+  if (env.TELEGRAM_WEBHOOK_SECRET) {
+    const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+    if (got !== env.TELEGRAM_WEBHOOK_SECRET) return error(401, 'unauthorized');
+  }
+
+  let update;
+  try { update = await request.json(); }
+  catch { return json({ ok: true }); } // ack malformed bodies so Telegram stops retrying
+
+  // Do the work and AWAIT it (a couple of fast API calls) so the sends actually
+  // complete before we ack — fire-and-forget proved unreliable here. We always
+  // return 200 regardless, so Telegram never retries.
+  let result;
+  try { result = await processSupportUpdate(env, update); }
+  catch (e) { result = { kind: 'error', error: String(e?.stack || e) }; console.error('support', e); }
+
+  // Stash the last event for /telegram/debug (best-effort; never blocks the ack).
+  ctx.waitUntil(env.LICENSES.put('tgdebug:last', JSON.stringify({
+    at: new Date().toISOString(),
+    incoming: summarizeUpdate(update),
+    result
+  }), { expirationTtl: 3600 }).catch(() => {}));
+
+  return json({ ok: true });
+}
+
+function summarizeUpdate(u = {}) {
+  const m = u.message;
+  const cq = u.callback_query;
+  if (cq) return { type: 'callback_query', data: cq.data, from: cq.from?.id };
+  if (m) return { type: 'message', from: m.from?.id, chat: m.chat?.id, text: m.text || m.caption || null, is_reply: !!m.reply_to_message };
+  return { type: 'other', keys: Object.keys(u).filter((k) => k !== 'update_id') };
+}
+
+// One-time helper: registers this worker's own URL as the bot's webhook, using
+// the token it already has stored. Lets you (re)connect the bot without ever
+// handling the token by hand. Guarded by the webhook secret.
+//   GET /telegram/setup?secret=<TELEGRAM_WEBHOOK_SECRET>
+async function handleTelegramSetup(request, env) {
+  const url = new URL(request.url);
+  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
+    return error(401, 'unauthorized');
+  }
+  if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
+
+  const webhookUrl = `${url.origin}/telegram/webhook`;
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      url: webhookUrl,
+      secret_token: env.TELEGRAM_WEBHOOK_SECRET,
+      allowed_updates: ['message', 'callback_query'],
+      drop_pending_updates: true
+    })
+  });
+  const data = await res.json();
+
+  // Also register the command menu (the blue «/» button) so the bot feels official.
+  const cmdRes = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setMyCommands`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      commands: [
+        { command: 'start', description: 'Меню поддержки' },
+        { command: 'help', description: 'Помощь и как пользоваться' }
+      ]
+    })
+  });
+  const commands = await cmdRes.json();
+
+  return json({ ok: data.ok === true, webhook: webhookUrl, telegram: data, commands });
+}
+
+// Diagnostics: returns Telegram's view of the webhook (url, pending count, last
+// error). Guarded by the webhook secret.
+//   GET /telegram/info?secret=<TELEGRAM_WEBHOOK_SECRET>
+async function handleTelegramInfo(request, env) {
+  const url = new URL(request.url);
+  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
+    return error(401, 'unauthorized');
+  }
+  if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
+  return json(await res.json());
+}
+
+// Diagnostics: sends a real "ping" message to a chat via the stored token and
+// returns Telegram's raw reply — proves whether the bot can DM that user.
+//   GET /telegram/test?secret=<TELEGRAM_WEBHOOK_SECRET>&chat=<id>
+async function handleTelegramTest(request, env) {
+  const url = new URL(request.url);
+  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
+    return error(401, 'unauthorized');
+  }
+  if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
+  const chat = url.searchParams.get('chat') || env.SUPPORT_CHAT_ID;
+  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ chat_id: chat, text: '✅ Проверка связи: бот СМЭШ AI работает.' })
+  });
+  return json(await res.json());
+}
+
+// Diagnostics: returns the last update the webhook processed and what the bot
+// did with it. Guarded by the webhook secret.
+//   GET /telegram/debug?secret=<TELEGRAM_WEBHOOK_SECRET>
+async function handleTelegramDebug(request, env) {
+  const url = new URL(request.url);
+  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
+    return error(401, 'unauthorized');
+  }
+  const last = await env.LICENSES.get('tgdebug:last');
+  return json({ ok: true, last: last ? JSON.parse(last) : null });
 }
 
 /* -------------------------- /webhook/yookassa ------------------------ */

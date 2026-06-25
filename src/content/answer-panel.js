@@ -15,6 +15,37 @@
   const HOST_ID = '__smesh-answer-panel-host';
   const DEFAULT_W = 400;
 
+  // Brand fonts, served from the extension bundle (web_accessible_resources).
+  // Injected into the Shadow DOM so the panel matches every other surface:
+  // Unbounded for the title, Manrope for the body. Falls back to the system
+  // stack if the resource can't be resolved (e.g. on an unexpected host).
+  function fontFaceCss() {
+    let url;
+    try { url = (p) => chrome.runtime.getURL('assets/fonts/' + p); }
+    catch { return ''; }
+    return `
+      @font-face {
+        font-family: "SmeshManrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+        src: url("${url('manrope-cyrillic.woff2')}") format("woff2");
+        unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+      }
+      @font-face {
+        font-family: "SmeshManrope"; font-style: normal; font-weight: 200 800; font-display: swap;
+        src: url("${url('manrope-latin.woff2')}") format("woff2");
+        unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2122, U+2212, U+FEFF, U+FFFD;
+      }
+      @font-face {
+        font-family: "SmeshUnbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+        src: url("${url('unbounded-cyrillic.woff2')}") format("woff2");
+        unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+      }
+      @font-face {
+        font-family: "SmeshUnbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+        src: url("${url('unbounded-latin.woff2')}") format("woff2");
+        unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2122, U+2212, U+FEFF, U+FFFD;
+      }`;
+  }
+
   let hostEl = null;
   let shadow = null;
   let lastPayload = null;
@@ -97,10 +128,16 @@
     const qid = escapeHtml(questionId(q, i));
     const text = (q.text || '').trim();
     const ans = escapeHtml(q.answer ?? '');
-    if (text) {
-      return `<li data-qid="${qid}"><span class="num">${escapeHtml(num)}.</span> <span class="q">${escapeHtml(text)}</span><span class="a">${ans}</span></li>`;
-    }
-    return `<li data-qid="${qid}"><span class="num">№${escapeHtml(num)}</span><span class="a">${ans}</span></li>`;
+    const inner = text
+      ? `<span class="num">${escapeHtml(num)}.</span> <span class="q">${escapeHtml(text)}</span><span class="a">${ans}</span>`
+      : `<span class="num">№${escapeHtml(num)}</span><span class="a">${ans}</span>`;
+    // The «↻» re-asks just THIS question (re-captures the page + solves one),
+    // so a single doubtful answer doesn't need a full-page re-solve. data-qi
+    // carries the array index back to the handler.
+    return `<li data-qid="${qid}">` +
+      `<span class="qline">${inner}</span>` +
+      `<button class="btn-resolve" type="button" data-qi="${i}" title="Перерешать этот вопрос" aria-label="Перерешать этот вопрос">↻</button>` +
+      `</li>`;
   }
 
   function buildPanel(payload) {
@@ -109,39 +146,47 @@
 
     shadow.innerHTML = `
       <style>
+        ${fontFaceCss()}
         :host, * { box-sizing: border-box; }
 
-        /* Theme tokens — toggled live via .panel[data-theme]. Defaults to dark
-           so the panel never flashes unstyled before the preference resolves. */
+        /* Brand tokens — mirror src/common/theme.css, toggled live via
+           .panel[data-theme]. Defaults to dark so the panel never flashes
+           unstyled before the preference resolves. */
         .panel[data-theme="dark"] {
-          --p-bg: rgba(22, 24, 30, 0.94);
-          --p-text: #f3f4f8;
-          --p-border: rgba(255, 255, 255, 0.08);
-          --p-shadow: 0 14px 40px rgba(0, 0, 0, 0.45);
-          --p-titlebar: rgba(255, 255, 255, 0.04);
-          --p-muted: #8a92a3;
-          --p-btn-border: rgba(255, 255, 255, 0.14);
-          --p-btn-hover: rgba(255, 255, 255, 0.10);
-          --p-btn-active: rgba(255, 255, 255, 0.16);
-          --p-li-border: rgba(255, 255, 255, 0.05);
-          --p-q: #cbd0d8;
-          --p-answer: #82e2b6;
-          --p-arrow: #6c7280;
+          --p-bg: rgba(36, 51, 49, 0.97);
+          --p-text: #e8e4d8;
+          --p-border: rgba(255, 255, 255, 0.10);
+          --p-shadow: 0 18px 50px -12px rgba(0, 0, 0, 0.75);
+          --p-titlebar: #1b2827;
+          --p-muted: #8a948f;
+          --p-accent: #4fd1c5;
+          --p-btn-border: rgba(255, 255, 255, 0.18);
+          --p-btn-hover: rgba(255, 255, 255, 0.06);
+          --p-btn-active: rgba(255, 255, 255, 0.12);
+          --p-li-border: rgba(255, 255, 255, 0.09);
+          --p-q: #a6b0ad;
+          --p-answer: #5bd07a;
+          --p-arrow: #8a948f;
+          --p-warn: #e8b05a;
+          --p-danger: #ff6b5e;
         }
         .panel[data-theme="light"] {
-          --p-bg: rgba(255, 255, 255, 0.96);
-          --p-text: #0d0d0d;
-          --p-border: rgba(0, 0, 0, 0.10);
-          --p-shadow: 0 14px 40px rgba(0, 0, 0, 0.16);
-          --p-titlebar: rgba(0, 0, 0, 0.035);
-          --p-muted: #6b6b73;
-          --p-btn-border: rgba(0, 0, 0, 0.16);
-          --p-btn-hover: rgba(0, 0, 0, 0.05);
-          --p-btn-active: rgba(0, 0, 0, 0.09);
-          --p-li-border: rgba(0, 0, 0, 0.06);
-          --p-q: #3a3a42;
-          --p-answer: #1a7f37;
-          --p-arrow: #9b9ba4;
+          --p-bg: rgba(255, 255, 255, 0.97);
+          --p-text: #2a2620;
+          --p-border: rgba(42, 38, 32, 0.12);
+          --p-shadow: 0 12px 40px -8px rgba(40, 33, 20, 0.22);
+          --p-titlebar: #efece3;
+          --p-muted: #756d5e;
+          --p-accent: #1f8f8b;
+          --p-btn-border: rgba(42, 38, 32, 0.18);
+          --p-btn-hover: rgba(42, 38, 32, 0.05);
+          --p-btn-active: rgba(42, 38, 32, 0.09);
+          --p-li-border: rgba(42, 38, 32, 0.10);
+          --p-q: #6b6354;
+          --p-answer: #198049;
+          --p-arrow: #9a917f;
+          --p-warn: #b5751a;
+          --p-danger: #c7382e;
         }
 
         .panel {
@@ -150,13 +195,15 @@
           max-height: 70vh;
           background: var(--p-bg);
           color: var(--p-text);
-          border: 1px solid var(--p-border);
-          border-radius: 12px;
-          box-shadow: var(--p-shadow);
-          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+          /* Single shadow stack carries both the hairline edge and the
+             elevation — no separate 1px border (avoids the ghost-card pair). */
+          border: none;
+          border-radius: 16px;
+          box-shadow: 0 0 0 1px var(--p-border), var(--p-shadow);
+          font-family: "SmeshManrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
           font-size: 13px;
-          backdrop-filter: blur(10px);
-          -webkit-backdrop-filter: blur(10px);
+          backdrop-filter: blur(8px);
+          -webkit-backdrop-filter: blur(8px);
           display: flex;
           flex-direction: column;
           pointer-events: auto;
@@ -166,28 +213,39 @@
           display: flex;
           align-items: center;
           gap: 6px;
-          padding: 8px 10px;
+          padding: 9px 10px 9px 13px;
           cursor: grab;
           background: var(--p-titlebar);
+          border-bottom: 1px solid var(--p-li-border);
           user-select: none;
         }
         .titlebar.dragging { cursor: grabbing; }
-        .title { flex: 1; font-weight: 600; font-size: 12px; letter-spacing: 0.2px; }
-        .count { color: var(--p-muted); font-weight: 500; margin-left: 4px; }
+        .title {
+          flex: 1;
+          font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, sans-serif;
+          font-weight: 700; font-size: 12.5px; letter-spacing: -0.2px;
+          color: var(--p-text);
+        }
+        .count { color: var(--p-muted); font-weight: 500; font-family: "SmeshManrope", sans-serif; margin-left: 4px; }
         button {
           background: transparent;
           color: inherit;
           border: 1px solid var(--p-btn-border);
-          border-radius: 6px;
-          padding: 3px 7px;
+          border-radius: 8px;
+          padding: 4px 8px;
+          font-family: "SmeshManrope", -apple-system, sans-serif;
           font-size: 12px;
+          font-weight: 600;
           line-height: 1;
           cursor: pointer;
-          font-family: inherit;
-          min-width: 24px;
+          min-width: 26px;
+          transition: background 0.15s cubic-bezier(0.22, 0.61, 0.36, 1), border-color 0.15s ease, color 0.15s ease;
         }
-        button:hover { background: var(--p-btn-hover); }
+        button:hover { background: var(--p-btn-hover); border-color: var(--p-arrow); }
         button:active { background: var(--p-btn-active); }
+        button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--p-accent); }
+        /* Primary action: fill the form. Tinted to the brand accent. */
+        .btn-fill { color: var(--p-accent); border-color: var(--p-accent); }
         .btn-copy { font-weight: 600; }
         .body {
           overflow-y: auto;
@@ -199,11 +257,16 @@
           list-style: none;
         }
         li {
+          display: flex;
+          align-items: baseline;
+          gap: 8px;
           padding: 6px 0;
           line-height: 1.45;
           border-bottom: 1px solid var(--p-li-border);
         }
         li:last-child { border-bottom: none; }
+        /* Holds num + question + answer; the re-solve button sits to its right. */
+        .qline { flex: 1; min-width: 0; }
         .num { color: var(--p-muted); margin-right: 6px; font-variant-numeric: tabular-nums; }
         .q { color: var(--p-q); }
         .a {
@@ -217,12 +280,35 @@
         .panel.minimized .body { display: none; }
         .panel.minimized { max-height: none; }
         .copied { color: var(--p-answer); border-color: var(--p-answer); }
-        .failed { color: #e5534b; border-color: #e5534b; }
+        .failed { color: var(--p-danger); border-color: var(--p-danger); }
         .btn-fill { font-weight: 600; }
         /* Per-line fill markers, set after "Заполнить" runs. */
         .mark { font-variant-numeric: tabular-nums; margin-right: 4px; }
         .mark.ok { color: var(--p-answer); }
-        .mark.warn { color: #d9a300; }
+        .mark.warn { color: var(--p-warn); }
+        /* Per-line «перерешать» (↻). Quiet by default, lights up on row hover. */
+        .btn-resolve {
+          flex: none;
+          min-width: 0;
+          padding: 2px 6px;
+          font-size: 13px;
+          border-color: transparent;
+          color: var(--p-muted);
+          opacity: 0.45;
+          transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.4s ease;
+        }
+        li:hover .btn-resolve { opacity: 0.9; }
+        .btn-resolve:hover { color: var(--p-accent); border-color: var(--p-accent); opacity: 1; }
+        .btn-resolve:disabled { cursor: default; }
+        .btn-resolve.spinning { opacity: 1; color: var(--p-accent); animation: smesh-resolve-spin 0.7s linear infinite; }
+        .btn-resolve.failed { color: var(--p-danger); border-color: var(--p-danger); opacity: 1; }
+        /* The answer slot while its question is being re-solved. */
+        .a.resolving { color: var(--p-muted); font-style: italic; }
+        @keyframes smesh-resolve-spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+          button { transition: none; }
+          .btn-resolve.spinning { animation-duration: 1.6s; }
+        }
       </style>
       <div class="panel${state.minimized ? ' minimized' : ''}" data-theme="${resolveTheme()}">
         <div class="titlebar" data-drag>
@@ -320,6 +406,23 @@
     });
   }
 
+  // Set the ✓ / ⚠ marker on ONE line only (after a single-question re-fill),
+  // without touching the other lines' markers the way markFillResults would.
+  function markOneLine(qid, kind) {
+    if (!shadow) return;
+    const li = [...shadow.querySelectorAll('li[data-qid]')]
+      .find((el) => el.getAttribute('data-qid') === String(qid));
+    if (!li) return;
+    let mark = li.querySelector('.mark');
+    if (!mark) {
+      mark = document.createElement('span');
+      mark.className = 'mark';
+      li.insertBefore(mark, li.firstChild);
+    }
+    if (kind === 'ok') { mark.className = 'mark ok'; mark.textContent = '✓ '; }
+    else if (kind === 'warn') { mark.className = 'mark warn'; mark.textContent = '⚠ '; }
+  }
+
   // Fill just THIS frame's form via scraper.js (same isolated world). Used as a
   // fallback when the service worker can't be reached.
   function localFill(qs) {
@@ -356,11 +459,83 @@
     });
   }
 
+  // Promise-wrapped sendMessage with a hard timeout so a recycled service
+  // worker (dropped reply) never leaves a line spinning forever.
+  function sendMsg(type, payload, timeoutMs) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs);
+      try {
+        chrome.runtime.sendMessage({ type, payload }, (r) => {
+          clearTimeout(t);
+          if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+          else finish(r || { ok: false, error: 'no response' });
+        });
+      } catch (e) { clearTimeout(t); finish({ ok: false, error: String(e) }); }
+    });
+  }
+
+  // «Перерешать этот вопрос»: re-ask one question, drop the fresh answer into
+  // the line, then push just that answer into the form and re-mark the line.
+  // The page is the source of truth, so the worker re-captures it server-side.
+  async function resolveOne(btn) {
+    if (btn.disabled) return;
+    const li = btn.closest('li');
+    const aEl = li && li.querySelector('.a');
+    const qid = li && li.getAttribute('data-qid');
+    const i = Number(btn.dataset.qi);
+    const qs = (lastPayload && lastPayload.questions) || [];
+    const q = qs[i];
+    if (!q || !aEl) return;
+
+    const prev = q.answer ?? '';
+    btn.disabled = true;
+    btn.classList.add('spinning');
+    btn.classList.remove('failed');
+    aEl.classList.add('resolving');
+    const prevText = aEl.textContent;
+    aEl.textContent = '…';
+
+    const r = await sendMsg('RESOLVE_QUESTION', {
+      index: q.index != null ? q.index : i + 1,
+      prevAnswer: prev,
+      questionText: q.text || ''
+    }, 130000);
+
+    btn.classList.remove('spinning');
+    btn.disabled = false;
+    aEl.classList.remove('resolving');
+
+    if (!r || !r.ok || !r.answer) {
+      aEl.textContent = prevText; // restore the prior answer
+      btn.classList.add('failed');
+      setTimeout(() => btn.classList.remove('failed'), 1500);
+      return;
+    }
+
+    q.answer = r.answer;
+    aEl.textContent = r.answer;
+    // Best-effort: push only this answer into the form and re-mark the line.
+    // Pin `index` to the line's qid so scraper.js targets this exact question
+    // by number/position — identical to the full-page fill — even when the
+    // model returned no number of its own (qid then falls back to i+1).
+    try {
+      const summary = await requestFill([{ ...q, index: qid }]);
+      const filled = new Set((summary?.filled || []).map(String));
+      markOneLine(qid, filled.has(String(qid)) ? 'ok' : 'warn');
+    } catch { /* answer is updated; user can still hit «Заполнить» */ }
+  }
+
   function wireButtons(panel, questions) {
     const closeBtn = panel.querySelector('.btn-close');
     const toggleBtn = panel.querySelector('.btn-toggle');
     const copyBtn = panel.querySelector('.btn-copy');
     const fillBtn = panel.querySelector('.btn-fill');
+
+    panel.querySelectorAll('.btn-resolve').forEach((b) => {
+      b.addEventListener('click', () => resolveOne(b));
+    });
 
     closeBtn.addEventListener('click', hide);
 

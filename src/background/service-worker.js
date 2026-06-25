@@ -4,6 +4,7 @@
  * All API keys live here / in storage, never in content scripts.
  */
 import { askAI } from '../lib/ai.js';
+import { fetchOpenRouterCredits, getSpendHistory } from '../lib/openrouter.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { createSession, addMessage, listSessions, listMessages } from '../lib/history.js';
@@ -210,6 +211,38 @@ async function solveTest({ text, screenshot }) {
     responseFormat: 'json_object',
     reasoning: { effort: 'high' }
   });
+}
+
+/**
+ * Re-solve a SINGLE question on the current test page (the answer panel's
+ * «перерешать» button). Re-captures the visible page (the page on screen is the
+ * source of truth — the original screenshot isn't kept) and asks the model for
+ * just that one question, optionally telling it the previous answer so it can
+ * confirm or correct. Same licence/consent gate as solveTest. Returns the fresh
+ * answer string ('' if nothing parseable came back).
+ */
+async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, questionText } = {}) {
+  await ensureLicensed();
+  if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
+  const { pageText, screenshot } = await capturePageForPill(tabId, windowId);
+  const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
+  const systemPrompt =
+    promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
+  const n = String(index ?? '').trim();
+  const focus =
+    `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (текст страницы ниже + скриншот).` +
+    (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
+    (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
+    ` Верни JSON {"answers":[{"n":"${n}","a":"…"}]} ровно с одним элементом для этого вопроса.\n\n` +
+    'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
+    (pageText || '(текст не извлечён, смотри скриншот)');
+  const answer = await askAI(systemPrompt, focus, screenshot ? [screenshot] : [], [], {
+    responseFormat: 'json_object',
+    reasoning: { effort: 'high' }
+  });
+  const parsed = parseTestAnswers(answer);
+  const match = parsed.find((q) => String(q.index) === n) || parsed[0];
+  return match ? match.answer : '';
 }
 
 /**
@@ -488,6 +521,110 @@ async function testNextPage(tabId) {
   return clicked ? 'clicked' : (finish ? 'finish' : 'none');
 }
 
+/* ---------- Floating "Solve" pill (page-triggered test solving) ---------- */
+// The pill (src/content/test-pill.js) is a content script, so it CANNOT call
+// chrome.tabs.captureVisibleTab or chrome.scripting — the screenshot capture +
+// solve + autofill (+ the multi-page advance loop) all have to run HERE. These
+// handlers lift the orchestration that used to live only in the popup
+// (solveTestOnScreen / solveAllPages) into the worker so it can be driven from
+// the page instead of the toolbar. The popup's own flow is untouched.
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const PILL_MAX_PAGES = 30; // same cap as the popup's solveAllPages
+
+/**
+ * Capture the visible test page: top-frame text + a PNG screenshot. Mirrors
+ * popup.js capturePage, but runs in the worker (the pill can't reach these APIs).
+ * windowId pins captureVisibleTab to the pill's own window.
+ */
+async function capturePageForPill(tabId, windowId) {
+  const [pageText, dataUrl] = await Promise.all([
+    chrome.scripting
+      .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
+      .then(([inj]) => inj?.result || '')
+      .catch(() => ''),
+    chrome.tabs.captureVisibleTab(windowId, { format: 'png' })
+  ]);
+  const b64 = (dataUrl || '').split(',')[1];
+  if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
+  return { pageText, screenshot: { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' } };
+}
+
+/**
+ * Solve ONE captured page: run the existing solve path, drop the answers into
+ * the in-page panel (showAnswersInTab) and autofill the form across every frame
+ * (fillAllFrames). Returns the parsed questions + fill summary.
+ */
+async function pillSolveOnePage(tabId, windowId) {
+  const { pageText, screenshot } = await capturePageForPill(tabId, windowId);
+  const answer = await solveTest({ text: pageText, screenshot });
+  const questions = parseTestAnswers(answer);
+  if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
+  await showAnswersInTab(tabId, questions);
+  const summary = await fillAllFrames(tabId, questions);
+  return { questions, summary };
+}
+
+// Poll the page signature until it differs from `beforeSig` (page advanced) or
+// the budget runs out. Mirrors popup.js waitForChange.
+async function waitForPillPageChange(tabId, beforeSig, timeout) {
+  const start = Date.now();
+  await sleep(600);
+  while (Date.now() - start < timeout) {
+    const sig = await testPageSig(tabId);
+    if (sig && sig !== beforeSig) return true;
+    await sleep(500);
+  }
+  return false;
+}
+
+// Try to advance to the next page. Mirrors popup.js advancePage: 'ok' | 'finish'
+// | 'none' | 'stuck'. NEVER clicks a submit/finish control (testNextPage refuses).
+async function advancePillPage(tabId, beforeSig) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const status = await testNextPage(tabId);
+    if (status === 'finish') return 'finish';
+    if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
+    if (await waitForPillPageChange(tabId, beforeSig, attempt === 0 ? 8000 : 4000)) return 'ok';
+  }
+  return 'stuck';
+}
+
+// Fire-and-forget live-status ping to the pill (page number / phase). Reading
+// lastError in the callback swallows the "no receiver" noise if the pill is gone.
+function notifyPill(tabId, payload) {
+  try {
+    chrome.tabs.sendMessage(tabId, { type: 'PILL_PROGRESS', payload }, () => void chrome.runtime.lastError);
+  } catch { /* tab closed mid-run */ }
+}
+
+/**
+ * Multi-page autopilot: for each page — solve, fill, then advance — until the
+ * end. NEVER submits; mirrors popup.js solveAllPages exactly. Returns
+ * { outcome, solved } so the pill can render the same Russian summary.
+ */
+async function pillSolveAllPages(tabId, windowId) {
+  let solved = 0;
+  let outcome = 'done';
+  for (let page = 1; page <= PILL_MAX_PAGES; page++) {
+    notifyPill(tabId, { phase: 'solve', page });
+    const { questions } = await pillSolveOnePage(tabId, windowId);
+    if (questions.length) solved++;
+    // Let the fill's React re-render settle so the signature reflects the filled
+    // state — otherwise a late repaint could look like a navigation.
+    await sleep(700);
+    notifyPill(tabId, { phase: 'next', page });
+    const beforeSig = await testPageSig(tabId);
+    const nav = await advancePillPage(tabId, beforeSig);
+    if (nav === 'finish') { outcome = 'finish'; break; }
+    if (nav === 'none') { outcome = 'none'; break; }
+    if (nav === 'stuck') { outcome = 'stuck'; break; }
+    if (page === PILL_MAX_PAGES) { outcome = 'max'; break; }
+    await sleep(500);
+  }
+  return { outcome, solved };
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     try {
@@ -543,6 +680,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, status: await testNextPage(tabId) });
           break;
         }
+        case 'PILL_SOLVE_PAGE': {
+          // The in-page pill's primary action. sender.tab is the test tab — the
+          // pill (a content script) can't screenshot/script, so the worker does
+          // it all: capture → solve → panel → autofill the visible page.
+          const tabId = sender?.tab?.id;
+          const windowId = sender?.tab?.windowId;
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          const { questions, summary } = await pillSolveOnePage(tabId, windowId);
+          sendResponse({ ok: true, count: questions.length, summary });
+          break;
+        }
+        case 'PILL_SOLVE_ALL': {
+          // The pill's «все страницы» autopilot: solve+fill every page, advancing
+          // with «Далее», stopping before any submit/finish control.
+          const tabId = sender?.tab?.id;
+          const windowId = sender?.tab?.windowId;
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          const { outcome, solved } = await pillSolveAllPages(tabId, windowId);
+          sendResponse({ ok: true, outcome, solved });
+          break;
+        }
+        case 'RESOLVE_QUESTION': {
+          // The answer panel's per-line «перерешать» button: re-solve ONE
+          // question on the panel's tab. sender.tab is that (test) tab.
+          const tabId = sender?.tab?.id;
+          const windowId = sender?.tab?.windowId;
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          const answer = await resolveOneQuestion(tabId, windowId, msg.payload || {});
+          sendResponse({ ok: true, answer });
+          break;
+        }
         case 'GET_RUNTIME_CONFIG':
           // Remote hot-fix config (scrape selectors / vocabulary / update notice)
           // with built-in fallback. Never throws; cached for RUNTIME_CONFIG_TTL_MS.
@@ -551,6 +719,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'CLASSIFY_TASKS':
           sendResponse({ ok: true, kinds: await classifyTasksAI(msg.payload?.tasks || []) });
           break;
+        case 'OPENROUTER_CREDITS': {
+          // Settings usage dashboard: OpenRouter balance (+ a daily spend
+          // snapshot recorded as a side effect) and the derived spend history.
+          const credits = await fetchOpenRouterCredits();
+          const spendHistory = await getSpendHistory();
+          sendResponse({ ...credits, spendHistory });
+          break;
+        }
         case 'DOWNLOAD_FILES':
           sendResponse({ ok: true, files: await downloadFiles(msg.payload || {}) });
           break;
@@ -654,7 +830,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: false, error: 'Unknown message type' });
       }
     } catch (e) {
-      sendResponse({ ok: false, error: String(e) });
+      // Surface the clean message (e.g. the friendly Russian "Ключ … не задан")
+      // WITHOUT the "Error: " class prefix that String(e) prepends — same as the
+      // streaming port below. The prefix would otherwise leak into the popup's
+      // "Ошибка: …" line and defeat the pill errText's Cyrillic-passthrough.
+      sendResponse({ ok: false, error: String(e?.message || e) });
     }
   })();
   return true; // async

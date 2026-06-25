@@ -1,8 +1,10 @@
 /* ============================================================================
-   СМЭШ AI — shared design tokens. "Warm" theme.
-   Soft cream paper + a calm teal accent in light mode; deep teal-ink with a
-   brighter mint accent in dark mode. Flat surfaces, hairline separators, soft
-   squircles, no gradients. Type is Manrope (bundled locally, full Cyrillic).
+   СМЭШ AI — shared design tokens. Mirrors the marketing site's visual identity.
+   Warm off-white ground + crisp white cards + a calm teal accent in light mode;
+   deep teal-ink with a brighter mint accent in dark mode. Flat surfaces,
+   hairline separators, 16px cards, no gradients. Display type is Unbounded
+   (titles, headings, numbers); body/UI type is Manrope — both bundled locally
+   with full Cyrillic. The "СМЭШ AI" wordmark stays in Manrope.
    `data-theme` on <html> is set by src/common/theme.js. A matching block lives
    under prefers-color-scheme so dark mode never flashes light before JS runs.
    ========================================================================== */
@@ -33,31 +35,58 @@
     U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
+/* Unbounded — rounded display face for titles, headings and numbers. Bundled
+   locally, variable weight 600–800. Same script subsets as Manrope so Cyrillic
+   renders correctly offline. The "СМЭШ AI" wordmark stays in Manrope. ------- */
+@font-face {
+  font-family: "Unbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+  src: url("../../assets/fonts/unbounded-cyrillic.woff2") format("woff2");
+  unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+@font-face {
+  font-family: "Unbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+  src: url("../../assets/fonts/unbounded-cyrillic-ext.woff2") format("woff2");
+  unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F;
+}
+@font-face {
+  font-family: "Unbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+  src: url("../../assets/fonts/unbounded-latin.woff2") format("woff2");
+  unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC,
+    U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+@font-face {
+  font-family: "Unbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
+  src: url("../../assets/fonts/unbounded-latin-ext.woff2") format("woff2");
+  unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304,
+    U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0,
+    U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
 :root {
   color-scheme: light;
 
   /* Typography — Manrope first, system stack as the graceful fallback. ------ */
   --font-sans: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI",
     Roboto, system-ui, Helvetica, Arial, sans-serif;
-  --font-display: "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI",
+  --font-display: "Unbounded", "Manrope", -apple-system, BlinkMacSystemFont, "Segoe UI",
     Roboto, system-ui, sans-serif;
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
-  /* Surfaces — warm cream paper. ------------------------------------------ */
-  --bg: #faf6ec;
+  /* Surfaces — warm off-white ground, crisp white cards. ------------------ */
+  --bg: #f7f4ee;
   --bg-tint: none;
-  --card: #fffdf8;
-  --surface-2: #f3ecdb;
-  --sidebar-bg: #f4eedd;
-  --chrome: rgba(250, 246, 236, 0.82);
-  --input-bg: #f1ead8;
+  --card: #ffffff;
+  --surface-2: #efece3;
+  --sidebar-bg: #f3efe6;
+  --chrome: rgba(247, 244, 238, 0.82);
+  --input-bg: #ece7da;
   --code-bg: rgba(60, 50, 30, 0.06);
-  --bubble: #f1ead8;            /* neutral user-message bubble */
+  --bubble: #ece7da;            /* neutral user-message bubble */
 
   /* Text — warm near-black, never pure #000. ------------------------------ */
   --text: #2a2620;
   --secondary: #6b6354;
-  --tertiary: #9a917f;
+  --tertiary: #756d5e;
 
   /* Lines & states -------------------------------------------------------- */
   --separator: rgba(42, 38, 32, 0.10);
@@ -84,12 +113,12 @@
   --danger: #c7382e;
   --danger-soft: rgba(199, 56, 46, 0.12);
 
-  /* Radii — soft squircles ------------------------------------------------ */
+  /* Radii — cards/panels 16px, larger frames 20px, pills for tags/buttons. - */
   --r-xs: 8px;
   --r-sm: 10px;
   --r-md: 14px;
-  --r-lg: 18px;
-  --r-xl: 22px;
+  --r-lg: 16px;
+  --r-xl: 16px;
   --r-2xl: 20px;
   --r-pill: 999px;
 
@@ -118,7 +147,7 @@
 
   --text: #e8e4d8;
   --secondary: #a6b0ad;
-  --tertiary: #76817e;
+  --tertiary: #8a948f;
 
   --separator: rgba(255, 255, 255, 0.09);
   --border-strong: rgba(255, 255, 255, 0.18);
@@ -163,7 +192,7 @@
     --bubble: #2b3a37;
     --text: #e8e4d8;
     --secondary: #a6b0ad;
-    --tertiary: #76817e;
+    --tertiary: #8a948f;
     --separator: rgba(255, 255, 255, 0.09);
     --border-strong: rgba(255, 255, 255, 0.18);
     --hover: rgba(255, 255, 255, 0.06);

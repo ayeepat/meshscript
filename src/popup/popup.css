@@ -30,7 +30,8 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brandtext { display: flex; flex-direction: column; line-height: 1.05; min-width: 0; }
-.brandtext h1 { font-family: var(--font-display); font-size: 17px; font-weight: 700; letter-spacing: -0.4px; margin: 0; }
+/* Wordmark stays in the geometric sans, never the display face. */
+.brandtext h1 { font-family: var(--font-sans); font-size: 17px; font-weight: 800; letter-spacing: -0.4px; margin: 0; }
 .brandsub { font-size: 11px; font-weight: 500; color: var(--tertiary); margin-top: 2px; }
 
 .iconbtn {
@@ -232,7 +233,7 @@ body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
 
 /* ---------- First-run onboarding ---------- */
 .onboard { padding: 16px; }
-.ob-title { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.4px; margin: 4px 0 4px; }
+.ob-title { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.4px; margin: 4px 0 4px; text-wrap: balance; line-height: 1.2; }
 .ob-lede { margin: 0 0 14px; font-size: 12.5px; line-height: 1.5; color: var(--secondary); }
 .ob-step {
   background: var(--card); border: 1px solid var(--separator); border-radius: var(--r-lg);
@@ -279,6 +280,22 @@ body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
   transition: color 0.15s ease;
 }
 .ob-ghost:hover { color: var(--text); }
+
+/* ---------- Support button ---------- */
+.supportbtn {
+  display: flex; align-items: center; justify-content: center; gap: 7px;
+  margin: 10px 16px 0;
+  padding: 9px 12px;
+  font-size: 12.5px; font-weight: 600;
+  color: var(--accent); text-decoration: none;
+  background: var(--accent-soft); border: 1px solid var(--separator);
+  border-radius: var(--r-md, 10px);
+  transition: background 0.15s ease, transform 0.12s ease;
+}
+.supportbtn:hover { background: var(--accent-soft-strong); }
+.supportbtn:active { transform: scale(0.98); }
+.supportbtn svg { flex: none; }
+body.compact .supportbtn { margin-top: 8px; font-size: 12px; padding: 8px 10px; }
 
 /* ---------- Legal footer ---------- */
 .legal {

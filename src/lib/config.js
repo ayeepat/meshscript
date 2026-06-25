@@ -10,6 +10,11 @@
 // Update this to your custom domain once it's pointed at the worker.
 export const BACKEND_URL = 'https://api.smesh.app';
 
+// Support bot deep link. The «Поддержка» buttons (popup + settings) open this.
+// ⚠️ REPLACE `smesh_support_bot` with YOUR bot's @username from @BotFather
+// (without the @). The `?start=support` part makes the bot greet the user.
+export const SUPPORT_BOT_URL = 'https://t.me/smeshaibot?start=support';
+
 // When false, the extension still verifies and shows status in Settings but
 // NEVER blocks AI calls. Flip to true on launch day after preorders ship.
 // Keep false during preorder window so testers without keys aren't locked out.

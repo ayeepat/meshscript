@@ -27,7 +27,7 @@ export const isTextFile = (f) =>
  */
 export const isAudioFile = (f) =>
   /^audio\//.test(f?.mimeType || '') ||
-  /\.(mp3|mpga|mpeg|m4a|wav|flac|ogg|oga|opus|aac|weba)$/i.test(f?.name || '');
+  /\.(mp3|mpga|mpeg|m4a|wav|flac|ogg|oga|opus|aac|weba|webm)$/i.test(f?.name || '');
 
 /**
  * Office Open XML / legacy office docs. We can't hand these to a model, but the

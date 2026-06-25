@@ -11,10 +11,15 @@ import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
 import { isVersionBelow } from '../lib/remote-config.js';
+import { SUPPORT_BOT_URL } from '../lib/config.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 initTheme();
+
+// Point the «Поддержка» link at the support bot (single source of truth in config.js).
+const supportLink = document.getElementById('supportLink');
+if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 
 // Remote hot-fix config (scrape selectors / vocabulary / update notice), pulled
 // once per popup open from the service worker. Null until loaded; every consumer

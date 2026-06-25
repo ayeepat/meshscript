@@ -12,7 +12,85 @@ import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { chargeOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
+const CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits';
 const MODEL = 'google/gemini-2.5-flash';
+
+// Daily spend dashboard (Settings). OpenRouter's /credits only reports the
+// LIFETIME cumulative usage, so to chart spend-per-day we snapshot that
+// cumulative value once per day (latest wins) under `orUsageSnap` and derive
+// each day's spend as the delta between consecutive recorded snapshots. The
+// trail is short-lived and pruned to the chart window on every write.
+const SPEND_DAYS = 14;
+const SNAP_KEY = 'orUsageSnap';
+
+function spendDayKey(d = new Date()) {
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function spendLastNDays(n) {
+  const today = new Date();
+  const days = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const x = new Date(today);
+    x.setDate(today.getDate() - i);
+    days.push(spendDayKey(x));
+  }
+  return days;
+}
+
+// Record today's cumulative usage (overwrites today's bucket with the latest
+// reading). Keeps one extra day beyond the window so the first in-window day
+// still has a prior snapshot to diff against. Best-effort; never throws.
+async function recordSpendSnapshot(usage) {
+  try {
+    const { [SNAP_KEY]: snap = {} } = await chrome.storage.local.get(SNAP_KEY);
+    const keep = new Set(spendLastNDays(SPEND_DAYS + 1));
+    const out = {};
+    for (const k of Object.keys(snap)) if (keep.has(k)) out[k] = snap[k];
+    out[spendDayKey()] = usage;
+    await chrome.storage.local.set({ [SNAP_KEY]: out });
+  } catch { /* snapshot is best-effort */ }
+}
+
+/**
+ * Per-day OpenRouter spend (USD) for the last `days` days, derived from the
+ * cumulative-usage snapshots. Days with no diff available read 0. Ascending.
+ * @returns {Promise<Array<{day:string, spend:number}>>}
+ */
+export async function getSpendHistory(days = SPEND_DAYS) {
+  let snap = {};
+  try { ({ [SNAP_KEY]: snap = {} } = await chrome.storage.local.get(SNAP_KEY)); }
+  catch { snap = {}; }
+  const recorded = Object.keys(snap).filter((k) => Number.isFinite(Number(snap[k]))).sort();
+  const deltaByDay = {};
+  for (let i = 1; i < recorded.length; i++) {
+    const v = Number(snap[recorded[i]]) - Number(snap[recorded[i - 1]]);
+    deltaByDay[recorded[i]] = v > 0 ? v : 0;
+  }
+  return spendLastNDays(days).map((day) => ({ day, spend: deltaByDay[day] || 0 }));
+}
+
+/**
+ * Account balance from OpenRouter's /credits endpoint, using the stored key.
+ * Records a daily spend snapshot on success (for getSpendHistory). Never throws
+ * — returns { ok:false, reason } so Settings can show a calm fallback.
+ * @returns {Promise<{ok:true,total:number,usage:number,remaining:number}|{ok:false,reason:string,status?:number}>}
+ */
+export async function fetchOpenRouterCredits() {
+  const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
+  if (!openrouterApiKey) return { ok: false, reason: 'no_key' };
+  try {
+    const res = await fetch(CREDITS_ENDPOINT, { headers: { Authorization: `Bearer ${openrouterApiKey}` } });
+    if (!res.ok) return { ok: false, reason: 'http', status: res.status };
+    const data = await res.json().catch(() => null);
+    const d = data?.data || {};
+    const total = Number(d.total_credits);
+    const usage = Number(d.total_usage);
+    if (!Number.isFinite(total) || !Number.isFinite(usage)) return { ok: false, reason: 'parse' };
+    await recordSpendSnapshot(usage);
+    return { ok: true, total, usage, remaining: Math.max(0, total - usage) };
+  } catch { return { ok: false, reason: 'network' }; }
+}
 
 // Decode a base64 payload to UTF-8 text (service worker has no FileReader).
 function b64ToUtf8(b64) {

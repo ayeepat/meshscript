@@ -4,14 +4,17 @@
  * and lets the user raise/lower the caps in Settings.
  *
  * Storage:
- *   rateLimits: { openrouter: number, groq: number }   // user-set caps
- *   rateUsage:  { openrouter: { day, count }, groq: { day, count } }
+ *   rateLimits:  { openrouter: number, groq: number }   // user-set caps
+ *   rateUsage:   { openrouter: { day, count }, groq: { day, count } }
+ *   rateHistory: { 'YYYY-MM-DD': { openrouter: number, groq: number } }  // per-day, last 14 days
  *
  * `day` is a local-time YYYY-MM-DD string; when it rolls over, the counter
- * resets implicitly (no background sweep needed).
+ * resets implicitly (no background sweep needed). rateHistory keeps a short
+ * append-only trail so Settings can chart requests/day; it's pruned on write.
  */
 
 export const DEFAULT_LIMITS = { openrouter: 80, groq: 300 };
+const HISTORY_DAYS = 14;
 
 function todayKey() {
   const d = new Date();
@@ -19,9 +22,31 @@ function todayKey() {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
 
+// Ascending list of the last `n` local-time YYYY-MM-DD strings (today last).
+function lastNDays(n) {
+  const pad = (k) => String(k).padStart(2, '0');
+  const today = new Date();
+  const days = [];
+  for (let i = n - 1; i >= 0; i--) {
+    const x = new Date(today);
+    x.setDate(today.getDate() - i);
+    days.push(`${x.getFullYear()}-${pad(x.getMonth() + 1)}-${pad(x.getDate())}`);
+  }
+  return days;
+}
+
+// Drop history entries older than the window so the map can't grow unbounded.
+function pruneHistory(hist) {
+  const keep = new Set(lastNDays(HISTORY_DAYS));
+  const out = {};
+  for (const k of Object.keys(hist || {})) if (keep.has(k)) out[k] = hist[k];
+  return out;
+}
+
 async function load() {
-  const { rateLimits = {}, rateUsage = {} } = await chrome.storage.local.get(['rateLimits', 'rateUsage']);
-  return { rateLimits, rateUsage };
+  const { rateLimits = {}, rateUsage = {}, rateHistory = {} } =
+    await chrome.storage.local.get(['rateLimits', 'rateUsage', 'rateHistory']);
+  return { rateLimits, rateUsage, rateHistory };
 }
 
 function limitFor(rateLimits, provider) {
@@ -41,7 +66,7 @@ function currentCount(slot, day) {
  * to the UI verbatim.
  */
 export async function chargeOne(provider) {
-  const { rateLimits, rateUsage } = await load();
+  const { rateLimits, rateUsage, rateHistory } = await load();
   const limit = limitFor(rateLimits, provider);
   const day = todayKey();
   const used = currentCount(rateUsage[provider], day);
@@ -53,7 +78,11 @@ export async function chargeOne(provider) {
     );
   }
   const next = { ...rateUsage, [provider]: { day, count: used + 1 } };
-  await chrome.storage.local.set({ rateUsage: next });
+  // Mirror the charge into the per-day trail (pruned) so Settings can chart it.
+  const hist = pruneHistory(rateHistory);
+  const row = hist[day] || {};
+  hist[day] = { ...row, [provider]: (Number(row[provider]) || 0) + 1 };
+  await chrome.storage.local.set({ rateUsage: next, rateHistory: hist });
 }
 
 /** Snapshot of today's usage for each provider. Used by Settings. */
@@ -68,4 +97,18 @@ export async function getUsage() {
     };
   }
   return out;
+}
+
+/**
+ * Per-day request counts for the last `days` days (ascending, today last).
+ * Gaps are zero-filled so the Settings chart always has a full axis.
+ * @returns {Promise<Array<{day:string, openrouter:number, groq:number}>>}
+ */
+export async function getUsageHistory(days = HISTORY_DAYS) {
+  const { rateHistory } = await load();
+  return lastNDays(days).map((day) => ({
+    day,
+    openrouter: Number(rateHistory[day]?.openrouter) || 0,
+    groq: Number(rateHistory[day]?.groq) || 0
+  }));
 }

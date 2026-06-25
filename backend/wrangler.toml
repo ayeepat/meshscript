@@ -12,6 +12,8 @@
 #        npx wrangler secret put RESEND_API_KEY              # optional
 #        npx wrangler secret put TELEGRAM_BOT_TOKEN          # optional
 #        npx wrangler secret put OWNER_LICENSE_KEY           # optional dev-bypass key
+#        npx wrangler secret put SUPPORT_CHAT_ID             # your numeric Telegram id (support bot)
+#        npx wrangler secret put TELEGRAM_WEBHOOK_SECRET     # random string (support bot webhook auth)
 #  4. `npx wrangler deploy`
 #  5. Point your custom domain at the worker (Cloudflare → Workers → Triggers).
 
@@ -22,7 +24,7 @@ compatibility_date = "2025-01-15"
 # License rows. Keyed by license key string. Value is the JSON in licenses.js.
 [[kv_namespaces]]
 binding = "LICENSES"
-id = "REPLACE_ME_WITH_KV_NAMESPACE_ID"
+id = "ab3e52d938304a4c909766cb2033834a"
 
 # Non-secret config. Override in the Cloudflare dashboard for production.
 [vars]

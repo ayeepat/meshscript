@@ -138,6 +138,31 @@ curl 'https://api.smesh.app/verify?key=SMESH-XXXX-XXXX-XXXX&device_id=test'
 # → { "ok": true, "type": "lifetime", "expires_at": null }
 ```
 
+## Support bot
+
+Reuses the same `TELEGRAM_BOT_TOKEN`. The «Поддержка» buttons in the extension
+(popup + settings) open `t.me/<bot>?start=support`. A user writes to the bot,
+the worker forwards the ticket to you, and your replies relay back to the user.
+
+Setup:
+
+```sh
+# 1. Your numeric Telegram id — message @userinfobot, it replies with your id.
+npx wrangler secret put SUPPORT_CHAT_ID
+
+# 2. Any long random string — authenticates Telegram's webhook calls.
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+
+npx wrangler deploy
+
+# 3. Tell Telegram where to send updates (use the SAME secret as step 2).
+curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://api.smesh.app/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+```
+
+Then set `SUPPORT_BOT_URL` in `src/lib/config.js` to your bot's `@username`.
+To answer a user, just **reply** to the ticket message in Telegram — the bot
+relays your reply to them. `wrangler tail` shows webhook logs.
+
 ## When subscriptions launch (Tier B)
 
 Three changes, no migration:

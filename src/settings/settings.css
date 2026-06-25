@@ -25,7 +25,8 @@ body.on-settings { padding-bottom: 92px; }
 }
 .appbar .brandmark { width: 34px; height: 34px; font-size: 19px; border-radius: var(--r-sm); }
 .appbar .brandtext { display: flex; flex-direction: column; line-height: 1.1; }
-.appbar h1 { font-family: var(--font-display); font-size: 18px; font-weight: 700; letter-spacing: -0.4px; margin: 0; }
+/* Wordmark stays in the geometric sans, never the display face. */
+.appbar h1 { font-family: var(--font-sans); font-size: 18px; font-weight: 800; letter-spacing: -0.4px; margin: 0; }
 .appbar .brandsub { font-size: 12px; color: var(--tertiary); margin-top: 2px; }
 
 /* Compact theme switch, top-right of the app bar */
@@ -78,6 +79,26 @@ body.on-settings { padding-bottom: 92px; }
   transition: border-color 0.2s var(--ease), box-shadow 0.2s var(--ease);
 }
 .panel:hover { border-color: var(--border-strong); }
+
+/* Support card — sits above both tabs, opens the Telegram support bot. */
+.support-card {
+  display: flex; align-items: center; gap: 14px;
+  margin-bottom: 18px; padding: 16px 18px;
+  background: var(--accent-soft); border: 1px solid var(--separator);
+  border-radius: var(--r-2xl); text-decoration: none; color: inherit;
+  transition: border-color 0.2s var(--ease), background 0.2s var(--ease), transform 0.12s var(--ease);
+}
+.support-card:hover { border-color: var(--accent); background: var(--accent-soft-strong); }
+.support-card:active { transform: scale(0.995); }
+.support-ic {
+  flex: none; width: 42px; height: 42px; border-radius: var(--r-md);
+  display: grid; place-items: center;
+  background: var(--accent); color: var(--on-accent);
+}
+.support-txt { display: flex; flex-direction: column; gap: 3px; }
+.support-txt strong { font-size: 14.5px; font-weight: 650; color: var(--text); }
+.support-txt small { font-size: 12.5px; color: var(--tertiary); line-height: 1.4; }
+.support-arrow { margin-left: auto; flex: none; color: var(--accent); }
 
 /* Small section label inside a panel ("Мои учебники"). */
 .subhead {
@@ -390,3 +411,74 @@ body.on-settings .savebar { display: block; }
 .gdz-result .tag.paid { color: var(--warn); background: var(--warn-soft); }
 .gdz-result .tag.added { color: var(--success); background: var(--success-soft, var(--accent-soft)); }
 .gdz-result.added { background: var(--card); border-color: var(--accent-soft-strong); }
+
+/* ============ Usage & spend dashboard ============ */
+
+.spendgrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+  margin-top: 4px;
+}
+.spendtile {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 12px 14px;
+  background: var(--input-bg);
+  border-radius: var(--r-md);
+}
+.spendlabel { font-size: 11px; font-weight: 600; color: var(--tertiary); }
+.spendval {
+  font-family: var(--font-display);
+  font-size: 22px; font-weight: 700; line-height: 1.1;
+  color: var(--text); font-variant-numeric: tabular-nums;
+}
+.spendval.accent { color: var(--accent); }
+.spendsub { font-size: 10.5px; color: var(--tertiary); }
+
+/* Balance used vs purchased. */
+.balancebar {
+  height: 6px; margin-top: 12px;
+  background: var(--input-bg); border-radius: var(--r-pill); overflow: hidden;
+}
+.balancefill {
+  display: block; height: 100%; width: 0;
+  background: var(--accent); border-radius: var(--r-pill);
+  transition: width 0.4s ease;
+}
+.spendnote { font-size: 11.5px; color: var(--tertiary); margin-top: 8px; }
+.spendnote:empty { display: none; }
+
+.charthead {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; margin-top: 18px; margin-bottom: 6px;
+}
+.charttitle { font-size: 12px; font-weight: 650; color: var(--secondary); }
+.charthead .seg.small { width: auto; flex: none; }
+.charthead .seg.small button { padding: 6px 12px; }
+
+.usagechart { width: 100%; }
+.usagechart svg { width: 100%; height: auto; display: block; }
+.usagechart .bar { transition: opacity 0.15s ease; }
+.usagechart .bar:hover { opacity: 0.78; }
+.usagechart .bar-or, .usagechart .bar-usd { fill: var(--accent); }
+.usagechart .bar-groq { fill: var(--tertiary); }
+.usagechart .axis { stroke: var(--separator); stroke-width: 1; }
+.usagechart .xlab { fill: var(--tertiary); font-size: 7px; font-family: var(--font-sans); }
+.chartempty {
+  padding: 22px 14px; text-align: center;
+  font-size: 12px; color: var(--tertiary);
+  background: var(--input-bg); border-radius: var(--r-md);
+}
+
+.chartlegend { display: flex; gap: 16px; margin-top: 8px; }
+.chartlegend .lg {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; color: var(--secondary);
+}
+.chartlegend .sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.chartlegend .sw.or { background: var(--accent); }
+.chartlegend .sw.groq { background: var(--tertiary); }
+
+@media (max-width: 560px) {
+  .spendgrid { grid-template-columns: 1fr 1fr; }
+}
