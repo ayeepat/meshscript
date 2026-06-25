@@ -28,16 +28,38 @@
 (() => {
   if (window.__smeshPill) return;
 
+  // Namespaced diagnostics — same prefix style as scraper.js. Lets us confirm
+  // the script injected and see WHY detection did/didn't fire from the page
+  // console (filter on "СМЭШ AI pill"). Flip to false before a store release.
+  const DEBUG = true;
+  const log = (...a) => { if (DEBUG) { try { console.debug('[СМЭШ AI pill]', ...a); } catch { /* */ } } };
+
   /* ---------- Test-page detection (single source of truth) ---------- */
-  // The manifest matches both test hosts broadly; this decides whether the
-  // current page is actually a test before we show anything (stealth-first).
+  // The manifest matches both МЭШ hosts broadly (uchebnik.mos.ru + school.mos.ru
+  // minus /diary). This decides whether the CURRENT page is actually a test
+  // before we show anything (stealth-first). Tests appear as:
+  //   • a launch URL carrying xAPI params (activityId / cwork_id / registration),
+  //   • a path under /exam, /challenge, /cwork, /test, …, OR
+  //   • a host page that embeds the uchebnik test player in an <iframe>
+  //     (Библиотека МЭШ / Цифровой учитель shell the player this way).
+  // Any one signal is enough — designed to err toward showing on a real test.
+  function hasTestIframe() {
+    try {
+      return !!document.querySelector(
+        'iframe[src*="uchebnik.mos.ru"], iframe[src*="/lrs"], iframe[src*="/exam"], ' +
+        'iframe[src*="/launch"], iframe[src*="activityId"], iframe[src*="cwork"]'
+      );
+    } catch { return false; }
+  }
   function looksLikeTest() {
     const { pathname, search } = location;
-    // Strong xAPI/LRS launch signature shared by every МЭШ test launch.
-    if (/[?&]activityId=/.test(search) && /(lrs|endpoint=|registration=)/i.test(search)) return true;
-    // Path markers: exam/challenge (uchebnik), cwork (school.mos.ru course paths).
-    if (/\/(exam|challenge|cwork|test)(\/|$)/i.test(pathname)) return true;
-    if (/[?&]cwork_id=/.test(search)) return true;
+    // xAPI launch params — the strongest signal; any one is decisive.
+    if (/[?&](activityId|cwork_id|registration|lesson_id|scorm_id)=/i.test(search)) return true;
+    if (/[?&]endpoint=[^&]*lrs/i.test(search)) return true;
+    // Path markers across МЭШ test surfaces.
+    if (/\/(exam|challenge|cwork|control[-_]?work|test|testing|training|diagnostic|quiz)(\/|$|\?)/i.test(pathname)) return true;
+    // A page that embeds the test player as an iframe.
+    if (hasTestIframe()) return true;
     return false;
   }
 
@@ -47,6 +69,7 @@
   // Mark loaded immediately so a re-inject is a no-op even if the page isn't a
   // test yet (SPA route may turn into one — see the URL watcher at the bottom).
   let built = false;
+  let dismissed = false; // user pressed Esc / × — don't auto-rebuild on the same page
   let hostEl = null;
   let shadow = null;
   let state = { x: null, y: null };
@@ -554,25 +577,40 @@
     });
   }
 
-  // Panic / quick-hide: instantly remove the pill AND the answer panel. The
-  // content script stays loaded, so a reload (or SPA re-detect) brings it back.
+  // Panic / quick-hide: instantly remove the pill AND the answer panel, and stay
+  // hidden on THIS page (the poll must not rebuild it a second later). A reload
+  // or a navigation to another test URL clears the dismissal and brings it back.
   function panicHide() {
     if (thinker) { thinker.stop(); thinker = null; }
     busy = false; // a stale in-flight solve must not block a rebuilt pill
+    dismissed = true;
     if (hostEl) { hostEl.remove(); hostEl = null; shadow = null; built = false; }
     try { window.__smeshPanel?.hide(); } catch { /* panel not present */ }
   }
 
-  window.__smeshPill = { build, hide: panicHide, looksLikeTest };
+  window.__smeshPill = { build, hide: panicHide, looksLikeTest, evaluate };
 
-  /* ---------- URL watcher (always on; the only cost on non-test pages) ---------- */
-  // Build now if this is a test, and re-check on route changes. The МЭШ test
-  // launch URL carries its params at load (full navigation / new tab), so the
-  // initial check is the real path; the delayed re-check and history hooks just
-  // cover a late client-side route into a test.
-  function maybeBuild() { if (!built && looksLikeTest()) build(); }
-  maybeBuild();
-  if (!built) setTimeout(maybeBuild, 1500);
-  window.addEventListener('popstate', maybeBuild);
-  window.addEventListener('hashchange', maybeBuild);
+  /* ---------- Detection watcher (poll-based; survives SPA navigation) ---------- */
+  // A content script lives in an ISOLATED world, so it CANNOT hook the page's
+  // history.pushState — the МЭШ React app routes into a test client-side, which
+  // fires no event we can hear. So we poll location.href (cheap string compare)
+  // and re-evaluate. This also catches the test player loading its iframe a beat
+  // after navigation. The poll is gentle and only runs on МЭШ hosts.
+  let lastHref = location.href;
+  function evaluate() {
+    if (location.href !== lastHref) { lastHref = location.href; dismissed = false; } // new route → pill allowed again
+    if (dismissed) return;
+    if (!looksLikeTest()) return;
+    if (!built) { log('test detected → showing pill', location.href); build(); return; }
+    // Already built: if a heavy SPA re-render detached our host, re-attach it.
+    if (hostEl && !document.documentElement.contains(hostEl)) {
+      document.documentElement.appendChild(hostEl);
+    }
+  }
+
+  log('loaded', location.href, '· isTest=' + looksLikeTest());
+  evaluate();
+  setInterval(evaluate, 1200);
+  window.addEventListener('popstate', evaluate);
+  window.addEventListener('hashchange', evaluate);
 })();
