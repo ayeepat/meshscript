@@ -1297,43 +1297,21 @@ function distributeFieldValues(question, inputs) {
 
 // --- React-aware writers ---
 
-// Write a value into an answer box. Plain Mesh boxes (e.g. the system's x & y)
-// accept the React-controlled path: native value setter + an input event, which
-// React's value tracker picks up. The FORMULA/MATH boxes (the «x₁ =» roots and
-// the coordinate «( ; )» fields — the ones with the keypad icon) are custom
-// widgets that ignore a bare value-set, so we ALSO:
-//   • fire a real InputEvent (beforeinput + input) carrying the inserted text —
-//     what most rich/math editors actually listen to;
-//   • set a contenteditable display's text, or call a <math-field>-style
-//     value API, when the box isn't a standard <input>.
-// Every step is guarded so a widget that throws on one path still gets the rest.
+// Write a value into a standard answer box: native value setter (so React's value
+// tracker picks it up) + bubbling input/change. Deliberately MINIMAL and fast —
+// no focus(), no InputEvent/beforeinput. Those were added to try to drive Mesh's
+// MyScript formula widgets, but they triggered heavy SYNCHRONOUS recognition work
+// inside the page on every box, which hung the whole fill (and so the solve) to
+// the timeout. The formula boxes need a different, non-blocking approach (TODO:
+// see __smeshDumpBoxes diagnostics); plain inputs fill reliably with just this.
 function setNativeValue(el, value) {
-  try { el.focus({ preventScroll: true }); } catch { /* not focusable */ }
-
-  const tag = el.tagName;
-  if (tag === 'INPUT' || tag === 'TEXTAREA') {
-    try {
-      const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
-        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
-    } catch { /* not a standard input after all */ }
-  } else {
-    // Custom element with a value API (MathLive <math-field> etc.).
-    try {
-      if (typeof el.setValue === 'function') el.setValue(value);
-      else if ('value' in el) el.value = value;
-    } catch { /* no value API */ }
-    // contenteditable display.
-    if (el.isContentEditable) { try { el.textContent = value; } catch { /* */ } }
-  }
-
-  // A real InputEvent (with the inserted text) reaches BOTH React's input tracker
-  // and custom editors that only react to InputEvent/beforeinput.
-  try { el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: value })); } catch { /* InputEvent unsupported */ }
-  try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value })); }
-  catch { try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* */ } }
-  try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch { /* */ }
+  const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
+    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+  if (desc && desc.set) desc.set.call(el, value);
+  else el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+  el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
 function selectRadio(input) {
