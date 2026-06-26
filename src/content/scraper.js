@@ -1498,8 +1498,41 @@ function fillTestAnswers(questions) {
   });
 
   try { console.log('[СМЭШ AI fill] result:', summary); } catch { /* */ }
+  // Attach a per-unit diagnostic so the worker can log it from ITS console
+  // (the test runs in an iframe, so page-console logs are easy to miss). Cheap;
+  // ignored by every existing caller (they read .filled/.skipped only).
+  try {
+    summary.diag = units.map((u) => ({
+      number: u.number, type: u.type, boxes: u.inputs.length,
+      els: u.type === 'text' ? u.inputs.slice(0, 6).map(boxInfo) : undefined
+    }));
+  } catch { /* */ }
   return summary;
 }
+
+// Broad, detection-independent scan of every input-like / editable element in
+// THIS frame — including MyScript / math-field / contenteditable widgets that the
+// normal unit detection might miss. Surfaced for diagnostics so the real shape of
+// the formula boxes («x₁ =», coordinate fields) can be seen without DevTools
+// frame-hunting (the worker logs it; see fillAllFrames).
+function dumpBoxes() {
+  const sel = [
+    'input', 'textarea', 'select',
+    '[contenteditable=""]', '[contenteditable="true"]', '[role="textbox"]',
+    'canvas', 'math-field',
+    '[class*="myscript" i]', '[class*="mathfield" i]', '[class*="mathquill" i]',
+    '[class*="mq-" i]', '[class*="equation" i]', '[class*="formula" i]'
+  ].join(',');
+  let els = [];
+  try { els = Array.from(document.querySelectorAll(sel)); } catch { return []; }
+  return els.slice(0, 50).map((el) => {
+    const info = boxInfo(el) || {};
+    let size = '?';
+    try { const b = el.getBoundingClientRect(); size = Math.round(b.width) + 'x' + Math.round(b.height); } catch { /* */ }
+    return { ...info, id: (el.id || '').slice(0, 30), size };
+  });
+}
+window.__smeshDumpBoxes = dumpBoxes;
 
 // Shared isolated-world entry point: answer-panel.js (same content-script world,
 // so it sees this global) calls it directly — chrome.runtime messaging can't

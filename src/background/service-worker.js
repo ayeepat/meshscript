@@ -506,7 +506,21 @@ async function fillAllFrames(tabId, questions) {
   for (const r of (results || [])) {
     const s = r && r.result;
     if (s && Array.isArray(s.filled)) s.filled.forEach((id) => filled.add(String(id)));
+    // Log each frame's box diagnostic from the WORKER console (one place, no
+    // iframe-console hunting). Lets a stubborn box's real widget type be seen.
+    if (s && s.diag) { try { console.log('[СМЭШ AI fill][frame diag]', JSON.stringify(s.diag)); } catch { /* */ } }
   }
+  // Detection-independent dump of every input-like / MyScript / math-field box
+  // across all frames — the definitive picture of what the formula boxes are.
+  try {
+    const dumps = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => { try { return (typeof window.__smeshDumpBoxes === 'function') ? window.__smeshDumpBoxes() : null; } catch { return null; } }
+    });
+    for (const d of (dumps || [])) {
+      if (d && d.result && d.result.length) console.log('[СМЭШ AI fill][boxes]', JSON.stringify(d.result));
+    }
+  } catch { /* dump is best-effort */ }
   const filledIds = [];
   const skipped = [];
   questions.forEach((q, i) => {
