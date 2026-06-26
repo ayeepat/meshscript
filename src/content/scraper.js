@@ -1297,14 +1297,43 @@ function distributeFieldValues(question, inputs) {
 
 // --- React-aware writers ---
 
+// Write a value into an answer box. Plain Mesh boxes (e.g. the system's x & y)
+// accept the React-controlled path: native value setter + an input event, which
+// React's value tracker picks up. The FORMULA/MATH boxes (the «x₁ =» roots and
+// the coordinate «( ; )» fields — the ones with the keypad icon) are custom
+// widgets that ignore a bare value-set, so we ALSO:
+//   • fire a real InputEvent (beforeinput + input) carrying the inserted text —
+//     what most rich/math editors actually listen to;
+//   • set a contenteditable display's text, or call a <math-field>-style
+//     value API, when the box isn't a standard <input>.
+// Every step is guarded so a widget that throws on one path still gets the rest.
 function setNativeValue(el, value) {
-  const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
-    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const desc = Object.getOwnPropertyDescriptor(proto, 'value');
-  if (desc && desc.set) desc.set.call(el, value);
-  else el.value = value;
-  el.dispatchEvent(new Event('input', { bubbles: true }));
-  el.dispatchEvent(new Event('change', { bubbles: true }));
+  try { el.focus({ preventScroll: true }); } catch { /* not focusable */ }
+
+  const tag = el.tagName;
+  if (tag === 'INPUT' || tag === 'TEXTAREA') {
+    try {
+      const proto = (typeof HTMLTextAreaElement !== 'undefined' && el instanceof HTMLTextAreaElement)
+        ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+      if (desc && desc.set) desc.set.call(el, value); else el.value = value;
+    } catch { /* not a standard input after all */ }
+  } else {
+    // Custom element with a value API (MathLive <math-field> etc.).
+    try {
+      if (typeof el.setValue === 'function') el.setValue(value);
+      else if ('value' in el) el.value = value;
+    } catch { /* no value API */ }
+    // contenteditable display.
+    if (el.isContentEditable) { try { el.textContent = value; } catch { /* */ } }
+  }
+
+  // A real InputEvent (with the inserted text) reaches BOTH React's input tracker
+  // and custom editors that only react to InputEvent/beforeinput.
+  try { el.dispatchEvent(new InputEvent('beforeinput', { bubbles: true, cancelable: true, inputType: 'insertText', data: value })); } catch { /* InputEvent unsupported */ }
+  try { el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value })); }
+  catch { try { el.dispatchEvent(new Event('input', { bubbles: true })); } catch { /* */ } }
+  try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch { /* */ }
 }
 
 function selectRadio(input) {
@@ -1322,6 +1351,27 @@ function setCheckbox(input, desired) {
     input.checked = desired;
     input.dispatchEvent(new Event('change', { bubbles: true }));
   }
+}
+
+// Compact element description for the fill diagnostics — enough to identify a
+// box's real widget type (plain <input> vs formula/contenteditable/math-field)
+// from the console without guessing.
+function boxInfo(el) {
+  if (!el || !el.tagName) return null;
+  let cls = '';
+  try { cls = (typeof el.className === 'string' ? el.className : (el.getAttribute && el.getAttribute('class')) || '').slice(0, 60); } catch { /* */ }
+  let kids = '';
+  try { kids = Array.from(el.children || []).slice(0, 5).map((c) => c.tagName.toLowerCase()).join(','); } catch { /* */ }
+  return {
+    tag: el.tagName.toLowerCase(),
+    type: (el.getAttribute && el.getAttribute('type')) || '',
+    role: (el.getAttribute && el.getAttribute('role')) || '',
+    ce: !!el.isContentEditable,
+    ro: !!(el.readOnly || (el.getAttribute && el.getAttribute('readonly') != null)),
+    val: (() => { try { return String(el.value ?? '').slice(0, 16); } catch { return ''; } })(),
+    cls,
+    kids
+  };
 }
 
 // Don't act on a "not visible, scroll" sentinel or an empty answer.
@@ -1400,7 +1450,8 @@ function fillTestAnswers(questions) {
   // from the test tab's console (filter on «СМЭШ AI fill») without guesswork.
   try {
     console.log('[СМЭШ AI fill] units:', units.map((u) => ({
-      type: u.type, number: u.number, boxes: u.inputs.length
+      type: u.type, number: u.number, boxes: u.inputs.length,
+      els: u.type === 'text' ? u.inputs.slice(0, 6).map(boxInfo) : undefined
     })), 'questions:', questions.map((q, i) => ({ id: idFor(q, i), parts: q.parts ? q.parts.length : 0 })));
   } catch { /* console unavailable */ }
   if (!units.length) {
@@ -1468,7 +1519,8 @@ function debugUnits() {
     number: u.number,
     boxes: u.inputs.length,
     labels: u.inputs.slice(0, 8).map((inp) =>
-      u.type === 'text' ? fieldLabel(inp) : normalizeForMatch(controlLabelText(inp)).slice(0, 24))
+      u.type === 'text' ? fieldLabel(inp) : normalizeForMatch(controlLabelText(inp)).slice(0, 24)),
+    elems: u.inputs.slice(0, 8).map(boxInfo)
   }));
 }
 window.__smeshDebugUnits = debugUnits;
