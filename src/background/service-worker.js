@@ -207,9 +207,17 @@ async function solveTest({ text, screenshot }) {
   // answers-only JSON. That reasoning streams on delta.reasoning, which
   // postStream drops — so the user only ever sees the answers, never the steps,
   // and the answers array can no longer be truncated by a long reasoning blob.
+  //
+  // Effort is MEDIUM, not high, on the bulk solve: 'high' lets Gemini think
+  // unbounded, and on a full page of hard problems (6 algebra tasks at once) that
+  // routinely ran past the pill's time cap → the whole solve timed out and the
+  // student got NOTHING. Medium reasons through school-level math reliably and
+  // finishes in roughly half the time. The per-question «перерешать» (↻) re-solves
+  // a single doubtful question at 'high' (see resolveOneQuestion), so max accuracy
+  // is still one click away without holding the whole page hostage.
   return askAI(systemPrompt, userText, screenshot ? [screenshot] : [], [], {
     responseFormat: 'json_object',
-    reasoning: { effort: 'high' }
+    reasoning: { effort: 'medium' }
   });
 }
 

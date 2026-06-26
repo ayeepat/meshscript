@@ -909,25 +909,40 @@ function leadingQuestionNumber(node) {
 const QNUM_TEXT_RE = /(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i;
 function collectQuestionMarkers() {
   const out = [];
-  let els;
-  // Scan ELEMENTS (querySelectorAll is document-ordered) rather than raw text
-  // nodes, so a heading split across styled spans («<b>ЗАДАНИЕ</b> <span>№1</span>»)
-  // is still caught via the parent element's combined text. A few duplicate
-  // markers (a heading span AND its wrapper) are harmless — numberForNode just
-  // takes the nearest preceding one.
-  try {
-    els = document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,b,strong,em,legend,label,th,td,li,a,button');
-  } catch { return out; }
-  for (const el of els) {
-    const s = normalize(el.textContent);
-    if (!s) continue;
-    const m = s.match(QNUM_TEXT_RE);
-    if (!m) continue;
-    // A real «ЗАДАНИЕ №N» heading is either a short element OR leads its text
-    // (a task-id badge may sit just before it). A deep mention buried in a long
-    // prose/equation block is not a heading — skip it.
-    if (s.length > 40 && m.index > 20) continue;
-    out.push({ number: parseInt(m[1], 10), node: el });
+  const root = document.body || document.documentElement;
+  if (!root) return out;
+  let walker;
+  // Walk TEXT NODES once (O(total text)) — fast even on Mesh's huge React DOM,
+  // unlike reading textContent on every element (which is O(n²) and was bloating
+  // the fill). A cheap word pre-filter skips the ~99.9% of nodes that can't be a
+  // heading before any regex/normalize work.
+  try { walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, null); }
+  catch { return out; }
+  const checkedParents = new Set();
+  let t;
+  while ((t = walker.nextNode())) {
+    const raw = t.nodeValue;
+    if (!raw || !/задани|вопрос/i.test(raw)) continue;
+    const s = normalize(raw);
+    let m = s.match(QNUM_TEXT_RE);
+    // A real «ЗАДАНИЕ №N» heading is short OR leads its text (a task-id badge may
+    // sit just before it); a deep mention inside prose is not a heading.
+    if (m && (s.length <= 60 || m.index <= 20)) {
+      out.push({ number: parseInt(m[1], 10), node: t.parentElement || t });
+      continue;
+    }
+    // The heading may be split across spans («ЗАДАНИЕ» | «№1»): the digit lives in
+    // a sibling node. Check the SHORT parent's combined text once (cheap, and only
+    // for the handful of nodes that mention «задание/вопрос»).
+    const p = t.parentElement;
+    if (p && !checkedParents.has(p)) {
+      checkedParents.add(p);
+      const ps = normalize(p.textContent);
+      if (ps.length <= 40) {
+        m = ps.match(QNUM_TEXT_RE);
+        if (m) out.push({ number: parseInt(m[1], 10), node: p });
+      }
+    }
   }
   return out;
 }

@@ -485,7 +485,10 @@
     busy = true;
     setButtonsDisabled(true);
     showThinking('');
-    const r = await send('PILL_SOLVE_PAGE', 130000);
+    // Generous cap: a full page of hard problems can take a couple of minutes to
+    // solve + fill. The worker keeps the SW alive via the streaming call, so this
+    // only bounds a genuinely stuck run, not a slow-but-progressing one.
+    const r = await send('PILL_SOLVE_PAGE', 240000);
     busy = false;
     if (!r.ok) { showResult(errText(r.error), true); return; }
     if (!r.count) { showResult('Вопросы не распознаны. Проверьте, что тест на экране.', true); return; }
