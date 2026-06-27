@@ -1037,6 +1037,15 @@ function collectUnits() {
   }
   for (const { container, inputs } of cbByKey.values()) units.push(makeUnit('checkbox', inputs, container, numFor(inputs[0])));
 
+  // --- selects (native dropdowns) ---
+  // A «выберите из списка» question (e.g. «система … имеет …») is one <select>.
+  // One select = one unit; filled by matching the answer to an <option> text.
+  for (const s of pickControls('select')) {
+    if (consumed.has(s)) continue;
+    consumed.add(s);
+    units.push(makeUnit('select', [s], null, numFor(s)));
+  }
+
   // --- free text / number / textarea ---
   // Group the boxes that belong to the SAME question (a system's x & y, a
   // quadratic's x₁ & x₂, several blanks) into ONE multi-field unit, so a single
@@ -1318,6 +1327,21 @@ function setNativeValue(el, value) {
   el.dispatchEvent(new Event('change', { bubbles: true }));
 }
 
+// React-aware <select> writer: set the value through the native setter (so a
+// controlled React select picks it up), mark the option selected, then fire
+// input/change. Mirrors setNativeValue for text inputs.
+function setSelectValue(sel, option) {
+  try {
+    const proto = HTMLSelectElement.prototype;
+    const desc = Object.getOwnPropertyDescriptor(proto, 'value');
+    if (desc && desc.set) desc.set.call(sel, option.value);
+    else sel.value = option.value;
+  } catch { sel.value = option.value; }
+  try { option.selected = true; } catch { /* */ }
+  sel.dispatchEvent(new Event('input', { bubbles: true }));
+  sel.dispatchEvent(new Event('change', { bubbles: true }));
+}
+
 function selectRadio(input) {
   if (!input.checked) input.click(); // real click → React's onChange fires
   if (!input.checked) { // belt-and-braces for non-standard handlers
@@ -1396,6 +1420,31 @@ function fillUnit(unit, question) {
     if (!wrote) setNativeValue(inputs[0], ans);
     // Honest result: ✓ only if at least one box actually ended up populated.
     return inputs.some(valueTook);
+  }
+
+  if (unit.type === 'select') {
+    const sel = unit.inputs[0];
+    if (!sel || !document.documentElement.contains(sel) || !sel.options || !sel.options.length) return false;
+    const aNorm = normalizeForMatch(ans);
+    let best = null;
+    let second = null;
+    for (const o of sel.options) {
+      const norm = normalizeForMatch(o.textContent);
+      if (!norm) continue; // skip the empty placeholder («?»)
+      const s = similarity(aNorm, norm);
+      if (!best || s > best.s) { second = best; best = { o, s }; }
+      else if (!second || s > second.s) second = { o, s };
+    }
+    // The model's `choice` hint (1-based option number) breaks a tie / weak match.
+    if (!best || best.s < MATCH_MIN || (second && best.s - second.s < MATCH_MARGIN)) {
+      const idxs = parseChoiceIndices(question.choice, sel.options.length);
+      // Choice indices count VISIBLE options; the placeholder shifts them by one.
+      const offset = (sel.options[0] && !normalizeForMatch(sel.options[0].textContent)) ? 1 : 0;
+      if (idxs.length && sel.options[idxs[0] + offset]) best = { o: sel.options[idxs[0] + offset], s: 1 };
+      else if (!best || best.s < MATCH_MIN) return false;
+    }
+    setSelectValue(sel, best.o);
+    return sel.value === best.o.value;
   }
 
   const options = unit.inputs
