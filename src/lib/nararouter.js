@@ -7,14 +7,16 @@
  *
  * Role: a FREE alternative to OpenRouter for the user's own testing. Like Groq
  * it splits text vs. vision across two models:
- *  - Text only:                 mimo-v2.5-pro-free
+ *  - Text only:  a MiMo model.
  *  - Vision (images / test screenshots / any upload that needs seeing):
- *                               mistral-medium-3.5
+ *                a Mistral Medium model.
  *
- * NOTE on model aliases: these must match what `GET /v1/models` returns for your
- * plan. The free lineup has been seen advertised as `mistral-medium-3-5`
- * (dashes) too — if a call 400s with "unknown model", check the dashboard and
- * adjust the two constants below.
+ * MODEL ALIASES ARE RESOLVED LIVE. The NaraRouter free lineup gets renamed and
+ * retired without notice — a hardcoded id eventually 404s with "model does not
+ * exist". So instead of trusting one constant, we fetch the account's actual
+ * `/v1/models` list, pick the best match for the wanted modality, cache it, and
+ * (on a stale-model 404) re-discover + retry once. The constants below are only
+ * PREFERENCES / last-resort fallbacks.
  *
  * Caveats vs. OpenRouter (kept deliberately out of this file's job):
  *  - No native PDF reading — the solver still forces OpenRouter for PDFs.
@@ -31,13 +33,72 @@ import { base64ToUtf8 } from './extract.js';
 import { chargeOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://router.bynara.id/v1/chat/completions';
-const TEXT_MODEL = 'mimo-v2.5-pro-free';
-const VISION_MODEL = 'mistral-medium-3.5';
+const MODELS_ENDPOINT = 'https://router.bynara.id/v1/models';
+
+// Preferred aliases, best → worst, matched against the live model list. Vision
+// path = the test solver (screenshots); text path = plain homework.
+const VISION_PREFS = ['mistral-medium-3.5', 'mistral-medium-3-5', 'mistral-medium', 'mistral-large', 'pixtral-large'];
+const TEXT_PREFS = ['mimo-v2.5-pro-free', 'mimo-v2-5-pro-free', 'mimo-v2.5-free', 'mimo-v2-5-free', 'mimo'];
+// Used ONLY if /v1/models can't be read at all (offline / unexpected shape).
+const VISION_FALLBACK = 'mistral-medium-3-5';
+const TEXT_FALLBACK = 'mimo-v2.5-pro-free';
+
+const MODELS_CACHE_KEY = 'nararouterModelsCache';
+const MODELS_TTL_MS = 6 * 60 * 60 * 1000;
 
 async function getKey() {
   const { nararouterApiKey } = await chrome.storage.local.get('nararouterApiKey');
   if (!nararouterApiKey) throw new Error('Ключ NaraRouter не задан. Откройте настройки расширения.');
   return nararouterApiKey;
+}
+
+/**
+ * The model aliases this key/plan can actually use. Cached for MODELS_TTL_MS
+ * (a renamed lineup is rare). Returns string[] or null on any failure — the
+ * caller then falls back to a constant.
+ */
+async function fetchModelIds(key, force = false) {
+  try {
+    if (!force) {
+      const { [MODELS_CACHE_KEY]: c } = await chrome.storage.local.get(MODELS_CACHE_KEY);
+      if (c && Array.isArray(c.ids) && c.ids.length && (Date.now() - c.at) < MODELS_TTL_MS) return c.ids;
+    }
+    const res = await fetch(MODELS_ENDPOINT, { headers: { Authorization: `Bearer ${key}` } });
+    if (!res.ok) return null;
+    const data = await res.json().catch(() => null);
+    // OpenAI shape is { data: [{ id }, ...] }; be lenient about wrappers.
+    const list = Array.isArray(data?.data) ? data.data : (Array.isArray(data?.models) ? data.models : null);
+    const ids = list ? list.map((m) => (typeof m === 'string' ? m : m?.id)).filter(Boolean) : null;
+    if (ids && ids.length) await chrome.storage.local.set({ [MODELS_CACHE_KEY]: { ids, at: Date.now() } });
+    return ids && ids.length ? ids : null;
+  } catch { return null; }
+}
+
+/** Pick the best available alias for the wanted modality from a live id list. */
+function chooseModel(ids, wantVision) {
+  if (!ids || !ids.length) return null;
+  const pairs = ids.map((id) => [id, String(id).toLowerCase()]);
+  // 1. an exact preferred alias.
+  for (const p of (wantVision ? VISION_PREFS : TEXT_PREFS)) {
+    const hit = pairs.find(([, l]) => l === p);
+    if (hit) return hit[0];
+  }
+  // 2. fuzzy by family name.
+  const fam = wantVision ? /mistral|pixtral/ : /mimo/;
+  const fuzzy = pairs.find(([, l]) => fam.test(l));
+  if (fuzzy) return fuzzy[0];
+  // 3. vision needs a multimodal model — accept any obviously-vision id.
+  if (wantVision) {
+    const v = pairs.find(([, l]) => /vision|vl|pixtral|gemini|claude|llava/.test(l));
+    if (v) return v[0];
+  }
+  return null;
+}
+
+/** Resolve the alias to send: live list → preferred → constant fallback. */
+async function resolveModel(key, wantVision, force = false) {
+  const ids = await fetchModelIds(key, force);
+  return chooseModel(ids, wantVision) || (wantVision ? VISION_FALLBACK : TEXT_FALLBACK);
 }
 
 // One file -> one OpenAI-style content part. NaraRouter (like Groq) has no native
@@ -77,6 +138,11 @@ function historyToMessage(m) {
   return { role, content: m.content };
 }
 
+// True when the provider rejected the model id (retired / renamed / not on plan).
+function isModelMissing(err) {
+  return /does not exist|no such model|unknown model|model_not_found|not found/i.test(String(err?.message || err));
+}
+
 export async function askNararouter(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null, signal = null } = opts;
   const key = await getKey();
@@ -89,12 +155,10 @@ export async function askNararouter(systemPrompt, userText, files = [], history 
   // and lose the original photo (same logic as groq.js).
   const hasImages = files.some(isImageFile) ||
     history.some((m) => m.role !== 'assistant' && m.files?.some(isImageFile));
-  const model = hasImages ? VISION_MODEL : TEXT_MODEL;
 
   const userContent = buildUserContent(userText, files);
-
   const body = {
-    model,
+    model: await resolveModel(key, hasImages),
     messages: [
       { role: 'system', content: systemPrompt },
       ...history.map(historyToMessage),
@@ -104,11 +168,7 @@ export async function askNararouter(systemPrompt, userText, files = [], history 
     ],
     temperature: 0.3
   };
-  // JSON mode only on the TEXT model. The vision path (mistral-medium-3.5) is the
-  // test solver's path, and an unknown free gateway can hard-error on
-  // response_format with an image; the TEST_ANSWER prompt already mandates a JSON
-  // object and the caller salvages partial/non-JSON replies (parseTestAnswers /
-  // formatTestAnswers), so dropping the flag on vision is safe. Mirrors groq.js.
+  // JSON mode only on the TEXT model — see groq.js for the same reasoning.
   if (responseFormat === 'json_object' && !hasImages) body.response_format = { type: 'json_object' };
 
   // We intentionally do NOT forward opts.reasoning: it's an OpenRouter-specific
@@ -116,9 +176,26 @@ export async function askNararouter(systemPrompt, userText, files = [], history 
 
   const headers = { Authorization: `Bearer ${key}` };
 
-  // ALWAYS stream, same as openrouter.js / groq.js: the per-chunk idle timeout
-  // keeps a slow vision reply from tripping the hard timeout that made the test
-  // solver hang. onDelta may be null in JSON mode — postStream accumulates and
-  // returns the full text.
-  return postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
+  // ALWAYS stream (per-chunk idle timeout keeps slow vision replies from tripping
+  // the hard timeout). The 404 path below only fires PRE-stream (bad model id), so
+  // nothing has been emitted yet — a clean retry is safe.
+  try {
+    return await postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
+  } catch (e) {
+    if (!isModelMissing(e)) throw e;
+    // The cached/preferred alias was retired or renamed. Re-discover the live
+    // list (bypassing cache) and retry ONCE with a fresh pick.
+    const alt = await resolveModel(key, hasImages, true);
+    if (alt && alt !== body.model) {
+      body.model = alt;
+      try {
+        return await postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
+      } catch (e2) { if (!isModelMissing(e2)) throw e2; /* else fall through to guidance */ }
+    }
+    throw new Error(
+      'NaraRouter не нашёл нужную модель (бесплатный список моделей у них часто меняется). ' +
+      'Откройте router.bynara.id, посмотрите доступные модели в своём тарифе и сообщите мне точные названия, ' +
+      'либо временно переключитесь на OpenRouter / Groq в настройках расширения.'
+    );
+  }
 }
