@@ -762,15 +762,16 @@ async function scanHomework() {
 
 /* ---------- First-run onboarding (consent + a working AI key) ---------- */
 
-const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey' };
+const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey', nararouter: 'nararouterApiKey' };
 const PROVIDER_KEY_LINK = {
   groq: { url: 'https://console.groq.com/keys', label: 'Получить бесплатный ключ →', placeholder: 'gsk_…' },
-  openrouter: { url: 'https://openrouter.ai/keys', label: 'Получить ключ OpenRouter →', placeholder: 'sk-or-v1-…' }
+  openrouter: { url: 'https://openrouter.ai/keys', label: 'Получить ключ OpenRouter →', placeholder: 'sk-or-v1-…' },
+  nararouter: { url: 'https://router.bynara.id/', label: 'Получить бесплатный ключ →', placeholder: 'sk-nry-…' }
 };
 let obProvider = 'groq';
 
 function setObProvider(p) {
-  obProvider = (p === 'openrouter') ? 'openrouter' : 'groq';
+  obProvider = PROVIDER_KEY_FIELD[p] ? p : 'groq';
   const meta = PROVIDER_KEY_LINK[obProvider];
   for (const b of document.querySelectorAll('#obProvider button')) {
     b.classList.toggle('active', b.dataset.p === obProvider);
@@ -830,9 +831,11 @@ function wireOnboarding() {
 // onboarding so the very first "Решить" can never dead-end on a bare key error.
 async function isReadyToSolve() {
   if (!(await hasConsent())) return false;
-  const { aiProvider = 'openrouter', openrouterApiKey, groqApiKey } =
-    await chrome.storage.local.get(['aiProvider', 'openrouterApiKey', 'groqApiKey']);
-  return aiProvider === 'groq' ? !!groqApiKey : !!openrouterApiKey;
+  const stored = await chrome.storage.local.get(['aiProvider', ...Object.values(PROVIDER_KEY_FIELD)]);
+  const provider = stored.aiProvider || 'openrouter';
+  // Fall back to OpenRouter's key field for any unknown/legacy provider value.
+  const field = PROVIDER_KEY_FIELD[provider] || 'openrouterApiKey';
+  return !!stored[field];
 }
 
 /* ---------- Runtime-config notice (update required / operator message) ---------- */

@@ -13,7 +13,10 @@
  * append-only trail so Settings can chart requests/day; it's pruned on write.
  */
 
-export const DEFAULT_LIMITS = { openrouter: 80, groq: 300 };
+export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, nararouter: 200 };
+
+// Human-readable provider names for the over-limit error message.
+const PROVIDER_NAMES = { openrouter: 'OpenRouter', groq: 'Groq', nararouter: 'NaraRouter' };
 const HISTORY_DAYS = 14;
 
 function todayKey() {
@@ -71,7 +74,7 @@ export async function chargeOne(provider) {
   const day = todayKey();
   const used = currentCount(rateUsage[provider], day);
   if (used >= limit) {
-    const name = provider === 'openrouter' ? 'OpenRouter' : 'Groq';
+    const name = PROVIDER_NAMES[provider] || provider;
     throw new Error(
       `Дневной лимит ${name} исчерпан (${used}/${limit}). ` +
       `Изменить лимит можно в настройках расширения, либо дождитесь завтра — счётчик сбросится.`
@@ -90,7 +93,7 @@ export async function getUsage() {
   const { rateLimits, rateUsage } = await load();
   const day = todayKey();
   const out = {};
-  for (const p of ['openrouter', 'groq']) {
+  for (const p of ['openrouter', 'groq', 'nararouter']) {
     out[p] = {
       used: currentCount(rateUsage[p], day),
       limit: limitFor(rateLimits, p)

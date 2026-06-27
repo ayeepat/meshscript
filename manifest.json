@@ -5,15 +5,16 @@
   "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest"],
   "host_permissions": [
-    "<all_urls>",
     "https://school.mos.ru/*",
     "https://*.mos.ru/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
+    "https://router.bynara.id/*",
     "https://gdz-ru.com/*",
     "https://*.gdz-ru.com/*",
     "https://gdz.ru/*",
-    "https://*.smeshai.xyz/*"
+    "https://*.smeshai.xyz/*",
+    "https://smesh-licenses.smeshai.workers.dev/*"
   ],
   "declarative_net_request": {
     "rule_resources": [

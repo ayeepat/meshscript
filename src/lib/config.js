@@ -7,8 +7,12 @@
  */
 
 // Base URL of the license backend (Cloudflare Worker). Hit `/verify` here.
-// Update this to your custom domain once it's pointed at the worker.
-export const BACKEND_URL = 'https://api.smesh.app';
+// This is the worker's live workers.dev URL (account subdomain "smeshai",
+// worker name "smesh-licenses" — see backend/wrangler.toml). It must also be
+// listed in manifest.json `host_permissions`, or the verify fetch is blocked.
+// If you later bind a custom domain (e.g. https://api.smesh.app) in the
+// Cloudflare dashboard, update BOTH this line and the host permission.
+export const BACKEND_URL = 'https://smesh-licenses.smeshai.workers.dev';
 
 // Support bot deep link. The «Поддержка» buttons (popup + settings) open this.
 // ⚠️ REPLACE `smesh_support_bot` with YOUR bot's @username from @BotFather

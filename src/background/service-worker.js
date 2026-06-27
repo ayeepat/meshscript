@@ -111,6 +111,42 @@ function missingInputGate(category, task, files) {
 }
 
 /**
+ * Last-ditch material fetch for the missing-material gate. When a homework is
+ * about to be refused because its source material isn't attached (a bare «Упр.
+ * 25 / §3 / с. 112», or a "do the attached file" with nothing readable), try the
+ * GDZ (reshebnik) book(s) the user configured for this subject: resolve the
+ * task's number(s) and return the answer image(s) as inline files, so the model
+ * can solve FROM the worked answer instead of telling the student to photograph
+ * the page. Reuses the same plumbing as the GDZ_FOR_TASK handler.
+ *
+ * Bounded (each GDZ call self-times-out) and silent on any miss — returns [] so
+ * the original refusal still applies. Only attaches up to a few images to keep
+ * the provider payload (and cost) sane.
+ */
+async function fetchGdzMaterial(subject, task) {
+  try {
+    const sid = mapSubjectToId(subject);
+    if (sid == null) return [];
+    const { gdzBooks = {} } = await chrome.storage.local.get('gdzBooks');
+    const raw = gdzBooks[sid];
+    const books = Array.isArray(raw) ? raw : (raw ? [raw] : []);
+    if (!books.length) return [];
+    const images = [];
+    for (const book of books) {
+      const res = await resolveForTask(book, task || '');
+      for (const a of res.answers) {
+        if (!a.found || !Array.isArray(a.images) || !a.images.length) continue;
+        const settled = await Promise.all(a.images.map((u) => fetchTaskImage(u).catch(() => null)));
+        for (const img of settled) if (img && images.length < 6) images.push(img);
+        if (images.length >= 6) break;
+      }
+      if (images.length >= 6) break;
+    }
+    return images;
+  } catch { return []; }
+}
+
+/**
  * Solve a task with the AI provider + chat history. Persist to local history.
  * @param {object} p
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
@@ -144,9 +180,21 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // prompt guard alone doesn't reliably stop a model inventing answers to
   // material it never received, so when a required input is genuinely missing we
   // refuse deterministically instead of guessing. See missingInputGate.
+  //
+  // Before refusing, make ONE last attempt to supply the material ourselves: if
+  // the user pinned a GDZ (reshebnik) book for this subject, fetch the answer
+  // image(s) for the task's number(s) and attach them, then proceed instead of
+  // asking the student to photograph the page. Audio gaps can't be filled this
+  // way (a reshebnik has no listening answers), so we skip GDZ for those.
+  let gdzAttached = 0;
   if (history.length === 0) {
     const gate = missingInputGate(category, task, files);
-    if (gate) return { answer: gate, needsUpload: true, sessionId };
+    if (gate) {
+      const audioGap = needsAudio(task) && !files.some(isReadableFile);
+      const gdzFiles = audioGap ? [] : await fetchGdzMaterial(subject, task);
+      if (gdzFiles.length) { files = files.concat(gdzFiles); gdzAttached = gdzFiles.length; }
+      else return { answer: gate, needsUpload: true, sessionId };
+    }
   }
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
@@ -161,14 +209,24 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
     if (!openrouterApiKey) {
       return {
         answer: 'В задании есть PDF, а его умеет читать только OpenRouter (модель Gemini). ' +
-          'Groq не читает PDF-файлы. Добавьте ключ OpenRouter в настройках расширения — ' +
-          'или пришлите это задание фотографиями страниц / текстом, и я решу через Groq.',
+          'Бесплатные Groq и NaraRouter не читают PDF-файлы. Добавьте ключ OpenRouter в настройках ' +
+          'расширения — или пришлите это задание фотографиями страниц / текстом, и я решу через бесплатный провайдер.',
         sessionId
       };
     }
   }
+  // When we auto-attached GDZ answer images above, tell the model what they are
+  // so it transcribes/adapts the worked solution rather than treating them as a
+  // fresh problem photo (and ignores any image whose number doesn't match).
+  let userTask = task || '(см. вложение)';
+  if (gdzAttached) {
+    userTask += `\n\n(К заданию приложены ${gdzAttached} изображени${gdzAttached === 1 ? 'е' : 'я'} с готовым ` +
+      'решением из решебника (ГДЗ) по этим номерам. Используй их как опорный материал: перепиши и адаптируй ' +
+      'решение под нужный формат ответа, исправляя очевидные ошибки распознавания. Если на изображении ' +
+      'явно не тот номер — не используй его.)';
+  }
   const answer = await askAI(
-    systemPrompt, task || '(см. вложение)', files,
+    systemPrompt, userTask, files,
     history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider, signal }
   );
 
@@ -680,6 +738,18 @@ async function fillAllFrames(tabId, questions) {
     }
   } catch { /* main-world injection blocked on this page — standard fill stands */ }
 
+  // Third pass: custom/ARIA widgets the native + MathQuill passes can't reach —
+  // dropdowns (incl. matching done as one dropdown per item), ARIA radio groups,
+  // MUI toggle groups. It's ASYNC (opens a popper, waits, clicks the option), so
+  // it runs last and is told which questions are already filled, so it never
+  // re-opens or toggles one back off. Best-effort: a page with no such widgets
+  // returns nothing and everything above stands.
+  try {
+    const already = [...filled];
+    const interactiveFilled = await fillInteractiveAllFrames(tabId, questions, already);
+    interactiveFilled.forEach((id) => filled.add(String(id)));
+  } catch { /* interactive pass is best-effort */ }
+
   const filledIds = [];
   const skipped = [];
   questions.forEach((q, i) => {
@@ -687,6 +757,36 @@ async function fillAllFrames(tabId, questions) {
     (filled.has(String(id)) ? filledIds : skipped).push(id);
   });
   return { filled: filledIds, skipped };
+}
+
+/**
+ * Run the async interactive-control pass (scraper.js __smeshFillInteractive) in
+ * every frame and merge the ids it filled. Separate from fillAllFrames' sync
+ * step because it has to await each dropdown's popper; the injected function
+ * returns a Promise, which chrome.scripting awaits for us. `alreadyFilled` are
+ * the ids the native + MathQuill passes already handled — passed through so the
+ * page-side pass skips them (never toggles a set control back off). Frames that
+ * disallow scripting are skipped silently; never throws.
+ */
+async function fillInteractiveAllFrames(tabId, questions, alreadyFilled = []) {
+  if (!tabId || !Array.isArray(questions) || !questions.length) return [];
+  let results = [];
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: (qs, done) => {
+        try { return (typeof window.__smeshFillInteractive === 'function') ? window.__smeshFillInteractive(qs, done) : null; }
+        catch { return null; }
+      },
+      args: [questions, alreadyFilled]
+    });
+  } catch { return []; }
+  const filled = [];
+  for (const r of (results || [])) {
+    const s = r && r.result;
+    if (s && Array.isArray(s.filled)) s.filled.forEach((id) => filled.push(String(id)));
+  }
+  return filled;
 }
 
 /* ---------- Multi-page test pagination ---------- */

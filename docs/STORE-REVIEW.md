@@ -37,6 +37,7 @@ reviewable and revocable in Settings → «Конфиденциальность 
 | `https://openrouter.ai/*`, `https://api.groq.com/*` | The AI providers that generate answers. The user supplies their own key. |
 | `https://gdz-ru.com/*`, `https://*.gdz-ru.com/*`, `https://gdz.ru/*` | Fetch ready textbook answers (GDZ) when the user pins a textbook, so common exercises don't need an AI call. |
 | `https://*.smeshai.xyz/*` | One-way `GET` of a small static config file (`extension-config.json`) used to hot-fix a scrape selector or show an "update available" notice without a re-publish. Sends no user data. |
+| `https://smesh-licenses.smeshai.workers.dev/*` | License check. A single `GET /verify?key=…&device_id=…` to our own Cloudflare Worker. Sends only the license key the user typed and an anonymous random device UUID — no homework, no Mesh data, no personal info. |
 
 ## The declarativeNetRequest rule (the part reviewers ask about)
 

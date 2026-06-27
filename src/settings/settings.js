@@ -14,7 +14,7 @@ initTheme();
 const supportLink = document.getElementById('supportLink');
 if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 
-const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
+const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey', 'nararouterApiKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 
 // Display metadata for each prompt category: an icon, a title and the subjects
@@ -91,6 +91,7 @@ async function load() {
   const limits = stored.rateLimits || {};
   document.getElementById('limitOpenrouter').value = limits.openrouter ?? DEFAULT_LIMITS.openrouter;
   document.getElementById('limitGroq').value = limits.groq ?? DEFAULT_LIMITS.groq;
+  document.getElementById('limitNararouter').value = limits.nararouter ?? DEFAULT_LIMITS.nararouter;
   const overrides = stored.promptOverrides || {};
   for (const cat of CATS) {
     const ta = document.getElementById('p_' + cat);
@@ -156,6 +157,7 @@ async function refreshUsage() {
   const fmt = (u) => `${u.used} / ${u.limit} сегодня`;
   document.getElementById('usageOpenrouter').textContent = fmt(usage.openrouter);
   document.getElementById('usageGroq').textContent = fmt(usage.groq);
+  document.getElementById('usageNararouter').textContent = fmt(usage.nararouter);
 }
 
 /* ---------- Usage & spend dashboard ---------- */
@@ -295,7 +297,8 @@ async function save() {
   data.aiProvider = document.getElementById('aiProvider').value;
   const orLimit = Math.max(1, parseInt(document.getElementById('limitOpenrouter').value, 10) || DEFAULT_LIMITS.openrouter);
   const groqLimit = Math.max(1, parseInt(document.getElementById('limitGroq').value, 10) || DEFAULT_LIMITS.groq);
-  data.rateLimits = { openrouter: orLimit, groq: groqLimit };
+  const naraLimit = Math.max(1, parseInt(document.getElementById('limitNararouter').value, 10) || DEFAULT_LIMITS.nararouter);
+  data.rateLimits = { openrouter: orLimit, groq: groqLimit, nararouter: naraLimit };
   const promptOverrides = {};
   for (const cat of CATS) {
     const v = document.getElementById('p_' + cat).value.trim();

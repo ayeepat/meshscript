@@ -1604,6 +1604,311 @@ function debugUnits() {
 window.__smeshDebugUnits = debugUnits;
 
 /* =====================================================================
+ * INTERACTIVE / CUSTOM CONTROLS (dropdowns, ARIA choices, matching)
+ * ---------------------------------------------------------------------
+ * fillTestAnswers() above covers native <input>/<select>/<textarea>, and the
+ * worker's MathQuill pass covers formula boxes. Mesh ALSO renders questions as
+ * custom widgets that carry NO native form control, so the sync fill silently
+ * leaves them blank:
+ *   • custom dropdowns — MUI Select etc.: a <div>/<button> with
+ *     role=combobox / aria-haspopup=listbox / .MuiSelect-select that opens a
+ *     portaled listbox of role=option items. «Соответствие» (matching) is often
+ *     ONE such dropdown per left-hand item, so it falls out of the same path;
+ *   • ARIA radio groups — role=radiogroup → role=radio rendered from <div>s;
+ *   • MUI toggle groups — role=group → <button aria-pressed> (single/multi choice).
+ *
+ * These need an ASYNC interaction (open the popper, wait a frame, click the
+ * option), so they CAN'T live in the synchronous fillTestAnswers. They run as a
+ * SEPARATE pass AFTER it (worker: fillInteractiveAllFrames), and are told which
+ * question ids an earlier pass already filled so we never re-open / toggle one
+ * back off. Best-effort throughout: anything not confidently matched is left for
+ * the copy-paste panel, and the form is NEVER submitted.
+ * ===================================================================== */
+
+const __smeshSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Candidate dropdown TRIGGERS: a custom control that opens a listbox. Strictly
+// custom widgets only — a native <select> is handled by the sync fill, and an
+// <input role=combobox> (autocomplete) is a text box, so both are excluded here.
+function findDropdownTriggers() {
+  const out = [];
+  const seen = new Set();
+  const add = (el) => {
+    if (!el || seen.has(el)) return;
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;     // native: sync fill owns it
+    if (el.closest && el.closest('select')) return;
+    if (!isVisible(el)) return;
+    if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return;
+    seen.add(el);
+    out.push(el);
+  };
+  let els = [];
+  try { els = Array.from(document.querySelectorAll('[aria-haspopup="listbox"], [role="combobox"], .MuiSelect-select')); }
+  catch { return []; }
+  for (const e of els) add(e);
+  return out;
+}
+
+// Discover interactive units in document order, numbered by the same «ЗАДАНИЕ
+// №N» markers the native fill uses. A matching question with several dropdowns
+// becomes ONE multi-field 'dropdown' unit (els = every dropdown in that question).
+function collectInteractiveUnits() {
+  const markers = collectQuestionMarkers();
+  const numFor = (el) => numberForNode(el, markers);
+  const units = [];
+  const consumed = new WeakSet();
+
+  // --- custom dropdowns (grouped by question number for matching) ---
+  const byNum = new Map();
+  const order = [];
+  const loose = [];
+  for (const t of findDropdownTriggers()) {
+    consumed.add(t);
+    const n = numFor(t);
+    if (n == null) { loose.push(t); continue; }
+    const key = 'n:' + n;
+    if (!byNum.has(key)) { byNum.set(key, { num: n, els: [] }); order.push(key); }
+    byNum.get(key).els.push(t);
+  }
+  for (const key of order) { const g = byNum.get(key); units.push({ type: 'dropdown', els: g.els, anchor: g.els[0], number: g.num }); }
+  for (const t of loose) units.push({ type: 'dropdown', els: [t], anchor: t, number: null });
+
+  // --- ARIA radio groups (role=radiogroup → role=radio) ---
+  let rgs = [];
+  try { rgs = Array.from(document.querySelectorAll('[role="radiogroup"]')).filter(isVisible); } catch { /* */ }
+  for (const grp of rgs) {
+    const radios = Array.from(grp.querySelectorAll('[role="radio"]')).filter((r) => isVisible(r) && !consumed.has(r));
+    if (!radios.length) continue;
+    radios.forEach((r) => consumed.add(r));
+    units.push({ type: 'aria-radio', els: radios, anchor: radios[0], number: numFor(grp) });
+  }
+
+  // --- MUI toggle-button groups (role=group → button[aria-pressed]) ---
+  let tgs = [];
+  try { tgs = Array.from(document.querySelectorAll('[role="group"]')).filter(isVisible); } catch { /* */ }
+  for (const grp of tgs) {
+    const btns = Array.from(grp.querySelectorAll('button[aria-pressed]')).filter((b) => isVisible(b) && !consumed.has(b));
+    if (btns.length < 2) continue; // a lone toggle isn't an answer group
+    btns.forEach((b) => consumed.add(b));
+    units.push({ type: 'toggle', els: btns, anchor: btns[0], number: numFor(grp) });
+  }
+
+  units.sort((a, b) => domOrderCompare(a.anchor, b.anchor));
+  return units;
+}
+
+// Close any open MUI/ARIA menu so the NEXT dropdown can open cleanly (only
+// needed when we DON'T pick an option — choosing one closes the menu itself).
+function closeOpenMenu() {
+  try { document.body.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true })); } catch { /* */ }
+  try {
+    const bd = document.querySelector('.MuiBackdrop-root, .MuiModal-backdrop');
+    if (bd) bd.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+  } catch { /* */ }
+}
+
+// Read the OPEN listbox's options for a trigger. Prefers the listbox the trigger
+// points at (aria-controls/owns); else the last visible listbox in the DOM (MUI
+// portals its menu to <body>, and only one is open at a time).
+function readOpenOptions(trigger) {
+  let lb = null;
+  const id = (trigger.getAttribute && (trigger.getAttribute('aria-controls') || trigger.getAttribute('aria-owns'))) || '';
+  if (id) lb = document.getElementById(id);
+  if (!lb) {
+    let all = [];
+    try { all = Array.from(document.querySelectorAll('[role="listbox"], ul.MuiMenu-list, .MuiMenu-list')).filter(isVisible); } catch { /* */ }
+    lb = all[all.length - 1] || null;
+  }
+  if (!lb) return [];
+  let opts = [];
+  try { opts = Array.from(lb.querySelectorAll('[role="option"], li')).filter(isVisible); } catch { /* */ }
+  return opts.map((el) => ({ el, norm: normalizeForMatch(el.textContent || '') }));
+}
+
+// Open a dropdown and return its options (waits a few frames for the portaled
+// menu to render). Returns [] if it never appeared.
+async function openDropdownOptions(trigger) {
+  try { trigger.scrollIntoView({ block: 'center', inline: 'center' }); } catch { /* */ }
+  try { trigger.click(); } catch { return []; }
+  for (let i = 0; i < 8; i++) {
+    await __smeshSleep(60);
+    const o = readOpenOptions(trigger);
+    if (o.length) return o;
+  }
+  return readOpenOptions(trigger);
+}
+
+// Pick the option whose text best matches the answer (same thresholds as the
+// native fill), falling back to a positional letter/number or the model's
+// `choice` hint. Returns the element to click, or null.
+function chooseOption(valueStr, opts, choice) {
+  const aNorm = normalizeForMatch(valueStr);
+  let best = null;
+  let second = null;
+  for (const o of opts) {
+    const s = similarity(aNorm, o.norm);
+    if (!best || s > best.s) { second = best; best = { o, s }; }
+    else if (!second || s > second.s) second = { o, s };
+  }
+  if (best && best.s >= MATCH_MIN && (!second || best.s - second.s >= MATCH_MARGIN)) return best.o.el;
+  let idx = asOptionIndex(valueStr);
+  if (idx < 0 && choice != null) { const idxs = parseChoiceIndices(choice, opts.length); if (idxs.length) idx = idxs[0]; }
+  if (idx >= 0 && idx < opts.length) return opts[idx].el;
+  return null;
+}
+
+// Fill ONE custom dropdown. Honest read-back: count it only if the trigger's
+// visible text ends up reflecting the chosen option (or at least changed).
+async function fillOneDropdown(trigger, valueStr, choice) {
+  if (isUnfillableAnswer(valueStr)) return false;
+  const before = normalizeForMatch(trigger.textContent || '');
+  const opts = await openDropdownOptions(trigger);
+  if (!opts.length) { closeOpenMenu(); return false; }
+  const target = chooseOption(valueStr, opts, choice);
+  if (!target) { closeOpenMenu(); return false; }
+  const want = normalizeForMatch(target.textContent || '');
+  try { target.click(); } catch { closeOpenMenu(); return false; }
+  await __smeshSleep(120);
+  const after = normalizeForMatch(trigger.textContent || '');
+  if (want && after && (after.includes(want) || want.includes(after))) return true;
+  return after !== before && after.length > 0;
+}
+
+// The left-hand label for a matching dropdown (the item it pairs an option to).
+function interactiveRowLabel(el) {
+  let t = '';
+  try { t = controlLabelText(el); } catch { /* */ }
+  if (!t) t = precedingFieldText(el);
+  return normalizeForMatch(t);
+}
+
+// Spread a matching question's {label,value} parts across its dropdowns: match
+// each dropdown to a part by its row label, then fill leftovers in screen order.
+// Mirrors distributeFieldValues for text boxes.
+function distributeInteractiveValues(question, els) {
+  const values = new Array(els.length).fill('');
+  const parts = questionParts(question);
+  if (!parts.length) return values;
+  const labels = els.map(interactiveRowLabel);
+  const usedPart = new Set();
+  // 1) label match — best part per dropdown, above the match floor.
+  els.forEach((_, k) => {
+    const lbl = labels[k];
+    if (!lbl) return;
+    let best = -1;
+    let bestS = 0;
+    for (let p = 0; p < parts.length; p++) {
+      if (usedPart.has(p)) continue;
+      const s = similarity(lbl, normalizeForMatch(parts[p].label));
+      if (s > bestS) { bestS = s; best = p; }
+    }
+    if (best >= 0 && bestS >= MATCH_MIN) { values[k] = parts[best].value; usedPart.add(best); }
+  });
+  // 2) leftovers in screen order.
+  let pp = 0;
+  for (let k = 0; k < els.length; k++) {
+    if (values[k] !== '') continue;
+    while (pp < parts.length && usedPart.has(pp)) pp++;
+    if (pp < parts.length) { values[k] = parts[pp].value; usedPart.add(pp); pp++; }
+  }
+  return values;
+}
+
+// Fill one interactive unit from one question. Returns true only on a real edit.
+async function fillInteractiveUnit(unit, question) {
+  const ans = String(question.answer ?? '').trim();
+
+  if (unit.type === 'dropdown') {
+    const els = unit.els.filter((e) => document.documentElement.contains(e));
+    if (!els.length) return false;
+    if (els.length === 1) return await fillOneDropdown(els[0], ans, question.choice);
+    // Matching: several dropdowns, one per left item.
+    const values = distributeInteractiveValues(question, els);
+    let any = false;
+    for (let k = 0; k < els.length; k++) {
+      const v = values[k];
+      if (!v) continue;
+      try { if (await fillOneDropdown(els[k], v, null)) any = true; } catch { /* this row failed; others try */ }
+    }
+    return any;
+  }
+
+  if (unit.type === 'aria-radio') {
+    const opts = unit.els
+      .filter((e) => document.documentElement.contains(e))
+      .map((el) => ({ el, norm: normalizeForMatch(controlLabelText(el) || el.textContent || '') }));
+    const target = chooseOption(ans, opts, question.choice);
+    if (!target) return false;
+    if (target.getAttribute('aria-checked') !== 'true') { try { target.click(); } catch { return false; } }
+    return true;
+  }
+
+  if (unit.type === 'toggle') {
+    const opts = unit.els
+      .filter((e) => document.documentElement.contains(e))
+      .map((el) => ({ el, norm: normalizeForMatch(controlLabelText(el) || el.textContent || '') }));
+    const parts = ans.split(/\s*(?:,|;|\bи\b|\/|\n)\s*/i).map((p) => p.trim()).filter(Boolean);
+    const targets = new Set();
+    for (const part of (parts.length ? parts : [ans])) { const t = chooseOption(part, opts, null); if (t) targets.add(t); }
+    for (const idx of parseChoiceIndices(question.choice, opts.length)) if (opts[idx]) targets.add(opts[idx].el);
+    if (!targets.size) return false;
+    for (const o of opts) {
+      const want = targets.has(o.el);
+      const isOn = o.el.getAttribute('aria-pressed') === 'true';
+      if (want && !isOn) { try { o.el.click(); } catch { /* */ } }
+    }
+    return true;
+  }
+
+  return false;
+}
+
+/**
+ * Async fill pass for custom/ARIA controls. Returns { filled:[ids] }. Mirrors
+ * fillTestAnswers' number-first/position-fallback matching and its absolute
+ * trust in on-screen «ЗАДАНИЕ №N» numbers, so it never cross-assigns a question
+ * onto another's controls. `alreadyFilled` are ids an earlier pass handled —
+ * skipped here so we never re-open or toggle them. Never throws, never submits.
+ */
+async function fillInteractiveAnswers(questions, alreadyFilled) {
+  const out = { filled: [] };
+  try {
+    if (!Array.isArray(questions) || !questions.length) return out;
+    const done = new Set((alreadyFilled || []).map(String));
+    let units = [];
+    try { units = collectInteractiveUnits(); } catch { units = []; }
+    if (!units.length) return out;
+
+    const idFor = (q, i) => (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+    const byNumber = new Map();
+    units.forEach((u) => { if (u.number != null && !byNumber.has(String(u.number))) byNumber.set(String(u.number), u); });
+    const pageHasNumbers = units.some((u) => u.number != null);
+    const used = new Set();
+    const acceptable = (u, id) =>
+      u && !used.has(u) && (!pageHasNumbers || u.number == null || String(u.number) === String(id));
+
+    for (let qi = 0; qi < questions.length; qi++) {
+      const q = questions[qi];
+      const id = idFor(q, qi);
+      if (done.has(String(id))) continue; // an earlier pass already filled this question
+      let unit = byNumber.get(String(id));
+      if (!unit || used.has(unit)) {
+        const posIdx = /^\d+$/.test(String(id)) ? parseInt(id, 10) - 1 : qi;
+        unit = acceptable(units[posIdx], id) ? units[posIdx]
+          : acceptable(units[qi], id) ? units[qi] : null;
+      }
+      if (!unit || used.has(unit)) continue;
+      let ok = false;
+      try { ok = await fillInteractiveUnit(unit, q); } catch { ok = false; }
+      if (ok) { used.add(unit); out.filled.push(String(id)); }
+    }
+    try { console.log('[СМЭШ AI fill] interactive:', out.filled, 'units:', units.map((u) => ({ type: u.type, number: u.number, n: u.els.length }))); } catch { /* */ }
+  } catch { /* whole pass is best-effort */ }
+  return out;
+}
+window.__smeshFillInteractive = fillInteractiveAnswers;
+
+/* =====================================================================
  * MULTI-PAGE TEST PAGINATION (per-frame)
  * ---------------------------------------------------------------------
  * Some Mesh tests show one question per page: answer, press «Далее», repeat.

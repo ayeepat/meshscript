@@ -114,19 +114,21 @@
           <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span>
           <div>
             <h2>AI-провайдер</h2>
-            <p>Кто решает задания. OpenRouter точнее и читает PDF, Groq бесплатный.</p>
+            <p>Кто решает задания. OpenRouter точнее и читает PDF, Groq и NaraRouter бесплатные.</p>
           </div>
         </div>
         <div class="selectwrap">
           <select id="aiProvider">
             <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
             <option value="groq">Groq — Llama (бесплатно, без карты)</option>
+            <option value="nararouter">NaraRouter — Mistral Medium 3.5 / MiMo (бесплатно, 7M токенов/день)</option>
           </select>
           <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
         </div>
         <div class="providerhints">
           <a class="linkpill" href="https://openrouter.ai/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Получить ключ OpenRouter</a>
           <a class="linkpill" href="https://console.groq.com/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Получить ключ Groq</a>
+          <a class="linkpill" href="https://router.bynara.id/" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Получить ключ NaraRouter</a>
         </div>
       </section>
 
@@ -191,6 +193,14 @@
           <div class="inputwrap">
             <input id="groqApiKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
             <button class="reveal" type="button" data-reveal="groqApiKey" title="Показать / скрыть"></button>
+          </div>
+        </div>
+
+        <div class="field">
+          <label for="nararouterApiKey">NaraRouter API Key</label>
+          <div class="inputwrap">
+            <input id="nararouterApiKey" type="password" placeholder="sk-nry-…" autocomplete="off" spellcheck="false" />
+            <button class="reveal" type="button" data-reveal="nararouterApiKey" title="Показать / скрыть"></button>
           </div>
         </div>
 
@@ -264,6 +274,16 @@
           </div>
           <div class="inputwrap">
             <input id="limitGroq" type="number" min="1" max="10000" step="1" placeholder="300" autocomplete="off" />
+          </div>
+        </div>
+
+        <div class="field">
+          <div class="limitrow">
+            <label for="limitNararouter">NaraRouter — запросов в день</label>
+            <span class="usage" id="usageNararouter">…</span>
+          </div>
+          <div class="inputwrap">
+            <input id="limitNararouter" type="number" min="1" max="10000" step="1" placeholder="200" autocomplete="off" />
           </div>
         </div>
       </section>
