@@ -113,6 +113,39 @@
       }`;
   }
 
+  // Register the brand fonts at DOCUMENT scope. Critical: Chrome ignores
+  // @font-face declared inside a shadow root (Blink bug 336876), so the shadow
+  // <style> above never actually loads Unbounded/Manrope — the pill silently
+  // falls back to a system sans. Fonts added to document.fonts ARE visible
+  // inside the shadow DOM, so this is what makes "Решить"/"все страницы" render
+  // in Unbounded. FontFace API (not an injected <style>) keeps us clear of the
+  // page's CSP style-src. Idempotent + harmless if FontFace is unavailable.
+  function loadBrandFonts() {
+    if (window.__smeshPillFonts) return;
+    let url;
+    try { url = (p) => chrome.runtime.getURL('assets/fonts/' + p); }
+    catch { return; }
+    if (typeof FontFace === 'undefined' || !document.fonts) return;
+    window.__smeshPillFonts = true;
+    const CYR = 'U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116';
+    const LAT = 'U+0000-00FF, U+0131, U+0152-0153, U+2000-206F, U+2122, U+2212, U+FEFF, U+FFFD';
+    const faces = [
+      ['SmeshManrope', 'manrope-cyrillic.woff2', CYR, '200 800'],
+      ['SmeshManrope', 'manrope-latin.woff2', LAT, '200 800'],
+      ['SmeshUnbounded', 'unbounded-cyrillic.woff2', CYR, '600 800'],
+      ['SmeshUnbounded', 'unbounded-latin.woff2', LAT, '600 800'],
+    ];
+    for (const [family, file, range, weight] of faces) {
+      try {
+        const ff = new FontFace(family, `url("${url(file)}") format("woff2")`,
+          { weight, unicodeRange: range, display: 'swap' });
+        ff.load()
+          .then((loaded) => { try { document.fonts.add(loaded); } catch { /* */ } })
+          .catch(() => { /* offline / blocked — fall back to the system stack */ });
+      } catch { /* bad descriptor on an old engine */ }
+    }
+  }
+
   function logoUrl() {
     try { return chrome.runtime.getURL('assets/icons/logo-mark.png'); } catch { return ''; }
   }
@@ -571,6 +604,7 @@
     if (built) return;
     built = true;
     wireGlobalsOnce();
+    loadBrandFonts(); // document-scope, so Unbounded actually renders in the shadow DOM
     await Promise.all([loadState(), loadTheme()]);
     ensureHost();
     render();
