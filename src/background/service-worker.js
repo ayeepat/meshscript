@@ -493,15 +493,43 @@ function fillMathQuillMain(questions) {
     }
 
     // Number each field by the nearest preceding «ЗАДАНИЕ №N» heading (document
-    // order), the same association the content script uses for plain inputs.
+    // order) — the SAME association the content script uses for plain inputs.
+    // This intentionally mirrors scraper.js collectQuestionMarkers (text-node
+    // walk; accept when the heading is short OR leads its text, plus the
+    // split-span «ЗАДАНИЕ»|«№1» case) so a formula question (№1/№5) is numbered
+    // identically to its plain-input neighbours. The earlier element-scan used a
+    // stricter length cap and no split-span handling, so a heading rendered
+    // inline with a long prompt would be missed and the formula box left unfilled.
     var QRE = /(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i;
     var markers = [];
-    var hs = document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,b,strong,legend,label,th,td,li');
-    for (var i = 0; i < hs.length; i++) {
-      var s = (hs[i].textContent || '').replace(/\s+/g, ' ').trim();
-      if (!s || s.length > 40) continue;
-      var mm = s.match(QRE);
-      if (mm) markers.push({ n: parseInt(mm[1], 10), node: hs[i] });
+    var qRoot = document.body || document.documentElement;
+    if (qRoot) {
+      var qWalker = document.createTreeWalker(qRoot, NodeFilter.SHOW_TEXT, null);
+      var checkedParents = new Set();
+      var tn;
+      while ((tn = qWalker.nextNode())) {
+        var raw = tn.nodeValue;
+        if (!raw || !/задани|вопрос/i.test(raw)) continue;
+        var s = raw.replace(/\s+/g, ' ').trim();
+        var mm = s.match(QRE);
+        // A real heading is short OR leads its text (a task-id badge may sit just
+        // before it); a deep mention inside prose is not a heading.
+        if (mm && (s.length <= 60 || mm.index <= 20)) {
+          markers.push({ n: parseInt(mm[1], 10), node: tn.parentElement || tn });
+          continue;
+        }
+        // The heading may be split across spans («ЗАДАНИЕ» | «№1»): the digit
+        // lives in a sibling node. Check the SHORT parent's combined text once.
+        var pp = tn.parentElement;
+        if (pp && !checkedParents.has(pp)) {
+          checkedParents.add(pp);
+          var ps = (pp.textContent || '').replace(/\s+/g, ' ').trim();
+          if (ps.length <= 40) {
+            mm = ps.match(QRE);
+            if (mm) markers.push({ n: parseInt(mm[1], 10), node: pp });
+          }
+        }
+      }
     }
     var numFor = function (node) {
       var num = null;
@@ -558,10 +586,20 @@ function fillMathQuillMain(questions) {
           }
           if (!field || typeof field.latex !== 'function') continue;
           field.latex(toLatex(val));
-          // Mirror into the hidden input the form submits (same id, "input"→"hidden-input").
+          // Honest read-back: MathQuill silently ignores LaTeX it can't parse,
+          // leaving the field empty. Confirm it ended non-empty before counting
+          // the question as filled — otherwise the panel would show a false ✓ on
+          // an empty formula box (the very thing the plain-input path guards via
+          // valueTook). Lenient on the exact text, so a field that reformats the
+          // value (e.g. -8/3 → \frac) still counts.
+          var after = '';
+          try { var got = field.latex(); after = String(got == null ? '' : got).trim(); } catch (eR) { after = ''; }
+          if (!after) continue;
+          // Mirror the accepted LaTeX into the hidden input the form submits
+          // (same id, "input"→"hidden-input").
           var hid = flds[f].id ? document.getElementById(flds[f].id.replace('i-mathquill-input-', 'i-mathquill-hidden-input-')) : null;
           if (hid) {
-            try { hid.value = field.latex(); } catch (e1) { hid.value = toLatex(val); }
+            hid.value = after;
             try { hid.dispatchEvent(new Event('input', { bubbles: true })); } catch (e2) { /* */ }
             try { hid.dispatchEvent(new Event('change', { bubbles: true })); } catch (e3) { /* */ }
           }

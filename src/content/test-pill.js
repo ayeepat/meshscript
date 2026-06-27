@@ -193,114 +193,141 @@
         ${fontFaceCss()}
         :host, * { box-sizing: border-box; }
 
-        /* Brand tokens — mirror answer-panel.js / theme.css, toggled live via
-           .pill[data-theme]. Default dark so it never flashes unstyled. */
+        /* Brand tokens — mirror theme.css surfaces (card + pop shadow + accent),
+           toggled live via .pill[data-theme]. Default dark so it never flashes
+           unstyled. Aligned 1:1 with the extension popup so the two surfaces feel
+           like one product. */
         .pill[data-theme="dark"] {
-          --p-bg: rgba(27, 40, 39, 0.86);
+          --p-bg: rgba(36, 51, 49, 0.92);
           --p-text: #e8e4d8;
-          --p-border: rgba(255, 255, 255, 0.10);
-          --p-shadow: 0 8px 28px -10px rgba(0, 0, 0, 0.7);
+          --p-border: rgba(255, 255, 255, 0.09);
+          --p-shadow: 0 18px 50px -12px rgba(0, 0, 0, 0.75);
           --p-muted: #8a948f;
           --p-accent: #4fd1c5;
-          --p-on-accent: #08110f;
+          --p-accent-hover: #6bdcd1;
+          --p-accent-shadow: 0 2px 12px -3px rgba(79, 209, 197, 0.5);
+          --p-on-accent: #0e1716;
+          --p-card: #243331;
           --p-btn-border: rgba(255, 255, 255, 0.16);
-          --p-btn-hover: rgba(255, 255, 255, 0.07);
+          --p-btn-hover: rgba(255, 255, 255, 0.06);
           --p-danger: #ff6b5e;
-          --p-sep: rgba(255, 255, 255, 0.12);
+          --p-sep: rgba(255, 255, 255, 0.09);
         }
         .pill[data-theme="light"] {
-          --p-bg: rgba(255, 255, 255, 0.88);
+          --p-bg: rgba(255, 255, 255, 0.92);
           --p-text: #2a2620;
-          --p-border: rgba(42, 38, 32, 0.12);
-          --p-shadow: 0 8px 26px -10px rgba(40, 33, 20, 0.28);
+          --p-border: rgba(42, 38, 32, 0.10);
+          --p-shadow: 0 12px 40px -8px rgba(40, 33, 20, 0.20);
           --p-muted: #756d5e;
           --p-accent: #1f8f8b;
-          --p-on-accent: #ffffff;
+          --p-accent-hover: #1a7c78;
+          --p-accent-shadow: 0 2px 10px -3px rgba(31, 143, 139, 0.36);
+          --p-on-accent: #fcfaf3;
+          --p-card: #ffffff;
           --p-btn-border: rgba(42, 38, 32, 0.16);
-          --p-btn-hover: rgba(42, 38, 32, 0.06);
+          --p-btn-hover: rgba(42, 38, 32, 0.045);
           --p-danger: #c7382e;
-          --p-sep: rgba(42, 38, 32, 0.12);
+          --p-sep: rgba(42, 38, 32, 0.10);
         }
 
         .pill {
           position: fixed;
           display: flex;
           align-items: center;
-          gap: 7px;
-          max-width: 320px;
-          padding: 5px 7px 5px 8px;
+          gap: 9px;
+          max-width: 380px;
+          padding: 7px 9px 7px 11px;
           background: var(--p-bg);
           color: var(--p-text);
-          border: none;
+          /* Hairline border + soft pop shadow — the extension's card language,
+             not a heavy ring. The solid teal action + logomark carry the brand. */
+          border: 1px solid var(--p-border);
           border-radius: 999px;
-          /* Teal ring so the pill reads as branded and is easy to spot. */
-          box-shadow: 0 0 0 1.5px var(--p-accent), var(--p-shadow);
+          box-shadow: var(--p-shadow);
           font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-          font-size: 12px;
-          backdrop-filter: blur(7px);
-          -webkit-backdrop-filter: blur(7px);
+          font-size: 13px;
+          backdrop-filter: blur(10px) saturate(1.2);
+          -webkit-backdrop-filter: blur(10px) saturate(1.2);
           pointer-events: auto;
           user-select: none;
+          /* The whole pill is a drag handle now (buttons opt out in wireDrag). */
+          cursor: grab;
         }
+        .pill.dragging { cursor: grabbing; }
 
-        /* Drag handle: the brand logomark. */
+        /* The brand logomark — visual anchor; the whole pill drags. */
         .grip {
           display: flex; align-items: center; justify-content: center;
-          flex: none; width: 22px; height: 22px;
-          cursor: grab; border-radius: 50%;
+          flex: none; width: 26px; height: 26px;
+          border-radius: 50%;
         }
-        .grip.dragging { cursor: grabbing; }
-        .grip img { width: 20px; height: 20px; object-fit: contain; -webkit-user-drag: none; pointer-events: none; }
+        .grip img { width: 25px; height: 25px; object-fit: contain; -webkit-user-drag: none; pointer-events: none; }
         /* Fallback "С" mark if the PNG can't be resolved on this host. */
         .grip .mark-fallback {
-          width: 20px; height: 20px; border-radius: 50%;
+          width: 25px; height: 25px; border-radius: 50%;
           display: none; align-items: center; justify-content: center;
-          font-family: "SmeshUnbounded", sans-serif; font-weight: 800; font-size: 12px;
-          color: #0b1413; background: var(--p-accent);
+          font-family: "SmeshUnbounded", sans-serif; font-weight: 800; font-size: 13px;
+          color: var(--p-on-accent); background: var(--p-accent);
         }
         .grip img.broken { display: none; }
         .grip img.broken + .mark-fallback { display: flex; }
 
         button {
+          /* Unbounded display face on the actions — the extension's heading type,
+             so the pill reads as part of the same product. */
           font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, sans-serif;
+          display: inline-flex; align-items: center; gap: 6px;
           background: transparent;
           color: inherit;
           border: 1px solid var(--p-btn-border);
           border-radius: 999px;
-          padding: 5px 12px;
-          font-size: 11px;
+          padding: 8px 15px;
+          font-size: 12px;
           font-weight: 700;
-          letter-spacing: -0.02em;
+          letter-spacing: -0.01em;
           line-height: 1;
           cursor: pointer;
           white-space: nowrap;
-          transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease, filter 0.15s ease;
+          transition: background 0.15s var(--ease, ease), border-color 0.15s ease, color 0.15s ease, opacity 0.15s ease, transform 0.15s ease, box-shadow 0.2s ease;
         }
         button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--p-accent); }
-        button[disabled] { opacity: 0.5; cursor: default; }
+        button[disabled] { opacity: 0.5; cursor: default; transform: none; }
+        .i { flex: none; display: block; }
+        .act-page .i { width: 15px; height: 15px; }
+        .act-all .i { width: 13px; height: 13px; }
 
-        /* Primary action — SOLID teal so it's unmistakable. */
+        /* Primary action — SOLID teal with the accent glow, exactly like the
+           popup's «Решить тест» button. */
         .act-page {
           color: var(--p-on-accent);
           background: var(--p-accent);
           border-color: var(--p-accent);
+          box-shadow: var(--p-accent-shadow);
         }
-        .act-page:hover { filter: brightness(1.08); }
-        /* Secondary — teal text, quieter, reads as the optional autopilot. */
-        .act-all { color: var(--p-accent); border-color: transparent; font-size: 10px; padding: 5px 9px; }
-        .act-all:hover { background: var(--p-btn-hover); }
+        .act-page:hover:not([disabled]) { background: var(--p-accent-hover); border-color: var(--p-accent-hover); transform: translateY(-1px); }
+        .act-page:active:not([disabled]) { transform: scale(0.97); }
+        /* Secondary — quiet card surface with teal text, mirrors «.secbtn». */
+        .act-all {
+          color: var(--p-accent);
+          background: var(--p-card);
+          border-color: var(--p-border);
+          font-size: 11px; padding: 8px 12px;
+        }
+        .act-all:hover:not([disabled]) { background: var(--p-btn-hover); border-color: var(--p-btn-border); }
+        .act-all:active:not([disabled]) { transform: scale(0.97); }
 
         .close {
-          flex: none; width: 22px; height: 22px; padding: 0;
+          flex: none; width: 26px; height: 26px; padding: 0;
           border: none; border-radius: 50%;
-          color: var(--p-muted); font-size: 16px; line-height: 1;
+          color: var(--p-muted); font-size: 17px; line-height: 1;
+          justify-content: center;
         }
         .close:hover { color: var(--p-danger); background: var(--p-btn-hover); }
 
         .actions { display: flex; align-items: center; gap: 6px; }
 
         /* Status area replaces the actions while solving. */
-        .status { display: none; align-items: center; gap: 7px; padding-right: 4px; min-width: 150px; }
+        .status { display: none; align-items: center; gap: 8px; padding-right: 4px; min-width: 164px; }
         .status .stext {
           font-family: "SmeshManrope", -apple-system, sans-serif;
           font-weight: 600;
@@ -318,7 +345,7 @@
 
         .spinner {
           display: inline-block; flex: none;
-          width: 13px; height: 13px;
+          width: 14px; height: 14px;
           border: 2px solid var(--p-sep); border-top-color: var(--p-accent);
           border-radius: 50%;
           animation: smesh-pill-spin 0.7s linear infinite;
@@ -329,14 +356,20 @@
           button, .pill { transition: none; }
         }
       </style>
-      <div class="pill" data-theme="${resolveTheme()}" role="group" aria-label="СМЭШ AI — решить тест">
-        <span class="grip" data-drag title="Перетащить">
+      <div class="pill" data-theme="${resolveTheme()}" role="group" aria-label="СМЭШ AI — решить тест" title="Перетащите за любую точку">
+        <span class="grip">
           <img alt="СМЭШ AI" src="${logoUrl()}">
           <span class="mark-fallback">С</span>
         </span>
         <div class="actions">
-          <button class="act-page" title="Решить и заполнить эту страницу">Решить</button>
-          <button class="act-all" title="Решить каждую страницу по очереди и переходить «Далее». Отправку не нажимаю.">все страницы</button>
+          <button class="act-page" title="Решить и заполнить эту страницу">
+            <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 14.5l.8 2.2L22 17.5l-2.2.8L19 20.5l-.8-2.2L16 17.5l2.2-.8z"/></svg>
+            <span>Решить</span>
+          </button>
+          <button class="act-all" title="Решить каждую страницу по очереди и переходить «Далее». Отправку не нажимаю.">
+            <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
+            <span>все страницы</span>
+          </button>
         </div>
         <div class="status" aria-live="polite">
           <span class="spinner" aria-hidden="true"></span>
@@ -375,8 +408,10 @@
     }
   }
 
+  // Drag from ANY point on the pill — not just the logomark. Buttons opt out
+  // (mousedown on them is ignored) so «Решить» / «все страницы» / × still click
+  // normally; everything else (logo, background, status text) grabs the pill.
   function wireDrag(pill) {
-    const grip = pill.querySelector('[data-drag]');
     let startX = 0, startY = 0, pillX = 0, pillY = 0, moved = false;
     const onMove = (e) => {
       moved = true;
@@ -389,14 +424,16 @@
     const onUp = () => {
       window.removeEventListener('mousemove', onMove, true);
       window.removeEventListener('mouseup', onUp, true);
-      grip.classList.remove('dragging');
+      pill.classList.remove('dragging');
       if (moved) {
         state.x = parseFloat(pill.style.left) || 0;
         state.y = parseFloat(pill.style.top) || 0;
         saveState();
       }
     };
-    grip.addEventListener('mousedown', (e) => {
+    pill.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;              // primary button only
+      if (e.target.closest('button')) return;  // let the action buttons handle their click
       const rect = pill.getBoundingClientRect();
       pill.style.left = rect.left + 'px';
       pill.style.top = rect.top + 'px';
@@ -404,7 +441,7 @@
       pill.style.bottom = 'auto';
       pillX = rect.left; pillY = rect.top;
       startX = e.clientX; startY = e.clientY; moved = false;
-      grip.classList.add('dragging');
+      pill.classList.add('dragging');
       window.addEventListener('mousemove', onMove, true);
       window.addEventListener('mouseup', onUp, true);
       e.preventDefault();
