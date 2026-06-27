@@ -5,6 +5,7 @@
   "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest"],
   "host_permissions": [
+    "<all_urls>",
     "https://school.mos.ru/*",
     "https://*.mos.ru/*",
     "https://api.groq.com/*",
