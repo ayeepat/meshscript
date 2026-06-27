@@ -852,13 +852,32 @@ const PILL_MAX_PAGES = 30; // same cap as the popup's solveAllPages
  * windowId pins captureVisibleTab to the pill's own window.
  */
 async function capturePageForPill(tabId, windowId) {
-  const [pageText, dataUrl] = await Promise.all([
-    chrome.scripting
-      .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
-      .then(([inj]) => inj?.result || '')
-      .catch(() => ''),
-    chrome.tabs.captureVisibleTab(windowId, { format: 'png' })
-  ]);
+  const textPromise = chrome.scripting
+    .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
+    .then(([inj]) => inj?.result || '')
+    .catch(() => '');
+  // captureVisibleTab needs ACTIVE host access to the tab. Triggered from the
+  // in-page pill there is no toolbar click, so `activeTab` isn't armed and Chrome
+  // relies on the *.mos.ru host permission — which only counts while the
+  // extension's site access is actually enabled. After a permissions change +
+  // reload Chrome can quietly reset that to "On click", and capture then fails
+  // with a raw English "Either '<all_urls>' or 'activeTab' permission is
+  // required". Map that to a clear, actionable Russian instruction (the pill's
+  // errText passes Cyrillic through verbatim).
+  const shotPromise = chrome.tabs
+    .captureVisibleTab(windowId, { format: 'png' })
+    .catch((e) => {
+      const m = String(e?.message || e);
+      if (/all_urls|activeTab|permission|cannot be captured/i.test(m)) {
+        throw new Error(
+          'Нет доступа к снимку страницы теста. Откройте chrome://extensions → СМЭШ AI → ' +
+          '«Доступ к сайтам» (Site access) и выберите «На всех сайтах», затем обновите страницу теста ' +
+          'и попробуйте снова.'
+        );
+      }
+      throw e;
+    });
+  const [pageText, dataUrl] = await Promise.all([textPromise, shotPromise]);
   const b64 = (dataUrl || '').split(',')[1];
   if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
   return { pageText, screenshot: { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' } };
