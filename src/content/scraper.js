@@ -1046,8 +1046,12 @@ function collectUnits() {
   // robust regardless of how deeply the boxes are nested. With no headings we
   // can't tell questions apart, so each box stays its own unit (legacy behavior,
   // safe for ordinary single-box tests).
+  // Exclude MathQuill's internal capture <textarea> (inside .mq-editable-field):
+  // it ignores a value-set — those formula boxes are filled separately via the
+  // MathQuill API in the page's main world (see service-worker fillMathQuillMain).
+  // Touching it here only created phantom units.
   const textCtrls = pickControls('input[type=text], input[type=number], input:not([type]), textarea')
-    .filter((t) => !consumed.has(t));
+    .filter((t) => !consumed.has(t) && !(t.closest && t.closest('.mq-editable-field, .mathquill-input')));
   if (markers.length) {
     const byNum = new Map();
     const order = [];
@@ -1352,6 +1356,18 @@ function boxInfo(el) {
   };
 }
 
+// Read-back honesty check: did a write actually populate the box? Returns true
+// only when the box now holds SOME content. A МЭШ MyScript formula box silently
+// drops a value-set (its canvas model is separate), leaving the box empty — this
+// catches that so it's reported as skipped (⚠), not a false «filled» (✓). Lenient
+// on the exact text so a widget that reformats the value isn't a false negative.
+function valueTook(el) {
+  let got = '';
+  try { got = String(el.value ?? '').trim(); } catch { /* not a value element */ }
+  if (!got) { try { got = normalize(el.textContent || ''); } catch { /* */ } }
+  return got.length > 0;
+}
+
 // Don't act on a "not visible, scroll" sentinel or an empty answer.
 function isUnfillableAnswer(ans) {
   return !ans || /не\s*видно|прокрут/i.test(ans);
@@ -1365,19 +1381,21 @@ function fillUnit(unit, question) {
   if (unit.type === 'text') {
     const inputs = unit.inputs.filter((i) => i && document.documentElement.contains(i));
     if (!inputs.length) return false;
-    // One box — the whole answer goes in (unchanged behavior).
-    if (inputs.length === 1) { setNativeValue(inputs[0], ans); return true; }
+    // One box — the whole answer goes in. Report ✓ only if it actually took, so a
+    // MyScript formula box that silently drops the value shows ⚠, not a false ✓.
+    if (inputs.length === 1) { setNativeValue(inputs[0], ans); return valueTook(inputs[0]); }
     // Several boxes for ONE question (system, multiple roots, several blanks):
     // spread the per-field values across them by label, then screen order.
     const values = distributeFieldValues(question, inputs);
-    let any = false;
+    let wrote = false;
     inputs.forEach((inp, k) => {
-      if (values[k] != null && values[k] !== '') { setNativeValue(inp, values[k]); any = true; }
+      if (values[k] != null && values[k] !== '') { setNativeValue(inp, values[k]); wrote = true; }
     });
     // Couldn't split (no parts, unparseable) → put the full answer in the first
     // box so something still lands, matching the legacy single-box fallback.
-    if (!any) setNativeValue(inputs[0], ans);
-    return true;
+    if (!wrote) setNativeValue(inputs[0], ans);
+    // Honest result: ✓ only if at least one box actually ended up populated.
+    return inputs.some(valueTook);
   }
 
   const options = unit.inputs

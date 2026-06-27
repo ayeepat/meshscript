@@ -466,6 +466,117 @@ async function downloadFiles({ urls = [], headers = null, token = null }) {
 }
 
 /**
+ * MAIN-world MathQuill filler. Mesh renders fraction / coordinate answer boxes
+ * (the «x₁ =» roots, the «( ; )» pairs — task ids like 95651) as MathQuill
+ * fields: an editable <span class="mq-editable-field" id="i-mathquill-input-…">
+ * plus a hidden <input name="input_answer__…"> the form actually submits.
+ * Setting the underlying textarea does nothing (MathQuill parses keystrokes), so
+ * the ONLY clean way is the MathQuill API: `MQ(field).latex(value)` updates the
+ * display + model, then we mirror the result into the hidden input for submit.
+ *
+ * This runs in the page's MAIN world (it needs window.MQ / window.MathQuill,
+ * which the isolated content-script world can't see). It is fully self-contained
+ * — executeScript serialises it, so it must reference nothing outside. Returns
+ * the list of question ids whose fields were filled. NEVER submits.
+ */
+function fillMathQuillMain(questions) {
+  try {
+    // Resolve the MathQuill v2 interface (Mesh exposes window.MQ).
+    var MQ = (typeof window.MQ === 'function') ? window.MQ : null;
+    if (!MQ && window.MathQuill) {
+      if (typeof window.MathQuill.getInterface === 'function') MQ = window.MathQuill.getInterface(2);
+      else if (typeof window.MathQuill === 'function') MQ = window.MathQuill;
+    }
+    var fields = Array.prototype.slice.call(document.querySelectorAll('.mq-editable-field'));
+    if (typeof MQ !== 'function' || !fields.length) {
+      return { ok: false, filled: [], reason: (typeof MQ !== 'function') ? 'no-mathquill' : 'no-fields' };
+    }
+
+    // Number each field by the nearest preceding «ЗАДАНИЕ №N» heading (document
+    // order), the same association the content script uses for plain inputs.
+    var QRE = /(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i;
+    var markers = [];
+    var hs = document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,b,strong,legend,label,th,td,li');
+    for (var i = 0; i < hs.length; i++) {
+      var s = (hs[i].textContent || '').replace(/\s+/g, ' ').trim();
+      if (!s || s.length > 40) continue;
+      var mm = s.match(QRE);
+      if (mm) markers.push({ n: parseInt(mm[1], 10), node: hs[i] });
+    }
+    var numFor = function (node) {
+      var num = null;
+      for (var j = 0; j < markers.length; j++) {
+        var pos = markers[j].node.compareDocumentPosition(node);
+        if (pos & (Node.DOCUMENT_POSITION_FOLLOWING | Node.DOCUMENT_POSITION_CONTAINED_BY)) num = markers[j].n;
+        else if (pos & Node.DOCUMENT_POSITION_PRECEDING) break;
+      }
+      return num;
+    };
+    var byNum = {};
+    for (var k = 0; k < fields.length; k++) {
+      var n = numFor(fields[k]);
+      if (n == null) continue;
+      (byNum[n] = byNum[n] || []).push(fields[k]);
+    }
+
+    // A plain value → LaTeX. Simple signed fractions «-8/3» become \frac so they
+    // render and check the way a typed answer would; everything else passes through.
+    var toLatex = function (v) {
+      v = String(v == null ? '' : v).trim();
+      var fm = v.match(/^(-?)(\d+)\s*\/\s*(\d+)$/);
+      if (fm) return fm[1] + '\\frac{' + fm[2] + '}{' + fm[3] + '}';
+      return v;
+    };
+    // Per-field values for a question: prefer the model's structured parts, else
+    // pull signed numbers / fractions out of the answer in order (handles a
+    // coordinate answer like «(2; 3) и (2; -3)» → 2, 3, 2, -3).
+    var valuesFor = function (q) {
+      if (q.parts && q.parts.length) return q.parts.map(function (p) { return p.value; });
+      var a = String(q.answer || '').trim();
+      return a.match(/-?\d+(?:\/\d+)?(?:[.,]\d+)?/g) || [];
+    };
+
+    var filled = [];
+    for (var qi = 0; qi < questions.length; qi++) {
+      var q = questions[qi];
+      var id = (q.index != null && String(q.index).trim() !== '') ? q.index : (qi + 1);
+      var flds = byNum[id];
+      if (!flds || !flds.length) continue;
+      var vals = valuesFor(q);
+      var any = false;
+      for (var f = 0; f < flds.length; f++) {
+        var val = (vals[f] != null) ? vals[f] : (vals.length === 1 ? vals[0] : '');
+        if (val === '' || val == null) continue;
+        try {
+          // MQ(el) returns the EXISTING field; fall back to (re)wrapping it as a
+          // MathField if the interface entry point differs. We still mirror the
+          // hidden input below, so even a re-wrap (which could drop Mesh's own
+          // edit handler) submits correctly.
+          var field = MQ(flds[f]);
+          if (!field || typeof field.latex !== 'function') {
+            if (typeof MQ.MathField === 'function') { try { field = MQ.MathField(flds[f]); } catch (e0) { field = null; } }
+          }
+          if (!field || typeof field.latex !== 'function') continue;
+          field.latex(toLatex(val));
+          // Mirror into the hidden input the form submits (same id, "input"→"hidden-input").
+          var hid = flds[f].id ? document.getElementById(flds[f].id.replace('i-mathquill-input-', 'i-mathquill-hidden-input-')) : null;
+          if (hid) {
+            try { hid.value = field.latex(); } catch (e1) { hid.value = toLatex(val); }
+            try { hid.dispatchEvent(new Event('input', { bubbles: true })); } catch (e2) { /* */ }
+            try { hid.dispatchEvent(new Event('change', { bubbles: true })); } catch (e3) { /* */ }
+          }
+          any = true;
+        } catch (e) { /* this field failed; others still try */ }
+      }
+      if (any) filled.push(String(id));
+    }
+    return { ok: true, filled: filled };
+  } catch (e) {
+    return { ok: false, filled: [], reason: String(e) };
+  }
+}
+
+/**
  * Fill the test form across EVERY frame of the tab. The Mesh test player is
  * sometimes embedded in an iframe (a different *.mos.ru origin), so a fill that
  * only touches the top frame finds no controls and skips everything. We inject
@@ -513,6 +624,24 @@ async function fillAllFrames(tabId, questions) {
     // on-demand global (__smeshDumpBoxes) for deliberate diagnosis only.
     if (s && s.diag) { try { console.log('[СМЭШ AI fill][frame diag]', JSON.stringify(s.diag)); } catch { /* */ } }
   }
+
+  // Second pass: fill MathQuill formula boxes via their API in the page's MAIN
+  // world (the isolated content-script world can't reach window.MQ). Runs in
+  // every frame; merge any question it filled into the same set. Best-effort —
+  // a page without MathQuill just returns nothing and the standard fill stands.
+  try {
+    const mqResults = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      world: 'MAIN',
+      func: fillMathQuillMain,
+      args: [questions]
+    });
+    for (const r of (mqResults || [])) {
+      const res = r && r.result;
+      if (res && Array.isArray(res.filled)) res.filled.forEach((id) => filled.add(String(id)));
+    }
+  } catch { /* main-world injection blocked on this page — standard fill stands */ }
+
   const filledIds = [];
   const skipped = [];
   questions.forEach((q, i) => {
