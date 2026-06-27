@@ -9,6 +9,7 @@ import { extractMath, restoreMath } from '../common/tex.js';
 import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
+import { mountProviderBadge } from '../common/provider-badge.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
@@ -872,6 +873,7 @@ async function init() {
   document.getElementById('solveTest').onclick = solveTestOnScreen;
   document.getElementById('solveAllPages').onclick = solveAllPages;
   document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
+  mountProviderBadge('provBadge'); // tiny "which AI" tag on the test tab
   wireOnboarding();
 
   // Runtime config first (drives both the update banner and the scrape overrides),

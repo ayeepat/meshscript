@@ -8,6 +8,10 @@ import { initTheme, toggleTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
+import { mountProviderBadge } from '../common/provider-badge.js';
+
+// Tiny "which AI service is active" tag next to the theme switch in the header.
+mountProviderBadge('provBadge');
 
 // Keep the theme button icon in sync with the resolved theme.
 document.addEventListener('themechange', (e) => {

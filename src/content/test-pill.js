@@ -77,6 +77,11 @@
   let thinker = null;
 
   let themePref = 'system';
+  // Active AI provider, shown as a tiny GRQ/OPR/NRY tag on the pill so the user
+  // sees which service will answer before pressing «Решить». Mirrors
+  // common/provider-badge.js (can't import an ES module into a content script).
+  let providerAbbr = 'OPR';
+  const PROV_ABBR = { groq: 'GRQ', openrouter: 'OPR', nararouter: 'NRY' };
   const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const resolveTheme = () =>
@@ -206,6 +211,20 @@
   function applyTheme() {
     const pill = shadow && shadow.querySelector('.pill');
     if (pill) pill.dataset.theme = resolveTheme();
+  }
+  function loadProvider() {
+    return new Promise((resolve) => {
+      try {
+        chrome.storage.local.get('aiProvider', (v) => {
+          if (!chrome.runtime.lastError) providerAbbr = PROV_ABBR[v?.aiProvider] || 'OPR';
+          resolve();
+        });
+      } catch { resolve(); }
+    });
+  }
+  function applyProvider() {
+    const el = shadow && shadow.querySelector('.prov');
+    if (el) el.textContent = providerAbbr;
   }
 
   /* ---------- DOM ---------- */
@@ -359,6 +378,18 @@
 
         .actions { display: flex; align-items: center; gap: 6px; }
 
+        /* Tiny read-only "which AI" tag (GRQ/OPR/NRY). Discreet, never clickable. */
+        .prov {
+          flex: none;
+          font-family: "SmeshManrope", -apple-system, sans-serif;
+          font-size: 9px; font-weight: 700; letter-spacing: 0.06em; line-height: 1;
+          color: var(--p-muted);
+          border: 1px solid var(--p-border);
+          border-radius: 5px;
+          padding: 3px 4px;
+          pointer-events: none; user-select: none;
+        }
+
         /* Status area replaces the actions while solving. */
         .status { display: none; align-items: center; gap: 8px; padding-right: 4px; min-width: 164px; }
         .status .stext {
@@ -404,6 +435,7 @@
             <span>все страницы</span>
           </button>
         </div>
+        <span class="prov" title="Активный ИИ-сервис">${providerAbbr}</span>
         <div class="status" aria-live="polite">
           <span class="spinner" aria-hidden="true"></span>
           <span class="stext"></span>
@@ -605,7 +637,7 @@
     built = true;
     wireGlobalsOnce();
     loadBrandFonts(); // document-scope, so Unbounded actually renders in the shadow DOM
-    await Promise.all([loadState(), loadTheme()]);
+    await Promise.all([loadState(), loadTheme(), loadProvider()]);
     ensureHost();
     render();
   }
@@ -632,9 +664,14 @@
     // Live theme sync from any extension page (settings/dashboard/popup).
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area === 'local' && changes.theme) {
+        if (area !== 'local') return;
+        if (changes.theme) {
           themePref = changes.theme.newValue || 'system';
           applyTheme();
+        }
+        if (changes.aiProvider) {
+          providerAbbr = PROV_ABBR[changes.aiProvider.newValue] || 'OPR';
+          applyProvider();
         }
       });
     } catch { /* storage events unavailable */ }

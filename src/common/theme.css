@@ -267,3 +267,17 @@ svg[fill="none"] { stroke-width: 1.75; }
 /* Live "thinking" status verb + elapsed counter (see common/thinking.js).
    Tabular numerals keep the seconds counter from jiggling the layout. */
 .thinkverb { font-variant-numeric: tabular-nums; }
+
+/* Provider badge — tiny read-only "which AI is active" tag (GRQ / OPR / NRY).
+   Shared by the popup test view and the dashboard header (see
+   common/provider-badge.js). Never interactive — purely informational. */
+.provbadge {
+  display: inline-block;
+  font-size: 9px; font-weight: 700; letter-spacing: 0.07em; line-height: 1;
+  color: var(--tertiary);
+  background: var(--card);
+  border: 1px solid var(--separator);
+  border-radius: 6px;
+  padding: 3px 5px;
+  pointer-events: none; user-select: none; white-space: nowrap;
+}

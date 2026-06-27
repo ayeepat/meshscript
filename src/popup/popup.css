@@ -176,6 +176,9 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 
 /* ---------- Тест view ---------- */
 .testview { padding: 14px 16px 18px; }
+/* Provider badge: a small right-aligned detail above the Solve button. Stays
+   visible on the compact test tab (where .testlede is hidden). */
+.testview .provbadge { display: block; width: fit-content; margin: 0 0 10px auto; }
 .testlede { margin: 0 0 12px; font-size: 12.5px; }
 .bigbtn {
   width: 100%; background: var(--accent); color: var(--on-accent);
