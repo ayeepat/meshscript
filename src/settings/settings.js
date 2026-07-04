@@ -16,6 +16,13 @@ if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 
 const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey', 'nararouterApiKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
+const SAVE_SECTIONS = new Set(['general', 'analytics', 'prompts']);
+
+let activeSection = 'general';
+let showSection = null;
+let usageDashboardLoaded = false;
+let gdzLoaded = false;
+let historyLoaded = false;
 
 // Display metadata for each prompt category: an icon, a title and the subjects
 // it covers. Keeps the markup DRY — the editors are generated, not hand-written.
@@ -99,7 +106,6 @@ async function load() {
     ta._refresh?.();
   }
   await refreshUsage();
-  refreshUsageDashboard(); // async, not awaited — the credits fetch shouldn't block the form
   await loadLicenseUi();
   await loadConsentUi();
 }
@@ -137,6 +143,17 @@ function renderConsentStatus(accepted) {
   const pill = document.getElementById('consentStatus');
   pill.textContent = accepted ? 'Согласие дано' : 'Не подтверждено';
   pill.dataset.state = accepted ? 'ok' : 'warn';
+  applyConsentGate(accepted);
+}
+
+function applyConsentGate(accepted) {
+  document.body.classList.toggle('consent-missing', !accepted);
+  for (const tab of document.querySelectorAll('.tab.gated')) {
+    tab.disabled = !accepted;
+    tab.setAttribute('aria-disabled', accepted ? 'false' : 'true');
+    tab.title = accepted ? '' : 'Сначала подтвердите согласие в разделе «Основное»';
+  }
+  if (!accepted && activeSection !== 'general' && showSection) showSection('general');
 }
 
 async function loadConsentUi() {
@@ -293,8 +310,14 @@ async function refreshUsageDashboard() {
   renderChart(chartMode);
 }
 
+async function ensureUsageDashboard(force = false) {
+  if (usageDashboardLoaded && !force) return;
+  usageDashboardLoaded = true;
+  await refreshUsageDashboard();
+}
+
 function wireUsageDashboard() {
-  document.getElementById('usageReload').onclick = () => refreshUsageDashboard();
+  document.getElementById('usageReload').onclick = () => ensureUsageDashboard(true);
   document.querySelectorAll('#chartMode button').forEach((b) => {
     b.onclick = () => {
       document.querySelectorAll('#chartMode button').forEach((x) => x.classList.remove('active'));
@@ -321,7 +344,7 @@ async function save() {
   data.promptOverrides = promptOverrides;
   await chrome.storage.local.set(data);
   await refreshUsage();
-  refreshUsageDashboard(); // reflect the new limit in the «Сегодня · N / лимит» tile
+  if (usageDashboardLoaded) refreshUsageDashboard(); // reflect the new limit in the «Сегодня · N / лимит» tile
   // Verify license against the backend ONLY when the key changed — saves a
   // network round-trip when the user is just editing prompts or limits.
   const newKey = document.getElementById('licenseKey').value.trim().toUpperCase();
@@ -578,6 +601,12 @@ async function loadGdz() {
   runBookSearch();
 }
 
+async function ensureGdz() {
+  if (gdzLoaded) return;
+  gdzLoaded = true;
+  await loadGdz();
+}
+
 function wireGdz() {
   document.getElementById('studentGrade').onchange = async (e) => {
     await chrome.storage.local.set({ studentGrade: e.target.value });
@@ -608,17 +637,25 @@ function wireTabs() {
   const tabs = [...document.querySelectorAll('.tab')];
   const panels = [...document.querySelectorAll('.tabpanel')];
   function show(name) {
+    if (name !== 'general' && document.body.classList.contains('consent-missing')) name = 'general';
+    activeSection = name;
     for (const t of tabs) {
       const on = t.dataset.tab === name;
       t.classList.toggle('active', on);
       t.setAttribute('aria-selected', on ? 'true' : 'false');
     }
     for (const p of panels) p.classList.toggle('active', p.dataset.panel === name);
-    // The save bar only matters on the AI/prompts tab — textbooks & grade auto-save.
-    document.body.classList.toggle('on-settings', name === 'settings');
+    document.body.classList.toggle('has-savebar', SAVE_SECTIONS.has(name));
+    if (name === 'analytics') ensureUsageDashboard();
+    if (name === 'books') ensureGdz();
+    if (name === 'history' && !historyLoaded) {
+      historyLoaded = true;
+      loadHistory();
+    }
   }
+  showSection = show;
   for (const t of tabs) t.onclick = () => show(t.dataset.tab);
-  show('books');
+  show('general');
 }
 
 /* ---------- Init ---------- */
@@ -626,10 +663,10 @@ function wireTabs() {
 buildPromptEditors();
 wireReveals();
 wireTabs();
+applyConsentGate(false);
 wireGdz();
 wireConsent();
 wireUsageDashboard();
 document.getElementById('save').onclick = save;
-document.getElementById('reload').onclick = loadHistory;
+document.getElementById('reload').onclick = () => { historyLoaded = true; loadHistory(); };
 load();
-loadGdz();
