@@ -239,8 +239,10 @@
         <div class="charthead">
           <span class="charttitle">Последние 14 дней</span>
           <div class="seg small" id="chartMode" role="group" aria-label="Метрика графика">
-            <button data-mode="req" class="active" type="button">Запросы</button>
-            <button data-mode="usd" type="button">Доллары</button>
+            <button data-mode="openrouter" class="active" type="button" title="OpenRouter — запросов в день">OPR</button>
+            <button data-mode="groq" type="button" title="Groq — запросов в день">GRQ</button>
+            <button data-mode="nararouter" type="button" title="NaraRouter — запросов в день">NRY</button>
+            <button data-mode="usd" type="button" title="Траты OpenRouter, $/день">$</button>
           </div>
         </div>
         <div id="usageChart" class="usagechart" role="img" aria-label="График использования по дням"></div>

@@ -214,6 +214,18 @@ body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
   white-space: normal; word-break: break-word;
 }
 .answer .spinner { margin-right: 9px; vertical-align: -2px; }
+.answer .ai-notice {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--separator);
+  color: var(--tertiary); font-size: 11.5px; line-height: 1.35;
+}
+.answer .ai-notice svg { flex: none; opacity: 0.8; }
+.answer .ai-notice a {
+  color: #2563eb; text-decoration: none; font-weight: 700;
+}
+.answer .ai-notice a:hover { text-decoration: underline; }
+:root[data-theme="dark"] .answer .ai-notice a { color: #60a5fa; }
+body.compact .answer .ai-notice { font-size: 11px; }
 .copybtn-lg {
   width: 100%; margin-top: 8px;
   background: var(--card); color: var(--accent); border: 1px solid var(--separator);

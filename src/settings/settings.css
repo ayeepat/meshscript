@@ -462,6 +462,7 @@ body.on-settings .savebar { display: block; }
 .usagechart .bar:hover { opacity: 0.78; }
 .usagechart .bar-or, .usagechart .bar-usd { fill: var(--accent); }
 .usagechart .bar-groq { fill: var(--tertiary); }
+.usagechart .bar-nara { fill: var(--warn); }
 .usagechart .axis { stroke: var(--separator); stroke-width: 1; }
 .usagechart .xlab { fill: var(--tertiary); font-size: 7px; font-family: var(--font-sans); }
 .chartempty {
@@ -478,6 +479,7 @@ body.on-settings .savebar { display: block; }
 .chartlegend .sw { width: 10px; height: 10px; border-radius: 3px; flex: none; }
 .chartlegend .sw.or { background: var(--accent); }
 .chartlegend .sw.groq { background: var(--tertiary); }
+.chartlegend .sw.nara { background: var(--warn); }
 
 @media (max-width: 560px) {
   .spendgrid { grid-template-columns: 1fr 1fr; }

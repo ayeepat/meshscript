@@ -14,6 +14,7 @@
   const STORAGE_KEY = 'smeshAnswerPanel';
   const HOST_ID = '__smesh-answer-panel-host';
   const DEFAULT_W = 400;
+  const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
   // Brand fonts, served from the extension bundle (web_accessible_resources).
   // Injected into the Shadow DOM so the panel matches every other surface:
@@ -277,6 +278,33 @@
         }
         li .q + .a::before { content: " → "; color: var(--p-arrow); font-weight: normal; margin-right: 4px; }
         .empty { color: var(--p-muted); font-style: italic; padding: 6px 0; }
+        .ai-note {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          flex-wrap: wrap;
+          margin-top: 8px;
+          padding-top: 9px;
+          border-top: 1px solid var(--p-li-border);
+          color: var(--p-muted);
+          font-size: 11.5px;
+          line-height: 1.35;
+        }
+        .ai-note .dot {
+          width: 5px;
+          height: 5px;
+          border-radius: 50%;
+          background: var(--p-accent);
+          opacity: 0.85;
+          flex: none;
+        }
+        .ai-note a {
+          color: #2563eb;
+          text-decoration: none;
+          font-weight: 700;
+        }
+        .panel[data-theme="dark"] .ai-note a { color: #60a5fa; }
+        .ai-note a:hover { text-decoration: underline; }
         .panel.minimized .body { display: none; }
         .panel.minimized { max-height: none; }
         .copied { color: var(--p-answer); border-color: var(--p-answer); }
@@ -322,6 +350,11 @@
           ${questions.length
             ? `<ol>${questions.map(questionLine).join('')}</ol>`
             : '<div class="empty">Ответы не распознаны.</div>'}
+          <div class="ai-note">
+            <span class="dot" aria-hidden="true"></span>
+            <span>Это ИИ: ответы могут быть неточными. Проверяйте источники.</span>
+            <a href="${AI_NOTICE_URL}" target="_blank" rel="noopener noreferrer">Подробнее</a>
+          </div>
         </div>
       </div>
     `;
@@ -625,4 +658,3 @@
   // Tear down on full navigation (SPA route changes won't fire — user closes manually).
   window.addEventListener('pagehide', hide);
 })();
-

@@ -27,6 +27,7 @@ const initialDay = params.get('day') || '';
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
 const weekEl = document.getElementById('week');
+const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
 // key -> { key, day, subject, task, sessionId, history: [{role, content}], started, pending }
 const chats = new Map();
@@ -125,6 +126,16 @@ function copyButton(getText) {
   return b;
 }
 
+function aiNoticeEl() {
+  const note = document.createElement('div');
+  note.className = 'ai-notice';
+  note.innerHTML =
+    `${iconSvg('info', 13)}` +
+    '<span>Это ИИ: ответы могут быть неточными. Проверяйте источники.</span>' +
+    `<a href="${AI_NOTICE_URL}" target="_blank" rel="noopener noreferrer">Подробнее</a>`;
+  return note;
+}
+
 /** Chip shown on a user message when files were attached: green check + icon. */
 function attachChip(files) {
   const chip = document.createElement('div');
@@ -158,6 +169,7 @@ function bubble(role, text, { animate = false, files = null, needsUpload = false
     if (animate) typewriter(body, text);
     else body.innerHTML = mdToHtml(text);
     d.appendChild(body);
+    d.appendChild(aiNoticeEl());
     d.appendChild(copyButton(() => text));
   } else {
     const span = document.createElement('div');
@@ -178,6 +190,7 @@ function assistantShell() {
   const body = document.createElement('div');
   body.className = 'mdbody';
   d.appendChild(body);
+  d.appendChild(aiNoticeEl());
   chatEl.appendChild(d);
   chatEl.scrollTop = chatEl.scrollHeight;
   return { wrap: d, body };

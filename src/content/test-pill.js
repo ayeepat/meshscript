@@ -30,8 +30,9 @@
 
   // Namespaced diagnostics — same prefix style as scraper.js. Lets us confirm
   // the script injected and see WHY detection did/didn't fire from the page
-  // console (filter on "СМЭШ AI pill"). Flip to false before a store release.
-  const DEBUG = true;
+  // console (filter on "СМЭШ AI pill"). OFF in shipped builds — flip to true to
+  // trace test detection on a live МЭШ page.
+  const DEBUG = false;
   const log = (...a) => { if (DEBUG) { try { console.debug('[СМЭШ AI pill]', ...a); } catch { /* */ } } };
 
   /* ---------- Test-page detection (single source of truth) ---------- */

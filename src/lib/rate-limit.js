@@ -104,14 +104,17 @@ export async function getUsage() {
 
 /**
  * Per-day request counts for the last `days` days (ascending, today last).
- * Gaps are zero-filled so the Settings chart always has a full axis.
- * @returns {Promise<Array<{day:string, openrouter:number, groq:number}>>}
+ * Gaps are zero-filled so the Settings chart always has a full axis. NaraRouter
+ * is a first-class free provider (its own cap + today's-usage tile), so it gets
+ * charted alongside OpenRouter and Groq — chargeOne already records it.
+ * @returns {Promise<Array<{day:string, openrouter:number, groq:number, nararouter:number}>>}
  */
 export async function getUsageHistory(days = HISTORY_DAYS) {
   const { rateHistory } = await load();
   return lastNDays(days).map((day) => ({
     day,
     openrouter: Number(rateHistory[day]?.openrouter) || 0,
-    groq: Number(rateHistory[day]?.groq) || 0
+    groq: Number(rateHistory[day]?.groq) || 0,
+    nararouter: Number(rateHistory[day]?.nararouter) || 0
   }));
 }

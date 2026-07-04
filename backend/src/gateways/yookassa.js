@@ -75,6 +75,43 @@ export function checkBasicAuth(request, env) {
 }
 
 /**
+ * Server-to-server confirmation of a payment. A webhook body is attacker-
+ * controllable if the IP allowlist or basic auth ever fails open (e.g. secrets
+ * unset), so the amount/status in the notification must NOT be trusted on their
+ * own. Re-fetch the payment straight from YooKassa's API and treat THAT as the
+ * source of truth before issuing.
+ *
+ * Uses HTTP Basic auth: username = shopId, password = secret key.
+ * Returns { ok:true, status, amount_rub } or { ok:false, reason }. When the shop
+ * credentials aren't configured it returns { ok:true, skipped:true } so an
+ * operator who hasn't set them yet keeps the old IP-allowlist-only behaviour —
+ * but the worker logs a warning in that case.
+ *
+ * Docs: https://yookassa.ru/developers/api#get_payment
+ */
+export async function verifyPayment(env, paymentId) {
+  if (!env.YOOKASSA_SHOP_ID || !env.YOOKASSA_SECRET_KEY) {
+    return { ok: true, skipped: true };
+  }
+  if (!paymentId) return { ok: false, reason: 'no_payment_id' };
+  const auth = 'Basic ' + btoa(`${env.YOOKASSA_SHOP_ID}:${env.YOOKASSA_SECRET_KEY}`);
+  let res;
+  try {
+    res = await fetch(`https://api.yookassa.ru/v3/payments/${encodeURIComponent(paymentId)}`, {
+      headers: { Authorization: auth, 'Content-Type': 'application/json' }
+    });
+  } catch (e) {
+    return { ok: false, reason: 'network' };
+  }
+  if (!res.ok) return { ok: false, reason: 'api_' + res.status };
+  const p = await res.json().catch(() => null);
+  if (!p || p.status !== 'succeeded' || p.paid !== true) {
+    return { ok: false, reason: 'not_succeeded' };
+  }
+  return { ok: true, status: p.status, amount_rub: Number(p?.amount?.value || 0) };
+}
+
+/**
  * Translate a YooKassa notification into the canonical shape the worker's
  * issuance path expects. Returns null on events we don't act on (canceled,
  * refunded, anything not succeeded) so the worker can 200-OK them.

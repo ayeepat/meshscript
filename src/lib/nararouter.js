@@ -5,26 +5,24 @@
  * background service worker. Key is entered in Settings and stored in
  * chrome.storage.local. Never hardcoded, never exposed to content scripts.
  *
- * Role: a FREE alternative to OpenRouter for the user's own testing. Like Groq
- * it splits text vs. vision across two models:
+ * Role: a FREE alternative to OpenRouter. Splits text vs. vision across two
+ * models:
  *  - Text only:  a MiMo model.
- *  - Vision (images / test screenshots / any upload that needs seeing):
- *                a Mistral Medium model.
+ *  - Vision (images / test screenshots): a Mistral Medium model.
  *
  * MODEL ALIASES ARE RESOLVED LIVE. The NaraRouter free lineup gets renamed and
- * retired without notice — a hardcoded id eventually 404s with "model does not
- * exist". So instead of trusting one constant, we fetch the account's actual
- * `/v1/models` list, pick the best match for the wanted modality, cache it, and
- * (on a stale-model 404) re-discover + retry once. The constants below are only
- * PREFERENCES / last-resort fallbacks.
+ * retired without notice (a hardcoded id eventually 404s "model does not exist").
+ * So instead of trusting one constant, we fetch the account's actual `/v1/models`
+ * list, pick the best match for the modality, cache it, and on a stale-model 404
+ * re-discover + retry once. The constants below are only PREFERENCES / fallbacks.
  *
- * Caveats vs. OpenRouter (kept deliberately out of this file's job):
- *  - No native PDF reading — the solver still forces OpenRouter for PDFs.
- *  - No OpenRouter-style `reasoning` channel — we don't forward opts.reasoning.
+ * Deliberately MINIMAL otherwise: these free models are NOT reasoning models, so
+ * we do NOT forward `reasoning`/`reasoning_effort` (it does nothing for them and
+ * over-instructing a small model only hurts accuracy). Likewise no native PDF
+ * reading — the solver forces OpenRouter for PDFs.
  *
- * Streams when opts.onDelta is given. Set opts.responseFormat = 'json_object'
- * for structured replies (only sent on the text path; the vision path relies on
- * the prompt + the caller's tiered JSON parser, mirroring groq.js).
+ * Streams when opts.onDelta is given. responseFormat = 'json_object' is sent only
+ * on the text path (vision relies on the prompt + the caller's tiered parser).
  */
 
 import { postStream } from './http.js';
@@ -53,9 +51,8 @@ async function getKey() {
 }
 
 /**
- * The model aliases this key/plan can actually use. Cached for MODELS_TTL_MS
- * (a renamed lineup is rare). Returns string[] or null on any failure — the
- * caller then falls back to a constant.
+ * The model aliases this key/plan can actually use. Cached for MODELS_TTL_MS.
+ * Returns string[] or null on any failure — the caller then uses a constant.
  */
 async function fetchModelIds(key, force = false) {
   try {
@@ -83,22 +80,28 @@ function chooseModel(ids, wantVision) {
     const hit = pairs.find(([, l]) => l === p);
     if (hit) return hit[0];
   }
-  // 2. fuzzy by family name.
-  const fam = wantVision ? /mistral|pixtral/ : /mimo/;
-  const fuzzy = pairs.find(([, l]) => fam.test(l));
-  if (fuzzy) return fuzzy[0];
-  // 3. vision needs a multimodal model — accept any obviously-vision id.
-  if (wantVision) {
-    const v = pairs.find(([, l]) => /vision|vl|pixtral|gemini|claude|llava/.test(l));
-    if (v) return v[0];
+  // 2. fuzzy by family. Vision stays multimodal-only so a screenshot never goes
+  // to a text-only model.
+  const fams = wantVision ? [/mistral|pixtral/, /-vl\b|vision|llava/] : [/mimo/];
+  for (const fam of fams) {
+    const hit = pairs.find(([, l]) => fam.test(l));
+    if (hit) return hit[0];
   }
-  return null;
+  // Vision: don't risk a text-only model — let the caller use the constant.
+  return wantVision ? null : ids[0];
 }
 
 /** Resolve the alias to send: live list → preferred → constant fallback. */
 async function resolveModel(key, wantVision, force = false) {
   const ids = await fetchModelIds(key, force);
-  return chooseModel(ids, wantVision) || (wantVision ? VISION_FALLBACK : TEXT_FALLBACK);
+  const chosen = chooseModel(ids, wantVision) || (wantVision ? VISION_FALLBACK : TEXT_FALLBACK);
+  // Logged to the SERVICE WORKER console so the user can see which models their
+  // key exposes and which one was picked (helps when a lineup changes).
+  try {
+    console.log('[СМЭШ AI nararouter]', wantVision ? 'vision' : 'text', '→', chosen,
+      '· доступные:', ids ? ids.join(', ') : '(список недоступен — fallback)');
+  } catch { /* no console */ }
+  return chosen;
 }
 
 // One file -> one OpenAI-style content part. NaraRouter (like Groq) has no native
@@ -138,7 +141,7 @@ function historyToMessage(m) {
   return { role, content: m.content };
 }
 
-// True when the provider rejected the model id (retired / renamed / not on plan).
+// The provider rejected the model id (retired / renamed / not on plan).
 function isModelMissing(err) {
   return /does not exist|no such model|unknown model|model_not_found|not found/i.test(String(err?.message || err));
 }
@@ -146,51 +149,41 @@ function isModelMissing(err) {
 export async function askNararouter(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null, signal = null } = opts;
   const key = await getKey();
-  // Charge the daily budget BEFORE the network round-trip — same reasoning as
-  // openrouter.js / groq.js: a runaway loop can't burn through the day's tokens.
+  // Charge the daily budget BEFORE the network round-trip — same as openrouter/groq.
   await chargeOne('nararouter');
 
-  // Pick the vision model if EITHER the current message OR a replayed history
-  // turn carries an image — otherwise a follow-up would route to the text model
-  // and lose the original photo (same logic as groq.js).
+  // Vision model if EITHER the current message OR a replayed history turn carries
+  // an image (so follow-ups keep the photo and stay on the vision model).
   const hasImages = files.some(isImageFile) ||
     history.some((m) => m.role !== 'assistant' && m.files?.some(isImageFile));
 
   const userContent = buildUserContent(userText, files);
-  const body = {
-    model: await resolveModel(key, hasImages),
-    messages: [
-      { role: 'system', content: systemPrompt },
-      ...history.map(historyToMessage),
-      // files.length (not hasImages): a non-image attachment still needs its
-      // "can't read this directly" note delivered to the model.
-      { role: 'user', content: files.length ? userContent : userText }
-    ],
-    temperature: 0.3
-  };
-  // JSON mode only on the TEXT model — see groq.js for the same reasoning.
-  if (responseFormat === 'json_object' && !hasImages) body.response_format = { type: 'json_object' };
-
-  // We intentionally do NOT forward opts.reasoning: it's an OpenRouter-specific
-  // param and these models aren't reasoning models on the free tier.
-
+  const messages = [
+    { role: 'system', content: systemPrompt },
+    ...history.map(historyToMessage),
+    // files.length (not hasImages): a non-image attachment still needs its
+    // "can't read this directly" note delivered to the model.
+    { role: 'user', content: files.length ? userContent : userText }
+  ];
   const headers = { Authorization: `Bearer ${key}` };
 
-  // ALWAYS stream (per-chunk idle timeout keeps slow vision replies from tripping
-  // the hard timeout). The 404 path below only fires PRE-stream (bad model id), so
-  // nothing has been emitted yet — a clean retry is safe.
+  const run = (model) => {
+    const body = { model, messages, temperature: 0.3 };
+    // JSON mode only on the TEXT model — see groq.js for the same reasoning.
+    if (responseFormat === 'json_object' && !hasImages) body.response_format = { type: 'json_object' };
+    return postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
+  };
+
+  const model = await resolveModel(key, hasImages);
   try {
-    return await postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
+    return await run(model);
   } catch (e) {
     if (!isModelMissing(e)) throw e;
-    // The cached/preferred alias was retired or renamed. Re-discover the live
-    // list (bypassing cache) and retry ONCE with a fresh pick.
+    // Stale/renamed alias → re-discover the live list and retry once.
     const alt = await resolveModel(key, hasImages, true);
-    if (alt && alt !== body.model) {
-      body.model = alt;
-      try {
-        return await postStream(ENDPOINT, { headers, body, label: 'NaraRouter', onDelta, signal });
-      } catch (e2) { if (!isModelMissing(e2)) throw e2; /* else fall through to guidance */ }
+    if (alt && alt !== model) {
+      try { return await run(alt); }
+      catch (e2) { if (!isModelMissing(e2)) throw e2; }
     }
     throw new Error(
       'NaraRouter не нашёл нужную модель (бесплатный список моделей у них часто меняется). ' +

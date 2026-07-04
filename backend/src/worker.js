@@ -3,6 +3,7 @@
  *
  * Routes:
  *   POST /webhook/yookassa   YooKassa notification, auto-issues a license
+ *   POST /webhook/yoomoney   YooMoney wallet notification, auto-issues a license
  *   GET  /verify             Extension calls this; returns active|expired|...
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
@@ -15,7 +16,8 @@
  */
 
 import { issueLicense, verifyLicense, getLicense, putLicense, normalizeKey } from './licenses.js';
-import { isYookassaIp, checkBasicAuth, parseNotification } from './gateways/yookassa.js';
+import { isYookassaIp, checkBasicAuth, parseNotification, verifyPayment } from './gateways/yookassa.js';
+import * as yoomoney from './gateways/yoomoney.js';
 import { sendLicenseEmail } from './delivery/email.js';
 import { sendLicenseTelegram } from './delivery/telegram.js';
 import { processSupportUpdate } from './delivery/support.js';
@@ -47,6 +49,7 @@ export default {
 
       if (path === '/verify' && method === 'GET') return await handleVerify(request, env);
       if (path === '/webhook/yookassa' && method === 'POST') return await handleYookassa(request, env, ctx);
+      if (path === '/webhook/yoomoney' && method === 'POST') return await handleYoomoney(request, env, ctx);
 
       if (path === '/admin/issue' && method === 'POST') return await handleAdminIssue(request, env);
       if (path === '/admin/revoke' && method === 'POST') return await handleAdminRevoke(request, env);
@@ -233,9 +236,27 @@ async function handleYookassa(request, env, ctx) {
     return json({ ok: true, ignored: true, note: 'no_contact' });
   }
 
-  // Decide product type from the amount. For now everything is lifetime;
-  // when subscriptions launch we'll branch on amount or on a metadata field.
-  const type = env.DEFAULT_LICENSE_TYPE || 'lifetime';
+  // Don't trust the amount/status in the webhook body — confirm the payment
+  // server-side against YooKassa's API before issuing (see verifyPayment).
+  // Falls back to the notification amount only when shop creds aren't set.
+  const confirmed = await verifyPayment(env, parsed.payment_id);
+  if (!confirmed.ok) {
+    console.error('yookassa: payment verification failed', parsed.payment_id, confirmed.reason);
+    return error(400, 'payment_unverified');
+  }
+  if (confirmed.skipped) console.warn('yookassa: issuing WITHOUT server-side verification (set YOOKASSA_SHOP_ID + YOOKASSA_SECRET_KEY)');
+  const amountRub = confirmed.skipped ? parsed.amount_rub : confirmed.amount_rub;
+
+  const floor = minPaymentRub(env);
+  if (floor > 0 && amountRub < floor) {
+    console.warn('yookassa: amount below floor, not issuing', parsed.payment_id, amountRub);
+    return json({ ok: true, ignored: true, note: 'amount_below_min' });
+  }
+
+  // Decide product (lifetime vs a fixed-length subscription) from the confirmed
+  // amount. Defaults keep everything lifetime unless SUBSCRIPTION_* is set.
+  const plan = planFromAmount(env, amountRub);
+  if (!plan) return json({ ok: true, ignored: true, note: 'amount_below_plan' });
   const isPreorder = isPreorderNow();
 
   const license = await issueLicense(env, {
@@ -243,13 +264,160 @@ async function handleYookassa(request, env, ctx) {
     payment_id: parsed.payment_id,
     email: parsed.email,
     telegram_user_id: parsed.telegram_user_id,
-    type,
-    amount_rub: parsed.amount_rub,
+    type: plan.type,
+    expires_at: plan.expires_at,
+    amount_rub: amountRub,
     is_preorder: isPreorder
   });
 
   ctx.waitUntil(deliverKey(env, license, isPreorder));
   return json({ ok: true, key_issued: true });
+}
+
+/* -------------------------- /webhook/yoomoney ------------------------ */
+
+async function handleYoomoney(request, env, ctx) {
+  // YooMoney posts application/x-www-form-urlencoded. There is no stable IP
+  // range to allowlist, so the SHA-1 signature is the ONLY authenticity gate —
+  // verify it first and fail closed on any mismatch or unset secret.
+  let form;
+  try { form = await request.formData(); }
+  catch { return error(400, 'bad_form'); }
+
+  const fields = yoomoney.parseForm(form);
+  const signed = await yoomoney.verifyNotification(fields, env.YOOMONEY_NOTIFICATION_SECRET);
+  if (!signed) {
+    console.warn('yoomoney: bad signature', fields.operation_id || '(no id)');
+    return error(403, 'bad_signature');
+  }
+
+  const n = yoomoney.normalize(fields);
+  // Signed but not fulfillable (test ping, protected/unaccepted payment, wrong
+  // currency): ack 200 so YooMoney stops retrying, but don't issue.
+  if (!n.ok) return json({ ok: true, ignored: true, note: n.reason });
+
+  // YooMoney's `amount` is credited NET of its commission (up to ~3% on card
+  // payments), so a buyer who pays exactly the 199₽/990₽ sticker price arrives
+  // BELOW it (~193₽/~960₽) — failing the floor (paid but no key) or demoting a
+  // lifetime purchase to a subscription. Gross the net amount back up by the
+  // worst-case fee before the floor and plan checks; the license record keeps
+  // the real net amount. (`withdraw_amount` carries the gross figure but is NOT
+  // covered by the SHA-1 signature, so it can't be trusted for this decision.)
+  const feePct = Math.min(Math.max(Number(env.YOOMONEY_FEE_PCT ?? 5), 0), 30);
+  const grossRub = n.amount_rub / (1 - feePct / 100);
+
+  // The Quickpay form's receiver/sum/label are plain client-side fields: anyone
+  // can resubmit the form with sum=1 and their own email in label, and YooMoney
+  // signs that notification like any real payment. The floor is what makes a
+  // signed payment a purchase — below it we ack without issuing.
+  const floor = minPaymentRub(env);
+  if (floor > 0 && grossRub < floor) {
+    console.warn('yoomoney: amount below floor, not issuing', n.payment_id, n.amount_rub);
+    return json({ ok: true, ignored: true, note: 'amount_below_min' });
+  }
+  if (floor <= 0) console.warn('yoomoney: NO payment floor configured — set MIN_PAYMENT_RUB or any signed amount (1₽) issues a license');
+
+  // The order page threads the buyer's contact through `label`. Resolve it to
+  // an email and/or a telegram_user_id (order-id lookup supported too).
+  const contact = await resolveYoomoneyContact(env, n.label);
+  if (!contact.email && !contact.telegram_user_id) {
+    console.error('yoomoney: payment without delivery contact', n.payment_id);
+    return json({ ok: true, ignored: true, note: 'no_contact' });
+  }
+
+  // Same null guard as the YooKassa handler: an amount that clears the hard
+  // floor but no plan threshold is not a purchase — ack without issuing (a
+  // thrown `plan.type` here would 500 and put YooMoney into a retry loop).
+  const plan = planFromAmount(env, grossRub);
+  if (!plan) return json({ ok: true, ignored: true, note: 'amount_below_plan' });
+  const isPreorder = isPreorderNow();
+
+  const license = await issueLicense(env, {
+    gateway: 'yoomoney',
+    payment_id: n.payment_id,     // operation_id → idempotent, replay-safe
+    email: contact.email,
+    telegram_user_id: contact.telegram_user_id,
+    type: plan.type,
+    expires_at: plan.expires_at,
+    amount_rub: n.amount_rub,
+    is_preorder: isPreorder
+  });
+
+  ctx.waitUntil(deliverKey(env, license, isPreorder));
+  return json({ ok: true, key_issued: true });
+}
+
+/**
+ * Resolve the delivery contact from a YooMoney `label`. Two supported shapes:
+ *  - a bare email  ("student@example.com")  → deliver there directly;
+ *  - an order id you registered on the pay page → look up `order:<id>` in KV,
+ *    which the order page wrote as { email, telegram_user_id } (short TTL).
+ * A label that is neither yields no contact and the caller acks-without-issuing.
+ */
+async function resolveYoomoneyContact(env, label) {
+  const raw = (label || '').trim();
+  if (!raw) return {};
+  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) return { email: raw, telegram_user_id: null };
+  try {
+    const stored = await env.LICENSES.get(`order:${raw}`);
+    if (stored) {
+      const o = JSON.parse(stored);
+      return {
+        email: typeof o.email === 'string' ? o.email : null,
+        telegram_user_id: o.telegram_user_id ? Number(o.telegram_user_id) : null
+      };
+    }
+  } catch { /* not JSON / not found */ }
+  return {};
+}
+
+/**
+ * Map a confirmed payment amount to a product plan.
+ *   { type: 'lifetime',     expires_at: null }
+ *   { type: 'subscription', expires_at: <now + N days ISO> }
+ *   null                    — amount clears no configured floor; do NOT issue
+ *
+ * Pricing is env-driven so it changes without a redeploy:
+ *   SUBSCRIPTION_MIN_RUB  — at/above this but below LIFETIME_MIN → subscription
+ *   SUBSCRIPTION_DAYS     — subscription length in days (default 30)
+ *   LIFETIME_MIN_RUB      — at/above this → lifetime
+ * With none set, everything is DEFAULT_LICENSE_TYPE (lifetime) — current behaviour.
+ */
+function planFromAmount(env, amountRub) {
+  const amount = Number(amountRub) || 0;
+  const subMin = Number(env.SUBSCRIPTION_MIN_RUB || 0);
+  const lifeMin = Number(env.LIFETIME_MIN_RUB || 0);
+  const subDays = Number(env.SUBSCRIPTION_DAYS || 30);
+
+  // Lifetime threshold wins when the payment clears it.
+  if (lifeMin > 0 && amount >= lifeMin) return { type: 'lifetime', expires_at: null };
+  // Otherwise, a subscription if the amount reaches the subscription floor.
+  if (subMin > 0 && amount >= subMin) {
+    const expires = new Date(Date.now() + subDays * 24 * 60 * 60 * 1000).toISOString();
+    return { type: 'subscription', expires_at: expires };
+  }
+  // At least one floor is configured but the amount clears none of them: that
+  // is not a purchase of any plan. Never fall through to the default here —
+  // a 1₽ payment must not mint a lifetime license.
+  if (subMin > 0 || lifeMin > 0) return null;
+  // No pricing configured at all: fall back to the default product type.
+  // (The MIN_PAYMENT_RUB gate in the webhook handlers covers this case.)
+  const type = env.DEFAULT_LICENSE_TYPE || 'lifetime';
+  return { type, expires_at: null };
+}
+
+/**
+ * Hard floor on what counts as a purchase at all, applied before any plan
+ * mapping. Explicit MIN_PAYMENT_RUB wins; otherwise the lowest configured
+ * plan floor. Returns 0 (no floor) only when nothing is configured — the
+ * handlers log a loud warning in that state.
+ */
+function minPaymentRub(env) {
+  const explicit = Number(env.MIN_PAYMENT_RUB || 0);
+  if (explicit > 0) return explicit;
+  const floors = [Number(env.SUBSCRIPTION_MIN_RUB || 0), Number(env.LIFETIME_MIN_RUB || 0)]
+    .filter((n) => n > 0);
+  return floors.length ? Math.min(...floors) : 0;
 }
 
 /* ---------------------------- delivery glue --------------------------- */

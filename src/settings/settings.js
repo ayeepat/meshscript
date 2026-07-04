@@ -163,9 +163,20 @@ async function refreshUsage() {
 /* ---------- Usage & spend dashboard ---------- */
 
 // Loaded by refreshUsageDashboard(), read by renderChart().
-let reqHistory = [];   // [{ day, openrouter, groq }]
+let reqHistory = [];   // [{ day, openrouter, groq, nararouter }]
 let spendHistory = []; // [{ day, spend }]  (OpenRouter $/day, from snapshots)
-let chartMode = 'req'; // 'req' | 'usd'
+// The chart shows ONE series at a time, picked by the #chartMode switcher, so
+// the providers never clog one cramped column. A provider mode = that
+// provider's daily request count; 'usd' = OpenRouter spend. Default: OpenRouter.
+let chartMode = 'openrouter'; // 'openrouter' | 'groq' | 'nararouter' | 'usd'
+
+// Per-provider chart metadata: which reqHistory field to read, the legend label,
+// and the bar/swatch CSS classes (colours defined in settings.css).
+const PROVIDER_CHART = {
+  openrouter: { key: 'openrouter', name: 'OpenRouter', label: 'OpenRouter', cls: 'bar-or', sw: 'or' },
+  groq:       { key: 'groq',       name: 'Groq',       label: 'Groq · бесплатно',       cls: 'bar-groq', sw: 'groq' },
+  nararouter: { key: 'nararouter', name: 'NaraRouter', label: 'NaraRouter · бесплатно', cls: 'bar-nara', sw: 'nara' }
+};
 
 const fmtUsd = (n) =>
   '$' + (Number(n) || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
@@ -204,9 +215,9 @@ function renderSpend(c) {
   }
 }
 
-// Compact responsive bar chart (inline SVG). Requests mode = grouped OR+Groq
-// bars; dollars mode = single OpenRouter spend bar. Exact values ride on each
-// bar's <title> for hover.
+// Compact responsive bar chart (inline SVG). One series at a time: a provider
+// mode draws that provider's daily request count; 'usd' draws OpenRouter spend.
+// Exact values ride on each bar's <title> for hover.
 function chartSvg(mode) {
   const W = 340, H = 110, padT = 10, padB = 18, padX = 6;
   const plotW = W - padX * 2, plotH = H - padT - padB;
@@ -215,26 +226,25 @@ function chartSvg(mode) {
   const colW = plotW / n;
   const baselineY = padT + plotH;
 
+  const prov = PROVIDER_CHART[mode] || null; // null only for 'usd'
   let max = 0;
   if (mode === 'usd') for (const d of spendHistory) max = Math.max(max, d.spend);
-  else for (const d of reqHistory) max = Math.max(max, d.openrouter, d.groq);
+  else for (const d of reqHistory) max = Math.max(max, d[prov.key] || 0);
   if (max <= 0) max = 1;
 
   const bars = [];
+  const bw = Math.max(3, colW * 0.6); // one centered bar per day
   for (let i = 0; i < n; i++) {
     const cx = padX + i * colW;
+    const x = (cx + (colW - bw) / 2).toFixed(1);
     if (mode === 'usd') {
       const v = spendHistory[i].spend;
       const h = (v / max) * plotH;
-      const bw = Math.max(3, colW * 0.6);
-      bars.push(`<rect class="bar bar-usd" x="${(cx + (colW - bw) / 2).toFixed(1)}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${fmtUsd(v)}</title></rect>`);
+      bars.push(`<rect class="bar bar-usd" x="${x}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${fmtUsd(v)}</title></rect>`);
     } else {
-      const o = reqHistory[i].openrouter, g = reqHistory[i].groq;
-      const bw = Math.max(2, colW * 0.3), gap = colW * 0.08;
-      const bx = cx + (colW - (bw * 2 + gap)) / 2;
-      const ho = (o / max) * plotH, hg = (g / max) * plotH;
-      bars.push(`<rect class="bar bar-or" x="${bx.toFixed(1)}" y="${(baselineY - ho).toFixed(1)}" width="${bw.toFixed(1)}" height="${ho.toFixed(1)}" rx="1.5"><title>${shortDay(days[i])}: OpenRouter ${o}</title></rect>`);
-      bars.push(`<rect class="bar bar-groq" x="${(bx + bw + gap).toFixed(1)}" y="${(baselineY - hg).toFixed(1)}" width="${bw.toFixed(1)}" height="${hg.toFixed(1)}" rx="1.5"><title>${shortDay(days[i])}: Groq ${g}</title></rect>`);
+      const v = reqHistory[i][prov.key] || 0;
+      const h = (v / max) * plotH;
+      bars.push(`<rect class="bar ${prov.cls}" x="${x}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${prov.name} ${v}</title></rect>`);
     }
   }
 
@@ -250,21 +260,25 @@ function chartSvg(mode) {
 
 function renderLegend(mode) {
   const legend = document.getElementById('chartLegend');
-  legend.innerHTML = mode === 'usd'
-    ? '<span class="lg"><i class="sw or"></i>Траты OpenRouter, $/день</span>'
-    : '<span class="lg"><i class="sw or"></i>OpenRouter</span><span class="lg"><i class="sw groq"></i>Groq · бесплатно</span>';
+  if (mode === 'usd') {
+    legend.innerHTML = '<span class="lg"><i class="sw or"></i>Траты OpenRouter, $/день</span>';
+  } else {
+    const m = PROVIDER_CHART[mode] || PROVIDER_CHART.openrouter;
+    legend.innerHTML = `<span class="lg"><i class="sw ${m.sw}"></i>${m.label} · запросов в день</span>`;
+  }
 }
 
 function renderChart(mode) {
   const host = document.getElementById('usageChart');
-  const hasReq = reqHistory.some((d) => d.openrouter + d.groq > 0);
-  const hasUsd = spendHistory.some((d) => d.spend > 0);
-  if (mode === 'usd' && !hasUsd) {
-    host.innerHTML = '<div class="chartempty">Данные о тратах по дням ещё копятся — загляните завтра. Общий расход — в плитке «Потрачено».</div>';
-  } else if (mode !== 'usd' && !hasReq) {
-    host.innerHTML = '<div class="chartempty">Пока нет запросов за этот период.</div>';
+  if (mode === 'usd') {
+    const hasUsd = spendHistory.some((d) => d.spend > 0);
+    host.innerHTML = hasUsd ? chartSvg(mode)
+      : '<div class="chartempty">Данные о тратах по дням ещё копятся — загляните завтра. Общий расход — в плитке «Потрачено».</div>';
   } else {
-    host.innerHTML = chartSvg(mode);
+    const key = (PROVIDER_CHART[mode] || PROVIDER_CHART.openrouter).key;
+    const has = reqHistory.some((d) => (d[key] || 0) > 0);
+    host.innerHTML = has ? chartSvg(mode)
+      : '<div class="chartempty">Пока нет запросов за этот период.</div>';
   }
   renderLegend(mode);
 }

@@ -15,6 +15,7 @@ import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
 initTheme();
 
@@ -383,6 +384,14 @@ function escapeHtml(s) {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
+function aiNoticeHtml() {
+  return '<div class="ai-notice">' +
+    iconSvg('info', 13) +
+    '<span>Это ИИ: ответы могут быть неточными. Проверяйте источники.</span>' +
+    `<a href="${AI_NOTICE_URL}" target="_blank" rel="noopener noreferrer">Подробнее</a>` +
+    '</div>';
+}
+
 /**
  * Last-resort rescue for a FREE-TEXT reply (no JSON at all) — the TEST_ANSWER
  * prompt mandates JSON, so this only runs when the model ignored it entirely.
@@ -487,7 +496,7 @@ function renderAnswer(el, raw) {
   const html = escapeHtml(text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
-  el.innerHTML = restoreMath(html, chunks);
+  el.innerHTML = restoreMath(html, chunks) + aiNoticeHtml();
   return plain;
 }
 

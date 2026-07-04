@@ -21,6 +21,12 @@
  * A MESH_DEBUG message returns diagnostics for tuning against the real DOM.
  */
 
+// Diagnostic logging. OFF in shipped builds — flip to true to trace homework
+// scraping, attachment auto-fetch and test auto-fill in the page console
+// (filter on "СМЭШ AI"). Kept out of production so a student's console stays clean.
+const SMESH_DEBUG = false;
+const dbg = (...a) => { if (SMESH_DEBUG) { try { console.log(...a); } catch { /* no console */ } } };
+
 // `let`, not `const`: the remote runtime config (lib/remote-config.js, passed in
 // on the MESH_SCAN message) can override this to add a subject Mesh renamed,
 // without a store re-publish. The built-in list below is always the fallback.
@@ -579,10 +585,10 @@ const isSameOrigin = (url) => {
 async function fetchInlineFile(url) {
   try {
     const res = await fetch(url, { credentials: 'include' });
-    if (!res.ok) { console.log('[СМЭШ AI] cs-download http', res.status, url); return null; }
+    if (!res.ok) { dbg('[СМЭШ AI] cs-download http', res.status, url); return null; }
     const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
+      dbg('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
       return { __auth: true };
     }
     const blob = await res.blob();
@@ -598,7 +604,7 @@ async function fetchInlineFile(url) {
       dataBase64: String(dataUrl).split(',')[1],
       name: fileNameFromUrl(url)
     };
-  } catch (e) { console.log('[СМЭШ AI] cs-download exception', String(e), url); return null; }
+  } catch (e) { dbg('[СМЭШ AI] cs-download exception', String(e), url); return null; }
 }
 
 /**
@@ -615,7 +621,7 @@ async function fetchInlineFile(url) {
 async function listMaterialUrls(lessonId, taskText) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
-  const log = (stage, extra) => console.log('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
+  const log = (stage, extra) => dbg('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
 
   // The API path is the precise one (it knows which homework owns which file), so
   // prefer it whenever we have a lesson id. The DOM scan is only a fallback for
@@ -1493,7 +1499,7 @@ function fillTestAnswers(questions) {
   try { units = collectUnits(); } catch { units = []; }
   // One-line picture of what the page exposed, so a mis-fill can be diagnosed
   // from the test tab's console (filter on «СМЭШ AI fill») without guesswork.
-  try {
+  if (SMESH_DEBUG) try {
     console.log('[СМЭШ AI fill] units:', units.map((u) => ({
       type: u.type, number: u.number, boxes: u.inputs.length,
       els: u.type === 'text' ? u.inputs.slice(0, 6).map(boxInfo) : undefined
@@ -1542,7 +1548,7 @@ function fillTestAnswers(questions) {
     else summary.skipped.push(id);
   });
 
-  try { console.log('[СМЭШ AI fill] result:', summary); } catch { /* */ }
+  dbg('[СМЭШ AI fill] result:', summary);
   // Attach a per-unit diagnostic so the worker can log it from ITS console
   // (the test runs in an iframe, so page-console logs are easy to miss). Cheap;
   // ignored by every existing caller (they read .filled/.skipped only).
@@ -1902,7 +1908,7 @@ async function fillInteractiveAnswers(questions, alreadyFilled) {
       try { ok = await fillInteractiveUnit(unit, q); } catch { ok = false; }
       if (ok) { used.add(unit); out.filled.push(String(id)); }
     }
-    try { console.log('[СМЭШ AI fill] interactive:', out.filled, 'units:', units.map((u) => ({ type: u.type, number: u.number, n: u.els.length }))); } catch { /* */ }
+    if (SMESH_DEBUG) try { console.log('[СМЭШ AI fill] interactive:', out.filled, 'units:', units.map((u) => ({ type: u.type, number: u.number, n: u.els.length }))); } catch { /* */ }
   } catch { /* whole pass is best-effort */ }
   return out;
 }

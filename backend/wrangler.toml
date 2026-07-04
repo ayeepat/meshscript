@@ -7,7 +7,8 @@
 #        npx wrangler kv namespace create LICENSES
 #     Wrangler prints an `id = "…"` — paste it below.
 #  3. Set the secrets (NOT in this file — see backend/README.md):
-#        npx wrangler secret put YOOKASSA_SECRET_KEY
+#        npx wrangler secret put YOOKASSA_SECRET_KEY         # used to CONFIRM each payment server-side
+#        npx wrangler secret put YOOMONEY_NOTIFICATION_SECRET # SHA-1 secret for the YooMoney wallet webhook
 #        npx wrangler secret put ADMIN_SECRET
 #        npx wrangler secret put RESEND_API_KEY              # optional
 #        npx wrangler secret put TELEGRAM_BOT_TOKEN          # optional
@@ -32,8 +33,34 @@ id = "ab3e52d938304a4c909766cb2033834a"
 YOOKASSA_SHOP_ID = ""
 # Email "from" address. Must be a verified sender in your Resend account.
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
-# Default product type issued by /webhook/yookassa for amounts under SUBSCRIPTION_MIN_RUB.
-# Tier B will flip this once we add subscription support — see worker.js.
+# Product type when no pricing threshold below matches (or none is set).
 DEFAULT_LICENSE_TYPE = "lifetime"
 # Anti-abuse: hard cap on how many devices a single license can activate.
 DEVICE_LIMIT = "3"
+
+# ── Pricing → plan (planFromAmount in worker.js) ──────────────────────────────
+# All amounts in RUB, all OPTIONAL. Leave unset to keep everything lifetime.
+#   amount >= LIFETIME_MIN_RUB                     → lifetime (expires_at = null)
+#   SUBSCRIPTION_MIN_RUB <= amount < LIFETIME_MIN  → subscription for SUBSCRIPTION_DAYS
+# Monthly 199₽, lifetime 990₽:
+SUBSCRIPTION_MIN_RUB = "199"
+LIFETIME_MIN_RUB = "990"
+# Subscription length in days (default 30 when unset).
+SUBSCRIPTION_DAYS = "30"
+
+# YooMoney credits `amount` NET of its commission (up to ~3% on card payments),
+# so a buyer paying the exact 199₽/990₽ sticker price arrives slightly below it.
+# The worker grosses the net amount back up by this worst-case fee % before the
+# floor and plan checks (YooMoney webhook only; YooKassa amounts are gross
+# already). Default 5 when unset; clamped to 0–30.
+YOOMONEY_FEE_PCT = "5"
+
+# ── Payment floor (SET THIS BEFORE THE PAY PAGE GOES LIVE) ────────────────────
+# Hard minimum: signed notifications below this amount (fee-adjusted for
+# YooMoney, see YOOMONEY_FEE_PCT) NEVER issue a key (the worker acks 200 and
+# ignores). The YooMoney Quickpay form is plain client-side fields — anyone can
+# resubmit it with sum=1 and their own email in label — so without a floor a 1₽
+# transfer mints a license. Falls back to the lowest plan floor above when
+# unset; with everything unset there is NO floor and the worker logs a warning
+# on every issuance.
+MIN_PAYMENT_RUB = "199"

@@ -19,6 +19,11 @@ import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 import { transcribeAudioFiles } from '../lib/transcribe.js';
 
+// Diagnostic logging. OFF in shipped builds — flip to true to trace attachment
+// downloads and the cross-frame test fill in the service-worker console.
+const DEBUG = false;
+const dbg = (...a) => { if (DEBUG) { try { console.log(...a); } catch { /* no console */ } } };
+
 // Follow-ups re-send prior context. Cap how many MESSAGES we replay: full
 // worked solutions are long, and on a paid provider every re-sent message is
 // money. 8 messages ≈ 4 back-and-forth turns — enough recent context to follow
@@ -458,15 +463,15 @@ function inferMime(name, contentType) {
   return 'application/octet-stream';
 }
 
-async function downloadFile(url, headers) {
+async function downloadFile(url, headers, { credentials = 'include' } = {}) {
   try {
-    const res = await fetch(url, { credentials: 'include', headers });
-    if (!res.ok) { console.log('[СМЭШ AI] download http', res.status, url); return null; }
+    const res = await fetch(url, { credentials, headers });
+    if (!res.ok) { dbg('[СМЭШ AI] download http', res.status, url); return null; }
     // An HTML response is an auth/login redirect, not the attachment — reject it
     // so we never hand the model (or the chat chip) a fake "file".
     const ct = (res.headers.get('content-type') || '').toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      console.log('[СМЭШ AI] download got HTML (auth redirect?)', url);
+      dbg('[СМЭШ AI] download got HTML (auth redirect?)', url);
       return null;
     }
     const buf = await res.arrayBuffer();
@@ -476,12 +481,12 @@ async function downloadFile(url, headers) {
     // while other attachments stay at 12 MB to bound memory / storage.
     const maxBytes = isAudioFile({ name, mimeType }) ? 25 * 1024 * 1024 : 12 * 1024 * 1024;
     if (!buf.byteLength || buf.byteLength > maxBytes) {
-      console.log('[СМЭШ AI] download size skip', buf.byteLength, url);
+      dbg('[СМЭШ AI] download size skip', buf.byteLength, url);
       return null;
     }
-    console.log('[СМЭШ AI] downloaded', name, mimeType, buf.byteLength + 'b');
+    dbg('[СМЭШ AI] downloaded', name, mimeType, buf.byteLength + 'b');
     return { mimeType, dataBase64: abToBase64(buf), name };
-  } catch (e) { console.log('[СМЭШ AI] download exception', String(e), url); return null; }
+  } catch (e) { dbg('[СМЭШ AI] download exception', String(e), url); return null; }
 }
 
 // Reconstruct Mesh's required family-web headers from a bare token. Mirrors the
@@ -516,8 +521,14 @@ async function downloadFiles({ urls = [], headers = null, token = null }) {
   const hdrs = headers || (token ? meshHeadersFromToken(token) : {});
   const files = [];
   for (const url of urls.slice(0, 5)) {
-    // Never hand the Mesh credential to a non-Mesh host (see isMeshHost).
-    const f = await downloadFile(url, isMeshHost(url) ? hdrs : {});
+    // Never hand the Mesh credential to a non-Mesh host (see isMeshHost). Beyond
+    // the explicit X-mes-*/Bearer header set, also withhold the AMBIENT cookie
+    // jar: a stray non-Mesh link in a homework's DOM would otherwise be fetched
+    // with the user's cookies for THAT third party (a confused-deputy fetch that
+    // leaks the user's session/IP). Mesh hosts keep credentials:'include' so the
+    // authed file store still serves the attachment; everyone else gets 'omit'.
+    const mesh = isMeshHost(url);
+    const f = await downloadFile(url, mesh ? hdrs : {}, { credentials: mesh ? 'include' : 'omit' });
     if (f) files.push(f);
   }
   return files;
@@ -718,7 +729,7 @@ async function fillAllFrames(tabId, questions) {
     // scan was removed from this hot path — it ran on every fill across every
     // iframe and contributed to the fill hanging. It stays available as an
     // on-demand global (__smeshDumpBoxes) for deliberate diagnosis only.
-    if (s && s.diag) { try { console.log('[СМЭШ AI fill][frame diag]', JSON.stringify(s.diag)); } catch { /* */ } }
+    if (s && s.diag) dbg('[СМЭШ AI fill][frame diag]', JSON.stringify(s.diag));
   }
 
   // Second pass: fill MathQuill formula boxes via their API in the page's MAIN
