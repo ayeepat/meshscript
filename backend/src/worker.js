@@ -2,7 +2,7 @@
  * СМЭШ AI license backend.
  *
  * Routes:
- *   POST /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
+ *   POST/GET /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
  *   GET  /verify             Extension calls this; returns active|expired|...
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
