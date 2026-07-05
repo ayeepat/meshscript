@@ -23,27 +23,47 @@ const params = new URLSearchParams(location.search);
 const initialSubject = params.get('subject') || '';
 const initialTask = params.get('task') || '';
 const initialDay = params.get('day') || '';
+const initialHomeworkId = params.get('homeworkId') || '';
+const initialHomeworkItemId = params.get('homeworkItemId') || '';
 
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
 const weekEl = document.getElementById('week');
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
-// key -> { key, day, subject, task, sessionId, history: [{role, content}], started, pending }
+// key -> { key, day, subject, task, homeworkId, homeworkItemId, sessionId, history, started, pending }
 const chats = new Map();
 let activeKey = null;
 let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
 
-// Task is part of the key: one subject can have two homeworks in a day.
-const keyFor = (day, subject, task) => `${day || '?'}||${subject}||${(task || '').slice(0, 40)}`;
+function taskPrefix(task, len = 40) {
+  return (task || '').replace(/\s+/g, ' ').trim().slice(0, len);
+}
+
+// Task plus Mesh row ids are part of the key: one subject/lesson can have
+// several homework rows in a day, and their first 40 chars can be similar.
+const keyFor = (day, subject, task, homeworkId = '', homeworkItemId = '') => {
+  const row = homeworkItemId || `${homeworkId || 'noid'}:${taskPrefix(task, 80)}`;
+  return `${day || '?'}||${subject}||${row}`;
+};
 const activeChat = () => chats.get(activeKey);
 
 // The task string scraped into the week can differ from the one passed via the
 // Solve URL by whitespace or truncation. Compare on a normalized 40-char prefix
-// (same granularity as keyFor) so a file the user attached for THIS solve isn't
-// silently dropped over a trivial text mismatch, while still refusing to attach
-// it to an unrelated homework of the same subject.
-const normTask = (t) => (t || '').replace(/\s+/g, ' ').trim().slice(0, 40);
+// only as a fallback when Mesh row ids are missing, so a file the user attached
+// for THIS solve isn't silently dropped over a trivial text mismatch.
+const normTask = (t) => taskPrefix(t, 40);
+
+function sameMeshRow(upload, chat) {
+  if (upload?.homeworkItemId && chat.homeworkItemId) {
+    return String(upload.homeworkItemId) === String(chat.homeworkItemId);
+  }
+  if (upload?.homeworkId && chat.homeworkId) {
+    return String(upload.homeworkId) === String(chat.homeworkId) &&
+      (!upload.task || normTask(upload.task) === normTask(chat.task));
+  }
+  return !upload?.task || normTask(upload.task) === normTask(chat.task);
+}
 
 /* ---------- Minimal safe markdown renderer (no external libs) ---------- */
 
@@ -529,12 +549,12 @@ async function startLesson(chat) {
   try {
     const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
     // Files come from the popup: manually attached OR auto-fetched from Mesh.
-    // Match on subject + day + TASK: a subject can have several homeworks on one
-    // day, and matching on subject alone attached the wrong (or no) file.
+    // Match on Mesh row ids when available, then fall back to task text. A
+    // subject can have several homeworks on one day, sometimes in one lesson.
     const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
     if (pending.length && pendingUpload.subject === chat.subject &&
         (!pendingUpload.day || pendingUpload.day === chat.day) &&
-        (!pendingUpload.task || normTask(pendingUpload.task) === normTask(chat.task))) {
+        sameMeshRow(pendingUpload, chat)) {
       files = pending; // the attachment chip (added by bubble) shows the file
       await chrome.storage.local.remove('pendingUpload');
     }
@@ -824,10 +844,15 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
   const { weekHomework } = await chrome.storage.local.get('weekHomework');
   for (const group of weekHomework?.days || []) {
     for (const item of group.subjects || []) {
-      const key = keyFor(group.day, item.subject, item.task);
+      const key = keyFor(group.day, item.subject, item.task, item.homeworkId, item.homeworkItemId);
       if (!chats.has(key)) {
         chats.set(key, {
-          key, day: group.day, subject: item.subject, task: item.task,
+          key,
+          day: group.day,
+          subject: item.subject,
+          task: item.task,
+          homeworkId: item.homeworkId || '',
+          homeworkItemId: item.homeworkItemId || '',
           sessionId: null, history: [], started: false, pending: false
         });
       }
@@ -841,15 +866,28 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
   if (initialSubject) {
     const all = [...chats.values()];
     const match =
+      (initialHomeworkItemId && all.find((c) =>
+        String(c.homeworkItemId || '') === String(initialHomeworkItemId) &&
+        c.subject === initialSubject
+      )) ||
+      (initialHomeworkId && all.find((c) =>
+        String(c.homeworkId || '') === String(initialHomeworkId) &&
+        c.day === initialDay && c.subject === initialSubject && normTask(c.task) === normTask(initialTask)
+      )) ||
       all.find((c) => c.day === initialDay && c.subject === initialSubject && c.task === initialTask) ||
       all.find((c) => c.subject === initialSubject && c.task === initialTask) ||
       all.find((c) => c.subject === initialSubject);
     if (match) {
       startKey = match.key;
     } else {
-      startKey = keyFor(initialDay, initialSubject, initialTask);
+      startKey = keyFor(initialDay, initialSubject, initialTask, initialHomeworkId, initialHomeworkItemId);
       chats.set(startKey, {
-        key: startKey, day: initialDay, subject: initialSubject, task: initialTask,
+        key: startKey,
+        day: initialDay,
+        subject: initialSubject,
+        task: initialTask,
+        homeworkId: initialHomeworkId,
+        homeworkItemId: initialHomeworkItemId,
         sessionId: null, history: [], started: false, pending: false
       });
     }

@@ -7,8 +7,7 @@
 #        npx wrangler kv namespace create LICENSES
 #     Wrangler prints an `id = "…"` — paste it below.
 #  3. Set the secrets (NOT in this file — see backend/README.md):
-#        npx wrangler secret put YOOKASSA_SECRET_KEY         # used to CONFIRM each payment server-side
-#        npx wrangler secret put YOOMONEY_NOTIFICATION_SECRET # SHA-1 secret for the YooMoney wallet webhook
+#        npx wrangler secret put ROBOKASSA_PASSWORD2         # ResultURL signature password from Robokassa
 #        npx wrangler secret put ADMIN_SECRET
 #        npx wrangler secret put RESEND_API_KEY              # optional
 #        npx wrangler secret put TELEGRAM_BOT_TOKEN          # optional
@@ -29,8 +28,10 @@ id = "ab3e52d938304a4c909766cb2033834a"
 
 # Non-secret config. Override in the Cloudflare dashboard for production.
 [vars]
-# Shop ID is public (YooKassa includes it in every notification). Safe to commit.
-YOOKASSA_SHOP_ID = ""
+# Must match the hash algorithm selected in Robokassa technical settings.
+ROBOKASSA_HASH_ALGO = "MD5"
+# Optional hard IP filter for ResultURL. Signature verification remains required.
+ROBOKASSA_ENFORCE_IP_ALLOWLIST = "false"
 # Email "from" address. Must be a verified sender in your Resend account.
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 # Product type when no pricing threshold below matches (or none is set).
@@ -48,19 +49,9 @@ LIFETIME_MIN_RUB = "990"
 # Subscription length in days (default 30 when unset).
 SUBSCRIPTION_DAYS = "30"
 
-# YooMoney credits `amount` NET of its commission (up to ~3% on card payments),
-# so a buyer paying the exact 199₽/990₽ sticker price arrives slightly below it.
-# The worker grosses the net amount back up by this worst-case fee % before the
-# floor and plan checks (YooMoney webhook only; YooKassa amounts are gross
-# already). Default 5 when unset; clamped to 0–30.
-YOOMONEY_FEE_PCT = "5"
-
 # ── Payment floor (SET THIS BEFORE THE PAY PAGE GOES LIVE) ────────────────────
-# Hard minimum: signed notifications below this amount (fee-adjusted for
-# YooMoney, see YOOMONEY_FEE_PCT) NEVER issue a key (the worker acks 200 and
-# ignores). The YooMoney Quickpay form is plain client-side fields — anyone can
-# resubmit it with sum=1 and their own email in label — so without a floor a 1₽
-# transfer mints a license. Falls back to the lowest plan floor above when
-# unset; with everything unset there is NO floor and the worker logs a warning
-# on every issuance.
+# Hard minimum: signed ResultURL notifications below this amount NEVER issue a
+# key (the worker still returns OK{InvId} so Robokassa does not retry forever).
+# Falls back to the lowest plan floor above when unset; with everything unset
+# there is NO floor and the worker logs a warning on every issuance.
 MIN_PAYMENT_RUB = "199"

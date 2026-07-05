@@ -14,7 +14,7 @@
  *     issued_at: ISO,
  *     expires_at: ISO | null,         // null = never (lifetime)
  *     payment_id: string | null,      // gateway's payment id, for idempotency
- *     gateway: "yookassa" | "tpay" | "manual",
+ *     gateway: "robokassa" | "tpay" | "manual",
  *     amount_rub: number | null,
  *     is_preorder: boolean,
  *     device_ids: string[],           // first-seen UUIDs; capped by DEVICE_LIMIT
@@ -60,7 +60,7 @@ export async function putLicense(env, license) {
 
 /**
  * Idempotent issuance. If a payment_id already produced a license, return that
- * one — protects against YooKassa replays and our own retries.
+ * one — protects against payment gateway replays and our own retries.
  *
  * We index by payment_id in a parallel KV key so the lookup is O(1).
  */

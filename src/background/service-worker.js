@@ -48,7 +48,9 @@ async function openDashboard(payload) {
   const url = chrome.runtime.getURL(
     `src/dashboard/dashboard.html?subject=${encodeURIComponent(payload.subject)}` +
     `&task=${encodeURIComponent(payload.task || '')}` +
-    `&day=${encodeURIComponent(payload.day || '')}`
+    `&day=${encodeURIComponent(payload.day || '')}` +
+    `&homeworkId=${encodeURIComponent(payload.homeworkId || '')}` +
+    `&homeworkItemId=${encodeURIComponent(payload.homeworkItemId || '')}`
   );
   await chrome.tabs.create({ url });
 }

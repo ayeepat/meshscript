@@ -151,16 +151,21 @@ function dayForNode(node, dayHeaders) {
 }
 
 /**
- * For each visible <h6> (Mesh's subject header), build a card:
+ * For each visible <h6> (Mesh's subject header), build cards for EVERY
+ * homework row inside that lesson card:
  *   subject = h6 text
- *   task    = <p> text inside the nearest homework anchor in the same card
- * Falls back to the next non-time <p> if the anchor isn't present.
+ *   task    = <p> text inside each homework anchor
+ * A single lesson can contain several homework rows (Mesh shows "Домашнее
+ * задание 2" and the detail drawer URL gets `sidebar=homeworks_<id>`). Older
+ * code took only `querySelector(...)`, so the popup collapsed two tasks into
+ * one and could attach the wrong file.
  */
 function collectCardsFromDom() {
   const headings = Array.from(document.querySelectorAll('h6')).filter(isVisible);
   if (!headings.length) return null;
 
   const cards = [];
+  const seen = new Set();
   for (const h6 of headings) {
     const subject = normalize(h6.textContent);
     if (!subject) continue;
@@ -177,26 +182,52 @@ function collectCardsFromDom() {
     }
     if (cardRoot === document.body) cardRoot = null;
 
-    let task = '';
-    let href = '';
+    const addCard = (task, href) => {
+      const cleanTask = task || '(текст задания не виден — откройте задание или загрузите фото)';
+      const key = `${subject}||${href || ''}||${cleanTask.slice(0, 120)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      cards.push({
+        h6,
+        subject,
+        task: cleanTask,
+        href,
+        homeworkId: homeworkIdFromHref(href),
+        homeworkItemId: homeworkItemIdFromHref(href)
+      });
+    };
+
+    let cardHasTaskRow = false;
+    let fallbackHref = '';
     if (cardRoot) {
-      const link = cardRoot.querySelector(HOMEWORK_ANCHOR_SEL);
-      if (link) {
-        href = link.getAttribute('href') || '';
-        // Prefer the FIRST <p> inside the anchor (the visible task text).
+      const links = Array.from(cardRoot.querySelectorAll(HOMEWORK_ANCHOR_SEL)).filter(isVisible);
+      for (const link of links) {
+        const href = link.getAttribute('href') || '';
+        if (href && !fallbackHref) fallbackHref = href;
+        let task = '';
+        // Prefer the first <p> inside this anchor (the visible row text).
         // Skip empty <p> wrappers Mesh sometimes emits around the text.
         const ps = link.querySelectorAll('p');
         for (const p of ps) {
           const t = normalize(p.textContent);
           if (t && !TIME_RE.test(t)) { task = t; break; }
         }
+        if (!task) {
+          const t = normalize(link.textContent);
+          if (t && !TIME_RE.test(t) && !isNoise(t)) task = t;
+        }
+        if (task) {
+          addCard(task, href);
+          cardHasTaskRow = true;
+        }
       }
     }
 
     // Last-resort fallback: walk forward siblings of the h6 looking for the
     // next non-time <p> text. Helps if Mesh ships a card without the anchor.
-    if (!task) {
+    if (!cardHasTaskRow && !cards.some((c) => c.h6 === h6)) {
       let sib = h6.nextElementSibling;
+      let task = '';
       let scanned = 0;
       while (sib && !task && scanned < 8) {
         if (sib.tagName === 'P') {
@@ -212,15 +243,8 @@ function collectCardsFromDom() {
         sib = sib.nextElementSibling;
         scanned++;
       }
+      addCard(task, fallbackHref);
     }
-
-    cards.push({
-      h6,
-      subject,
-      task: task || '(текст задания не виден — откройте задание или загрузите фото)',
-      href,
-      homeworkId: homeworkIdFromHref(href)
-    });
   }
   return cards;
 }
@@ -229,6 +253,18 @@ function collectCardsFromDom() {
 function homeworkIdFromHref(href) {
   const m = (href || '').match(/\/homeworks\/(\d+)/);
   return m ? m[1] : null;
+}
+
+/** Pull the row-specific homework id from Mesh's detail-drawer query param. */
+function homeworkItemIdFromHref(href) {
+  const raw = href || '';
+  let m = raw.match(/[?&]sidebar=homeworks_(\d+)/);
+  if (m) return m[1];
+  try {
+    const u = new URL(raw, location.href);
+    m = (u.searchParams.get('sidebar') || '').match(/^homeworks_(\d+)$/);
+    return m ? m[1] : null;
+  } catch { return null; }
 }
 
 function scanFromDom() {
@@ -242,7 +278,11 @@ function scanFromDom() {
     const key = day || '__nodate__';
     if (!byDay.has(key)) byDay.set(key, { day, subjects: [] });
     byDay.get(key).subjects.push({
-      subject: c.subject, task: c.task, href: c.href, homeworkId: c.homeworkId
+      subject: c.subject,
+      task: c.task,
+      href: c.href,
+      homeworkId: c.homeworkId,
+      homeworkItemId: c.homeworkItemId
     });
   }
 
@@ -378,7 +418,7 @@ function scanFromText() {
  * `student_id` lives in localStorage. The attachment files themselves are
  * served from the SAME origin (school.mos.ru/ej/attachments/...).
  */
-const FILE_URL_RE = /https?:\/\/[^\s"'<>]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|gif|webp|txt|rtf)(?:\?[^\s"'<>]*)?/i;
+const FILE_URL_RE = /https?:\/\/[^\s"'<>]+\.(?:pdf|docx?|pptx?|xlsx?|png|jpe?g|gif|webp|txt|rtf|mp3|mpga|m4a|wav|ogg|oga|opus|flac|aac)(?:\?[^\s"'<>]*)?/i;
 const MESH_FILE_HINT_RE = /(uchebnik\.mos\.ru|\/ej\/attachments?\/|\/files?\/|\/storage\/|file_id=)/i;
 
 const LESSON_API = (id, studentId, personId) => {
@@ -511,22 +551,108 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
  * made results flaky. Match the homework whose text matches the card task and
  * take ONLY its files; fall back to the whole lesson if nothing matches.
  */
-function urlsForHomework(json, taskText) {
-  const homeworks = Array.isArray(json?.lesson_homeworks) ? json.lesson_homeworks : [];
-  const norm = (s) => (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-  const t = norm(taskText);
-  let scope = homeworks;
-  if (t && homeworks.length > 1) {
-    const match = homeworks.filter((h) => {
-      const hw = norm(h.homework);
-      return hw && (hw.includes(t.slice(0, 25)) || t.includes(hw.slice(0, 25)));
-    });
-    if (match.length) scope = match;
+function idLooksLike(value, targetId) {
+  if (!targetId || value == null) return false;
+  const s = String(value);
+  return s === String(targetId) || s.includes(`homeworks_${targetId}`);
+}
+
+function homeworkHasItemId(node, targetId, depth = 0) {
+  if (!targetId || !node || depth > 5) return false;
+  if (Array.isArray(node)) return node.some((v) => homeworkHasItemId(v, targetId, depth + 1));
+  if (typeof node !== 'object') return idLooksLike(node, targetId);
+  for (const [key, value] of Object.entries(node)) {
+    if (/id|guid|url|href|link|sidebar/i.test(key) && idLooksLike(value, targetId)) return true;
+    if (value && typeof value === 'object' && homeworkHasItemId(value, targetId, depth + 1)) return true;
   }
+  return false;
+}
+
+function normMatchText(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function textMatchScore(a, b) {
+  const left = normMatchText(a);
+  const right = normMatchText(b);
+  if (!left || !right) return 0;
+  if (left.includes(right.slice(0, 40)) || right.includes(left.slice(0, 40))) return 100;
+  const aTokens = new Set(left.split(' ').filter((w) => w.length > 2));
+  const bTokens = right.split(' ').filter((w) => w.length > 2);
+  if (!aTokens.size || !bTokens.length) return 0;
+  let hits = 0;
+  for (const token of bTokens) if (aTokens.has(token)) hits++;
+  return hits / Math.max(aTokens.size, bTokens.length);
+}
+
+function homeworkText(h) {
+  return normalize(h?.homework || h?.description || h?.text || h?.name || h?.title || '');
+}
+
+function urlsRelevantToTask(urls, taskText) {
+  const task = normMatchText(taskText);
+  if (!task) return [];
+  const taskTokens = new Set(task.split(' ').filter((w) => w.length > 2));
+  const taskNums = new Set((task.match(/\d+/g) || []));
+  return urls.filter((url) => {
+    const name = normMatchText(fileNameFromUrl(url));
+    if (!name) return false;
+    const nameTokens = name.split(' ').filter((w) => w.length > 2);
+    const tokenHit = nameTokens.some((w) => taskTokens.has(w));
+    const nums = name.match(/\d+/g) || [];
+    const numberHit = nums.length && nums.some((n) => taskNums.has(n));
+    return tokenHit || numberHit;
+  });
+}
+
+function urlsForHomework(json, taskText, homeworkItemId) {
+  const homeworks = Array.isArray(json?.lesson_homeworks) ? json.lesson_homeworks : [];
+  const allLessonUrls = [...collectFileUrls(json)];
+  let scope = homeworks;
+  let matchedSpecificHomework = false;
+
+  if (homeworkItemId && homeworks.length) {
+    const byId = homeworks.filter((h) => homeworkHasItemId(h, homeworkItemId));
+    if (byId.length) {
+      scope = byId;
+      matchedSpecificHomework = true;
+    }
+  }
+
+  if (!matchedSpecificHomework && taskText && homeworks.length > 1) {
+    let bestScore = 0;
+    let best = [];
+    for (const h of homeworks) {
+      const score = textMatchScore(homeworkText(h), taskText);
+      if (score > bestScore) { bestScore = score; best = [h]; }
+      else if (score && score === bestScore) best.push(h);
+    }
+    if (bestScore >= 0.35 || bestScore >= 8) {
+      scope = best;
+      matchedSpecificHomework = true;
+    }
+  }
+
   const out = new Set();
   for (const h of scope) collectFileUrls(h, out);
-  // Matched homework had no file? Widen to the whole lesson (kr_attachments etc.).
-  if (!out.size) collectFileUrls(json, out);
+  // If the row matched but Mesh put the attachment at lesson level
+  // (kr_attachments / shared materials), only borrow URLs whose filename
+  // clearly points at this task. That keeps "Задание 1" from stealing the PDF
+  // belonging to "Задание 2".
+  if (!out.size && matchedSpecificHomework) {
+    for (const url of urlsRelevantToTask(allLessonUrls, taskText)) out.add(url);
+  }
+  // No specific row was matched: fall back to the whole lesson. With one
+  // homework row this is safe; with several rows it is still better than
+  // returning nothing when Mesh's API omitted row ids.
+  if (!out.size && !matchedSpecificHomework) {
+    for (const url of allLessonUrls) out.add(url);
+  }
   return [...out];
 }
 
@@ -575,6 +701,34 @@ const isSameOrigin = (url) => {
   try { return new URL(url, location.href).origin === location.origin; } catch { return false; }
 };
 
+const EXT_MIME = {
+  pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg',
+  gif: 'image/gif', webp: 'image/webp', bmp: 'image/bmp',
+  txt: 'text/plain', csv: 'text/csv', rtf: 'application/rtf', md: 'text/markdown',
+  mp3: 'audio/mpeg', mpga: 'audio/mpeg', m4a: 'audio/mp4', wav: 'audio/wav',
+  ogg: 'audio/ogg', oga: 'audio/ogg', opus: 'audio/opus', flac: 'audio/flac', aac: 'audio/aac',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+};
+
+function inferMime(name, contentType) {
+  const ct = (contentType || '').split(';')[0].trim().toLowerCase();
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  if (EXT_MIME[ext]) return EXT_MIME[ext];
+  if (ct && ct !== 'application/octet-stream' && ct !== 'binary/octet-stream') return ct;
+  return 'application/octet-stream';
+}
+
+function isAudioAttachment(name, mimeType) {
+  const ext = (name.split('.').pop() || '').toLowerCase();
+  return (mimeType || '').startsWith('audio/') ||
+    ['mp3', 'mpga', 'm4a', 'wav', 'ogg', 'oga', 'opus', 'flac', 'aac'].includes(ext);
+}
+
 /**
  * Download a SAME-ORIGIN attachment from inside the page. The content script
  * carries the user's real session cookies, so school.mos.ru/ej/attachments
@@ -591,8 +745,11 @@ async function fetchInlineFile(url) {
       dbg('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
       return { __auth: true };
     }
+    const name = fileNameFromUrl(url);
     const blob = await res.blob();
-    if (!blob.size || blob.size > 12 * 1024 * 1024) return null;
+    const mimeType = inferMime(name, ct || blob.type);
+    const maxBytes = isAudioAttachment(name, mimeType) ? 25 * 1024 * 1024 : 12 * 1024 * 1024;
+    if (!blob.size || blob.size > maxBytes) return null;
     const dataUrl = await new Promise((resolve, reject) => {
       const r = new FileReader();
       r.onload = () => resolve(r.result);
@@ -600,9 +757,9 @@ async function fetchInlineFile(url) {
       r.readAsDataURL(blob);
     });
     return {
-      mimeType: ct || blob.type || 'application/octet-stream',
+      mimeType,
       dataBase64: String(dataUrl).split(',')[1],
-      name: fileNameFromUrl(url)
+      name
     };
   } catch (e) { dbg('[СМЭШ AI] cs-download exception', String(e), url); return null; }
 }
@@ -618,7 +775,7 @@ async function fetchInlineFile(url) {
  * leftover cross-origin ones for the service worker.
  * @returns {Promise<{ok:boolean, files:object[], urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
  */
-async function listMaterialUrls(lessonId, taskText) {
+async function listMaterialUrls(lessonId, taskText, homeworkItemId) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => dbg('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
@@ -640,7 +797,7 @@ async function listMaterialUrls(lessonId, taskText) {
         log('api_error', res.status);
         return { ok: false, files: [], urls: [], token, headers, stage: 'api_error', status: res.status };
       }
-      urls = urlsForHomework(await res.json(), taskText).slice(0, 5);
+      urls = urlsForHomework(await res.json(), taskText, homeworkItemId).slice(0, 5);
       stage = urls.length ? 'found_api' : 'no_urls';
     } catch (e) {
       log('exception', String(e));
@@ -2053,7 +2210,7 @@ if (!window.__smeshListenerAdded) {
         // Async: keep the channel open until the API call resolves. Only
         // discovers URLs — the service worker downloads them (see comment above
         // listMaterialUrls for the MV3 CORS reason).
-        listMaterialUrls(msg.homeworkId, msg.task)
+        listMaterialUrls(msg.homeworkId, msg.task, msg.homeworkItemId)
           .then((r) => sendResponse(r))
           .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], token: null }));
         return true;

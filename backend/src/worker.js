@@ -2,8 +2,7 @@
  * СМЭШ AI license backend.
  *
  * Routes:
- *   POST /webhook/yookassa   YooKassa notification, auto-issues a license
- *   POST /webhook/yoomoney   YooMoney wallet notification, auto-issues a license
+ *   POST /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
  *   GET  /verify             Extension calls this; returns active|expired|...
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
@@ -16,8 +15,7 @@
  */
 
 import { issueLicense, verifyLicense, getLicense, putLicense, normalizeKey } from './licenses.js';
-import { isYookassaIp, checkBasicAuth, parseNotification, verifyPayment } from './gateways/yookassa.js';
-import * as yoomoney from './gateways/yoomoney.js';
+import * as robokassa from './gateways/robokassa.js';
 import { sendLicenseEmail } from './delivery/email.js';
 import { sendLicenseTelegram } from './delivery/telegram.js';
 import { processSupportUpdate } from './delivery/support.js';
@@ -48,8 +46,9 @@ export default {
       if (path === '/health') return json({ ok: true });
 
       if (path === '/verify' && method === 'GET') return await handleVerify(request, env);
-      if (path === '/webhook/yookassa' && method === 'POST') return await handleYookassa(request, env, ctx);
-      if (path === '/webhook/yoomoney' && method === 'POST') return await handleYoomoney(request, env, ctx);
+      if (path === '/webhook/robokassa' && (method === 'POST' || method === 'GET')) {
+        return await handleRobokassa(request, env, ctx);
+      }
 
       if (path === '/admin/issue' && method === 'POST') return await handleAdminIssue(request, env);
       if (path === '/admin/revoke' && method === 'POST') return await handleAdminRevoke(request, env);
@@ -203,138 +202,60 @@ async function handleTelegramDebug(request, env) {
   return json({ ok: true, last: last ? JSON.parse(last) : null });
 }
 
-/* -------------------------- /webhook/yookassa ------------------------ */
+/* ------------------------- /webhook/robokassa ------------------------ */
 
-async function handleYookassa(request, env, ctx) {
-  // YooKassa expects a 200 within ~10 seconds, otherwise it retries. The
-  // delivery I/O (email + Telegram) can be slow, so it's run after the
-  // response goes out via ctx.waitUntil.
+async function handleRobokassa(request, env, ctx) {
+  // Robokassa expects the ResultURL handler to return plain "OK{InvId}" after
+  // a valid notification. Delivery I/O (email + Telegram) can be slow, so it
+  // runs after the response goes out via ctx.waitUntil.
   const ip = request.headers.get('cf-connecting-ip') || '';
-  if (!isYookassaIp(ip)) {
-    console.warn('yookassa: rejected ip', ip);
+  if (robokassa.shouldEnforceIpAllowlist(env) && !robokassa.isRobokassaIp(ip)) {
+    console.warn('robokassa: rejected ip', ip);
     return error(403, 'forbidden');
   }
-  if (!checkBasicAuth(request, env)) {
-    console.warn('yookassa: bad basic auth');
-    return error(401, 'unauthorized');
+
+  let fields;
+  try { fields = await robokassa.readResultFields(request); }
+  catch {
+    return error(400, 'bad_form');
   }
 
-  let payload;
-  try { payload = await request.json(); }
-  catch { return error(400, 'bad_json'); }
-
-  const parsed = parseNotification(payload);
-  // Non-actionable events (canceled, refunded) — ack 200 so YooKassa stops
-  // retrying. Refund handling will live in a future revision.
-  if (!parsed) return json({ ok: true, ignored: true });
-
-  // Sanity guard: never auto-issue if the order page didn't carry an email
-  // OR a telegram_user_id through metadata. Without either we have no
-  // delivery channel.
-  if (!parsed.email && !parsed.telegram_user_id) {
-    console.error('yookassa: payment without delivery contact', parsed.payment_id);
-    return json({ ok: true, ignored: true, note: 'no_contact' });
-  }
-
-  // Don't trust the amount/status in the webhook body — confirm the payment
-  // server-side against YooKassa's API before issuing (see verifyPayment).
-  // Falls back to the notification amount only when shop creds aren't set.
-  const confirmed = await verifyPayment(env, parsed.payment_id);
-  if (!confirmed.ok) {
-    console.error('yookassa: payment verification failed', parsed.payment_id, confirmed.reason);
-    return error(400, 'payment_unverified');
-  }
-  if (confirmed.skipped) console.warn('yookassa: issuing WITHOUT server-side verification (set YOOKASSA_SHOP_ID + YOOKASSA_SECRET_KEY)');
-  const amountRub = confirmed.skipped ? parsed.amount_rub : confirmed.amount_rub;
-
-  const floor = minPaymentRub(env);
-  if (floor > 0 && amountRub < floor) {
-    console.warn('yookassa: amount below floor, not issuing', parsed.payment_id, amountRub);
-    return json({ ok: true, ignored: true, note: 'amount_below_min' });
-  }
-
-  // Decide product (lifetime vs a fixed-length subscription) from the confirmed
-  // amount. Defaults keep everything lifetime unless SUBSCRIPTION_* is set.
-  const plan = planFromAmount(env, amountRub);
-  if (!plan) return json({ ok: true, ignored: true, note: 'amount_below_plan' });
-  const isPreorder = isPreorderNow();
-
-  const license = await issueLicense(env, {
-    gateway: 'yookassa',
-    payment_id: parsed.payment_id,
-    email: parsed.email,
-    telegram_user_id: parsed.telegram_user_id,
-    type: plan.type,
-    expires_at: plan.expires_at,
-    amount_rub: amountRub,
-    is_preorder: isPreorder
-  });
-
-  ctx.waitUntil(deliverKey(env, license, isPreorder));
-  return json({ ok: true, key_issued: true });
-}
-
-/* -------------------------- /webhook/yoomoney ------------------------ */
-
-async function handleYoomoney(request, env, ctx) {
-  // YooMoney posts application/x-www-form-urlencoded. There is no stable IP
-  // range to allowlist, so the SHA-1 signature is the ONLY authenticity gate —
-  // verify it first and fail closed on any mismatch or unset secret.
-  let form;
-  try { form = await request.formData(); }
-  catch { return error(400, 'bad_form'); }
-
-  const fields = yoomoney.parseForm(form);
-  const signed = await yoomoney.verifyNotification(fields, env.YOOMONEY_NOTIFICATION_SECRET);
-  if (!signed) {
-    console.warn('yoomoney: bad signature', fields.operation_id || '(no id)');
+  const signed = await robokassa.verifyResultSignature(fields, env.ROBOKASSA_PASSWORD2, env.ROBOKASSA_HASH_ALGO);
+  if (!signed.ok) {
+    console.warn('robokassa: bad signature', signed.reason, robokassa.invoiceId(fields) || '(no invoice)');
     return error(403, 'bad_signature');
   }
 
-  const n = yoomoney.normalize(fields);
-  // Signed but not fulfillable (test ping, protected/unaccepted payment, wrong
-  // currency): ack 200 so YooMoney stops retrying, but don't issue.
-  if (!n.ok) return json({ ok: true, ignored: true, note: n.reason });
+  const n = robokassa.normalizeResult(fields);
+  if (!n.ok) {
+    console.warn('robokassa: invalid signed notification', n.reason);
+    return error(400, n.reason);
+  }
 
-  // YooMoney's `amount` is credited NET of its commission (up to ~3% on card
-  // payments), so a buyer who pays exactly the 199₽/990₽ sticker price arrives
-  // BELOW it (~193₽/~960₽) — failing the floor (paid but no key) or demoting a
-  // lifetime purchase to a subscription. Gross the net amount back up by the
-  // worst-case fee before the floor and plan checks; the license record keeps
-  // the real net amount. (`withdraw_amount` carries the gross figure but is NOT
-  // covered by the SHA-1 signature, so it can't be trusted for this decision.)
-  const feePct = Math.min(Math.max(Number(env.YOOMONEY_FEE_PCT ?? 5), 0), 30);
-  const grossRub = n.amount_rub / (1 - feePct / 100);
-
-  // The Quickpay form's receiver/sum/label are plain client-side fields: anyone
-  // can resubmit the form with sum=1 and their own email in label, and YooMoney
-  // signs that notification like any real payment. The floor is what makes a
-  // signed payment a purchase — below it we ack without issuing.
   const floor = minPaymentRub(env);
-  if (floor > 0 && grossRub < floor) {
-    console.warn('yoomoney: amount below floor, not issuing', n.payment_id, n.amount_rub);
-    return json({ ok: true, ignored: true, note: 'amount_below_min' });
+  if (floor > 0 && n.amount_rub < floor) {
+    console.warn('robokassa: amount below floor, not issuing', n.payment_id, n.amount_rub);
+    return robokassa.okResponse(n.invoice_id);
   }
-  if (floor <= 0) console.warn('yoomoney: NO payment floor configured — set MIN_PAYMENT_RUB or any signed amount (1₽) issues a license');
+  if (floor <= 0) console.warn('robokassa: NO payment floor configured — set MIN_PAYMENT_RUB or any paid amount can issue a license');
 
-  // The order page threads the buyer's contact through `label`. Resolve it to
-  // an email and/or a telegram_user_id (order-id lookup supported too).
-  const contact = await resolveYoomoneyContact(env, n.label);
+  // The order page should thread signed delivery data through Shp_* params, or
+  // pre-register order:<InvId> in KV. EMail from Robokassa is a last fallback.
+  const contact = await resolveRobokassaContact(env, fields, n.invoice_id);
   if (!contact.email && !contact.telegram_user_id) {
-    console.error('yoomoney: payment without delivery contact', n.payment_id);
-    return json({ ok: true, ignored: true, note: 'no_contact' });
+    console.error('robokassa: payment without delivery contact', n.payment_id);
+    return robokassa.okResponse(n.invoice_id);
   }
 
-  // Same null guard as the YooKassa handler: an amount that clears the hard
-  // floor but no plan threshold is not a purchase — ack without issuing (a
-  // thrown `plan.type` here would 500 and put YooMoney into a retry loop).
-  const plan = planFromAmount(env, grossRub);
-  if (!plan) return json({ ok: true, ignored: true, note: 'amount_below_plan' });
+  // An amount that clears the hard floor but no plan threshold is not a
+  // purchase — ack without issuing so Robokassa does not retry forever.
+  const plan = planFromAmount(env, n.amount_rub);
+  if (!plan) return robokassa.okResponse(n.invoice_id);
   const isPreorder = isPreorderNow();
 
   const license = await issueLicense(env, {
-    gateway: 'yoomoney',
-    payment_id: n.payment_id,     // operation_id → idempotent, replay-safe
+    gateway: 'robokassa',
+    payment_id: n.payment_id,     // InvId must be unique per order
     email: contact.email,
     telegram_user_id: contact.telegram_user_id,
     type: plan.type,
@@ -344,31 +265,49 @@ async function handleYoomoney(request, env, ctx) {
   });
 
   ctx.waitUntil(deliverKey(env, license, isPreorder));
-  return json({ ok: true, key_issued: true });
+  return robokassa.okResponse(n.invoice_id);
 }
 
 /**
- * Resolve the delivery contact from a YooMoney `label`. Two supported shapes:
- *  - a bare email  ("student@example.com")  → deliver there directly;
- *  - an order id you registered on the pay page → look up `order:<id>` in KV,
- *    which the order page wrote as { email, telegram_user_id } (short TTL).
- * A label that is neither yields no contact and the caller acks-without-issuing.
+ * Resolve the delivery contact from Robokassa ResultURL fields. Prefer signed
+ * Shp_* fields, then an order record in KV, then Robokassa's EMail fallback.
  */
-async function resolveYoomoneyContact(env, label) {
-  const raw = (label || '').trim();
-  if (!raw) return {};
-  if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw)) return { email: raw, telegram_user_id: null };
+async function resolveRobokassaContact(env, fields, invoiceId) {
+  const email = cleanEmail(fields.Shp_email) || cleanEmail(fields.Shp_Email);
+  const telegram_user_id = cleanTelegramUserId(fields.Shp_telegram_user_id || fields.Shp_tg_user_id);
+  const orderId = cleanOrderId(fields.Shp_order_id || fields.Shp_order || invoiceId);
+  let stored = {};
+
   try {
-    const stored = await env.LICENSES.get(`order:${raw}`);
-    if (stored) {
-      const o = JSON.parse(stored);
-      return {
-        email: typeof o.email === 'string' ? o.email : null,
-        telegram_user_id: o.telegram_user_id ? Number(o.telegram_user_id) : null
+    const raw = orderId ? await env.LICENSES.get(`order:${orderId}`) : null;
+    if (raw) {
+      const o = JSON.parse(raw);
+      stored = {
+        email: cleanEmail(o.email),
+        telegram_user_id: cleanTelegramUserId(o.telegram_user_id)
       };
     }
   } catch { /* not JSON / not found */ }
-  return {};
+
+  return {
+    email: email || stored.email || cleanEmail(fields.EMail) || cleanEmail(fields.Email),
+    telegram_user_id: telegram_user_id || stored.telegram_user_id || null
+  };
+}
+
+function cleanEmail(value) {
+  const raw = typeof value === 'string' ? value.trim() : '';
+  return /^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(raw) ? raw : null;
+}
+
+function cleanTelegramUserId(value) {
+  const n = Number(value);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+function cleanOrderId(value) {
+  const raw = value == null ? '' : String(value).trim();
+  return /^[A-Za-z0-9._:-]{1,128}$/.test(raw) ? raw : '';
 }
 
 /**

@@ -28,8 +28,9 @@ if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 // tolerates null and falls back to the values built into this release.
 let runtimeConfig = null;
 
-const uploads = {}; // `${day}||${subject}` -> [{mimeType, dataBase64, name}, ...]
+const uploads = {}; // per-card upload key -> [{mimeType, dataBase64, name}, ...]
 const autoFetched = new Set(); // upKeys we've already auto-pulled from Mesh
+const autoFetchFailures = new Map(); // upKey -> visible Russian reason
 
 // Upload buttons of the current render, in card order, so the async Groq
 // classification can refine their labels after the instant regex pass.
@@ -79,7 +80,16 @@ function refineDropLabels() {
         const card = drops[i];
         if (!card) return;
         setDropKind(card.drop, kind);
-        if (kind === 'attachment') card.fetchPromise = card.fetchPromise || tryAutoFetch(card);
+        if (kind === 'attachment') {
+          if (card.fetchPromise) {
+            card.fetchPromise = card.fetchPromise.then((ok) => {
+              if (!ok) showStoredAutoFetchFailure(card);
+              return ok;
+            });
+          } else {
+            card.fetchPromise = startAutoFetch(card);
+          }
+        }
       });
     }
   );
@@ -128,15 +138,33 @@ function sendToBackground(msg) {
  * On success the drop shows the file as already attached, so the user never
  * leaves the page to download it.
  */
-async function tryAutoFetch(card) {
-  const { homeworkId, upKey, drop } = card;
-  if (!homeworkId || autoFetched.has(upKey) || uploads[upKey]?.length) return;
+async function tryAutoFetch(card, { quiet = false } = {}) {
+  const { homeworkId, homeworkItemId, upKey, drop } = card;
+  if (uploads[upKey]?.length) return true;
+  if (!homeworkId) {
+    autoFetchFailures.set(upKey, 'нет id задания');
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
+  if (autoFetched.has(upKey)) {
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
   autoFetched.add(upKey);
   const tab = await getActiveTab();
-  if (!tab?.id) return;
-  setDropLoading(drop, 'Ищу файл в МЭШ…');
+  if (!tab?.id) {
+    autoFetchFailures.set(upKey, 'нет вкладки МЭШ');
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
+  if (!quiet) setDropLoading(drop, 'Ищу файл в МЭШ…');
 
-  const found = await sendToContent(tab.id, { type: 'MESH_LIST_MATERIALS', homeworkId, task: card.task });
+  const found = await sendToContent(tab.id, {
+    type: 'MESH_LIST_MATERIALS',
+    homeworkId,
+    homeworkItemId,
+    task: card.task
+  });
   // Same-origin attachments are already downloaded by the content script; any
   // cross-origin URLs come back for the service worker to fetch.
   let files = found?.files || [];
@@ -149,9 +177,11 @@ async function tryAutoFetch(card) {
   }
 
   if (files.length) {
+    if (uploads[upKey]?.length) return true;
+    autoFetchFailures.delete(upKey);
     uploads[upKey] = files;
     setDropAttached(drop, files);
-    return;
+    return true;
   }
 
   // Nothing usable — surface WHY so it's debuggable, then fall back to manual
@@ -166,7 +196,22 @@ async function tryAutoFetch(card) {
     download_failed: 'не скачалось',
     exception: 'ошибка запроса'
   }[found?.stage] || 'не найдено';
-  setDropAttachFallback(drop, why);
+  autoFetchFailures.set(upKey, why);
+  if (!quiet) showStoredAutoFetchFailure(card);
+  return false;
+}
+
+function startAutoFetch(card, opts = {}) {
+  return tryAutoFetch(card, opts).catch(() => {
+    autoFetchFailures.set(card.upKey, 'ошибка запроса');
+    if (!opts.quiet) showStoredAutoFetchFailure(card);
+    return false;
+  });
+}
+
+function showStoredAutoFetchFailure(card) {
+  if (uploads[card.upKey]?.length) return;
+  setDropAttachFallback(card.drop, autoFetchFailures.get(card.upKey) || 'не найдено');
 }
 
 // Restore the manual upload prompt, but append the auto-fetch failure reason so
@@ -195,8 +240,9 @@ async function runFetchDiag(btn) {
   const seen = new Set();
   const results = [];
   for (const c of cardDrops) {
-    if (!c.homeworkId || seen.has(c.homeworkId)) continue;
-    seen.add(c.homeworkId);
+    const diagKey = `${c.homeworkId || ''}:${c.homeworkItemId || (c.task || '').slice(0, 60)}`;
+    if (!c.homeworkId || seen.has(diagKey)) continue;
+    seen.add(diagKey);
     const resp = await sendToContent(tab.id, { type: 'MESH_DEBUG_FETCH', homeworkId: c.homeworkId });
     results.push({
       subject: c.subject,
@@ -263,14 +309,14 @@ function buildCard(day, item) {
   card.querySelector('.task').textContent = item.task;
   const row = card.querySelector('.row');
 
-  // Audio can NEVER be solved by this tool (no transcription). Warn up front so
-  // the student doesn't trust an invented listening answer — the solver guard
-  // refuses it too, this is just the visible heads-up.
+  // Listening needs real audio or a transcript. Attached audio can be
+  // transcribed by the solver; bare Google Drive links still need the user to
+  // send the clip/transcript because we cannot reliably fetch private Drive.
   if (needsAudio(item.task)) {
     const note = document.createElement('div');
     note.className = 'audionote';
     note.innerHTML = iconSvg('headphones', 14);
-    note.append('Аудирование не решается — пришлите текст/расшифровку записи. Остальное решу.');
+    note.append('Для аудирования нужен аудиофайл или расшифровка. Если файл приложен в МЭШ, попробую подтянуть его сам.');
     card.querySelector('.task').after(note);
   }
 
@@ -279,7 +325,9 @@ function buildCard(day, item) {
   // made them share/overwrite each other's uploads — the source of the
   // "sometimes the file is there, sometimes not" bug. Add the homework id (or
   // task) so every card owns its own attachment slot.
-  const upKey = `${day || '?'}||${item.subject}||${item.homeworkId || (item.task || '').slice(0, 40)}`;
+  const rowKey = item.homeworkItemId ||
+    `${item.homeworkId || 'noid'}:${(item.task || '').replace(/\s+/g, ' ').trim().slice(0, 80)}`;
+  const upKey = `${day || '?'}||${item.subject}||${rowKey}`;
 
   const solveBtn = document.createElement('button');
   solveBtn.className = 'solve';
@@ -291,11 +339,29 @@ function buildCard(day, item) {
     // Hand any attached files (manual or auto-fetched) to the dashboard. Include
     // the task so the dashboard matches THIS homework, not another same-subject one.
     if (uploads[upKey]?.length) {
-      await chrome.storage.local.set({ pendingUpload: { day, subject: item.subject, task: item.task, files: uploads[upKey] } });
+      await chrome.storage.local.set({
+        pendingUpload: {
+          day,
+          subject: item.subject,
+          task: item.task,
+          homeworkId: item.homeworkId,
+          homeworkItemId: item.homeworkItemId,
+          files: uploads[upKey]
+        }
+      });
     } else {
       await chrome.storage.local.remove('pendingUpload'); // drop stale leftovers
     }
-    chrome.runtime.sendMessage({ type: 'OPEN_DASHBOARD', payload: { subject: item.subject, task: item.task, day } });
+    chrome.runtime.sendMessage({
+      type: 'OPEN_DASHBOARD',
+      payload: {
+        subject: item.subject,
+        task: item.task,
+        day,
+        homeworkId: item.homeworkId,
+        homeworkItemId: item.homeworkItemId
+      }
+    });
   };
   row.appendChild(solveBtn);
 
@@ -307,14 +373,24 @@ function buildCard(day, item) {
   drop.innerHTML = '<span class="dropicon"></span><span class="droplabel"></span>';
   const firstKind = classifyTask(item.task).kind;
   setDropKind(drop, firstKind);
-  const cardObj = { task: item.task, subject: item.subject, drop, homeworkId: item.homeworkId, upKey, fetchPromise: null };
+  const cardObj = {
+    task: item.task,
+    subject: item.subject,
+    drop,
+    homeworkId: item.homeworkId,
+    homeworkItemId: item.homeworkItemId,
+    upKey,
+    fetchPromise: null
+  };
   cardDrops.push(cardObj);
-  // Attachment tasks: try to pull the file straight from Mesh right away. Keep
-  // the promise so a Solve click can await it (see solveBtn.onclick).
-  if (firstKind === 'attachment') cardObj.fetchPromise = tryAutoFetch(cardObj);
+  // Try to pull the file straight from Mesh for every homework row. Teachers
+  // don't always write "файл" in the text, so attachment detection must not
+  // depend on wording. Non-file-looking tasks do this quietly and leave the UI
+  // alone if Mesh has nothing attached.
+  if (item.homeworkId) cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
   const input = document.createElement('input');
   input.type = 'file';
-  input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*';
+  input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*,audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.aac';
   input.style.display = 'none';
   const setFile = async (file) => {
     uploads[upKey] = [await fileToInline(file)];
