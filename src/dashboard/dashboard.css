@@ -144,6 +144,34 @@ body {
 }
 .msg.assistant:hover .copybtn { opacity: 1; }
 .msg.assistant .copybtn:hover { background: var(--accent); color: var(--on-accent); }
+
+/* A failed solve ("Ошибка: …") gets a retry button next to the copy button.
+   Unlike copybtn it stays visible without hover — a broken answer is worth
+   surfacing immediately, not just on discovery. */
+.msg.assistant.errored { padding-right: 78px; }
+.msg.assistant .retrybtn {
+  position: absolute; top: 9px; right: 43px;
+  width: 28px; height: 28px; border-radius: var(--r-sm);
+  border: 1px solid transparent; cursor: pointer;
+  background: var(--warn-soft); color: var(--warn);
+  display: grid; place-items: center;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.msg.assistant .retrybtn:hover { background: var(--warn); color: var(--on-accent); }
+/* ---------- Toast (brief heads-up, e.g. "PDF may take longer") ---------- */
+.toast {
+  position: fixed; left: 50%; top: 78px; z-index: 50;
+  transform: translate(-50%, -10px);
+  max-width: min(420px, calc(100% - 32px));
+  background: var(--card); color: var(--text);
+  border: 1px solid var(--separator); border-radius: var(--r-md);
+  box-shadow: var(--shadow-pop);
+  padding: 11px 16px; font-size: 12.5px; line-height: 1.4; font-weight: 550;
+  opacity: 0; pointer-events: none;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+.toast.show { opacity: 1; transform: translate(-50%, 0); }
+
 .ai-notice {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--separator);

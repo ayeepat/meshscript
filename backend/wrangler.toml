@@ -14,17 +14,34 @@
 #        npx wrangler secret put OWNER_LICENSE_KEY           # optional dev-bypass key
 #        npx wrangler secret put SUPPORT_CHAT_ID             # your numeric Telegram id (support bot)
 #        npx wrangler secret put TELEGRAM_WEBHOOK_SECRET     # random string (support bot webhook auth)
+#        npx wrangler secret put AI_PROXY_API_KEY            # 302.AI key (AI proxy, ai-proxy.js)
 #  4. `npx wrangler deploy`
-#  5. Point your custom domain at the worker (Cloudflare → Workers → Triggers).
+#  5. Confirm smeshapi.site is bound to this worker (Cloudflare → Workers → Triggers).
 
 name = "smesh-licenses"
 main = "src/worker.js"
 compatibility_date = "2025-01-15"
 
+# Custom domain (dedicated apex, registered for the RU-block workaround: the
+# shared *.workers.dev suffix is DPI-blocked in Russia). Cloudflare creates the
+# DNS record + TLS cert automatically on deploy, since the smeshapi.site zone
+# lives in this same account. The extension client points BACKEND_URL here.
+routes = [
+  { pattern = "smeshapi.site", custom_domain = true }
+]
+
 # License rows. Keyed by license key string. Value is the JSON in licenses.js.
 [[kv_namespaces]]
 binding = "LICENSES"
-id = "ab3e52d938304a4c909766cb2033834a"
+id = "cc972aa483a741ff96bce115f84ab4c1"
+
+# Analytics: devices / events / purchases (see schema.sql + src/analytics.js).
+# Created with `npx wrangler d1 create smesh-analytics`. Apply the schema with:
+#   npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
+[[d1_databases]]
+binding = "DB"
+database_name = "smesh-analytics"
+database_id = "ccacb16f-f77e-4017-91f6-1c642d7a9b9a"
 
 # Non-secret config. Override in the Cloudflare dashboard for production.
 [vars]
@@ -48,6 +65,42 @@ SUBSCRIPTION_MIN_RUB = "199"
 LIFETIME_MIN_RUB = "990"
 # Subscription length in days (default 30 when unset).
 SUBSCRIPTION_DAYS = "30"
+
+# ── Referral program (referrals.js; all OPTIONAL, defaults shown) ────────────
+# Friend enters your code at checkout and PAYS → you earn this many free days.
+# Uncapped: every payout corresponds to a real purchase.
+REFERRAL_PAID_DAYS = "7"
+# The paying friend's OWN new subscription is extended by this percent
+# (30-day plan → 33 days). Subscriptions only; lifetime can't be extended.
+REFERRAL_BUYER_BONUS_PCT = "10"
+# Daily per-IP budget for the invite-code endpoint (/referral/code). "0" off.
+REFERRAL_IP_DAILY_LIMIT = "30"
+
+# ── AI proxy (ai-proxy.js): Qwen/DeepSeek for licensed users, no user keys ───
+# Requires the AI_PROXY_API_KEY secret (see above) + the proxy_quota table
+# (schema.sql). Daily request caps, all env-tunable without a redeploy:
+# OpenAI-compatible base URL. 302.AI resells Qwen + DeepSeek with no KYC —
+# switched from DashScope International 2026-07-07 (Alibaba wanted passport
+# KYC for a direct key). ai-proxy.js appends /chat/completions itself.
+AI_PROXY_BASE_URL = "https://api.302.ai/v1"
+# Models can be changed without code if the reseller renames/drops a model.
+# All three verified live on 302.AI 2026-07-07 (fallbacks via product pages).
+PROXY_QWEN_MODEL = "qwen3.7-plus"
+# Used for TEXT-ONLY requests. qwen-plus is text-only and, on a live probe,
+# answered a vision request with HTTP 200 + a WRONG guess instead of erroring
+# — never let it stand in for a vision request (see PROXY_QWEN_VISION_FALLBACK_MODELS).
+PROXY_QWEN_FALLBACK_MODELS = "qwen-vl-plus,qwen-plus"
+# Used instead of the above when the request carries an image (ai-proxy.js
+# modelChoices). qwen-vl-plus is vision-capable (verified live); deliberately
+# excludes qwen-plus.
+PROXY_QWEN_VISION_FALLBACK_MODELS = "qwen-vl-plus"
+PROXY_DEEPSEEK_MODEL = "deepseek-v4-flash"
+# per-license per-provider…
+PROXY_QWEN_DAILY = "80"
+PROXY_DEEPSEEK_DAILY = "150"
+# …and the global circuit breaker across ALL users. If tripped, students get a
+# friendly "перегружен" error and the day's spend stops growing, no matter what.
+PROXY_GLOBAL_DAILY = "3000"
 
 # ── Payment floor (SET THIS BEFORE THE PAY PAGE GOES LIVE) ────────────────────
 # Hard minimum: signed ResultURL notifications below this amount NEVER issue a

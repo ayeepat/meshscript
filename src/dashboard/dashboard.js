@@ -9,6 +9,7 @@ import { extractMath, restoreMath } from '../common/tex.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge } from '../common/provider-badge.js';
+import { isPdfFile } from '../lib/file-kinds.js';
 
 // Tiny "which AI service is active" tag next to the theme switch in the header.
 mountProviderBadge('provBadge');
@@ -131,6 +132,15 @@ function typewriter(el, fullText) {
 
 /* ---------- Chat UI ---------- */
 
+function retryButton(onClick) {
+  const b = document.createElement('button');
+  b.className = 'retrybtn';
+  b.title = 'Повторить попытку';
+  b.innerHTML = iconSvg('refresh', 13);
+  b.onclick = onClick;
+  return b;
+}
+
 function copyButton(getText) {
   const b = document.createElement('button');
   b.className = 'copybtn';
@@ -172,7 +182,7 @@ function attachChip(files) {
   return chip;
 }
 
-function bubble(role, text, { animate = false, files = null, needsUpload = false } = {}) {
+function bubble(role, text, { animate = false, files = null, needsUpload = false, onRetry = null } = {}) {
   const d = document.createElement('div');
   d.className = `msg ${role}`;
   if (role === 'assistant') {
@@ -191,6 +201,10 @@ function bubble(role, text, { animate = false, files = null, needsUpload = false
     d.appendChild(body);
     d.appendChild(aiNoticeEl());
     d.appendChild(copyButton(() => text));
+    // onRetry is only ever passed for the CURRENT last error in the chat (see
+    // renderChat / runSolveAttempt's finish) — an old, superseded error buried
+    // earlier in history renders without one.
+    if (onRetry) { d.classList.add('errored'); d.appendChild(retryButton(onRetry)); }
   } else {
     const span = document.createElement('div');
     span.className = 'usertext';
@@ -230,6 +244,24 @@ function thinkingBubble(opts) {
   return d;
 }
 
+/**
+ * Brief heads-up toast, e.g. warning that a PDF may take longer to solve.
+ * Reuses one element so repeated calls just reset the auto-hide timer.
+ */
+let toastEl = null;
+let toastTimer = null;
+function showToast(text) {
+  if (!toastEl) {
+    toastEl = document.createElement('div');
+    toastEl.className = 'toast';
+    document.body.appendChild(toastEl);
+  }
+  toastEl.textContent = text;
+  toastEl.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toastEl.classList.remove('show'), 7000);
+}
+
 // Stop a chat's thinking ticker and remove its bubble. Always pair the two so a
 // removed bubble never leaks its interval.
 function stopThinking(chat) {
@@ -248,7 +280,19 @@ function renderChat(chat) {
   }
   const card = gdzCardEl(chat); // GDZ answers sit above the chat
   if (card) chatEl.appendChild(card);
-  for (const m of chat.history) bubble(m.role, m.content, { files: m.files, needsUpload: m.needsUpload });
+  chat.history.forEach((m, i) => {
+    // Retry is only offered on the trailing error — the one that actually
+    // failed and can be resent. `m.error` is set by finish() at the point of
+    // failure (never sniffed from the answer text, so a real answer that opens
+    // with «Ошибка:» isn't mistaken for one). A user turn must precede it (it
+    // always does; see runSolveAttempt) so retryLastTurn has something to resend.
+    const isLastError = i === chat.history.length - 1 && m.role === 'assistant' &&
+      m.error === true && chat.history[i - 1]?.role === 'user';
+    bubble(m.role, m.content, {
+      files: m.files, needsUpload: m.needsUpload,
+      onRetry: isLastError ? () => retryLastTurn(chat) : null
+    });
+  });
   if (chat.pending) chat.thinkingEl = thinkingBubble();
 }
 
@@ -430,27 +474,22 @@ function fileToInline(file) {
 }
 
 /**
- * Send a message within a lesson's chat over a streaming port. Tokens are
- * revealed live; the answer is appended to that lesson's history even if the
- * user switched lessons meanwhile — the DOM is only touched when the lesson is
- * the active one. The active lesson can change mid-stream, so every render
- * guards on `activeKey === chat.key`.
+ * Run one solve attempt over a streaming port: `task`/`files` are what to
+ * solve, `history` is the prior turns to replay (already filtered of gate
+ * refusals). Tokens are revealed live; the answer is appended to the lesson's
+ * history even if the user switched lessons meanwhile — the DOM is only
+ * touched when the lesson is the active one. Shared by the first send
+ * (sendToChat) and a retry of a failed turn (retryLastTurn) — retry passes
+ * the SAME task/files/history so the model sees an identical request, it just
+ * runs again over a fresh port.
  */
-function sendToChat(chat, text, files) {
-  // Context BEFORE this message. Drop gate refusals (the "пришлите фото / нужен
-  // файл" prompts): they're UI nudges, not real conversation, and replaying
-  // them as assistant turns biases the next answer's tone.
-  const prior = chat.history.filter((m) => !m.needsUpload);
-  // Keep the FULL files (incl. base64) on the user turn. The chip only reads
-  // name/mime, but the service worker replays history attachments to the model
-  // so a follow-up question still "sees" the photo/PDF from an earlier turn.
-  // Bounded by MAX_HISTORY_MESSAGES in the service worker.
-  const turnFiles = files || [];
-  chat.history.push({ role: 'user', content: text, files: turnFiles });
+function runSolveAttempt(chat, task, files, history) {
   chat.pending = true;
-  if (activeKey === chat.key) {
-    bubble('user', text, { files: turnFiles });
-    chat.thinkingEl = thinkingBubble();
+  if (activeKey === chat.key) chat.thinkingEl = thinkingBubble();
+  // PDFs are the slowest attachments to solve — a quick, kind heads-up so the
+  // wait doesn't read as a stuck/broken UI.
+  if (activeKey === chat.key && (files || []).some(isPdfFile)) {
+    showToast('Извините, PDF иногда решается дольше обычного — не закрывайте вкладку, я продолжаю решать в фоне.');
   }
   renderSidebar();
 
@@ -494,18 +533,20 @@ function sendToChat(chat, text, files) {
       setTimeout(() => requestAnimationFrame(doFlush), wait);
     };
 
-    const finish = (answer, { animate = false, needsUpload = false } = {}) => {
+    const finish = (answer, { animate = false, needsUpload = false, isError = false } = {}) => {
       if (settled) return;
       settled = true;
       chat.pending = false;
-      chat.history.push({ role: 'assistant', content: answer, needsUpload });
+      const onRetry = isError ? () => retryLastTurn(chat) : null;
+      chat.history.push({ role: 'assistant', content: answer, needsUpload, error: isError });
       if (activeKey === chat.key) {
         stopThinking(chat);
         if (shell && shell.wrap.isConnected) {
           shell.body.innerHTML = mdToHtml(answer); // clean final render
           shell.wrap.appendChild(copyButton(() => answer));
+          if (onRetry) { shell.wrap.classList.add('errored'); shell.wrap.appendChild(retryButton(onRetry)); }
         } else {
-          bubble('assistant', answer, { animate, needsUpload });
+          bubble('assistant', answer, { animate, needsUpload, onRetry });
         }
       }
       renderSidebar();
@@ -523,18 +564,63 @@ function sendToChat(chat, text, files) {
         // animate only when nothing streamed (e.g. the photo-request guard).
         finish(m.result?.answer ?? acc, { animate: !acc, needsUpload: !!m.result?.needsUpload });
       } else if (m?.type === 'error') {
-        finish('Ошибка: ' + m.error);
+        finish('Ошибка: ' + m.error, { isError: true });
       }
     });
 
-    // The service worker can be torn down; surface that instead of hanging.
-    port.onDisconnect.addListener(() => finish(acc || 'Ошибка: соединение прервано.'));
+    // The service worker can be torn down; surface that instead of hanging. A
+    // disconnect after tokens already streamed keeps the partial answer (not an
+    // error); a disconnect with nothing streamed is a real failure — flag it so
+    // the retry button appears.
+    port.onDisconnect.addListener(() => acc
+      ? finish(acc)
+      : finish('Ошибка: соединение прервано.', { isError: true }));
 
     port.postMessage({
       type: 'SOLVE',
-      payload: { subject: chat.subject, task: text, files, sessionId: chat.sessionId, history: prior, mode: answerMode }
+      payload: { subject: chat.subject, task, files, sessionId: chat.sessionId, history, mode: answerMode }
     });
   });
+}
+
+/**
+ * Send a new message within a lesson's chat: records the user turn, shows its
+ * bubble, then runs the attempt. See runSolveAttempt for the streaming part.
+ */
+function sendToChat(chat, text, files) {
+  // Context BEFORE this message. Drop gate refusals (the "пришлите фото / нужен
+  // файл" prompts): they're UI nudges, not real conversation, and replaying
+  // them as assistant turns biases the next answer's tone.
+  const prior = chat.history.filter((m) => !m.needsUpload);
+  // Keep the FULL files (incl. base64) on the user turn. The chip only reads
+  // name/mime, but the service worker replays history attachments to the model
+  // so a follow-up question still "sees" the photo/PDF from an earlier turn.
+  // Bounded by MAX_HISTORY_MESSAGES in the service worker.
+  const turnFiles = files || [];
+  chat.history.push({ role: 'user', content: text, files: turnFiles });
+  if (activeKey === chat.key) bubble('user', text, { files: turnFiles });
+  return runSolveAttempt(chat, text, turnFiles, prior);
+}
+
+/**
+ * Retry the last turn after a failed solve (network drop, upstream hiccup —
+ * see the "Повторить попытку" button on an error bubble). Drops the failed
+ * assistant entry and re-runs the SAME user turn (same task text, same
+ * files, same prior history) rather than re-sending a duplicate user message.
+ * No-ops if the chat isn't actually sitting on a fresh, retryable error —
+ * e.g. a stale click after a later turn already succeeded.
+ */
+function retryLastTurn(chat) {
+  if (chat.pending) return;
+  const h = chat.history;
+  const last = h[h.length - 1];
+  if (!last || last.role !== 'assistant' || last.error !== true) return;
+  const prevUser = h[h.length - 2];
+  if (!prevUser || prevUser.role !== 'user') return;
+  h.pop(); // drop the failed assistant turn; prevUser is now the tail
+  const priorHistory = h.slice(0, h.length - 1).filter((m) => !m.needsUpload);
+  if (activeKey === chat.key) renderChat(chat);
+  runSolveAttempt(chat, prevUser.content, prevUser.files || [], priorHistory);
 }
 
 /**

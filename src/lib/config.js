@@ -7,12 +7,20 @@
  */
 
 // Base URL of the license backend (Cloudflare Worker). Hit `/verify` here.
-// This is the worker's live workers.dev URL (account subdomain "smeshai",
-// worker name "smesh-licenses" — see backend/wrangler.toml). It must also be
-// listed in manifest.json `host_permissions`, or the verify fetch is blocked.
-// If you later bind a custom domain (e.g. https://api.smesh.app) in the
-// Cloudflare dashboard, update BOTH this line and the host permission.
-export const BACKEND_URL = 'https://smesh-licenses.smeshai.workers.dev';
+// This is a dedicated custom domain bound to the `smesh-licenses` Worker via
+// Cloudflare Custom Domains, registered specifically for this purpose and
+// separate from the smeshai.xyz brand domain. If this hostname changes again,
+// update manifest.json `host_permissions` to match or extension fetches are
+// blocked.
+export const BACKEND_URL = 'https://smeshapi.site';
+
+// Base URL of the AI proxy (plain AWS box, NOT the Cloudflare worker). Only
+// /ai/start, /ai/poll and /ai/cancel live here (see lib/smesh-proxy.js for
+// why polling: RU DPI clamps long-lived connections to this SNI, so the AI
+// answer is fetched as a series of sub-second requests). Everything else —
+// license verify, payments, support — stays on BACKEND_URL. If this hostname
+// changes, update manifest.json `host_permissions` to match.
+export const AI_BACKEND_URL = 'https://ai.smeshapi.site';
 
 // Support bot deep link. The «Поддержка» buttons (popup + settings) open this.
 // ⚠️ REPLACE `smesh_support_bot` with YOUR bot's @username from @BotFather

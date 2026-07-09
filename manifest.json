@@ -10,12 +10,13 @@
     "https://*.mos.ru/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
-    "https://router.bynara.id/*",
+    "https://dashscope-intl.aliyuncs.com/*",
     "https://gdz-ru.com/*",
     "https://*.gdz-ru.com/*",
     "https://gdz.ru/*",
     "https://*.smeshai.xyz/*",
-    "https://smesh-licenses.smeshai.workers.dev/*"
+    "https://smeshapi.site/*",
+    "https://ai.smeshapi.site/*"
   ],
   "declarative_net_request": {
     "rule_resources": [

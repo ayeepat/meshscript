@@ -1,22 +1,25 @@
 /**
- * Groq-backed task classifier (background service worker only).
+ * Model-backed task classifier (background service worker only).
  *
  * Decides what each homework card needs from the user: an attached file from
  * Mesh, a photo of the textbook page, or nothing. Understanding "сделать
  * упражнение из прикреплённого документа" vs "упр. 25" vs "повторить
  * параграф" is a language task — teachers phrase it endlessly — so we let a
- * model sort it. ALWAYS Groq (free tier), never the paid solve provider:
- * classification must cost nothing.
+ * model sort it. Always a CHEAP text model, never the main solve provider:
+ * DeepSeek V4 Flash when it's usable — via an active СМЭШ license (the
+ * proxy) or a BYO Model Studio key; reachable from Russia, near-free —
+ * else Groq (genuinely free, but blocked on Russian networks).
  *
  * Design:
  *  - regex heuristics (task-classifier.js) give an instant first pass and
- *    are the fallback when no Groq key is set or the call fails;
+ *    are the fallback when no cheap-model key is set or the call fails;
  *  - all tasks of the week go in ONE batched call, not one per card;
  *  - results are cached in chrome.storage.local by task text, so re-opening
  *    the popup on the same week makes zero API calls.
  */
 
 import { askGroq } from './groq.js';
+import { askDeepseek } from './deepseek.js';
 import { classifyTask } from './task-classifier.js';
 
 const CACHE_KEY = 'taskClassCache';
@@ -60,12 +63,18 @@ function mergeClassCache(entries) {
  * @returns {Promise<Array<'attachment'|'textbook'|'none'>>} same order as input
  */
 export async function classifyTasksAI(tasks) {
-  // Instant heuristic pass — also the final answer if Groq is unavailable.
+  // Instant heuristic pass — also the final answer if no cheap model is available.
   const result = tasks.map((t) => classifyTask(t).kind || 'none');
 
-  const { groqApiKey, [CACHE_KEY]: cache = {} } =
-    await chrome.storage.local.get(['groqApiKey', CACHE_KEY]);
-  if (!groqApiKey) return result;
+  const { groqApiKey, qwenApiKey, licenseStatus, [CACHE_KEY]: cache = {} } =
+    await chrome.storage.local.get(['groqApiKey', 'qwenApiKey', 'licenseStatus', CACHE_KEY]);
+  // DeepSeek runs either on a BYO Model Studio key (one Alibaba key for both
+  // Qwen and DeepSeek, see deepseek.js) or through the СМЭШ proxy for
+  // licensed users. Preferred over Groq: Groq is unreachable from Russian
+  // networks, which is this extension's whole audience.
+  const deepseekUsable = !!qwenApiKey || !!licenseStatus?.ok;
+  const ask = deepseekUsable ? askDeepseek : (groqApiKey ? askGroq : null);
+  if (!ask) return result;
 
   const pending = [];
   tasks.forEach((t, i) => {
@@ -77,7 +86,7 @@ export async function classifyTasksAI(tasks) {
 
   try {
     const list = pending.map((i, n) => `${n + 1}. ${tasks[i].slice(0, 300)}`).join('\n');
-    const raw = await askGroq(SYSTEM, list, [], []);
+    const raw = await ask(SYSTEM, list, [], []);
     const m = raw.match(/\[[\s\S]*?\]/);
     const arr = m ? JSON.parse(m[0]) : [];
     const newEntries = {};
@@ -91,7 +100,7 @@ export async function classifyTasksAI(tasks) {
     // clobber the cache; capping happens inside (see mergeClassCache).
     await mergeClassCache(newEntries);
   } catch (_e) {
-    // Groq down / malformed reply — the heuristic result stands.
+    // Model down / malformed reply — the heuristic result stands.
   }
   return result;
 }

@@ -83,7 +83,7 @@ function historyToMessage(m) {
 }
 
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, signal = null } = opts;
+  const { onDelta = null, responseFormat = null, signal = null, onUsage = null } = opts;
   const key = await getKey();
   // Charge the daily budget BEFORE the network round-trip — same reasoning as
   // openrouter.js. classify-ai imports askGroq directly, so charging here
@@ -109,7 +109,11 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
       // "can't read this directly" note delivered to the model.
       { role: 'user', content: files.length ? userContent : userText }
     ],
-    temperature: 0.3
+    temperature: 0.3,
+    // Emit a final usage frame (token counts) at the end of the stream —
+    // postStream picks it up for telemetry. Groq is free, so cost stays 0;
+    // the token counts still feed the usage charts.
+    stream_options: { include_usage: true }
   };
   // Groq's vision model (llama-4-scout) does NOT reliably honour
   // response_format:json_object — the call can hard-error or return non-JSON.
@@ -126,7 +130,7 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
   // returns the full text. (On the vision path response_format is intentionally
   // dropped above, so the streamed text may be plain prose; the popup's tiered
   // parser salvages it.)
-  return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, signal });
+  return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, onUsage, signal });
 }
 
 /**

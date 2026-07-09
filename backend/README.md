@@ -24,12 +24,76 @@ are set, both fire and the buyer gets the key in both places.
 | Route                     | Auth                                      | Purpose                                  |
 |---------------------------|-------------------------------------------|------------------------------------------|
 | `GET /verify`             | none (CORS open — rate-limit at the edge) | Extension calls this to validate a key. |
+| `POST /ai/chat`           | license key + device id (verified server-side) | Qwen/DeepSeek AI proxy — see below.      |
 | `POST /webhook/robokassa` | `SignatureValue` with password #2         | Auto-issue on a successful ResultURL.    |
 | `GET /webhook/robokassa`  | same as POST                              | Accepted for dashboards configured as GET. |
+| `POST /referral/code`     | none (per-IP daily budget)                | Get/create a device's invite code.       |
+| `GET /referral/check`     | none                                      | Validate a code at checkout (before charging). |
+| `GET /referral/status`    | none                                      | Referral stats + reward key by device.   |
 | `POST /admin/issue`       | `X-Admin-Token` header                    | Manual issue (test keys, comp licenses). |
 | `POST /admin/revoke`      | `X-Admin-Token` header                    | Mark a key revoked (refunds, fraud).     |
 | `GET /admin/license`      | `X-Admin-Token` header                    | Inspect one license by key.              |
+| `GET /admin/referral`     | `X-Admin-Token` header                    | Inspect a referral by code or device id. |
 | `GET /health`             | none                                      | Liveness ping.                           |
+
+### AI proxy (`POST /ai/chat`)
+
+Qwen (`qwen3.7-plus`) and DeepSeek (`deepseek-v4-flash`) for licensed users
+**without their own API key** — full mechanics in `src/ai-proxy.js`. The
+extension sends `{ provider, license_key, device_id, messages }`; the worker
+verifies the license (same KV as `/verify`, incl. the device cap), charges
+daily quotas, then calls 302.AI (OpenAI-compatible reseller hosting both
+models; switched from Alibaba's DashScope 2026-07-07 to avoid passport KYC)
+with the single `AI_PROXY_API_KEY` secret and pipes the SSE stream back
+unparsed.
+
+Spend is bounded four ways: license required (server-side, unbypassable);
+per-license daily caps (`PROXY_QWEN_DAILY`/`PROXY_DEEPSEEK_DAILY` vars);
+a global daily circuit breaker (`PROXY_GLOBAL_DAILY`); and request hygiene
+(fixed models, clamped params, size caps). Counters live in the D1
+`proxy_quota` table (`schema.sql` — re-run the schema apply after pulling
+this). As a last line of defence, keep the 302.AI account on prepaid credit
+(it can't spend money that isn't loaded).
+
+Setup: `npx wrangler secret put AI_PROXY_API_KEY`, apply `schema.sql`,
+deploy. If the secret or D1 is missing the route fails CLOSED (503) —
+students see a calm "temporarily unavailable" message; the words "API key"
+never reach them (upstream auth/billing failures log to `wrangler tail`).
+
+### Referral program
+
+Full mechanics live in `src/referrals.js` (see its header comment). Short
+version: every device mints one invite code (`REF-XXXX-XXXX`), shown in the
+extension's Settings. There is a **single, payment-gated reward** — no
+client-side tracking, no abuse caps, nothing to fingerprint:
+
+- The buyer types a friend's code into the pay page at checkout.
+- On the confirmed Robokassa payment, the **referrer** earns
+  `REFERRAL_PAID_DAYS` (7) subscription days, and the **buyer's own** new
+  subscription is extended by `REFERRAL_BUYER_BONUS_PCT` (10%) — a 30-day plan
+  becomes 33 days (subscriptions only; lifetime can't be extended).
+- One payout per purchased license key, ever (idempotent across webhook
+  retries). Referrer days land on their own registered subscription key if
+  they have one, otherwise on an auto-minted reward license (gateway
+  `referral`) whose key Settings shows them.
+
+**Checkout integration (site side, `meshsitereal`).** The pay page must pass
+the code to Robokassa as a **signed custom parameter** so Robokassa echoes it
+back to this webhook:
+
+- Add `Shp_ref_code=REF-XXXX-XXXX` to the payment link and **include it in the
+  `SignatureValue`** (Robokassa signs `Shp_*` params in alphabetical order —
+  see the gateway's signing rules). Optionally `Shp_device_id=<uuid>` if the
+  checkout knows the buyer's extension device id (enables self-referral
+  blocking; usually absent on a static site — that's fine).
+- Alternatively, pre-register the order in KV as `order:<InvId>` with a JSON
+  body `{ "ref_code": "...", "email": "...", "device_id": "..." }`; the webhook
+  reads it as a fallback.
+- Before charging, the page can call `GET /referral/check?code=REF-…` →
+  `{ valid, buyer_bonus_pct }` to show "code valid — you'll get +10%".
+
+Invalid, self-referred, or absent codes are ignored silently — a real payment
+never fails over a referral.
 
 ## Setup
 
@@ -62,6 +126,9 @@ npx wrangler secret put TELEGRAM_BOT_TOKEN
 # Optional: dev-bypass key. Type this into your own extension Settings and
 # the gate always passes for you without a real purchase.
 npx wrangler secret put OWNER_LICENSE_KEY
+
+# AI proxy (Qwen/DeepSeek without user keys): your 302.AI key.
+npx wrangler secret put AI_PROXY_API_KEY
 ```
 
 Also check `[vars]` in `wrangler.toml`:
@@ -83,9 +150,9 @@ npx wrangler deploy
 
 Wrangler prints your worker URL, for example
 `https://smesh-licenses.<account>.workers.dev`. Hit `GET /health` to confirm
-it's up. Then point a custom domain at it from Cloudflare → Workers → Triggers
-→ Custom Domains. The extension will call `https://api.smesh.app/verify` (or
-whatever domain you pick — update `BACKEND_URL` in `src/lib/config.js`).
+it's up. The production custom domain is bound from Cloudflare → Workers →
+Triggers → Custom Domains as `https://smeshapi.site`. The extension calls
+`https://smeshapi.site/verify` via `BACKEND_URL` in `src/lib/config.js`.
 
 ### 5. Configure Robokassa
 

@@ -78,11 +78,16 @@
   let thinker = null;
 
   let themePref = 'system';
-  // Active AI provider, shown as a tiny GRQ/OPR/NRY tag on the pill so the user
-  // sees which service will answer before pressing «Решить». Mirrors
+  // Active AI provider, shown as a tiny GRQ/OPR/QWN/DSK tag on the pill so the
+  // user sees which service will answer before pressing «Решить». Mirrors
   // common/provider-badge.js (can't import an ES module into a content script).
+  let providerId = 'openrouter';
   let providerAbbr = 'OPR';
-  const PROV_ABBR = { groq: 'GRQ', openrouter: 'OPR', nararouter: 'NRY' };
+  const PROV_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
+  function setProvider(p) {
+    providerId = PROV_ABBR[p] ? p : 'openrouter';
+    providerAbbr = PROV_ABBR[providerId];
+  }
   const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   const resolveTheme = () =>
@@ -162,7 +167,11 @@
   // an updatable prefix so the multi-page loop can show «Страница N».
   const THINK_WORDS = [
     'Думаю', 'Решаю', 'Считаю', 'Разбираю', 'Анализирую',
-    'Соображаю', 'Вникаю', 'Размышляю', 'Сверяю', 'Проверяю'
+    'Соображаю', 'Вникаю', 'Размышляю', 'Сверяю', 'Проверяю',
+    'Читаю условие', 'Выстраиваю ход решения', 'Слежу за условием задачи',
+    'Иду по шагам', 'Прикидываю план решения', 'Ищу подходящий способ',
+    'Прохожу задание по порядку', 'Складываю картину', 'Уточняю детали',
+    'Сверяюсь с заданием', 'Прикидываю варианты', 'Формулирую ответ'
   ];
   function startThinking(el, opts = {}) {
     const startedAt = Date.now();
@@ -217,7 +226,7 @@
     return new Promise((resolve) => {
       try {
         chrome.storage.local.get('aiProvider', (v) => {
-          if (!chrome.runtime.lastError) providerAbbr = PROV_ABBR[v?.aiProvider] || 'OPR';
+          if (!chrome.runtime.lastError) setProvider(v?.aiProvider);
           resolve();
         });
       } catch { resolve(); }
@@ -379,7 +388,7 @@
 
         .actions { display: flex; align-items: center; gap: 6px; }
 
-        /* Tiny read-only "which AI" tag (GRQ/OPR/NRY). Discreet, never clickable. */
+        /* Tiny read-only "which AI" tag (GRQ/OPR/QWN/DSK). Discreet, never clickable. */
         .prov {
           flex: none;
           font-family: "SmeshManrope", -apple-system, sans-serif;
@@ -574,7 +583,7 @@
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
       const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs);
       try {
-        chrome.runtime.sendMessage({ type }, (r) => {
+        chrome.runtime.sendMessage({ type, payload: { provider: providerId } }, (r) => {
           clearTimeout(t);
           if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
           else finish(r || { ok: false, error: 'нет ответа' });
@@ -671,7 +680,7 @@
           applyTheme();
         }
         if (changes.aiProvider) {
-          providerAbbr = PROV_ABBR[changes.aiProvider.newValue] || 'OPR';
+          setProvider(changes.aiProvider.newValue);
           applyProvider();
         }
       });

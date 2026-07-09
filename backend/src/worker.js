@@ -4,9 +4,14 @@
  * Routes:
  *   POST/GET /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
  *   GET  /verify             Extension calls this; returns active|expired|...
+ *   POST /ai/chat            License-gated Qwen/DeepSeek proxy (see ai-proxy.js)
+ *   POST /referral/code      Get/create this device's referral code
+ *   GET  /referral/check     Validate a code at checkout (before charging)
+ *   GET  /referral/status    Referral stats + reward key for a device
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
  *   GET  /admin/license      Inspect one license by key
+ *   GET  /admin/referral     Inspect a referral record by code or device
  *   POST /telegram/webhook   Support bot: user tickets → owner, replies → user
  *   GET  /health             Liveness ping
  *
@@ -15,6 +20,9 @@
  */
 
 import { issueLicense, verifyLicense, getLicense, putLicense, normalizeKey } from './licenses.js';
+import { handleAiChat } from './ai-proxy.js';
+import * as referrals from './referrals.js';
+import * as analytics from './analytics.js';
 import * as robokassa from './gateways/robokassa.js';
 import { sendLicenseEmail } from './delivery/email.js';
 import { sendLicenseTelegram } from './delivery/telegram.js';
@@ -22,8 +30,11 @@ import { processSupportUpdate } from './delivery/support.js';
 
 const VERIFY_CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type',
+  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+  // x-admin-token: the admin dashboard (a static GitHub Pages app) calls the
+  // /admin/stats/* endpoints cross-origin. CORS is not the guard — the
+  // ADMIN_SECRET header check is; no cookies are involved anywhere.
+  'Access-Control-Allow-Headers': 'Content-Type, x-admin-token',
   'Access-Control-Max-Age': '86400'
 };
 
@@ -46,13 +57,28 @@ export default {
       if (path === '/health') return json({ ok: true });
 
       if (path === '/verify' && method === 'GET') return await handleVerify(request, env);
+      if (path === '/ai/chat' && method === 'POST') return await handleAiChat(request, env);
+      // TEMP RU-DPI probe — remove after diagnosis. Streams a heartbeat every 2s
+      // for 30s with no upstream AI, to test whether a steadily-active
+      // Cloudflare connection survives Russian DPI (vs. the idle /ai/chat stream
+      // that gets reset at ~20s). See ?interval=<ms>&seconds=<n>.
+      if (path === '/ai/streamtest' && method === 'GET') return handleStreamTest(request);
       if (path === '/webhook/robokassa' && (method === 'POST' || method === 'GET')) {
         return await handleRobokassa(request, env, ctx);
       }
 
+      if (path === '/referral/code' && method === 'POST') return await handleReferralCode(request, env);
+      if (path === '/referral/check' && method === 'GET') return await handleReferralCheck(request, env);
+      if (path === '/referral/status' && method === 'GET') return await handleReferralStatus(request, env);
+
+      if (path === '/t' && method === 'POST') return await handleTelemetry(request, env);
+      if (path.startsWith('/admin/stats/') && method === 'GET') return await handleAdminStats(request, env, path);
+      if (path === '/admin/backfill-licenses' && method === 'POST') return await handleAdminBackfill(request, env);
+
       if (path === '/admin/issue' && method === 'POST') return await handleAdminIssue(request, env);
       if (path === '/admin/revoke' && method === 'POST') return await handleAdminRevoke(request, env);
       if (path === '/admin/license' && method === 'GET') return await handleAdminLicense(request, env);
+      if (path === '/admin/referral' && method === 'GET') return await handleAdminReferral(request, env);
 
       if (path === '/telegram/webhook' && method === 'POST') return await handleTelegramWebhook(request, env, ctx);
       if (path === '/telegram/setup' && method === 'GET') return await handleTelegramSetup(request, env);
@@ -69,6 +95,45 @@ export default {
   }
 };
 
+/* --------------------------- /ai/streamtest -------------------------- */
+// TEMPORARY diagnostic (RU DPI). Emits a real SSE `data:` frame every
+// `interval` ms for `seconds` seconds, then `[DONE]`. No auth, no AI, no cost —
+// it exists only to answer one question: does a Cloudflare connection that
+// stays ACTIVE (bytes every couple seconds) survive Russian DPI? If a client
+// in RU sees all N frames arrive, the reset is idle-based and SSE heartbeats in
+// ai-proxy.js will fix the real endpoint. If it still dies at ~20-24s despite
+// steady frames, the reset is activity-independent and the proxy must move off
+// Cloudflare. DELETE this route + handler once decided.
+function handleStreamTest(request) {
+  const url = new URL(request.url);
+  const interval = Math.min(Math.max(Number(url.searchParams.get('interval')) || 2000, 500), 10000);
+  const seconds = Math.min(Math.max(Number(url.searchParams.get('seconds')) || 30, 2), 90);
+  const encoder = new TextEncoder();
+  const t0 = Date.now();
+  let n = 0;
+  const stream = new ReadableStream({
+    async pull(controller) {
+      if (Date.now() - t0 >= seconds * 1000) {
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+        return;
+      }
+      await new Promise((r) => setTimeout(r, interval));
+      n += 1;
+      controller.enqueue(encoder.encode(`data: {"n":${n},"elapsed_ms":${Date.now() - t0}}\n\n`));
+    }
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no',
+      'Access-Control-Allow-Origin': '*'
+    }
+  });
+}
+
 /* ------------------------------ /verify ------------------------------ */
 
 async function handleVerify(request, env) {
@@ -77,6 +142,33 @@ async function handleVerify(request, env) {
   const deviceId = url.searchParams.get('device_id') || '';
   const result = await verifyLicense(env, key, deviceId);
   return json(result, { headers: VERIFY_CORS });
+}
+
+/* ----------------------------- /referral/* ---------------------------- */
+// Called by the extension (settings page) and the checkout page, so they
+// share /verify's open CORS. Only /referral/code writes (behind a per-IP
+// daily budget). The real guarantee — one payout per paid license — is
+// enforced in the Robokassa webhook via referrals.js, not here.
+
+async function handleReferralCode(request, env) {
+  const ip = request.headers.get('cf-connecting-ip') || '';
+  if (!(await referrals.bumpIpBudget(env, ip))) return error(429, 'rate_limited', VERIFY_CORS);
+  let body;
+  try { body = await request.json(); } catch { return error(400, 'bad_json', VERIFY_CORS); }
+  const result = await referrals.getOrCreateCode(env, body.device_id, body.license_key);
+  return json(result, { status: result.ok ? 200 : 400, headers: VERIFY_CORS });
+}
+
+async function handleReferralCheck(request, env) {
+  const url = new URL(request.url);
+  const result = await referrals.checkCode(env, url.searchParams.get('code') || '');
+  return json(result, { headers: VERIFY_CORS });
+}
+
+async function handleReferralStatus(request, env) {
+  const url = new URL(request.url);
+  const result = await referrals.referralStatus(env, url.searchParams.get('device_id') || '');
+  return json(result, { status: result.ok ? 200 : 400, headers: VERIFY_CORS });
 }
 
 /* ------------------------- /telegram/webhook ------------------------- */
@@ -239,10 +331,11 @@ async function handleRobokassa(request, env, ctx) {
   }
   if (floor <= 0) console.warn('robokassa: NO payment floor configured — set MIN_PAYMENT_RUB or any paid amount can issue a license');
 
-  // The order page should thread signed delivery data through Shp_* params, or
-  // pre-register order:<InvId> in KV. EMail from Robokassa is a last fallback.
-  const contact = await resolveRobokassaContact(env, fields, n.invoice_id);
-  if (!contact.email && !contact.telegram_user_id) {
+  // The order page should thread signed delivery data + any referral code
+  // through Shp_* params, or pre-register order:<InvId> in KV. EMail from
+  // Robokassa is a last fallback.
+  const order = await resolveRobokassaOrder(env, fields, n.invoice_id);
+  if (!order.email && !order.telegram_user_id) {
     console.error('robokassa: payment without delivery contact', n.payment_id);
     return robokassa.okResponse(n.invoice_id);
   }
@@ -253,28 +346,54 @@ async function handleRobokassa(request, env, ctx) {
   if (!plan) return robokassa.okResponse(n.invoice_id);
   const isPreorder = isPreorderNow();
 
+  // Referral: a valid code the buyer entered at checkout (never self-referral)
+  // extends the buyer's OWN subscription by the buyer bonus, and — once the
+  // license exists — credits the referrer. A bad/self/absent code is ignored
+  // silently: a real payment must never fail over a referral.
+  const referral = await referrals.resolveReferral(env, {
+    code: order.ref_code,
+    buyerDeviceId: order.device_id
+  });
+  const expiresAt = (referral.valid && plan.type === 'subscription')
+    ? referrals.withBuyerBonus(env, plan.expires_at)
+    : plan.expires_at;
+
   const license = await issueLicense(env, {
     gateway: 'robokassa',
     payment_id: n.payment_id,     // InvId must be unique per order
-    email: contact.email,
-    telegram_user_id: contact.telegram_user_id,
+    email: order.email,
+    telegram_user_id: order.telegram_user_id,
     type: plan.type,
-    expires_at: plan.expires_at,
+    expires_at: expiresAt,
     amount_rub: n.amount_rub,
     is_preorder: isPreorder
   });
+
+  // Credit the referrer (idempotent per purchased license). Awaited, not
+  // waitUntil'd — it's a few fast KV writes, and finishing before we ack means
+  // a Robokassa retry can't race a half-written credit. issueLicense is itself
+  // idempotent, so on a retry `license` is the original (already-bonused) key
+  // and the refpaid marker skips a second payout.
+  if (referral.valid) {
+    try { await referrals.creditReferrerForPurchase(env, referral.ref, license.key); }
+    catch (e) { console.error('referral credit', e); }
+  }
 
   ctx.waitUntil(deliverKey(env, license, isPreorder));
   return robokassa.okResponse(n.invoice_id);
 }
 
 /**
- * Resolve the delivery contact from Robokassa ResultURL fields. Prefer signed
- * Shp_* fields, then an order record in KV, then Robokassa's EMail fallback.
+ * Resolve delivery contact + referral fields from Robokassa ResultURL fields.
+ * Prefer signed Shp_* fields, then an order record in KV, then Robokassa's
+ * EMail fallback for the contact. `device_id` is usually absent (a static
+ * checkout doesn't know it) and only feeds best-effort self-referral checks.
  */
-async function resolveRobokassaContact(env, fields, invoiceId) {
+async function resolveRobokassaOrder(env, fields, invoiceId) {
   const email = cleanEmail(fields.Shp_email) || cleanEmail(fields.Shp_Email);
   const telegram_user_id = cleanTelegramUserId(fields.Shp_telegram_user_id || fields.Shp_tg_user_id);
+  const ref_code = fields.Shp_ref_code || fields.Shp_ref || '';
+  const device_id = fields.Shp_device_id || fields.Shp_device || '';
   const orderId = cleanOrderId(fields.Shp_order_id || fields.Shp_order || invoiceId);
   let stored = {};
 
@@ -284,14 +403,18 @@ async function resolveRobokassaContact(env, fields, invoiceId) {
       const o = JSON.parse(raw);
       stored = {
         email: cleanEmail(o.email),
-        telegram_user_id: cleanTelegramUserId(o.telegram_user_id)
+        telegram_user_id: cleanTelegramUserId(o.telegram_user_id),
+        ref_code: o.ref_code || o.referral_code || '',
+        device_id: o.device_id || ''
       };
     }
   } catch { /* not JSON / not found */ }
 
   return {
     email: email || stored.email || cleanEmail(fields.EMail) || cleanEmail(fields.Email),
-    telegram_user_id: telegram_user_id || stored.telegram_user_id || null
+    telegram_user_id: telegram_user_id || stored.telegram_user_id || null,
+    ref_code: ref_code || stored.ref_code || '',
+    device_id: device_id || stored.device_id || ''
   };
 }
 
@@ -385,6 +508,53 @@ function isPreorderNow() {
   return Date.now() < Date.parse('2026-07-25T00:00:00Z');
 }
 
+/* ------------------------------ telemetry ---------------------------- */
+
+// POST /t — extension usage events (content-free; see analytics.js). Open like
+// /verify: the extension runs on chrome-extension:// origins, no credentials.
+async function handleTelemetry(request, env) {
+  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  const result = await analytics.handleIngest(request, env);
+  return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
+}
+
+/* --------------------------- /admin/stats/* --------------------------- */
+
+const STATS_ROUTES = {
+  overview:   (env, q) => analytics.statsOverview(env, Number(q.get('days')) || 0),
+  timeseries: (env, q) => analytics.statsTimeseries(env, Number(q.get('days')) || 30),
+  users:      (env, q) => analytics.statsUsers(env, Object.fromEntries(q)),
+  user:       (env, q) => analytics.statsUserDetail(env, q.get('device_id') || ''),
+  subjects:   (env, q) => analytics.statsSubjects(env, Number(q.get('days')) || 0),
+  purchases:  (env, q) => analytics.statsPurchases(env, Number(q.get('days')) || 0),
+  retention:  (env)    => analytics.statsRetention(env),
+  referrals:  (env)    => analytics.statsReferrals(env),
+  errors:     (env, q) => analytics.statsErrors(env, Number(q.get('days')) || 0),
+  rate:       (env, q) => analytics.statsRate(env, q.get('force') === '1')
+};
+
+// GET /admin/stats/<name> — dashboard aggregation endpoints. Same ADMIN_SECRET
+// guard as the other /admin routes, plus open CORS so the GitHub Pages
+// dashboard can call them (the token header is the actual gate).
+async function handleAdminStats(request, env, path) {
+  if (!adminGuard(request, env)) return error(401, 'unauthorized', VERIFY_CORS);
+  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  const name = path.slice('/admin/stats/'.length);
+  const route = STATS_ROUTES[name];
+  if (!route) return error(404, 'not_found', VERIFY_CORS);
+  const result = await route(env, new URL(request.url).searchParams);
+  return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
+}
+
+// POST /admin/backfill-licenses — re-mirror every KV license into D1. Used by
+// the dashboard's «Синхронизировать» button and for the initial import.
+async function handleAdminBackfill(request, env) {
+  if (!adminGuard(request, env)) return error(401, 'unauthorized', VERIFY_CORS);
+  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  const result = await analytics.backfillLicenses(env);
+  return json({ ok: true, ...result }, { headers: VERIFY_CORS });
+}
+
 /* ------------------------------- /admin ------------------------------ */
 
 function adminGuard(request, env) {
@@ -446,4 +616,17 @@ async function handleAdminLicense(request, env) {
   const license = await getLicense(env, key);
   if (!license) return error(404, 'not_found');
   return json({ ok: true, license });
+}
+
+// Inspect a referral: ?code=REF-XXXX-XXXX or ?device_id=<uuid> (the referrer's
+// device resolves to its code).
+async function handleAdminReferral(request, env) {
+  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  const url = new URL(request.url);
+  const result = await referrals.adminReferralLookup(env, {
+    code: url.searchParams.get('code') || '',
+    device_id: url.searchParams.get('device_id') || ''
+  });
+  if (!result.ref) return error(404, 'not_found');
+  return json({ ok: true, ...result });
 }

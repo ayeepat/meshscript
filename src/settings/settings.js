@@ -1,10 +1,11 @@
-/** Settings: theme, API keys, provider, daily limits, GDZ textbooks, prompts, 7-day history. */
+/** Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks, prompts, 7-day history. */
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 import { DEFAULT_LIMITS, getUsage, getUsageHistory } from '../lib/rate-limit.js';
 import { setLicenseKey, getLicenseStatus, reasonMessage } from '../lib/license.js';
+import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
 
@@ -14,7 +15,10 @@ initTheme();
 const supportLink = document.getElementById('supportLink');
 if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 
-const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey', 'nararouterApiKey'];
+// No qwenApiKey here: Qwen/DeepSeek run through the СМЭШ proxy on the license
+// key (see lib/smesh-proxy.js) — students never handle an Alibaba key. A BYO
+// key set directly in storage still works as a hidden power-user path.
+const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
 const CATS = Object.values(PROMPT_CATEGORIES);
 const SAVE_SECTIONS = new Set(['general', 'analytics', 'prompts']);
 
@@ -98,7 +102,8 @@ async function load() {
   const limits = stored.rateLimits || {};
   document.getElementById('limitOpenrouter').value = limits.openrouter ?? DEFAULT_LIMITS.openrouter;
   document.getElementById('limitGroq').value = limits.groq ?? DEFAULT_LIMITS.groq;
-  document.getElementById('limitNararouter').value = limits.nararouter ?? DEFAULT_LIMITS.nararouter;
+  document.getElementById('limitQwen').value = limits.qwen ?? DEFAULT_LIMITS.qwen;
+  document.getElementById('limitDeepseek').value = limits.deepseek ?? DEFAULT_LIMITS.deepseek;
   const overrides = stored.promptOverrides || {};
   for (const cat of CATS) {
     const ta = document.getElementById('p_' + cat);
@@ -108,6 +113,7 @@ async function load() {
   await refreshUsage();
   await loadLicenseUi();
   await loadConsentUi();
+  loadReferralUi(); // network-backed, deliberately not awaited
 }
 
 /* ---------- License key ---------- */
@@ -126,15 +132,76 @@ function renderLicenseStatus(status) {
     return;
   }
   if (status.ok) {
-    const label = status.owner
-      ? 'Активна · доступ владельца'
-      : (status.type === 'subscription' ? 'Активна · подписка' : 'Активна');
+    const label = status.type === 'subscription' ? 'Активна · подписка' : 'Активна';
     pill.textContent = label;
     pill.dataset.state = 'ok';
     return;
   }
   pill.textContent = reasonMessage(status.reason);
   pill.dataset.state = status.reason === 'network' ? 'warn' : 'err';
+}
+
+/* ---------- Referral («Пригласи друга») ---------- */
+
+// Ready-made invite message for the «Скопировать приглашение» button.
+const inviteText = (code) =>
+  'Решаю домашку и тесты МЭШ через расширение СМЭШ AI — https://www.smeshai.xyz\n' +
+  `Когда будешь оформлять подписку, введи мой код ${code} — тебе +10% дней к подписке, а мне пара дней в подарок :)`;
+
+function flashButton(btn, text = 'Скопировано!') {
+  const prior = btn.textContent;
+  btn.textContent = text;
+  setTimeout(() => { btn.textContent = prior; }, 1600);
+}
+
+function renderReferralStatus(status) {
+  const days = document.getElementById('refDays');
+  if (status.days_earned > 0) {
+    days.hidden = false;
+    days.textContent = `+${status.days_earned} дн. заработано`;
+  }
+  const stats = document.getElementById('refStats');
+  stats.hidden = false;
+  document.getElementById('refPurchases').textContent = status.purchases;
+  if (status.reward_key) {
+    const box = document.getElementById('refReward');
+    box.hidden = false;
+    document.getElementById('refRewardKey').textContent = status.reward_key;
+    const until = status.reward_expires_at
+      ? new Date(status.reward_expires_at).toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' })
+      : '';
+    document.getElementById('refRewardUntil').textContent = until ? `Действует до ${until}.` : '';
+  }
+}
+
+async function loadReferralUi() {
+  const codeEl = document.getElementById('refCode');
+  try {
+    const code = await getMyReferralCode({ sync: true }); // sync refreshes the license pointer
+    codeEl.textContent = code;
+    document.getElementById('refCopyCode').disabled = false;
+    document.getElementById('refCopyInvite').disabled = false;
+  } catch {
+    codeEl.textContent = 'нет связи';
+    return;
+  }
+  try {
+    renderReferralStatus(await fetchReferralStatus());
+  } catch { /* stats are decorative — the code alone is enough to share */ }
+}
+
+function wireReferral() {
+  const copy = (getText) => async (e) => {
+    const btn = e.currentTarget; // capture NOW — currentTarget is null after an await
+    try {
+      await navigator.clipboard.writeText(getText());
+      flashButton(btn);
+    } catch { /* clipboard denied — user can select the code by hand */ }
+  };
+  const codeText = () => document.getElementById('refCode').textContent;
+  document.getElementById('refCopyCode').onclick = copy(codeText);
+  document.getElementById('refCopyInvite').onclick = copy(() => inviteText(codeText()));
+  document.getElementById('refRewardCopy').onclick = copy(() => document.getElementById('refRewardKey').textContent);
 }
 
 /* ---------- Privacy consent ---------- */
@@ -174,25 +241,27 @@ async function refreshUsage() {
   const fmt = (u) => `${u.used} / ${u.limit} сегодня`;
   document.getElementById('usageOpenrouter').textContent = fmt(usage.openrouter);
   document.getElementById('usageGroq').textContent = fmt(usage.groq);
-  document.getElementById('usageNararouter').textContent = fmt(usage.nararouter);
+  document.getElementById('usageQwen').textContent = fmt(usage.qwen);
+  document.getElementById('usageDeepseek').textContent = fmt(usage.deepseek);
 }
 
 /* ---------- Usage & spend dashboard ---------- */
 
 // Loaded by refreshUsageDashboard(), read by renderChart().
-let reqHistory = [];   // [{ day, openrouter, groq, nararouter }]
+let reqHistory = [];   // [{ day, openrouter, groq, qwen, deepseek }]
 let spendHistory = []; // [{ day, spend }]  (OpenRouter $/day, from snapshots)
 // The chart shows ONE series at a time, picked by the #chartMode switcher, so
 // the providers never clog one cramped column. A provider mode = that
 // provider's daily request count; 'usd' = OpenRouter spend. Default: OpenRouter.
-let chartMode = 'openrouter'; // 'openrouter' | 'groq' | 'nararouter' | 'usd'
+let chartMode = 'openrouter'; // 'openrouter' | 'groq' | 'qwen' | 'deepseek' | 'usd'
 
 // Per-provider chart metadata: which reqHistory field to read, the legend label,
 // and the bar/swatch CSS classes (colours defined in settings.css).
 const PROVIDER_CHART = {
   openrouter: { key: 'openrouter', name: 'OpenRouter', label: 'OpenRouter', cls: 'bar-or', sw: 'or' },
-  groq:       { key: 'groq',       name: 'Groq',       label: 'Groq · бесплатно',       cls: 'bar-groq', sw: 'groq' },
-  nararouter: { key: 'nararouter', name: 'NaraRouter', label: 'NaraRouter · бесплатно', cls: 'bar-nara', sw: 'nara' }
+  groq:       { key: 'groq',       name: 'Groq',       label: 'Groq · бесплатно', cls: 'bar-groq', sw: 'groq' },
+  qwen:       { key: 'qwen',       name: 'Qwen',       label: 'Qwen', cls: 'bar-qwen', sw: 'qwen' },
+  deepseek:   { key: 'deepseek',   name: 'DeepSeek',   label: 'DeepSeek', cls: 'bar-deepseek', sw: 'deepseek' }
 };
 
 const fmtUsd = (n) =>
@@ -334,8 +403,9 @@ async function save() {
   data.aiProvider = document.getElementById('aiProvider').value;
   const orLimit = Math.max(1, parseInt(document.getElementById('limitOpenrouter').value, 10) || DEFAULT_LIMITS.openrouter);
   const groqLimit = Math.max(1, parseInt(document.getElementById('limitGroq').value, 10) || DEFAULT_LIMITS.groq);
-  const naraLimit = Math.max(1, parseInt(document.getElementById('limitNararouter').value, 10) || DEFAULT_LIMITS.nararouter);
-  data.rateLimits = { openrouter: orLimit, groq: groqLimit, nararouter: naraLimit };
+  const qwenLimit = Math.max(1, parseInt(document.getElementById('limitQwen').value, 10) || DEFAULT_LIMITS.qwen);
+  const deepseekLimit = Math.max(1, parseInt(document.getElementById('limitDeepseek').value, 10) || DEFAULT_LIMITS.deepseek);
+  data.rateLimits = { openrouter: orLimit, groq: groqLimit, qwen: qwenLimit, deepseek: deepseekLimit };
   const promptOverrides = {};
   for (const cat of CATS) {
     const v = document.getElementById('p_' + cat).value.trim();
@@ -666,6 +736,7 @@ wireTabs();
 applyConsentGate(false);
 wireGdz();
 wireConsent();
+wireReferral();
 wireUsageDashboard();
 document.getElementById('save').onclick = save;
 document.getElementById('reload').onclick = () => { historyLoaded = true; loadHistory(); };

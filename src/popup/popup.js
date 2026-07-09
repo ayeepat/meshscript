@@ -9,8 +9,9 @@ import { extractMath, restoreMath } from '../common/tex.js';
 import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
-import { mountProviderBadge } from '../common/provider-badge.js';
+import { mountProviderBadge, PROVIDER_ABBR } from '../common/provider-badge.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
+import { getLicenseStatus, setLicenseKey, reasonMessage } from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
 
@@ -594,9 +595,11 @@ function withTimeout(promise, ms, message) {
 }
 
 /**
- * Capture the visible test page: top-frame text + a PNG screenshot. Page text is
- * best-effort (some pages/iframes forbid injection); the screenshot is lossless
- * so small numbers/formulas stay crisp and usually carries the question alone.
+ * Capture the visible test page: top-frame text + a JPEG screenshot. Page text
+ * is best-effort (some pages/iframes forbid injection). JPEG (q90), not PNG: a
+ * retina PNG is 1.5–4 MB of base64 and the whole capture rides ONE /ai/start
+ * POST, which is too slow for the RU DPI per-connection clamp window (see
+ * lib/smesh-proxy.js); q90 keeps test text and formulas perfectly readable.
  * @returns {Promise<{pageText:string, screenshot:object}>}
  */
 async function capturePage(tabId) {
@@ -606,7 +609,7 @@ async function capturePage(tabId) {
         .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
         .then(([inj]) => inj?.result || '')
         .catch(() => ''),
-      chrome.tabs.captureVisibleTab(undefined, { format: 'png' })
+      chrome.tabs.captureVisibleTab(undefined, { format: 'jpeg', quality: 90 })
     ]),
     20000,
     'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
@@ -615,25 +618,37 @@ async function capturePage(tabId) {
   // of throwing on dataUrl.split (which read as a cryptic error).
   const b64 = (dataUrl || '').split(',')[1];
   if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
-  return { pageText, screenshot: { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' } };
+  return { pageText, screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' } };
 }
 
 /**
  * Ask the service worker to solve one captured page. tabId lets it also drop the
  * answers into the in-page floating panel. The 120-s cap guarantees the popup
- * never spins forever — its message is deliberately actionable (key/credits).
+ * never spins forever with a provider-neutral, actionable message.
  * @returns {Promise<{ok:boolean, answer?:string, questions?:object[], error?:string}>}
  */
-function requestSolve(tabId, screenshot, pageText) {
+function timeoutMessage(provider) {
+  const name = {
+    openrouter: 'OpenRouter',
+    groq: 'Groq',
+    qwen: 'Qwen',
+    deepseek: 'DeepSeek'
+  }[provider] || 'выбранного ИИ-сервиса';
+  return `Не удалось получить ответ за 2 минуты. Проверьте интернет и настройки ${name}, затем попробуйте ещё раз.`;
+}
+
+async function requestSolve(tabId, screenshot, pageText) {
+  const { aiProvider } = await chrome.storage.local.get('aiProvider');
+  const provider = PROVIDER_ABBR[aiProvider] ? aiProvider : undefined;
   return withTimeout(
     new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId } }, (r) => {
+      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId, provider } }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
         else resolve(r || { ok: false, error: 'нет ответа' });
       });
     }),
     120000,
-    'Не удалось получить ответ за 2 минуты. Проверьте интернет, а также API-ключ и баланс OpenRouter в настройках расширения, затем попробуйте ещё раз.'
+    timeoutMessage(provider)
   );
 }
 
@@ -848,16 +863,22 @@ async function scanHomework() {
 
 /* ---------- First-run onboarding (consent + a working AI key) ---------- */
 
-const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey', nararouter: 'nararouterApiKey' };
+const OB_PROVIDERS = ['groq', 'openrouter', 'qwen', 'deepseek'];
+// Qwen/DeepSeek deliberately have NO key field: they run through the СМЭШ
+// proxy, and the LICENSE key is the credential (lib/smesh-proxy.js). The
+// student never sees the words "API key" for them.
+const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey' };
+const LICENSE_LINK = { url: 'https://www.smeshai.xyz/', label: 'Купить лицензию СМЭШ →', placeholder: 'SMESH-XXXX-XXXX-XXXX' };
 const PROVIDER_KEY_LINK = {
   groq: { url: 'https://console.groq.com/keys', label: 'Получить бесплатный ключ →', placeholder: 'gsk_…' },
   openrouter: { url: 'https://openrouter.ai/keys', label: 'Получить ключ OpenRouter →', placeholder: 'sk-or-v1-…' },
-  nararouter: { url: 'https://router.bynara.id/', label: 'Получить бесплатный ключ →', placeholder: 'sk-nry-…' }
+  qwen: LICENSE_LINK,
+  deepseek: LICENSE_LINK
 };
 let obProvider = 'groq';
 
 function setObProvider(p) {
-  obProvider = PROVIDER_KEY_FIELD[p] ? p : 'groq';
+  obProvider = OB_PROVIDERS.includes(p) ? p : 'groq';
   const meta = PROVIDER_KEY_LINK[obProvider];
   for (const b of document.querySelectorAll('#obProvider button')) {
     b.classList.toggle('active', b.dataset.p === obProvider);
@@ -891,13 +912,26 @@ async function finishOnboarding() {
   const typed = document.getElementById('obKey').value.trim();
   if (!consent) { showObError('Поставьте галочку согласия, чтобы продолжить.'); return; }
   const field = PROVIDER_KEY_FIELD[obProvider];
-  // Re-pasting isn't required if a key for the chosen provider is already stored
-  // (e.g. set earlier in Settings) — consent alone is enough to proceed then.
-  const { [field]: existing } = await chrome.storage.local.get(field);
-  if (!typed && !existing) { showObError('Вставьте API-ключ выбранного сервиса.'); return; }
+  if (field) {
+    // Re-pasting isn't required if a key for the chosen provider is already stored
+    // (e.g. set earlier in Settings) — consent alone is enough to proceed then.
+    const { [field]: existing } = await chrome.storage.local.get(field);
+    if (!typed && !existing) { showObError('Вставьте API-ключ выбранного сервиса.'); return; }
+  } else {
+    // Qwen/DeepSeek: the typed value is the СМЭШ license key. Verify it right
+    // here so the very first «Решить» can't fail on a bad license. An already
+    // active license (entered earlier in Settings) passes without retyping.
+    if (typed) {
+      const r = await setLicenseKey(typed);
+      if (!r.ok) { showObError(reasonMessage(r.reason)); return; }
+    } else {
+      const status = await getLicenseStatus();
+      if (!status?.ok) { showObError('Введите ключ лицензии СМЭШ (SMESH-…) или купите её на сайте.'); return; }
+    }
+  }
   showObError('');
   const data = { aiProvider: obProvider };
-  if (typed) data[field] = typed;
+  if (field && typed) data[field] = typed;
   await chrome.storage.local.set(data);
   await setConsent(true);
   showOnboarding(false);
@@ -913,12 +947,29 @@ function wireOnboarding() {
   document.getElementById('obSettings').onclick = () => chrome.runtime.openOptionsPage();
 }
 
-// Ready = consent given AND the selected provider has a key. Otherwise show
-// onboarding so the very first "Решить" can never dead-end on a bare key error.
+// Ready = consent given AND the selected provider has a WORKING credential (an
+// API key, or for Qwen/DeepSeek a valid license / hidden BYO key). Otherwise
+// show onboarding so the very first "Решить" can never dead-end on a bare
+// credential error.
 async function isReadyToSolve() {
   if (!(await hasConsent())) return false;
-  const stored = await chrome.storage.local.get(['aiProvider', ...Object.values(PROVIDER_KEY_FIELD)]);
+  const stored = await chrome.storage.local.get(
+    ['aiProvider', 'licenseStatus', 'qwenApiKey', ...Object.values(PROVIDER_KEY_FIELD)]
+  );
   const provider = stored.aiProvider || 'openrouter';
+  if (provider === 'qwen' || provider === 'deepseek') {
+    // Hidden BYO Model Studio key bypasses the license entirely.
+    if (stored.qwenApiKey) return true;
+    // Otherwise the license must be USABLE, not merely entered: a confirmed-bad
+    // verdict (expired / revoked / not_found / device_limit) has no working
+    // credential, so send the user to onboarding — where the error and a fix
+    // field are shown — instead of letting every «Решить» dead-end on the proxy.
+    // A network-only failure is ambiguous (the key may be fine, the verify just
+    // didn't reach the server), so we DON'T bounce on it — mirroring license.js's
+    // keep-last-good policy and askViaProxy's deliberate leniency.
+    const lic = stored.licenseStatus;
+    return !!lic?.key && (lic.ok === true || lic.reason === 'network');
+  }
   // Fall back to OpenRouter's key field for any unknown/legacy provider value.
   const field = PROVIDER_KEY_FIELD[provider] || 'openrouterApiKey';
   return !!stored[field];

@@ -7,7 +7,7 @@
  * LICENSE_ENFORCED is on; while off, it's a no-op so dev usage is free.
  *
  * Cache shape (chrome.storage.local.licenseStatus):
- *   { key, ok, type, expires_at, reason, checkedAt, owner? }
+ *   { key, ok, type, expires_at, reason, checkedAt }
  *
  * `reason` is set only when `ok === false`. We surface its Russian translation
  * in Settings and in the gate error.
@@ -84,7 +84,6 @@ export async function verifyKey(key) {
     type: result.type || null,
     expires_at: result.expires_at || null,
     reason: result.ok ? null : (result.reason || 'not_found'),
-    owner: !!result.owner,
     checkedAt: Date.now()
   };
   await saveStatus(status);

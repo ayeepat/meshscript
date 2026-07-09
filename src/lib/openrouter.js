@@ -161,7 +161,7 @@ function historyToMessage(m) {
 }
 
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, reasoning = null, signal = null } = opts;
+  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null } = opts;
   const key = await getKey();
   // Charge the daily budget BEFORE the network round-trip so a runaway loop
   // can't drain credit; chargeOne throws a Russian-language error past the
@@ -177,7 +177,11 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
       ...history.map(historyToMessage),
       { role: 'user', content: files.length ? content : userText }
     ],
-    temperature: 0.3
+    temperature: 0.3,
+    // Ask OpenRouter to append an EXACT cost + token usage frame at the end of
+    // the stream (postStream captures it via onUsage → telemetry). Cheap and
+    // does not affect the answer.
+    usage: { include: true }
   };
   if (responseFormat === 'json_object') body.response_format = { type: 'json_object' };
 
@@ -218,5 +222,5 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   // mode — postStream just accumulates and returns the full text, which is
   // exactly what solveTest/the popup parse. response_format stays in the body,
   // so the streamed content is still a JSON object.
-  return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, signal });
+  return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, onUsage, signal });
 }

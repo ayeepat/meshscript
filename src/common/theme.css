@@ -268,7 +268,7 @@ svg[fill="none"] { stroke-width: 1.75; }
    Tabular numerals keep the seconds counter from jiggling the layout. */
 .thinkverb { font-variant-numeric: tabular-nums; }
 
-/* Provider badge — tiny read-only "which AI is active" tag (GRQ / OPR / NRY).
+/* Provider badge — tiny read-only "which AI is active" tag (GRQ / OPR / QWN / DSK).
    Shared by the popup test view and the dashboard header (see
    common/provider-badge.js). Never interactive — purely informational. */
 .provbadge {

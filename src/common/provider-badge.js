@@ -1,5 +1,5 @@
 /**
- * Tiny read-only "which AI service is active" indicator (GRQ / OPR / NRY).
+ * Tiny read-only "which AI service is active" indicator (GRQ / OPR / QWN / DSK).
  *
  * A small detail so the user knows which provider will answer BEFORE they hit
  * Solve. Never clickable. Reflects the `aiProvider` setting and updates live if
@@ -9,8 +9,8 @@
  * carries its own inlined copy of this — keep PROVIDER_ABBR in sync there.
  */
 
-export const PROVIDER_ABBR = { groq: 'GRQ', openrouter: 'OPR', nararouter: 'NRY' };
-const PROVIDER_NAME = { groq: 'Groq', openrouter: 'OpenRouter', nararouter: 'NaraRouter' };
+export const PROVIDER_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
+const PROVIDER_NAME = { groq: 'Groq', openrouter: 'OpenRouter', qwen: 'Qwen', deepseek: 'DeepSeek' };
 
 function pick(provider) {
   const p = PROVIDER_ABBR[provider] ? provider : 'openrouter';

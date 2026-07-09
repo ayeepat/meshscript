@@ -3,7 +3,8 @@
  * Orchestrates the AI provider call and local solve-history persistence.
  * All API keys live here / in storage, never in content scripts.
  */
-import { askAI } from '../lib/ai.js';
+import { askAI, normalizeAIProvider } from '../lib/ai.js';
+import { getByoKey } from '../lib/qwen.js';
 import { fetchOpenRouterCredits, getSpendHistory } from '../lib/openrouter.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
@@ -13,11 +14,13 @@ import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
-import { isReadableFile, hasPdf, isAudioFile } from '../lib/file-kinds.js';
+import { isReadableFile, hasPdf, isAudioFile, isPdfFile, isImageFile } from '../lib/file-kinds.js';
+import { track, heartbeat, usageFields } from '../lib/telemetry.js';
 import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } from '../lib/gdz-api.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 import { transcribeAudioFiles } from '../lib/transcribe.js';
+import { compressImageFiles } from '../lib/image-compress.js';
 
 // Diagnostic logging. OFF in shipped builds — flip to true to trace attachment
 // downloads and the cross-frame test fill in the service-worker console.
@@ -42,6 +45,36 @@ try {
 // fetch at most once per TTL). Fire-and-forget — a failure is a silent no-op and
 // the extension uses its built-in defaults. See lib/remote-config.js.
 getRuntimeConfig().catch(() => { /* offline / not hosted — defaults apply */ });
+
+// Daily-active signal for the admin dashboard. Self-throttled to one ping per
+// 6h (see telemetry.heartbeat), so frequent SW spin-ups don't spam the backend.
+heartbeat();
+
+// First install / version upgrade — a one-shot funnel signal. Fire-and-forget.
+chrome.runtime.onInstalled.addListener((details) => {
+  if (details.reason === 'install') track('install');
+  else if (details.reason === 'update') {
+    track('update', { meta: { from: details.previousVersion || null } });
+    migrateNararouter().catch(() => { /* best-effort */ });
+  }
+});
+
+// NaraRouter was removed (replaced by Qwen/DeepSeek). An install that still has
+// it selected would fall through to the dispatcher's OpenRouter default and
+// dead-end on "ключ не задан" — instead, move the selection to a provider the
+// user actually has a key for, and drop the orphaned key from storage.
+async function migrateNararouter() {
+  const { aiProvider, nararouterApiKey, openrouterApiKey } =
+    await chrome.storage.local.get(['aiProvider', 'nararouterApiKey', 'openrouterApiKey']);
+  if (aiProvider === 'nararouter') {
+    // Prefer OpenRouter if its key exists, else Groq. If neither key exists the
+    // popup's isReadyToSolve() gate reopens onboarding — the right recovery path.
+    await chrome.storage.local.set({ aiProvider: openrouterApiKey ? 'openrouter' : 'groq' });
+  }
+  if (nararouterApiKey !== undefined) {
+    await chrome.storage.local.remove(['nararouterApiKey', 'nararouterModelsCache']);
+  }
+}
 
 // Open the full-window dashboard when the popup asks to "Solve".
 async function openDashboard(payload) {
@@ -204,22 +237,41 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
     }
   }
 
+  // Shrink big images (phone photos, GDZ page scans) LAST, after every source
+  // that can add one: a multi-MB image inside the single /ai/start POST body
+  // is exactly what dies on the RU DPI clamp (and blows the proxy's data-URI
+  // cap). History too — the dashboard replays a turn's ORIGINAL files on
+  // follow-ups, so without this a follow-up re-ships the uncompressed photo.
+  // Fail-open — an image that can't be recompressed ships as-is.
+  files = await compressImageFiles(files);
+  history = await Promise.all(history.map(async (m) =>
+    m?.files?.length ? { ...m, files: await compressImageFiles(m.files) } : m));
+
   const systemPrompt = await buildSystemPrompt(subject, mode);
-  // PDFs require a PDF-capable backend; force OpenRouter (Gemini reads PDFs
-  // natively) even if the user picked Groq, which cannot read them at all.
-  const provider = hasPdf(files) ? 'openrouter' : undefined;
-  // If a PDF forced OpenRouter but no OpenRouter key is set, explain WHY a key
-  // is suddenly needed (the user may have deliberately picked free Groq, which
-  // can't read PDFs) instead of surfacing a bare "key not set" error.
-  if (provider === 'openrouter') {
-    const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
-    if (!openrouterApiKey) {
-      return {
-        answer: 'В задании есть PDF, а его умеет читать только OpenRouter (модель Gemini). ' +
-          'Бесплатные Groq и NaraRouter не читают PDF-файлы. Добавьте ключ OpenRouter в настройках ' +
-          'расширения — или пришлите это задание фотографиями страниц / текстом, и я решу через бесплатный провайдер.',
-        sessionId
-      };
+  // PDFs require a PDF-capable backend. The СМЭШ proxy (Qwen/DeepSeek without
+  // a BYO Alibaba key) handles them itself — it re-routes a PDF-carrying job
+  // to its Gemini chain server-side — so those requests pass through
+  // untouched. Everyone else (Groq, OpenRouter, BYO DashScope) is forced to
+  // OpenRouter, whose Gemini reads PDFs natively.
+  let provider;
+  if (hasPdf(files)) {
+    const { aiProvider } = await chrome.storage.local.get('aiProvider');
+    const chosen = normalizeAIProvider(aiProvider);
+    const proxyReadsPdf = (chosen === 'qwen' || chosen === 'deepseek') && !(await getByoKey());
+    if (!proxyReadsPdf) {
+      provider = 'openrouter';
+      // Explain WHY a key is suddenly needed (the user may have deliberately
+      // picked free Groq, which can't read PDFs) instead of a bare "key not
+      // set" error — and point at the keyless licensed path first.
+      const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
+      if (!openrouterApiKey) {
+        return {
+          answer: 'В задании есть PDF. Его умеют читать Qwen и DeepSeek (по лицензии СМЭШ, ключи не нужны) — ' +
+            'переключитесь на один из них в настройках расширения. Либо добавьте ключ OpenRouter (модель Gemini), ' +
+            'либо пришлите это задание фотографиями страниц / текстом.',
+          sessionId
+        };
+      }
     }
   }
   // When we auto-attached GDZ answer images above, tell the model what they are
@@ -232,10 +284,27 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
       'решение под нужный формат ответа, исправляя очевидные ошибки распознавания. Если на изображении ' +
       'явно не тот номер — не используй его.)';
   }
+  let usage = null, usedProvider = null;
   const answer = await askAI(
     systemPrompt, userTask, files,
-    history.slice(-MAX_HISTORY_MESSAGES), { onDelta, provider, signal }
+    history.slice(-MAX_HISTORY_MESSAGES),
+    { onDelta, provider, signal, onUsage: (u, prov) => { usage = u; usedProvider = prov; } }
   );
+
+  // Usage telemetry: one content-free 'solve' event with tokens/cost, subject
+  // and attachment counts. Fire-and-forget — never blocks or fails the answer.
+  track('solve', {
+    subject,
+    ...usageFields(usedProvider, usage),
+    files_pdf: files.filter(isPdfFile).length,
+    files_img: files.filter(isImageFile).length,
+    meta: {
+      mode: mode || 'brief',
+      followup: history.length > 0 ? 1 : 0,
+      gdz_auto: gdzAttached || 0,
+      category
+    }
+  });
 
   // Persist to local history (non-fatal if storage write fails).
   try {
@@ -256,7 +325,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
  * Solve an in-app Mesh test from a screenshot + extracted page text.
  * Answers are concise («№N: ответ») and intentionally NOT persisted.
  */
-async function solveTest({ text, screenshot }) {
+async function solveTest({ text, screenshot, provider } = {}) {
   await ensureLicensed();
   // Same privacy backstop as solve(): no consent → no provider call. Thrown so
   // the popup's requestSolve surfaces it as a clear error instead of a "result".
@@ -280,10 +349,24 @@ async function solveTest({ text, screenshot }) {
   // finishes in roughly half the time. The per-question «перерешать» (↻) re-solves
   // a single doubtful question at 'high' (see resolveOneQuestion), so max accuracy
   // is still one click away without holding the whole page hostage.
-  return askAI(systemPrompt, userText, screenshot ? [screenshot] : [], [], {
+  let usage = null, usedProvider = null;
+  const providerOverride = normalizeAIProvider(provider, null);
+  const askOpts = {
     responseFormat: 'json_object',
-    reasoning: { effort: 'medium' }
+    reasoning: { effort: 'medium' },
+    onUsage: (u, prov) => { usage = u; usedProvider = prov; }
+  };
+  if (providerOverride) askOpts.provider = providerOverride;
+  // Shrink the capture before it's sent: a full-page JPEG is still hundreds of
+  // KB, and on the proxy (RU) path that becomes a chunked upload — fewer, faster
+  // chunks the smaller it is. Fail-open (compressImageFiles returns it as-is).
+  const shot = screenshot ? (await compressImageFiles([screenshot]))[0] : null;
+  const answer = await askAI(systemPrompt, userText, shot ? [shot] : [], [], askOpts);
+  track('test_solve', {
+    ...usageFields(usedProvider, usage),
+    files_img: screenshot ? 1 : 0
   });
+  return answer;
 }
 
 /**
@@ -310,10 +393,14 @@ async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, question
     ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).\n\n' +
     'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
     (pageText || '(текст не извлечён, смотри скриншот)');
-  const answer = await askAI(systemPrompt, focus, screenshot ? [screenshot] : [], [], {
+  let usage = null, usedProvider = null;
+  const shot = screenshot ? (await compressImageFiles([screenshot]))[0] : null;
+  const answer = await askAI(systemPrompt, focus, shot ? [shot] : [], [], {
     responseFormat: 'json_object',
-    reasoning: { effort: 'high' }
+    reasoning: { effort: 'high' },
+    onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   });
+  track('test_requestion', { ...usageFields(usedProvider, usage), files_img: screenshot ? 1 : 0 });
   const parsed = parseTestAnswers(answer);
   const match = parsed.find((q) => String(q.index) === n) || parsed[0];
   // Return parts too so a re-solved multi-field question (x & y, x₁ & x₂) still
@@ -877,8 +964,12 @@ async function capturePageForPill(tabId, windowId) {
   // with a raw English "Either '<all_urls>' or 'activeTab' permission is
   // required". Map that to a clear, actionable Russian instruction (the pill's
   // errText passes Cyrillic through verbatim).
+  // JPEG, not PNG: a retina PNG of a test page is 1.5–4 MB of base64 and the
+  // whole thing rides ONE /ai/start POST — too slow for the RU DPI clamp
+  // window (see smesh-proxy.js). q90 JPEG is 5–10× smaller and test text /
+  // formulas stay perfectly readable for the vision model.
   const shotPromise = chrome.tabs
-    .captureVisibleTab(windowId, { format: 'png' })
+    .captureVisibleTab(windowId, { format: 'jpeg', quality: 90 })
     .catch((e) => {
       const m = String(e?.message || e);
       if (/all_urls|activeTab|permission|cannot be captured/i.test(m)) {
@@ -894,7 +985,7 @@ async function capturePageForPill(tabId, windowId) {
   const [pageText, dataUrl] = await Promise.all([textPromise, shotPromise]);
   const b64 = (dataUrl || '').split(',')[1];
   if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
-  return { pageText, screenshot: { mimeType: 'image/png', dataBase64: b64, name: 'screen.png' } };
+  return { pageText, screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' } };
 }
 
 /**
@@ -902,9 +993,9 @@ async function capturePageForPill(tabId, windowId) {
  * the in-page panel (showAnswersInTab) and autofill the form across every frame
  * (fillAllFrames). Returns the parsed questions + fill summary.
  */
-async function pillSolveOnePage(tabId, windowId) {
+async function pillSolveOnePage(tabId, windowId, provider) {
   const { pageText, screenshot } = await capturePageForPill(tabId, windowId);
-  const answer = await solveTest({ text: pageText, screenshot });
+  const answer = await solveTest({ text: pageText, screenshot, provider });
   const questions = parseTestAnswers(answer);
   if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
   await showAnswersInTab(tabId, questions);
@@ -950,12 +1041,12 @@ function notifyPill(tabId, payload) {
  * end. NEVER submits; mirrors popup.js solveAllPages exactly. Returns
  * { outcome, solved } so the pill can render the same Russian summary.
  */
-async function pillSolveAllPages(tabId, windowId) {
+async function pillSolveAllPages(tabId, windowId, provider) {
   let solved = 0;
   let outcome = 'done';
   for (let page = 1; page <= PILL_MAX_PAGES; page++) {
     notifyPill(tabId, { phase: 'solve', page });
-    const { questions } = await pillSolveOnePage(tabId, windowId);
+    const { questions } = await pillSolveOnePage(tabId, windowId, provider);
     if (questions.length) solved++;
     // Let the fill's React re-render settle so the signature reflects the filled
     // state — otherwise a late repaint could look like a navigation.
@@ -982,10 +1073,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         case 'SOLVE':
           // Non-streaming fallback (popup / callers that don't open a port).
-          sendResponse({ ok: true, result: await solve(msg.payload) });
+          sendResponse({ ok: true, result: await withKeepAlive(() => solve(msg.payload)) });
           break;
         case 'SOLVE_TEST': {
-          const answer = await solveTest(msg.payload);
+          const answer = await withKeepAlive(() => solveTest(msg.payload));
           // Parse once: the panel needs it now, and the popup's «Решить все
           // страницы» loop needs the structured questions to auto-fill the page.
           const questions = parseTestAnswers(answer);
@@ -1034,7 +1125,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { questions, summary } = await pillSolveOnePage(tabId, windowId);
+          const { questions, summary } = await withKeepAlive(() => pillSolveOnePage(tabId, windowId, msg.payload?.provider));
           sendResponse({ ok: true, count: questions.length, summary });
           break;
         }
@@ -1044,7 +1135,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { outcome, solved } = await pillSolveAllPages(tabId, windowId);
+          const { outcome, solved } = await withKeepAlive(() => pillSolveAllPages(tabId, windowId, msg.payload?.provider));
           sendResponse({ ok: true, outcome, solved });
           break;
         }
@@ -1054,7 +1145,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const resolved = await resolveOneQuestion(tabId, windowId, msg.payload || {});
+          const resolved = await withKeepAlive(() => resolveOneQuestion(tabId, windowId, msg.payload || {}));
           sendResponse({ ok: true, answer: resolved.answer, parts: resolved.parts });
           break;
         }
@@ -1110,6 +1201,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           );
           const inlined = settled.filter(Boolean);
           if (!inlined.length) { sendResponse({ ok: false, error: 'images unavailable' }); break; }
+          track('gdz_pull', { meta: { source: 'manual', images: inlined.length } });
           sendResponse({ ok: true, result: { ...result, inlined } });
           break;
         }
@@ -1146,6 +1238,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             answers.push(...res.answers);
           }
           const fallback = { title: books[0].title, breadcrumb: books[0].breadcrumb, year: books[0].year, study_level: books[0].study_level };
+          // GDZ pull telemetry: count it only when we actually surfaced answer
+          // image(s), not on an empty lookup. Content-free (subject + counts).
+          const gdzImages = answers.reduce((s, a) => s + (a.found ? (a.inlined?.length || 0) : 0), 0);
+          if (gdzImages > 0) {
+            track('gdz_pull', { subject, meta: { source: 'lesson', books: books.length, images: gdzImages } });
+          }
           sendResponse({
             ok: true, configured: true,
             mode: primaryMode || 'exercise',
@@ -1181,11 +1279,54 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // WITHOUT the "Error: " class prefix that String(e) prepends — same as the
       // streaming port below. The prefix would otherwise leak into the popup's
       // "Ошибка: …" line and defeat the pill errText's Cyrillic-passthrough.
-      sendResponse({ ok: false, error: String(e?.message || e) });
+      const emsg = String(e?.message || e);
+      // Content-free error signal for the dashboard: the message is our own
+      // (mostly Russian) phrasing or a provider error, never user text.
+      track('error', { meta: { msg: emsg.slice(0, 160), op: msg?.type || null } });
+      sendResponse({ ok: false, error: emsg });
     }
   })();
   return true; // async
 });
+
+// MV3 keepalive. A service worker is killed after ~30s in which it makes no
+// qualifying chrome.* API call — and crucially, `fetch()` does NOT count, nor
+// does posting over a port. The СМЭШ proxy answer is now delivered by a loop of
+// short poll fetches (lib/smesh-proxy.js — long-lived connections to our SNI
+// are throttled by RU DPI), so a long answer makes no qualifying call for tens
+// of seconds and Chrome tears the worker down mid-stream (observed: dead at
+// ~17s, port dropped → "соединение прервано"). Pinging a trivial chrome API on
+// an interval resets the idle timer. Ref-counted so overlapping solves share
+// one timer and it stops the moment the last one ends.
+let keepAliveTimer = null;
+let keepAliveHolders = 0;
+function pingAlive() {
+  try { chrome.runtime.getPlatformInfo(() => void chrome.runtime.lastError); } catch { /* no-op */ }
+}
+function acquireKeepAlive() {
+  keepAliveHolders += 1;
+  if (!keepAliveTimer) {
+    pingAlive(); // reset the idle timer NOW — the worker may already be aged
+    keepAliveTimer = setInterval(pingAlive, 10000);
+  }
+}
+function releaseKeepAlive() {
+  keepAliveHolders = Math.max(0, keepAliveHolders - 1);
+  if (keepAliveHolders === 0 && keepAliveTimer) {
+    clearInterval(keepAliveTimer);
+    keepAliveTimer = null;
+  }
+}
+
+// Long AI work behind a chrome.runtime MESSAGE (popup / pill flows) needs the
+// same keepalive as the port-based solve below: a chunked upload plus the
+// poll loop can run for minutes making no qualifying chrome.* call, and the
+// worker would otherwise be recycled mid-solve. Hoisted declaration — used by
+// the onMessage listener defined above.
+async function withKeepAlive(fn) {
+  acquireKeepAlive();
+  try { return await fn(); } finally { releaseKeepAlive(); }
+}
 
 // Streaming solve over a long-lived port. The dashboard connects with
 // name 'solve', sends one { type:'SOLVE', payload }, and receives a series of
@@ -1199,6 +1340,7 @@ chrome.runtime.onConnect.addListener((port) => {
   // charged) until the 60-s idle timeout, even though no UI is listening.
   let activeCtrl = null;
   port.onDisconnect.addListener(() => {
+    console.log('[solve] port disconnected');
     try { activeCtrl?.abort(); } catch { /* already aborted */ }
     activeCtrl = null;
   });
@@ -1206,16 +1348,23 @@ chrome.runtime.onConnect.addListener((port) => {
     if (msg?.type !== 'SOLVE') return;
     const ctrl = new AbortController();
     activeCtrl = ctrl;
+    const t0 = Date.now();
     const safePost = (m) => { try { port.postMessage(m); } catch { /* port closed */ } };
+    acquireKeepAlive();
+    console.log('[solve] SOLVE received');
     try {
       const result = await solve(msg.payload, (text) => safePost({ type: 'delta', text }), ctrl.signal);
+      console.log('[solve] done +' + (Date.now() - t0) + 'ms');
       safePost({ type: 'done', result });
     } catch (e) {
+      console.log('[solve] threw +' + (Date.now() - t0) + 'ms:', e?.name, String(e?.message || e), 'aborted=' + ctrl.signal.aborted);
       // Caller-initiated abort: the port is already gone, no point posting.
       if (e?.name !== 'AbortError' && !ctrl.signal.aborted) {
+        track('error', { meta: { msg: String(e?.message || e).slice(0, 160), op: 'solve_stream' } });
         safePost({ type: 'error', error: String(e?.message || e) });
       }
     } finally {
+      releaseKeepAlive();
       if (activeCtrl === ctrl) activeCtrl = null;
     }
   });

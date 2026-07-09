@@ -109,12 +109,45 @@
           </a>
         </div>
 
+        <section class="panel" id="refPanel">
+          <div class="panel-head">
+            <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg></span>
+            <div>
+              <h3>Пригласи друга</h3>
+              <p>Друг вводит ваш код при оплате подписки — ему <strong>+10% дней</strong> (30 → 33 дня), а вам <strong>+7 дней</strong> подписки за каждого купившего.</p>
+            </div>
+            <span class="licstatus" id="refDays" data-state="ok" hidden></span>
+          </div>
+
+          <div class="ref-code-row">
+            <div class="ref-code" id="refCode">·····</div>
+            <button class="refbtn" id="refCopyCode" type="button" disabled>Скопировать код</button>
+            <button class="refbtn accent" id="refCopyInvite" type="button" disabled>Скопировать приглашение</button>
+          </div>
+
+          <div class="ref-stats" id="refStats" hidden>
+            <span>Купили по вашему коду: <b id="refPurchases">0</b></span>
+          </div>
+
+          <div class="ref-reward" id="refReward" hidden>
+            <div class="ref-reward-txt">
+              <strong>Ваш бонусный ключ</strong>
+              <code id="refRewardKey"></code>
+              <small id="refRewardUntil"></small>
+              <small>Вставьте его в поле «Ключ доступа» выше, чтобы использовать бесплатные дни.</small>
+            </div>
+            <button class="refbtn" id="refRewardCopy" type="button">Скопировать</button>
+          </div>
+
+          <p class="ref-hint">Код действует бесплатно и бессрочно. Бонусные дни начисляются автоматически после оплаты друга.</p>
+        </section>
+
         <section class="panel">
           <div class="panel-head">
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span>
             <div>
               <h3>Провайдер</h3>
-              <p>OpenRouter точнее и читает PDF, Groq и NaraRouter бесплатные.</p>
+              <p>OpenRouter точнее и читает PDF; Groq бесплатный; Qwen и DeepSeek работают по лицензии СМЭШ — ключи не нужны. Qwen видит изображения; DeepSeek — самый быстрый на тексте (фото и скриншоты за него решает Qwen).</p>
             </div>
           </div>
 
@@ -122,7 +155,8 @@
             <select id="aiProvider">
               <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
               <option value="groq">Groq — Llama (бесплатно, без карты)</option>
-              <option value="nararouter">NaraRouter — Mistral Medium 3.5 / MiMo (бесплатно, 7M токенов/день)</option>
+              <option value="qwen">Qwen3.7-Plus — видит изображения (по лицензии СМЭШ)</option>
+              <option value="deepseek">DeepSeek V4 Flash — быстрый, текст (по лицензии СМЭШ)</option>
             </select>
             <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
           </div>
@@ -130,7 +164,6 @@
           <div class="providerhints">
             <a class="linkpill" href="https://openrouter.ai/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>OpenRouter</a>
             <a class="linkpill" href="https://console.groq.com/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Groq</a>
-            <a class="linkpill" href="https://router.bynara.id/" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>NaraRouter</a>
           </div>
 
           <div class="key-grid">
@@ -147,14 +180,6 @@
               <div class="inputwrap">
                 <input id="groqApiKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
                 <button class="reveal" type="button" data-reveal="groqApiKey" title="Показать / скрыть"></button>
-              </div>
-            </div>
-
-            <div class="field">
-              <label for="nararouterApiKey">NaraRouter API Key</label>
-              <div class="inputwrap">
-                <input id="nararouterApiKey" type="password" placeholder="sk-nry-…" autocomplete="off" spellcheck="false" />
-                <button class="reveal" type="button" data-reveal="nararouterApiKey" title="Показать / скрыть"></button>
               </div>
             </div>
           </div>
@@ -196,7 +221,8 @@
             <div class="seg small" id="chartMode" role="group" aria-label="Метрика графика">
               <button data-mode="openrouter" class="active" type="button" title="OpenRouter — запросов в день">OPR</button>
               <button data-mode="groq" type="button" title="Groq — запросов в день">GRQ</button>
-              <button data-mode="nararouter" type="button" title="NaraRouter — запросов в день">NRY</button>
+              <button data-mode="qwen" type="button" title="Qwen — запросов в день">QWN</button>
+              <button data-mode="deepseek" type="button" title="DeepSeek — запросов в день">DSK</button>
               <button data-mode="usd" type="button" title="Траты OpenRouter, $/день">$</button>
             </div>
           </div>
@@ -236,11 +262,21 @@
 
             <div class="field">
               <div class="limitrow">
-                <label for="limitNararouter">NaraRouter — запросов в день</label>
-                <span class="usage" id="usageNararouter">…</span>
+                <label for="limitQwen">Qwen — запросов в день</label>
+                <span class="usage" id="usageQwen">…</span>
               </div>
               <div class="inputwrap">
-                <input id="limitNararouter" type="number" min="1" max="10000" step="1" placeholder="200" autocomplete="off" />
+                <input id="limitQwen" type="number" min="1" max="10000" step="1" placeholder="80" autocomplete="off" />
+              </div>
+            </div>
+
+            <div class="field">
+              <div class="limitrow">
+                <label for="limitDeepseek">DeepSeek — запросов в день</label>
+                <span class="usage" id="usageDeepseek">…</span>
+              </div>
+              <div class="inputwrap">
+                <input id="limitDeepseek" type="number" min="1" max="10000" step="1" placeholder="150" autocomplete="off" />
               </div>
             </div>
           </div>

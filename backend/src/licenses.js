@@ -22,6 +22,8 @@
  *   }
  */
 
+import { mirrorLicense } from './analytics.js';
+
 // Crockford base32 with confusable chars (0/O, 1/I/L, U) removed.
 // 28 symbols — entropy per char ~4.8 bits. A 12-char key = ~58 bits, plenty
 // for the volumes we'll see and short enough to type if Telegram delivery
@@ -56,6 +58,16 @@ export async function getLicense(env, key) {
 
 export async function putLicense(env, license) {
   await env.LICENSES.put(license.key, JSON.stringify(license));
+  // Mirror into the D1 `purchases` table so the admin dashboard can query
+  // revenue/retention with plain SQL. KV stays the source of truth: a D1
+  // failure must never fail a payment webhook or a /verify device add.
+  // (Import cycle with analytics.js is fine — both sides only call functions
+  // at runtime, never during module evaluation.)
+  try {
+    await mirrorLicense(env, license);
+  } catch (e) {
+    console.warn('license mirror failed', license.key, String(e));
+  }
 }
 
 /**
@@ -132,11 +144,13 @@ export async function issueLicense(env, params) {
 export async function verifyLicense(env, rawKey, deviceId) {
   const key = normalizeKey(rawKey);
   if (!key) return { ok: false, reason: 'not_found' };
-  // Dev-bypass: a single hardcoded key the operator types into their own
-  // Settings, lets them keep using the app without a real purchase. Set via
-  // `wrangler secret put OWNER_LICENSE_KEY`. Empty/unset env disables the gate.
+  // Operator bypass: a single server-side secret the operator types into their
+  // own Settings, letting them keep using the app without a real purchase. Set
+  // via `wrangler secret put OWNER_LICENSE_KEY`. Empty/unset env disables it.
+  // Deliberately return the same public shape as a lifetime license so the
+  // client UI/network response does not fingerprint this as an owner key.
   if (env.OWNER_LICENSE_KEY && key === normalizeKey(env.OWNER_LICENSE_KEY)) {
-    return { ok: true, type: 'lifetime', expires_at: null, owner: true };
+    return { ok: true, type: 'lifetime', expires_at: null };
   }
   const license = await getLicense(env, key);
   if (!license) return { ok: false, reason: 'not_found' };

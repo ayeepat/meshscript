@@ -13,6 +13,12 @@
       "runtimeArgs": ["run", "dev"],
       "port": 5173,
       "cwd": "/Users/annaermakova/Downloads/meshsitereal"
+    },
+    {
+      "name": "dashboard",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "http.server", "4599", "--directory", "/Users/annaermakova/Downloads/smeshaidashboard"],
+      "port": 4599
     }
   ]
 }
