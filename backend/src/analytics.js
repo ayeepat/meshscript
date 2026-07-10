@@ -322,7 +322,11 @@ export async function statsOverview(env, days) {
 export async function statsTimeseries(env, days) {
   const n = Math.max(1, Math.min(365, days || 30));
   const from = daysBack(n - 1);
-  const fromTs = Date.now() - n * DAY_MS;
+  // Start of `from` as a real timestamp (MSK midnight), NOT a rolling
+  // now-minus-N-days cutoff: devices/purchases landing between the rolling
+  // cutoff and the first charted day would otherwise be silently dropped
+  // (their computed day key predates the chart's first row).
+  const fromTs = Date.parse(from + 'T00:00:00Z') - MSK_OFFSET_MS;
 
   const [ev, dev, pur] = await Promise.all([
     env.DB.prepare(

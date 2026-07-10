@@ -14,6 +14,8 @@
 
 const STORAGE_KEY = 'meshHistory';
 const TTL_MS = 7 * 24 * 60 * 60 * 1000;
+let stateQueue = Promise.resolve();
+let deviceIdPromise = null;
 
 async function load() {
   const { [STORAGE_KEY]: data } = await chrome.storage.local.get(STORAGE_KEY);
@@ -24,6 +26,19 @@ async function load() {
 
 async function save(state) {
   await chrome.storage.local.set({ [STORAGE_KEY]: state });
+}
+
+// Storage writes are read-modify-write operations. One queue prevents parallel
+// dashboard solves from losing a session or message when the last writer wins.
+function mutateState(mutator) {
+  const run = stateQueue.then(async () => {
+    const state = prune(await load());
+    const result = await mutator(state);
+    await save(state);
+    return result;
+  });
+  stateQueue = run.catch(() => {});
+  return run;
 }
 
 // Drop anything older than TTL_MS. Returns a fresh state with stale sessions
@@ -41,51 +56,60 @@ function prune(state) {
 }
 
 export async function getDeviceId() {
-  let { deviceId } = await chrome.storage.local.get('deviceId');
-  if (!deviceId) {
-    deviceId = crypto.randomUUID();
-    await chrome.storage.local.set({ deviceId });
+  if (!deviceIdPromise) {
+    deviceIdPromise = (async () => {
+      let { deviceId } = await chrome.storage.local.get('deviceId');
+      if (!deviceId) {
+        deviceId = crypto.randomUUID();
+        await chrome.storage.local.set({ deviceId });
+      }
+      return deviceId;
+    })().catch((e) => {
+      deviceIdPromise = null;
+      throw e;
+    });
   }
-  return deviceId;
+  return deviceIdPromise;
 }
 
 export async function createSession(subject, taskText) {
-  const state = prune(await load());
-  const session = {
-    id: crypto.randomUUID(),
-    subject,
-    task_text: taskText,
-    created_at: new Date().toISOString()
-  };
-  state.sessions.unshift(session);
-  state.messages[session.id] = [];
-  await save(state);
-  return session;
+  return mutateState((state) => {
+    const session = {
+      id: crypto.randomUUID(),
+      subject,
+      task_text: taskText,
+      created_at: new Date().toISOString()
+    };
+    state.sessions.unshift(session);
+    state.messages[session.id] = [];
+    return session;
+  });
 }
 
 export async function addMessage(sessionId, role, content) {
-  const state = prune(await load());
-  const msg = {
-    id: crypto.randomUUID(),
-    session_id: sessionId,
-    role,
-    content,
-    created_at: new Date().toISOString()
-  };
-  if (!state.messages[sessionId]) state.messages[sessionId] = [];
-  state.messages[sessionId].push(msg);
-  await save(state);
-  return msg;
+  return mutateState((state) => {
+    const msg = {
+      id: crypto.randomUUID(),
+      session_id: sessionId,
+      role,
+      content,
+      created_at: new Date().toISOString()
+    };
+    if (!state.messages[sessionId]) state.messages[sessionId] = [];
+    state.messages[sessionId].push(msg);
+    return msg;
+  });
 }
 
 export async function listSessions() {
-  const state = prune(await load());
-  await save(state);
-  return [...state.sessions].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  return mutateState((state) =>
+    [...state.sessions].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
+  );
 }
 
 export async function listMessages(sessionId) {
-  const state = prune(await load());
-  const msgs = state.messages[sessionId] || [];
-  return [...msgs].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  return mutateState((state) => {
+    const msgs = state.messages[sessionId] || [];
+    return [...msgs].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+  });
 }

@@ -56,6 +56,7 @@ const START_URL = `${AI_BACKEND_URL}/ai/start`;
 const POLL_URL = `${AI_BACKEND_URL}/ai/poll`;
 const CANCEL_URL = `${AI_BACKEND_URL}/ai/cancel`;
 const BLOB_URL = `${AI_BACKEND_URL}/ai/blob`;
+const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;
 
 // Chunked upload for large attachments (see the module header). A part whose
 // data URI exceeds INLINE_MAX_CHARS is uploaded in small pieces instead of
@@ -165,8 +166,7 @@ function sleep(ms, signal) {
 // Error carries `.sentAny` (were ANY chunks delivered before the failure?) so
 // the adaptive wrapper below can tell "this size doesn't work at all" (retry
 // smaller) apart from "a real error mid-upload" (surface it, don't retry).
-async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, dbg }) {
-  const blobId = self.crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2));
+async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, dbg, blobId, uploadToken }) {
   const total = Math.max(1, Math.ceil(text.length / chunkChars));
   const tUp = Date.now();
   let nextSeq = 0;
@@ -183,7 +183,7 @@ async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, 
         const r = await fetchText(BLOB_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ blob_id: blobId, seq, total, chunk, mime, name })
+          body: JSON.stringify({ blob_id: blobId, upload_token: uploadToken, seq, total, chunk, mime, name })
         }, signal, BLOB_CHUNK_TIMEOUT_MS);
         if (r.ok) {
           sent += 1;
@@ -243,6 +243,30 @@ async function uploadBlob(text, mime, name, opts) {
   }
 }
 
+// Blob chunks are intentionally tiny and numerous, so they cannot each afford
+// a remote /verify request. Obtain one short-lived, license-bound capability
+// first; the VPS binds every chunk and the final /ai/start to it.
+async function createUploadTicket(licenseKey, deviceId, signal) {
+  let res;
+  try {
+    res = await fetchText(UPLOAD_TICKET_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ license_key: licenseKey, device_id: deviceId })
+    }, signal, START_TIMEOUT_MS);
+  } catch (e) {
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    throw new Error('Не удалось подтвердить загрузку вложения. Проверьте интернет и попробуйте ещё раз.');
+  }
+  if (!res.ok) throw new Error(proxyMessage(res.text, 'Не удалось подтвердить загрузку вложения. Попробуйте ещё раз.'));
+  let ticket;
+  try { ticket = JSON.parse(res.text); } catch { ticket = null; }
+  if (!ticket?.ok || typeof ticket.upload_token !== 'string' || typeof ticket.blob_id !== 'string') {
+    throw new Error('Не удалось подтвердить загрузку вложения. Попробуйте ещё раз.');
+  }
+  return ticket;
+}
+
 export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, signal = null, responseFormat = null, reasoning = null } = {}) {
   // Only require that a key has been ENTERED — the server re-verifies anyway,
   // and its verdict (expired/revoked/…) comes back as a ready Russian message.
@@ -259,10 +283,11 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   const t0 = Date.now();
   const dbg = (...a) => console.log('[smesh-poll]', '+' + (Date.now() - t0) + 'ms', ...a);
 
+  const deviceId = await getDeviceId();
   const body = {
     provider,
     license_key: status.key,
-    device_id: await getDeviceId(),
+    device_id: deviceId,
     messages
   };
   if (responseFormat) body.response_format = responseFormat;
@@ -281,7 +306,10 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
     dbg('start body', payload.length + 'ch — externalizing messages (' + messagesJson.length + 'ch) via /ai/blob');
     let blobId;
     try {
-      blobId = await uploadBlob(messagesJson, 'application/json', 'messages', { signal, dbg });
+      const ticket = await createUploadTicket(status.key, deviceId, signal);
+      blobId = await uploadBlob(messagesJson, 'application/json', 'messages', {
+        signal, dbg, blobId: ticket.blob_id, uploadToken: ticket.upload_token
+      });
     } catch (e) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       throw new Error(`${label}: ${e?.message || 'не удалось загрузить вложение. Попробуйте ещё раз.'}`);

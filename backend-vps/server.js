@@ -147,6 +147,7 @@ const MAX_BLOB_CHARS = 9 * 1024 * 1024;      // one blob: a whole messages JSON 
 const MAX_TOTAL_BLOB_CHARS = 80 * 1024 * 1024; // across ALL blobs — bounds worst-case memory
 const MAX_CHUNK_CHARS = 256 * 1024;          // per-chunk sanity (client sends ~8 KB)
 const MAX_BLOB_PARTS = 4096;
+const MAX_UPLOAD_TICKETS_PER_DEVICE = 2;     // bounds pre-start reservations by one valid license/device
 
 // Student-facing copy — identical wording to ai-proxy.js. Never mentions keys.
 const UNAVAILABLE = 'ИИ-сервис временно недоступен. Попробуйте позже или переключитесь на другой провайдер в настройках.';
@@ -158,7 +159,8 @@ const LICENSE_ERRORS = {
   not_found: 'Ключ лицензии не найден. Проверьте его в настройках расширения.',
   expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться Qwen и DeepSeek.',
   revoked: 'Эта лицензия была отозвана. Напишите в поддержку.',
-  device_limit: 'Достигнут лимит устройств для этой лицензии.'
+  device_limit: 'Достигнут лимит устройств для этой лицензии.',
+  bad_device: NEED_DEVICE_ID
 };
 const TOO_BIG = 'Запрос слишком большой. Уберите часть вложений и попробуйте снова.';
 
@@ -276,9 +278,15 @@ async function verifyLicense(licenseKey, deviceId) {
   const timer = setTimeout(() => ctrl.abort(), 10000);
   try {
     const r = await fetch(url, { signal: ctrl.signal });
-    if (!r.ok) return { ok: false, reason: 'not_found' };
+    // /verify always answers 200 with a JSON verdict (ok:false rides a 200).
+    // Any non-200 is worker/network infrastructure trouble, NOT a verdict on
+    // the key — surface it as retryable 503, never "key not found".
+    if (!r.ok) {
+      console.error('verify http error', r.status);
+      return { ok: false, reason: '_unreachable' };
+    }
     const j = await r.json();
-    return (j && typeof j === 'object') ? j : { ok: false, reason: 'not_found' };
+    return (j && typeof j === 'object') ? j : { ok: false, reason: '_unreachable' };
   } catch (e) {
     console.error('verify unreachable', String(e));
     return { ok: false, reason: '_unreachable' };
@@ -354,13 +362,58 @@ function hasPdfParts(messages) {
 
 const blobs = new Map();
 let totalBlobChars = 0;
+// Short-lived, license-verified capabilities for /ai/blob. A blob upload happens
+// before /ai/start can charge a quota, so accepting anonymous chunks turned this
+// bounded memory store into a public denial-of-service primitive.
+const uploadTickets = new Map(); // token -> { blobId, licenseKey, deviceId, chars, expiresAt, lastAccess }
 
 function freeBlob(id) {
   const b = blobs.get(id);
   if (!b) return;
   totalBlobChars -= b.chars || 0;
   if (totalBlobChars < 0) totalBlobChars = 0;
+  if (b.uploadToken) uploadTickets.delete(b.uploadToken);
   blobs.delete(id);
+}
+
+function ticketFor(token, blobId) {
+  const ticket = uploadTickets.get(typeof token === 'string' ? token : '');
+  if (!ticket || ticket.expiresAt <= Date.now() || ticket.blobId !== blobId) return null;
+  ticket.lastAccess = Date.now();
+  ticket.expiresAt = ticket.lastAccess + BLOB_TTL_MS;
+  return ticket;
+}
+
+async function handleUploadTicket(res, rawBody) {
+  let body;
+  try { body = JSON.parse(rawBody); } catch { return sendErr(res, 400, 'Некорректный запрос.'); }
+  const licenseKey = normalizeKey(typeof body.license_key === 'string' ? body.license_key : '');
+  const deviceId = typeof body.device_id === 'string' ? body.device_id.slice(0, 64) : '';
+  if (!licenseKey) return sendErr(res, 403, NEED_LICENSE);
+  if (!deviceId) return sendErr(res, 403, NEED_DEVICE_ID);
+
+  const verdict = await verifyLicense(licenseKey, deviceId);
+  if (!verdict.ok) {
+    if (verdict.reason === '_unreachable') return sendErr(res, 503, UNAVAILABLE);
+    return sendErr(res, 403, LICENSE_ERRORS[verdict.reason] || NEED_LICENSE);
+  }
+
+  let activeForDevice = 0;
+  const now = Date.now();
+  for (const ticket of uploadTickets.values()) {
+    if (ticket.expiresAt > now && ticket.licenseKey === licenseKey && ticket.deviceId === deviceId) activeForDevice += 1;
+  }
+  if (activeForDevice >= MAX_UPLOAD_TICKETS_PER_DEVICE) {
+    return sendErr(res, 429, 'Слишком много незавершённых загрузок. Подождите минуту и попробуйте ещё раз.');
+  }
+
+  const uploadToken = crypto.randomBytes(32).toString('base64url');
+  const blobId = crypto.randomUUID();
+  uploadTickets.set(uploadToken, {
+    blobId, licenseKey, deviceId, chars: 0,
+    expiresAt: now + BLOB_TTL_MS, lastAccess: now
+  });
+  sendJson(res, 200, { ok: true, upload_token: uploadToken, blob_id: blobId });
 }
 
 // One chunk of a blob. Chunks are plain SUBSTRINGS concatenated in seq order
@@ -378,6 +431,8 @@ function handleBlob(req, res, rawBody) {
     return sendErr(res, 400, 'Некорректный запрос.');
   }
   if (chunk.length > MAX_CHUNK_CHARS) return sendErr(res, 413, TOO_BIG);
+  const ticket = ticketFor(b.upload_token, id);
+  if (!ticket) return sendErr(res, 403, 'Загрузка не подтверждена или устарела. Попробуйте ещё раз.');
 
   let blob = blobs.get(id);
   if (!blob) {
@@ -388,19 +443,42 @@ function handleBlob(req, res, rawBody) {
       parts: new Map(), total, chars: 0, done: false, data: '',
       mime: typeof b.mime === 'string' ? b.mime.slice(0, 80) : '',
       name: typeof b.name === 'string' ? b.name.slice(0, 120) : '',
+      uploadToken: b.upload_token,
+      licenseKey: ticket.licenseKey,
+      deviceId: ticket.deviceId,
       lastAccess: Date.now()
     };
     blobs.set(id, blob);
   }
+  if (blob.uploadToken !== b.upload_token) {
+    return sendErr(res, 403, 'Загрузка не подтверждена или устарела. Попробуйте ещё раз.');
+  }
+  // Same ticket, different chunking = the client's adaptive size fallback
+  // restarting the upload (its probe attempt may have landed a chunk here even
+  // though the client saw only timeouts — see uploadBlob in smesh-proxy.js).
+  // The ticket already authenticates the owner, so treat it as a fresh start
+  // for this blob instead of 403-ing every retry into a dead end.
+  if (blob.total !== total) {
+    totalBlobChars -= blob.chars;
+    if (totalBlobChars < 0) totalBlobChars = 0;
+    ticket.chars = Math.max(0, ticket.chars - blob.chars);
+    blob.parts.clear();
+    blob.total = total;
+    blob.chars = 0;
+    blob.done = false;
+    blob.data = '';
+  }
   blob.lastAccess = Date.now();
 
   if (!blob.done && !blob.parts.has(seq)) {
-    if (blob.chars + chunk.length > MAX_BLOB_CHARS || totalBlobChars + chunk.length > MAX_TOTAL_BLOB_CHARS) {
+    if (blob.chars + chunk.length > MAX_BLOB_CHARS || ticket.chars + chunk.length > MAX_BLOB_CHARS ||
+        totalBlobChars + chunk.length > MAX_TOTAL_BLOB_CHARS) {
       freeBlob(id);
       return sendErr(res, 413, TOO_BIG);
     }
     blob.parts.set(seq, chunk);
     blob.chars += chunk.length;
+    ticket.chars += chunk.length;
     totalBlobChars += chunk.length;
   }
   if (!blob.done && blob.parts.size >= blob.total) {
@@ -429,20 +507,6 @@ async function prepareChat(rawBody) {
   const provider = PROVIDERS[body.provider];
   if (!provider) return { err: { status: 400, message: 'Неизвестный провайдер.' } };
 
-  // A big request arrives with its messages chunk-uploaded to /ai/blob (the
-  // whole /ai/start body must stay tiny — RU DPI gives each connection only a
-  // ~16 KB transfer allowance) and referenced here. The blob holds the raw
-  // messages JSON; parse it and continue exactly as if it were inline.
-  if (typeof body.messages_blob === 'string') {
-    const blob = blobs.get(body.messages_blob);
-    if (!blob || !blob.done) {
-      return { err: { status: 410, message: 'Загруженное вложение устарело. Пришлите его ещё раз.' } };
-    }
-    try { body.messages = JSON.parse(blob.data); }
-    catch { freeBlob(body.messages_blob); return { err: { status: 400, message: 'Некорректный запрос.' } }; }
-    freeBlob(body.messages_blob);
-  }
-
   const licenseKey = normalizeKey(typeof body.license_key === 'string' ? body.license_key : '');
   const deviceId = typeof body.device_id === 'string' ? body.device_id.slice(0, 64) : '';
   if (!licenseKey) return { err: { status: 403, message: NEED_LICENSE } };
@@ -452,6 +516,22 @@ async function prepareChat(rawBody) {
   if (!verdict.ok) {
     if (verdict.reason === '_unreachable') return { err: { status: 503, message: UNAVAILABLE } };
     return { err: { status: 403, message: LICENSE_ERRORS[verdict.reason] || NEED_LICENSE } };
+  }
+
+  // A large request arrives with its messages chunk-uploaded to /ai/blob. Bind
+  // the completed blob to this same license/device before reading it, so a
+  // guessed or leaked blob id cannot be redeemed by another caller.
+  if (typeof body.messages_blob === 'string') {
+    const blob = blobs.get(body.messages_blob);
+    if (!blob || !blob.done) {
+      return { err: { status: 410, message: 'Загруженное вложение устарело. Пришлите его ещё раз.' } };
+    }
+    if (blob.licenseKey !== licenseKey || blob.deviceId !== deviceId) {
+      return { err: { status: 403, message: 'Загрузка не принадлежит этому устройству. Пришлите вложение ещё раз.' } };
+    }
+    try { body.messages = JSON.parse(blob.data); }
+    catch { freeBlob(body.messages_blob); return { err: { status: 400, message: 'Некорректный запрос.' } }; }
+    freeBlob(body.messages_blob);
   }
 
   const messages = sanitizeMessages(body.messages);
@@ -587,6 +667,13 @@ setInterval(() => {
   // /ai/start inlines it, so anything left here is genuinely orphaned.
   for (const [id, blob] of blobs) {
     if (now - blob.lastAccess > BLOB_TTL_MS) freeBlob(id);
+  }
+  for (const [token, ticket] of uploadTickets) {
+    if (ticket.expiresAt <= now) {
+      // A ticket may expire before its first chunk creates a blob.
+      if (blobs.has(ticket.blobId)) freeBlob(ticket.blobId);
+      else uploadTickets.delete(token);
+    }
   }
 }, JOB_GC_INTERVAL_MS).unref();
 
@@ -774,6 +861,7 @@ const server = http.createServer((req, res) => {
   if (pathName === '/health') return sendJson(res, 200, { ok: true });
   if (pathName === '/ai/streamtest' && req.method === 'GET') return handleStreamTest(req, res, url);
   if (pathName === '/ai/poll' && req.method === 'GET') return handleAiPoll(req, res, url);
+  if (pathName === '/ai/upload-ticket' && req.method === 'POST') return withBody(req, res, (raw) => handleUploadTicket(res, raw));
   if (pathName === '/ai/blob' && req.method === 'POST') return withBody(req, res, (raw) => handleBlob(req, res, raw));
   if (pathName === '/ai/start' && req.method === 'POST') return withBody(req, res, (raw) => handleAiStart(req, res, raw));
   if (pathName === '/ai/cancel' && req.method === 'POST') return withBody(req, res, (raw) => handleAiCancel(req, res, raw));

@@ -19,6 +19,11 @@ export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, qwen: 80, deepseek: 1
 const PROVIDER_NAMES = { openrouter: 'OpenRouter', groq: 'Groq', qwen: 'Qwen', deepseek: 'DeepSeek' };
 const HISTORY_DAYS = 14;
 
+// chrome.storage.local has no compare-and-swap. Serialising read-modify-write
+// charges inside this service-worker prevents simultaneous solves from each
+// reading the same count and then overwriting one another's increment.
+let chargeQueue = Promise.resolve();
+
 function todayKey() {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, '0');
@@ -68,7 +73,7 @@ function currentCount(slot, day) {
  * Error when over the cap so the existing service-worker try/catch surfaces it
  * to the UI verbatim.
  */
-export async function chargeOne(provider) {
+async function chargeOneInner(provider) {
   const { rateLimits, rateUsage, rateHistory } = await load();
   const limit = limitFor(rateLimits, provider);
   const day = todayKey();
@@ -86,6 +91,14 @@ export async function chargeOne(provider) {
   const row = hist[day] || {};
   hist[day] = { ...row, [provider]: (Number(row[provider]) || 0) + 1 };
   await chrome.storage.local.set({ rateUsage: next, rateHistory: hist });
+}
+
+export function chargeOne(provider) {
+  const run = chargeQueue.then(() => chargeOneInner(provider));
+  // Keep later charges usable after an over-limit error while preserving that
+  // error for this caller.
+  chargeQueue = run.catch(() => {});
+  return run;
 }
 
 /** Snapshot of today's usage for each provider. Used by Settings. */

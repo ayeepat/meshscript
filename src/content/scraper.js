@@ -748,7 +748,9 @@ async function fetchInlineFile(url) {
     const name = fileNameFromUrl(url);
     const blob = await res.blob();
     const mimeType = inferMime(name, ct || blob.type);
-    const maxBytes = isAudioAttachment(name, mimeType) ? 25 * 1024 * 1024 : 12 * 1024 * 1024;
+    // Keep the same normal-file ceiling as manual/background uploads: after
+    // base64 expansion the licensed proxy has only 9 MB for its messages blob.
+    const maxBytes = isAudioAttachment(name, mimeType) ? 25 * 1024 * 1024 : 6 * 1024 * 1024;
     if (!blob.size || blob.size > maxBytes) return null;
     const dataUrl = await new Promise((resolve, reject) => {
       const r = new FileReader();

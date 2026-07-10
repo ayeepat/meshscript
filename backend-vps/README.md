@@ -18,6 +18,8 @@ Extension ──GET /ai/poll──┐         └─ POST (SSE) ──▶ api.30
           ◀─{chunk,done}──┘ ~0.6s        buffered in memory per job — this leg
    … repeat until done …                 never touches Russia)
 Extension ──POST /ai/cancel──▶  (abort: stop paying 302.AI)
+Extension ──POST /ai/upload-ticket──▶ (validates license, authorizes one blob)
+Extension ──POST /ai/blob──▶    (short chunks, bound to that ticket)
 
 Extension ──everything else──▶ smeshapi.site (CF worker, unchanged)
 ```
@@ -33,11 +35,14 @@ big upload delivered exactly 16 KB then crawled to a 408, and 96 KB chunks
 died with 0 bytes through. So EVERY request — `/ai/start` included — must fit
 under ~16 KB. When the start body would be bigger (screenshot, PDF, long
 replayed history), the client slices the whole `messages` JSON into **8 KB**
-substring chunks and `POST`s them to **`/ai/blob`** on a few parallel
-connections (each connection brings its own allowance); the server
-reassembles the string (bounded + 90s TTL, swept by GC) and `/ai/start`
-arrives tiny with `{ messages_blob: <id> }`, which `prepareChat` parses back
-into `messages`. See `uploadBlob` in `src/lib/smesh-proxy.js`.
+ substring chunks and `POST`s them to **`/ai/blob`** on a few parallel
+ connections (each connection brings its own allowance). Before the chunks,
+ the extension obtains a short-lived `/ai/upload-ticket` after server-side
+ license verification; every chunk and the final `/ai/start` are bound to that
+ ticket's generated blob id, license, and device. The server reassembles the
+ string (bounded + 90s inactivity TTL, swept by GC) and `/ai/start` arrives
+ tiny with `{ messages_blob: <id> }`, which `prepareChat` parses back into
+ `messages`. See `uploadBlob` in `src/lib/smesh-proxy.js`.
 
 ## Files
 - `server.js` — the proxy (Node 18+, **zero npm deps**). License verified via

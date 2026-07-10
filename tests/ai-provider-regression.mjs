@@ -27,6 +27,7 @@ globalThis.chrome = {
 };
 
 const { askAI, normalizeAIProvider } = await import('../src/lib/ai.js');
+const { getUsage } = await import('../src/lib/rate-limit.js');
 
 function source(path) {
   return readFileSync(new URL(path, import.meta.url), 'utf8');
@@ -58,6 +59,7 @@ delete store.licenseStatus;
 await expectQwenPath('stored qwen provider', () =>
   askAI('system', 'user', [], [], { responseFormat: 'json_object' })
 );
+assert.equal((await getUsage()).qwen.used, 0, 'a missing proxy license must not consume the Qwen local quota');
 
 store.aiProvider = 'openrouter';
 delete store.openrouterApiKey;
@@ -65,6 +67,7 @@ delete store.licenseStatus;
 await expectQwenPath('explicit qwen provider override', () =>
   askAI('system', 'user', [], [], { provider: 'qwen', responseFormat: 'json_object' })
 );
+assert.equal((await getUsage()).qwen.used, 0, 'rejected proxy requests must leave the local quota unchanged');
 
 assert.equal(normalizeAIProvider('qwen'), 'qwen');
 assert.equal(normalizeAIProvider('deepseek'), 'deepseek');
@@ -73,6 +76,8 @@ assert.equal(normalizeAIProvider('nararouter', null), null);
 
 assertContains('../src/popup/popup.js', "const provider = PROVIDER_ABBR[aiProvider] ? aiProvider : undefined;");
 assertContains('../src/popup/popup.js', "payload: { text: pageText, screenshot, tabId, provider }");
+assertContains('../src/popup/popup.js', 'function requireMeshTestTab(tab)');
+assertContains('../src/popup/popup.js', 'Другие вкладки расширение не снимает и не отправляет ИИ.');
 
 assertContains('../src/content/test-pill.js', "let providerId = 'openrouter';");
 assertContains('../src/content/test-pill.js', "payload: { provider: providerId }");
@@ -80,5 +85,7 @@ assertContains('../src/content/test-pill.js', "payload: { provider: providerId }
 assertContains('../src/background/service-worker.js', 'async function solveTest({ text, screenshot, provider } = {})');
 assertContains('../src/background/service-worker.js', 'const providerOverride = normalizeAIProvider(provider, null);');
 assertContains('../src/background/service-worker.js', 'if (providerOverride) askOpts.provider = providerOverride;');
+assertContains('../src/lib/smesh-proxy.js', 'const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;');
+assertContains('../src/lib/smesh-proxy.js', 'upload_token: uploadToken');
 
 console.log('ai-provider regression passed');

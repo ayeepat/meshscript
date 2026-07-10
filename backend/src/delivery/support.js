@@ -40,7 +40,11 @@ const MENU = {
   ]
 };
 
-const ID_RE = /#id(\d+)/;
+// The routing tag is ALWAYS appended by routeSubmission after the user's own
+// text, so the LAST match is ours. Matching the first would let a user write
+// "#id<someone else>" in their ticket body and have the owner's reply DM'd to
+// an arbitrary Telegram account.
+const ID_RE = /#id(\d+)(?![\s\S]*#id\d)/;
 const senderName = (u = {}) => [u.first_name, u.last_name].filter(Boolean).join(' ') || 'без имени';
 const senderHandle = (u = {}) => (u.username ? `@${u.username}` : '—');
 

@@ -31,10 +31,9 @@ import { processSupportUpdate } from './delivery/support.js';
 const VERIFY_CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  // x-admin-token: the admin dashboard (a static GitHub Pages app) calls the
-  // /admin/stats/* endpoints cross-origin. CORS is not the guard — the
-  // ADMIN_SECRET header check is; no cookies are involved anywhere.
-  'Access-Control-Allow-Headers': 'Content-Type, x-admin-token',
+  // Public extension endpoints accept JSON only. Admin routes are deliberately
+  // CLI/server-to-server only and must not be callable by a static website.
+  'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Max-Age': '86400'
 };
 
@@ -58,11 +57,6 @@ export default {
 
       if (path === '/verify' && method === 'GET') return await handleVerify(request, env);
       if (path === '/ai/chat' && method === 'POST') return await handleAiChat(request, env);
-      // TEMP RU-DPI probe — remove after diagnosis. Streams a heartbeat every 2s
-      // for 30s with no upstream AI, to test whether a steadily-active
-      // Cloudflare connection survives Russian DPI (vs. the idle /ai/chat stream
-      // that gets reset at ~20s). See ?interval=<ms>&seconds=<n>.
-      if (path === '/ai/streamtest' && method === 'GET') return handleStreamTest(request);
       if (path === '/webhook/robokassa' && (method === 'POST' || method === 'GET')) {
         return await handleRobokassa(request, env, ctx);
       }
@@ -94,45 +88,6 @@ export default {
     }
   }
 };
-
-/* --------------------------- /ai/streamtest -------------------------- */
-// TEMPORARY diagnostic (RU DPI). Emits a real SSE `data:` frame every
-// `interval` ms for `seconds` seconds, then `[DONE]`. No auth, no AI, no cost —
-// it exists only to answer one question: does a Cloudflare connection that
-// stays ACTIVE (bytes every couple seconds) survive Russian DPI? If a client
-// in RU sees all N frames arrive, the reset is idle-based and SSE heartbeats in
-// ai-proxy.js will fix the real endpoint. If it still dies at ~20-24s despite
-// steady frames, the reset is activity-independent and the proxy must move off
-// Cloudflare. DELETE this route + handler once decided.
-function handleStreamTest(request) {
-  const url = new URL(request.url);
-  const interval = Math.min(Math.max(Number(url.searchParams.get('interval')) || 2000, 500), 10000);
-  const seconds = Math.min(Math.max(Number(url.searchParams.get('seconds')) || 30, 2), 90);
-  const encoder = new TextEncoder();
-  const t0 = Date.now();
-  let n = 0;
-  const stream = new ReadableStream({
-    async pull(controller) {
-      if (Date.now() - t0 >= seconds * 1000) {
-        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-        controller.close();
-        return;
-      }
-      await new Promise((r) => setTimeout(r, interval));
-      n += 1;
-      controller.enqueue(encoder.encode(`data: {"n":${n},"elapsed_ms":${Date.now() - t0}}\n\n`));
-    }
-  });
-  return new Response(stream, {
-    status: 200,
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      'X-Accel-Buffering': 'no',
-      'Access-Control-Allow-Origin': '*'
-    }
-  });
-}
 
 /* ------------------------------ /verify ------------------------------ */
 
@@ -533,31 +488,32 @@ const STATS_ROUTES = {
   rate:       (env, q) => analytics.statsRate(env, q.get('force') === '1')
 };
 
-// GET /admin/stats/<name> — dashboard aggregation endpoints. Same ADMIN_SECRET
-// guard as the other /admin routes, plus open CORS so the GitHub Pages
-// dashboard can call them (the token header is the actual gate).
+// GET /admin/stats/<name> — CLI/server-to-server aggregation endpoints.
 async function handleAdminStats(request, env, path) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized', VERIFY_CORS);
-  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  if (!env.DB) return error(503, 'no_db');
   const name = path.slice('/admin/stats/'.length);
   const route = STATS_ROUTES[name];
-  if (!route) return error(404, 'not_found', VERIFY_CORS);
+  if (!route) return error(404, 'not_found');
   const result = await route(env, new URL(request.url).searchParams);
-  return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
+  return json(result, { status: result.status || (result.ok ? 200 : 400) });
 }
 
-// POST /admin/backfill-licenses — re-mirror every KV license into D1. Used by
-// the dashboard's «Синхронизировать» button and for the initial import.
+// POST /admin/backfill-licenses — re-mirror every KV license into D1.
 async function handleAdminBackfill(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized', VERIFY_CORS);
-  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  if (!env.DB) return error(503, 'no_db');
   const result = await analytics.backfillLicenses(env);
-  return json({ ok: true, ...result }, { headers: VERIFY_CORS });
+  return json({ ok: true, ...result });
 }
 
 /* ------------------------------- /admin ------------------------------ */
 
 function adminGuard(request, env) {
+  // A static dashboard has no safe place to keep an administrator secret.
+  // Browser fetches send Origin, so reject them before checking the token.
+  // CLI/server-to-server callers have no Origin header and remain supported.
+  if (request.headers.get('origin')) return false;
   const token = request.headers.get('x-admin-token') || '';
   if (!env.ADMIN_SECRET) return false;
   // Constant-time compare to avoid timing leaks. Equal-length check first;

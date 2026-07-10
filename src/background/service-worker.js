@@ -567,8 +567,9 @@ async function downloadFile(url, headers, { credentials = 'include' } = {}) {
     const name = nameFromUrl(url);
     const mimeType = inferMime(name, res.headers.get('content-type'));
     // Audio (listening clips) gets a higher cap — Whisper accepts up to ~25 MB —
-    // while other attachments stay at 12 MB to bound memory / storage.
-    const maxBytes = isAudioFile({ name, mimeType }) ? 25 * 1024 * 1024 : 12 * 1024 * 1024;
+    // while other attachments stay at 6 MB. Base64 inflates files by ~33%, and
+    // the licensed proxy stores the resulting messages JSON under a 9 MB cap.
+    const maxBytes = isAudioFile({ name, mimeType }) ? 25 * 1024 * 1024 : 6 * 1024 * 1024;
     if (!buf.byteLength || buf.byteLength > maxBytes) {
       dbg('[СМЭШ AI] download size skip', buf.byteLength, url);
       return null;

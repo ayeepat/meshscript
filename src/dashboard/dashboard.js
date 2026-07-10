@@ -10,6 +10,7 @@ import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge } from '../common/provider-badge.js';
 import { isPdfFile } from '../lib/file-kinds.js';
+import { assertUploadAllowed } from '../lib/upload-limits.js';
 
 // Tiny "which AI service is active" tag next to the theme switch in the header.
 mountProviderBadge('provBadge');
@@ -465,6 +466,7 @@ async function maybeShowGdz(chat) {
 }
 
 function fileToInline(file) {
+  assertUploadAllowed(file);
   return new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = () => resolve({ mimeType: file.type || 'application/octet-stream', dataBase64: String(r.result).split(',')[1], name: file.name });
@@ -746,7 +748,14 @@ function clearAttachment() {
 document.getElementById('attach').onclick = () => fileInput.click();
 fileInput.onchange = async () => {
   const f = fileInput.files[0];
-  if (f) { pendingFile = await fileToInline(f); showAttachment(f.name); }
+  if (!f) return;
+  try {
+    pendingFile = await fileToInline(f);
+    showAttachment(f.name);
+  } catch (e) {
+    fileInput.value = '';
+    showToast(e?.message || 'Не удалось прочитать файл.');
+  }
 };
 document.getElementById('clearfile').onclick = clearAttachment;
 
@@ -758,8 +767,12 @@ document.addEventListener('paste', async (e) => {
   if (!blob) return;
   e.preventDefault();
   const name = blob.name || `screenshot-${Date.now()}.png`;
-  pendingFile = await fileToInline(new File([blob], name, { type: blob.type || 'image/png' }));
-  showAttachment(name);
+  try {
+    pendingFile = await fileToInline(new File([blob], name, { type: blob.type || 'image/png' }));
+    showAttachment(name);
+  } catch (e) {
+    showToast(e?.message || 'Не удалось прочитать изображение.');
+  }
 });
 
 /* ---------- Microphone capture → Whisper transcription ---------- */
@@ -823,9 +836,16 @@ async function onRecordingStop() {
   }
   const blob = new Blob(chunks, { type: baseMime });
   const name = `Запись с микрофона.${REC_EXT[baseMime] || 'webm'}`;
-  pendingFile = await fileToInline(new File([blob], name, { type: baseMime }));
-  fileChip.classList.remove('recording');
-  showAttachment(name);
+  try {
+    pendingFile = await fileToInline(new File([blob], name, { type: baseMime }));
+    fileChip.classList.remove('recording');
+    showAttachment(name);
+  } catch (e) {
+    pendingFile = null;
+    fileChip.hidden = true;
+    fileChip.classList.remove('recording');
+    showToast(e?.message || 'Запись слишком большая.');
+  }
 }
 
 async function startRecording() {

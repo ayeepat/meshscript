@@ -25,6 +25,7 @@ import { isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
 import { chargeOne } from './rate-limit.js';
 import { getByoKey } from './qwen.js';
+import { getLicenseStatus } from './license.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
 // PROXY_DEEPSEEK_MODEL, now served via 302.AI) — see the matching comment in
@@ -75,16 +76,21 @@ function historyToMessage(m, allowPdf) {
 
 export async function askDeepseek(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null } = opts;
-  // Charge the daily budget BEFORE the network round-trip — same reasoning as
-  // every other provider here. Separate cap from Qwen despite the shared
-  // account: they're still distinct models/spend the user may want to budget
-  // apart.
-  await chargeOne('deepseek');
-
   // Key decides the message SHAPE, so resolve it before building: only the
   // proxy can carry PDF file parts (see fileToContentPart).
   const key = await getByoKey();
   const allowPdf = !key;
+
+  // See qwen.js: a known missing/invalid proxy credential must fail before it
+  // consumes this local UX quota. The server remains authoritative whenever a
+  // key is present but its cached status is inconclusive.
+  let skipLocalCharge = false;
+  if (!key) {
+    const license = await getLicenseStatus();
+    if (!license?.key || (license.ok === false && license.reason !== 'network')) {
+      skipLocalCharge = true;
+    }
+  }
 
   const userContent = buildUserContent(userText, files, allowPdf);
   const messages = [
@@ -93,6 +99,8 @@ export async function askDeepseek(systemPrompt, userText, files = [], history = 
     { role: 'user', content: files.length ? userContent : userText }
   ];
   const wantJson = responseFormat === 'json_object';
+
+  if (!skipLocalCharge) await chargeOne('deepseek');
 
   if (!key) {
     // The solver's reasoning {effort} rides along; the proxy maps it to

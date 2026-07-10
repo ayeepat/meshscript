@@ -14,6 +14,7 @@ import { hasConsent, setConsent } from '../lib/consent.js';
 import { getLicenseStatus, setLicenseKey, reasonMessage } from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
+import { assertUploadAllowed } from '../lib/upload-limits.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
@@ -97,6 +98,7 @@ function refineDropLabels() {
 }
 
 function fileToInline(file) {
+  assertUploadAllowed(file);
   return new Promise((resolve, reject) => {
     const r = new FileReader();
     r.onload = () => {
@@ -111,6 +113,27 @@ function fileToInline(file) {
 async function getActiveTab() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   return tab;
+}
+
+// The Test tab sends a screenshot and page text to an AI provider. It is a
+// Mesh-only feature, so never capture an arbitrary active tab (mail, banking,
+// private documents) just because the popup happened to stay open after a tab
+// switch. Keep this deliberately narrower than the manifest's host permission.
+function isMeshTestTab(tab) {
+  try {
+    const url = new URL(tab?.url || '');
+    return url.protocol === 'https:' &&
+      (url.hostname === 'school.mos.ru' || url.hostname === 'uchebnik.mos.ru');
+  } catch {
+    return false;
+  }
+}
+
+function requireMeshTestTab(tab) {
+  if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
+  if (!isMeshTestTab(tab)) {
+    throw new Error('Для решения теста откройте тест МЭШ на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+  }
 }
 
 function sendToContent(tabId, msg) {
@@ -394,11 +417,16 @@ function buildCard(day, item) {
   input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*,audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.aac';
   input.style.display = 'none';
   const setFile = async (file) => {
-    uploads[upKey] = [await fileToInline(file)];
-    drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
-    drop.querySelector('.droplabel').textContent = file.name;
-    drop.classList.remove('need');
-    drop.classList.add('has');
+    try {
+      uploads[upKey] = [await fileToInline(file)];
+      drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
+      drop.querySelector('.droplabel').textContent = file.name;
+      drop.classList.remove('need');
+      drop.classList.add('has');
+    } catch (e) {
+      delete uploads[upKey];
+      setDropAttachFallback(drop, e?.message || 'не удалось прочитать файл');
+    }
   };
   input.onchange = () => { if (input.files[0]) setFile(input.files[0]); };
   drop.appendChild(input);
@@ -665,7 +693,7 @@ async function solveTestOnScreen() {
   let ticker = null;
   try {
     const tab = await getActiveTab();
-    if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
+    requireMeshTestTab(tab);
 
     const { pageText, screenshot } = await capturePage(tab.id);
 
@@ -785,7 +813,7 @@ async function solveAllPages() {
   let outcome = 'done';
   try {
     const tab = await getActiveTab();
-    if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
+    requireMeshTestTab(tab);
 
     for (let page = 1; page <= MAX_PAGES; page++) {
       // Solve the visible page. Progress reads «Страница N · Решаю… 12s».

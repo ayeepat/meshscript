@@ -160,6 +160,15 @@ export async function verifyLicense(env, rawKey, deviceId) {
   }
   const limit = Number(env.DEVICE_LIMIT || 3);
   if (deviceId) {
+    // Real clients send crypto.randomUUID() (see the extension's history.js).
+    // /verify is public, so bound what gets persisted: without this, a caller
+    // who knows a key could push arbitrary multi-megabyte strings into the
+    // license row (or burn its slots with garbage). Reject rather than treat
+    // as absent — treating garbage as "no device" would let a scripted caller
+    // skip device binding entirely.
+    if (!/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) {
+      return { ok: false, reason: 'bad_device' };
+    }
     if (!license.device_ids.includes(deviceId)) {
       if (license.device_ids.length >= limit) {
         return { ok: false, reason: 'device_limit', limit };

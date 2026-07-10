@@ -30,10 +30,10 @@ are set, both fire and the buyer gets the key in both places.
 | `POST /referral/code`     | none (per-IP daily budget)                | Get/create a device's invite code.       |
 | `GET /referral/check`     | none                                      | Validate a code at checkout (before charging). |
 | `GET /referral/status`    | none                                      | Referral stats + reward key by device.   |
-| `POST /admin/issue`       | `X-Admin-Token` header                    | Manual issue (test keys, comp licenses). |
-| `POST /admin/revoke`      | `X-Admin-Token` header                    | Mark a key revoked (refunds, fraud).     |
-| `GET /admin/license`      | `X-Admin-Token` header                    | Inspect one license by key.              |
-| `GET /admin/referral`     | `X-Admin-Token` header                    | Inspect a referral by code or device id. |
+| `POST /admin/issue`       | `X-Admin-Token` header; CLI/server only   | Manual issue (test keys, comp licenses). |
+| `POST /admin/revoke`      | `X-Admin-Token` header; CLI/server only   | Mark a key revoked (refunds, fraud).     |
+| `GET /admin/license`      | `X-Admin-Token` header; CLI/server only   | Inspect one license by key.              |
+| `GET /admin/referral`     | `X-Admin-Token` header; CLI/server only   | Inspect a referral by code or device id. |
 | `GET /health`             | none                                      | Liveness ping.                           |
 
 ### AI proxy (`POST /ai/chat`)
@@ -243,6 +243,10 @@ invoice. The Worker acks valid payments without issuing if it cannot find an
 email or Telegram user id.
 
 ## Manual Issue
+
+Admin routes intentionally reject browser requests. Keep `ADMIN_SECRET` only
+in a local shell environment or a server-side secret store; never place it in
+a static dashboard, extension, browser storage, URL, or client-side code.
 
 ```sh
 curl -X POST https://api.smesh.app/admin/issue \

@@ -35,6 +35,7 @@ import { askViaProxy } from './smesh-proxy.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
 import { chargeOne } from './rate-limit.js';
+import { getLicenseStatus } from './license.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
 // PROXY_QWEN_MODEL, now served via 302.AI) — this constant talks to
@@ -106,10 +107,6 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   // medium/high effort. The solver's effort setting is already honored where a
   // real knob exists: OpenRouter (body.reasoning) and DeepSeek (reasoning_effort).
   const { onDelta = null, responseFormat = null, signal = null, onUsage = null } = opts;
-  // Charge the daily budget BEFORE the network round-trip — same reasoning as
-  // openrouter.js/groq.js.
-  await chargeOne('qwen');
-
   // Vision if EITHER the current message OR a replayed history turn carries an
   // image, so a follow-up doesn't lose the original photo's context.
   const hasImages = files.some(isImageFile) ||
@@ -120,6 +117,18 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   const key = await getByoKey();
   const allowPdf = !key;
 
+  // The proxy is the authority for licensed traffic. Do not burn the local UX
+  // limit on a credential failure that cannot possibly reach the model (for
+  // example, an empty or known-revoked license); valid/unknown credentials keep
+  // the existing pre-flight limit behaviour.
+  let skipLocalCharge = false;
+  if (!key) {
+    const license = await getLicenseStatus();
+    if (!license?.key || (license.ok === false && license.reason !== 'network')) {
+      skipLocalCharge = true;
+    }
+  }
+
   const userContent = buildUserContent(userText, files, allowPdf);
   const messages = [
     { role: 'system', content: systemPrompt },
@@ -129,6 +138,8 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
     { role: 'user', content: files.length ? userContent : userText }
   ];
   const wantJson = responseFormat === 'json_object' && !hasImages;
+
+  if (!skipLocalCharge) await chargeOne('qwen');
 
   if (!key) {
     return askViaProxy('qwen', messages, {

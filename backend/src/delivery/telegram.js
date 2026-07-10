@@ -22,7 +22,7 @@ export async function sendLicenseTelegram(env, { user_id, key, isPreorder }) {
   const text =
     '*Спасибо за поддержку\\!* 🙌\n\n' +
     'Ваш ключ доступа к *СМЭШ AI*:\n\n' +
-    `\`${escapeMd(key)}\`\n\n` +
+    `\`${escapeMdCode(key)}\`\n\n` +
     `${escapeMd(launchNote)}\n\n` +
     '_Ключ работает на трёх устройствах\\. Если что — напишите прямо в этот чат\\._';
 
@@ -43,8 +43,14 @@ export async function sendLicenseTelegram(env, { user_id, key, isPreorder }) {
 }
 
 // MarkdownV2 reserves a long set of chars (https://core.telegram.org/bots/api#markdownv2-style).
-// Escape everything outside the key's own block (we wrap the key in backticks
-// which is monospace — chars inside backticks only need backslash for ` and \).
+// For prose OUTSIDE code spans, escape the full reserved set.
 function escapeMd(s) {
   return String(s).replace(/[_*[\]()~`>#+\-=|{}.!\\]/g, (c) => '\\' + c);
+}
+
+// INSIDE a `code` entity only ` and \ may be escaped — escaping anything else
+// (e.g. the hyphens in SMESH-XXXX-…) makes Telegram render the backslashes
+// literally, so the buyer copies a key like SMESH\-XXXX that /verify rejects.
+function escapeMdCode(s) {
+  return String(s).replace(/[`\\]/g, (c) => '\\' + c);
 }

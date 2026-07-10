@@ -97,7 +97,8 @@ const LICENSE_ERRORS = {
   not_found: 'Ключ лицензии не найден. Проверьте его в настройках расширения.',
   expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться Qwen и DeepSeek.',
   revoked: 'Эта лицензия была отозвана. Напишите в поддержку.',
-  device_limit: 'Достигнут лимит устройств для этой лицензии.'
+  device_limit: 'Достигнут лимит устройств для этой лицензии.',
+  bad_device: NEED_DEVICE_ID
 };
 
 const errResponse = (status, message) => new Response(
