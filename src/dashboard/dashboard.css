@@ -77,6 +77,7 @@ body {
 }
 .modeseg button:hover:not(.active) { color: var(--text); }
 .modeseg button.active { background: var(--card); color: var(--accent); box-shadow: var(--shadow-btn); }
+.history-mode .modeseg button:disabled { cursor: default; }
 
 .iconbtn {
   background: var(--card); border: 1px solid var(--separator); color: var(--secondary); cursor: pointer;
@@ -263,6 +264,14 @@ body {
 }
 .send:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 16px -4px var(--accent-glow); }
 .send:active { transform: scale(0.92); background: var(--accent-press); }
+.history-mode .composer button:disabled,
+.history-mode .composer textarea:disabled {
+  cursor: default;
+}
+.history-mode .composer textarea:disabled {
+  color: var(--secondary);
+  -webkit-text-fill-color: var(--secondary);
+}
 
 .week .lesson.active .spinner { border-color: var(--accent-soft); border-top-color: var(--accent); }
 

@@ -23,7 +23,7 @@ globalThis.chrome = {
 };
 
 const { reserveOne, commitOne, cancelOne, getUsage } = await import('../src/lib/rate-limit.js');
-const { createSession, addMessage, listMessages } = await import('../src/lib/history.js');
+const { createSession, addMessage, listMessages, getHistorySnapshot } = await import('../src/lib/history.js');
 const { assertUploadAllowed, MAX_STANDARD_UPLOAD_BYTES, MAX_AUDIO_UPLOAD_BYTES } = await import('../src/lib/upload-limits.js');
 
 const reservations = await Promise.all(Array.from({ length: 8 }, () => reserveOne('openrouter')));
@@ -53,6 +53,9 @@ await Promise.all([
   addMessage(second.id, 'user', 'three')
 ]);
 assert.equal((await listMessages(first.id)).length, 2, 'parallel messages must not overwrite each other');
+const snapshot = await getHistorySnapshot();
+assert.equal(snapshot.sessions.length, 2, 'history dashboard snapshot must include every saved chat');
+assert.equal(snapshot.messages[first.id].length, 2, 'history dashboard snapshot must include saved messages');
 
 assert.doesNotThrow(() => assertUploadAllowed({ name: 'sheet.pdf', type: 'application/pdf', size: MAX_STANDARD_UPLOAD_BYTES }));
 assert.throws(() => assertUploadAllowed({ name: 'sheet.pdf', type: 'application/pdf', size: MAX_STANDARD_UPLOAD_BYTES + 1 }));

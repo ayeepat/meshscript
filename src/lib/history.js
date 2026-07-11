@@ -114,6 +114,21 @@ export async function listMessages(sessionId) {
   });
 }
 
+// One local read for the dashboard's history-replay mode. Returning the whole
+// snapshot avoids one extension message (and one storage rewrite) per chat.
+export async function getHistorySnapshot() {
+  return mutateState((state) => {
+    const sessions = [...state.sessions]
+      .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+    const messages = {};
+    for (const session of sessions) {
+      messages[session.id] = [...(state.messages[session.id] || [])]
+        .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+    }
+    return { sessions, messages };
+  });
+}
+
 /* ---------------------- scheduled retention sweep ---------------------- */
 
 // prune() only runs when someone touches the history. A student who stops

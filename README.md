@@ -78,8 +78,8 @@ generated copy inside `backend-vps/setup.sh` was not committed with it.
 3. Press **Solve** on a subject to open the full-window dashboard. The
    sidebar lists every lesson of the week — click one to solve it (the AI
    is only called when you open a lesson, and each lesson keeps its own
-   chat while the tab is open). Solve history (7-day TTL) is viewable in
-   Settings, not in the sidebar.
+   chat while the tab is open). Solve history (7-day TTL) is opened from
+   Settings in the same dashboard, with all saved chats in a read-only sidebar.
 
 ## Notes & trade-offs
 - **Local-only history.** Solve history lives in `chrome.storage.local` with a

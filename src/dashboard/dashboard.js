@@ -2,7 +2,7 @@
  * Full-window dashboard: week-of-homework sidebar + chat solve view.
  * Each sidebar lesson keeps its own chat in this tab. The AI is only called
  * when a lesson is opened for the first time (or you send a follow-up).
- * Chat history (7-day TTL) lives in Settings, not here.
+ * Settings can also reopen the 7-day local history here in read-only mode.
  */
 import { initTheme, toggleTheme } from '../common/theme.js';
 import { extractMath, restoreMath } from '../common/tex.js';
@@ -28,6 +28,8 @@ document.addEventListener('themechange', (e) => {
 initTheme();
 
 const params = new URLSearchParams(location.search);
+const historySessionId = params.get('history') || '';
+const historyMode = params.has('history');
 const launchPayload = await (async () => {
   const launch = params.get('launch');
   if (!launch) return {};
@@ -290,6 +292,10 @@ function renderChat(chat) {
   }
   const card = gdzCardEl(chat); // GDZ answers sit above the chat
   if (card) chatEl.appendChild(card);
+  if (historyMode && !chat.history.length) {
+    chatEl.innerHTML = '<p class="hintmsg">В этом чате нет сохранённых сообщений.</p>';
+    return;
+  }
   chat.history.forEach((m, i) => {
     // Retry is only offered on the trailing error — the one that actually
     // failed and can be resent. `m.error` is set by finish() at the point of
@@ -696,7 +702,7 @@ async function activateLesson(key) {
   titleEl.textContent = `${chat.subject} — решение`;
   renderChat(chat);
   renderSidebar();
-  if (!chat.started) await startLesson(chat); // the only place the API gets triggered automatically
+  if (!historyMode && !chat.started) await startLesson(chat); // the only place the API gets triggered automatically
 }
 
 /* ---------- Sidebar: whole week, grouped by day, scrollable ---------- */
@@ -791,6 +797,7 @@ document.getElementById('clearfile').onclick = clearAttachment;
 
 // Paste a screenshot / snipped image straight into the chat (Ctrl/⌘+V).
 document.addEventListener('paste', async (e) => {
+  if (historyMode) return;
   const item = [...(e.clipboardData?.items || [])].find((it) => it.type.startsWith('image/'));
   if (!item) return;
   const blob = item.getAsFile();
@@ -966,6 +973,7 @@ window.addEventListener('pagehide', () => {
 });
 
 async function sendFromComposer() {
+  if (historyMode) return;
   const chat = activeChat();
   if (!chat || chat.pending) return; // ignore until the current answer lands
   if (mediaRecorder && mediaRecorder.state === 'recording') return; // stop the recording first
@@ -1014,11 +1022,82 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
   if (saved === 'brief' || saved === 'explain') markMode(saved);
 });
 
+/* ---------- Read-only replay of locally saved chats ---------- */
+
+function savedDay(createdAt) {
+  const date = new Date(createdAt);
+  if (Number.isNaN(date.getTime())) return 'Сохранённые';
+  return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+}
+
+function configureHistoryMode() {
+  document.body.classList.add('history-mode');
+  document.querySelector('.sidebar h2').textContent = 'История чатов';
+  document.querySelector('.brandsub').textContent = 'Сохранённые решения';
+  inputEl.placeholder = 'История сохранена локально · только просмотр';
+  for (const control of document.querySelectorAll('.composer button, .composer input, .composer textarea, #modeSeg button')) {
+    control.disabled = true;
+  }
+}
+
+async function loadHistoryDashboard() {
+  configureHistoryMode();
+  let response;
+  try {
+    response = await chrome.runtime.sendMessage({ type: 'GET_HISTORY_SNAPSHOT' });
+  } catch {
+    response = null;
+  }
+  const snapshot = response?.ok ? response.snapshot : null;
+  if (!snapshot?.sessions?.length) {
+    weekDataError = response?.error || 'Сохранённых чатов пока нет.';
+    renderSidebar();
+    titleEl.textContent = 'История решений';
+    chatEl.innerHTML = '<p class="hintmsg">Сохранённых чатов пока нет.</p>';
+    return;
+  }
+
+  for (const session of snapshot.sessions) {
+    const key = `history:${session.id}`;
+    const messages = Array.isArray(snapshot.messages?.[session.id])
+      ? snapshot.messages[session.id]
+        .filter((message) => message?.role === 'user' || message?.role === 'assistant')
+        .map((message) => ({
+          role: message.role,
+          content: typeof message.content === 'string' ? message.content : ''
+        }))
+      : [];
+    chats.set(key, {
+      key,
+      day: savedDay(session.created_at),
+      subject: session.subject || 'Задание',
+      task: session.task_text || '(без описания)',
+      homeworkId: '',
+      homeworkItemId: '',
+      rowToken: '',
+      sessionId: session.id,
+      history: messages,
+      started: true,
+      pending: false,
+      historyOnly: true
+    });
+  }
+
+  renderSidebar();
+  const requestedKey = `history:${historySessionId}`;
+  const startKey = chats.has(requestedKey) ? requestedKey : chats.keys().next().value;
+  await activateLesson(startKey);
+}
+
 /* ---------- Init: load week from the last popup scan ---------- */
 
 const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
 
 (async function init() {
+  if (historyMode) {
+    await loadHistoryDashboard();
+    return;
+  }
   const { weekHomework } = await chrome.storage.local.get('weekHomework');
   const scannedAt = weekHomework?.scannedAt;
   const scanAge = Date.now() - scannedAt;

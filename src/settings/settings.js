@@ -444,68 +444,6 @@ async function save() {
 
 /* ---------- History ---------- */
 
-function historyMessageEl(message) {
-  const row = document.createElement('div');
-  const role = message.role === 'assistant' ? 'assistant' : 'user';
-  row.className = `history-message ${role}`;
-
-  const label = document.createElement('div');
-  label.className = 'history-message-role';
-  label.textContent = role === 'assistant' ? 'СМЭШ AI' : 'Вы';
-
-  const content = document.createElement('div');
-  content.className = 'history-message-content';
-  content.textContent = message.content || '';
-  row.append(label, content);
-
-  if (role === 'assistant' && message.content) {
-    const copy = document.createElement('button');
-    copy.className = 'history-copy';
-    copy.type = 'button';
-    copy.title = 'Скопировать ответ';
-    copy.setAttribute('aria-label', 'Скопировать ответ');
-    copy.innerHTML = iconSvg('copy', 13);
-    copy.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(message.content);
-        copy.innerHTML = iconSvg('check', 13);
-        setTimeout(() => { copy.innerHTML = iconSvg('copy', 13); }, 1200);
-      } catch { /* clipboard denied — the answer remains selectable */ }
-    };
-    row.appendChild(copy);
-  }
-  return row;
-}
-
-function loadSessionMessages(session, toggle, conversation) {
-  conversation.hidden = false;
-  conversation.innerHTML = `<div class="loading"><span class="spinner"></span><span>Открываю сохранённый чат…</span></div>`;
-  chrome.runtime.sendMessage({ type: 'LIST_MESSAGES', sessionId: session.id }, (resp) => {
-    if (chrome.runtime.lastError || !resp?.ok) {
-      delete conversation.dataset.loaded;
-      conversation.innerHTML = '';
-      const error = document.createElement('div');
-      error.className = 'empty';
-      error.innerHTML = iconSvg('alert', 15);
-      const text = document.createElement('span');
-      text.textContent = `Не удалось открыть чат: ${resp?.error || 'нет данных'}`;
-      error.appendChild(text);
-      conversation.appendChild(error);
-      return;
-    }
-    conversation.innerHTML = '';
-    if (!resp.messages?.length) {
-      const empty = document.createElement('div');
-      empty.className = 'empty';
-      empty.textContent = 'В этом чате нет сохранённых сообщений.';
-      conversation.appendChild(empty);
-      return;
-    }
-    for (const message of resp.messages) conversation.appendChild(historyMessageEl(message));
-    toggle.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-  });
-}
-
 function loadHistory() {
   const box = document.getElementById('history');
   box.innerHTML = `<div class="loading"><span class="spinner"></span><span>Загрузка…</span></div>`;
@@ -525,7 +463,6 @@ function loadHistory() {
       const toggle = document.createElement('button');
       toggle.className = 'session-toggle';
       toggle.type = 'button';
-      toggle.setAttribute('aria-expanded', 'false');
       const top = document.createElement('div');
       top.className = 'session-top';
       const pill = document.createElement('span');
@@ -540,28 +477,15 @@ function loadHistory() {
       task.textContent = s.task_text || '(без описания)';
       const affordance = document.createElement('span');
       affordance.className = 'session-affordance';
-      affordance.innerHTML = `${iconSvg('chevronDown', 15)}<span>Открыть чат</span>`;
+      affordance.innerHTML = `<span>Открыть в панели</span>${iconSvg('chevronRight', 15)}`;
       toggle.append(top, task, affordance);
-
-      const conversation = document.createElement('div');
-      conversation.className = 'history-conversation';
-      conversation.hidden = true;
       toggle.onclick = () => {
-        const opening = toggle.getAttribute('aria-expanded') !== 'true';
-        toggle.setAttribute('aria-expanded', String(opening));
-        affordance.querySelector('span').textContent = opening ? 'Скрыть чат' : 'Открыть чат';
-        if (!opening) {
-          conversation.hidden = true;
-          return;
-        }
-        if (!conversation.dataset.loaded) {
-          conversation.dataset.loaded = 'true';
-          loadSessionMessages(s, toggle, conversation);
-        } else {
-          conversation.hidden = false;
-        }
+        const url = chrome.runtime.getURL(
+          `src/dashboard/dashboard.html?history=${encodeURIComponent(s.id)}`
+        );
+        chrome.tabs.create({ url });
       };
-      d.append(toggle, conversation);
+      d.appendChild(toggle);
       box.appendChild(d);
     }
   });

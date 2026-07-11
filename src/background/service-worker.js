@@ -8,7 +8,14 @@ import { getByoKey } from '../lib/qwen.js';
 import { fetchOpenRouterCredits, getSpendHistory } from '../lib/openrouter.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
-import { createSession, addMessage, listSessions, listMessages, cleanupLocalData } from '../lib/history.js';
+import {
+  createSession,
+  addMessage,
+  listSessions,
+  listMessages,
+  getHistorySnapshot,
+  cleanupLocalData
+} from '../lib/history.js';
 import { ensureLicensed } from '../lib/license.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
@@ -1305,7 +1312,7 @@ const SENDER_MESSAGE_TYPES = {
   extension: new Set([
     'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
     'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG', 'CLASSIFY_TASKS',
-    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES',
+    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES', 'GET_HISTORY_SNAPSHOT',
     'GDZ_CATALOG', 'GDZ_SEARCH', 'GDZ_RESOLVE', 'GDZ_FOR_TASK', 'GDZ_SELFTEST',
     'CONSUME_DASH_LAUNCH'
   ])
@@ -1410,6 +1417,7 @@ const MESSAGE_SCHEMAS = {
     isOptionalString(msg.payload.token, 8192),
   LIST_SESSIONS: noPayload,
   LIST_MESSAGES: (msg) => noPayload(msg) && isString(msg.sessionId, 512),
+  GET_HISTORY_SNAPSHOT: noPayload,
   GDZ_CATALOG: (msg) => noPayload(msg) ||
     (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
   GDZ_SEARCH: (msg) => payloadRecord(msg, ['grade', 'subjectId', 'subtype', 'query']) &&
@@ -1626,6 +1634,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         case 'LIST_MESSAGES':
           sendResponse({ ok: true, messages: await listMessages(msg.sessionId) });
+          break;
+        case 'GET_HISTORY_SNAPSHOT':
+          sendResponse({ ok: true, snapshot: await getHistorySnapshot() });
           break;
         // ---------- GDZ ----------
         case 'GDZ_CATALOG': {
