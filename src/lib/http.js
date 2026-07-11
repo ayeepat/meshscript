@@ -73,45 +73,55 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
   let usage = null;
   let model = null;
 
+  function processLine(line) {
+    line = line.trim();
+    if (!line.startsWith('data:')) return;
+    const data = line.slice(5).trim();
+    if (data === '[DONE]') return;
+    let json;
+    try { json = JSON.parse(data); }
+    catch { return; } // incomplete / non-JSON frame — ignore, never fatal
+    // A 200 OK can still carry a provider error MID-STREAM: a rate limit hit
+    // while generating, a moderation block, or an upstream model drop. The
+    // old code only read delta.content, so such a frame was silently dropped
+    // and the user got "(пустой ответ)" / a truncated answer with no reason.
+    // Surface it as the same friendly error a pre-stream failure would.
+    if (json?.error) {
+      // Proxied streams (rawErrors) relay the UPSTREAM provider's frames —
+      // an English DashScope error or a bogus status would mistranslate,
+      // so collapse mid-stream failures to one generic retry message.
+      if (rawErrors) {
+        throw new Error(`${label}: сервис прервал ответ. Попробуйте ещё раз.`);
+      }
+      const code = Number(json.error.code) || Number(json.error.status) || 0;
+      throw code
+        ? httpError(label, code, JSON.stringify(json))
+        : new Error(`${label}: ${json.error.message || 'провайдер прервал ответ ошибкой. Попробуйте ещё раз.'}`);
+    }
+    if (!model && json?.model) model = json.model;
+    if (json?.usage) usage = json.usage;
+    else if (json?.x_groq?.usage) usage = json.x_groq.usage;
+    const delta = json?.choices?.[0]?.delta?.content;
+    if (delta) { full += delta; onDelta?.(delta); }
+  }
+
   return {
     push(text) {
       buffer += text;
       // SSE frames are separated by blank lines; process complete lines.
       let nl;
       while ((nl = buffer.indexOf('\n')) !== -1) {
-        const line = buffer.slice(0, nl).trim();
+        const line = buffer.slice(0, nl);
         buffer = buffer.slice(nl + 1);
-        if (!line.startsWith('data:')) continue;
-        const data = line.slice(5).trim();
-        if (data === '[DONE]') continue;
-        let json;
-        try { json = JSON.parse(data); }
-        catch { continue; } // incomplete / non-JSON frame — ignore, never fatal
-        // A 200 OK can still carry a provider error MID-STREAM: a rate limit hit
-        // while generating, a moderation block, or an upstream model drop. The
-        // old code only read delta.content, so such a frame was silently dropped
-        // and the user got "(пустой ответ)" / a truncated answer with no reason.
-        // Surface it as the same friendly error a pre-stream failure would.
-        if (json?.error) {
-          // Proxied streams (rawErrors) relay the UPSTREAM provider's frames —
-          // an English DashScope error or a bogus status would mistranslate,
-          // so collapse mid-stream failures to one generic retry message.
-          if (rawErrors) {
-            throw new Error(`${label}: сервис прервал ответ. Попробуйте ещё раз.`);
-          }
-          const code = Number(json.error.code) || Number(json.error.status) || 0;
-          throw code
-            ? httpError(label, code, JSON.stringify(json))
-            : new Error(`${label}: ${json.error.message || 'провайдер прервал ответ ошибкой. Попробуйте ещё раз.'}`);
-        }
-        if (!model && json?.model) model = json.model;
-        if (json?.usage) usage = json.usage;
-        else if (json?.x_groq?.usage) usage = json.x_groq.usage;
-        const delta = json?.choices?.[0]?.delta?.content;
-        if (delta) { full += delta; onDelta?.(delta); }
+        processLine(line);
       }
     },
     finish() {
+      if (buffer) {
+        const line = buffer;
+        buffer = '';
+        processLine(line);
+      }
       if (onUsage && (usage || model)) {
         try { onUsage({ ...(usage || {}), model }); } catch { /* telemetry never breaks the answer */ }
       }
@@ -177,9 +187,9 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
   }
 
   if (!res.ok) {
+    const text = await res.text().catch(() => '');
     clearTimeout(timer);
     signal?.removeEventListener('abort', onExternalAbort);
-    const text = await res.text().catch(() => '');
     if (rawErrors) {
       throw new Error(extractError(text) || `${label}: ошибка сервера (${res.status}). Попробуйте ещё раз.`);
     }
@@ -205,6 +215,7 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
       bump();
       sink.push(decoder.decode(value, { stream: true }));
     }
+    sink.push(decoder.decode());
   } catch (e) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     throw e;

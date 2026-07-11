@@ -30,10 +30,6 @@
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
           <span>Учебники</span>
         </button>
-        <button class="tab gated" data-tab="prompts" role="tab" aria-selected="false" type="button">
-          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 14.5l.8 2.2L22 17.5l-2.2.8L19 20.5l-.8-2.2L16 17.5l2.2-.8z"/></svg>
-          <span>Промпты</span>
-        </button>
         <button class="tab gated" data-tab="history" role="tab" aria-selected="false" type="button">
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span>История</span>
@@ -68,7 +64,7 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
             <div>
               <h3>Конфиденциальность и данные</h3>
-              <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы выбранному ИИ-сервису. История хранится только локально и не дольше 7 дней.</p>
+              <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы выбранному ИИ-сервису: OpenRouter, Groq, Qwen (Alibaba) или DeepSeek — для лицензии последние два работают через сервер СМЭШ (ai.smeshapi.site). Туда же уходят задания для определения типа (нужен ли файл) и аудиофайлы для расшифровки. История хранится только локально и не дольше 7 дней.</p>
             </div>
           </div>
           <label class="consent-row">
@@ -78,6 +74,15 @@
               <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a>.
               Остальные разделы настроек откроются после подтверждения.</span>
           </label>
+          <label class="consent-row">
+            <input id="telemetryToggle" type="checkbox" />
+            <span>Отправлять анонимную статистику использования (тип события, предмет, число токенов, тип браузера и версия — без текста заданий, ответов и файлов). Выключено по умолчанию; работает только вместе с согласием выше.</span>
+          </label>
+          <div class="consent-actions">
+            <button id="deleteStats" class="resetbtn" type="button">Удалить мои данные статистики</button>
+            <button id="deleteLocal" class="resetbtn" type="button">Удалить все локальные данные</button>
+            <span class="licstatus" id="privacyStatus" data-state="idle" hidden></span>
+          </div>
         </section>
 
         <div class="general-grid">
@@ -147,42 +152,49 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span>
             <div>
               <h3>Провайдер</h3>
-              <p>OpenRouter точнее и читает PDF; Groq бесплатный; Qwen и DeepSeek работают по лицензии СМЭШ — ключи не нужны. Qwen видит изображения; DeepSeek — самый быстрый на тексте (фото и скриншоты за него решает Qwen).</p>
+              <p>OpenRouter — по вашим ключам OpenRouter и Groq: точнее и читает PDF. 302.AI — Qwen и DeepSeek по лицензии СМЭШ, ключи не нужны (DeepSeek быстрый на тексте, а фото, скриншоты и PDF за него решает Qwen).</p>
             </div>
           </div>
 
           <div class="selectwrap">
             <select id="aiProvider">
-              <option value="openrouter">OpenRouter — Gemini 2.5 Flash (рекомендуется)</option>
-              <option value="groq">Groq — Llama (бесплатно, без карты)</option>
-              <option value="qwen">Qwen3.7-Plus — видит изображения (по лицензии СМЭШ)</option>
-              <option value="deepseek">DeepSeek V4 Flash — быстрый, текст (по лицензии СМЭШ)</option>
+              <option value="openrouter">OpenRouter — ваши ключи (Gemini 2.5 Flash + Groq)</option>
+              <option value="deepseek">302.AI — Qwen и DeepSeek (по лицензии СМЭШ)</option>
             </select>
             <span class="selectchev"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
           </div>
 
-          <div class="providerhints">
-            <a class="linkpill" href="https://openrouter.ai/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>OpenRouter</a>
-            <a class="linkpill" href="https://console.groq.com/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Groq</a>
-          </div>
-
-          <div class="key-grid">
-            <div class="field">
-              <label for="openrouterApiKey">OpenRouter API Key</label>
-              <div class="inputwrap">
-                <input id="openrouterApiKey" type="password" placeholder="sk-or-v1-…" autocomplete="off" spellcheck="false" />
-                <button class="reveal" type="button" data-reveal="openrouterApiKey" title="Показать / скрыть"></button>
-              </div>
+          <!-- OpenRouter path only: two BYO keys (OpenRouter for solving, Groq for
+               cheap classification/audio). Hidden for 302.AI, which runs on the
+               СМЭШ license — no keys. Toggled in settings.js syncProviderKeys(). -->
+          <div id="orKeyFields">
+            <div class="providerhints">
+              <a class="linkpill" href="https://openrouter.ai/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>OpenRouter</a>
+              <a class="linkpill" href="https://console.groq.com/keys" target="_blank" rel="noopener"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>Groq</a>
             </div>
 
-            <div class="field">
-              <label for="groqApiKey">Groq API Key</label>
-              <div class="inputwrap">
-                <input id="groqApiKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
-                <button class="reveal" type="button" data-reveal="groqApiKey" title="Показать / скрыть"></button>
+            <div class="key-grid">
+              <div class="field">
+                <label for="openrouterApiKey">OpenRouter API Key</label>
+                <div class="inputwrap">
+                  <input id="openrouterApiKey" type="password" placeholder="sk-or-v1-…" autocomplete="off" spellcheck="false" />
+                  <button class="reveal" type="button" data-reveal="openrouterApiKey" title="Показать / скрыть"></button>
+                </div>
+              </div>
+
+              <div class="field">
+                <label for="groqApiKey">Groq API Key</label>
+                <div class="inputwrap">
+                  <input id="groqApiKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
+                  <button class="reveal" type="button" data-reveal="groqApiKey" title="Показать / скрыть"></button>
+                </div>
               </div>
             </div>
           </div>
+
+          <!-- 302.AI path only: no keys, just the СМЭШ license (entered in the
+               «Лицензия» panel). Shown in place of the key fields above. -->
+          <p class="ref-hint" id="licenseKeyNote" hidden>Ключи не нужны — Qwen и DeepSeek работают по вашей лицензии СМЭШ. Ключ доступа вводится в разделе «Лицензия».</p>
         </section>
       </section>
 
@@ -335,20 +347,6 @@
             </div>
             <div id="gdzPickResults" class="gdz-results inline"></div>
           </div>
-        </section>
-      </section>
-
-      <section class="tabpanel" data-panel="prompts" role="tabpanel">
-        <div class="page-head">
-          <div>
-            <p class="eyebrow">Промпты</p>
-            <h2>Базовые промпты</h2>
-            <p>Как отвечать по каждой группе предметов. «Сброс» возвращает стандартный текст.</p>
-          </div>
-        </div>
-
-        <section class="panel">
-          <div id="promptList"></div>
         </section>
       </section>
 

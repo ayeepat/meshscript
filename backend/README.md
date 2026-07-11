@@ -60,6 +60,11 @@ deploy. If the secret or D1 is missing the route fails CLOSED (503) —
 students see a calm "temporarily unavailable" message; the words "API key"
 never reach them (upstream auth/billing failures log to `wrangler tail`).
 
+Applying `schema.sql` is also required for public telemetry ingestion: its
+`telemetry_budget` table provides atomic per-IP and per-device abuse limits.
+Without that table `/t` deliberately fails instead of falling back to the old
+raceable KV counter.
+
 ### Referral program
 
 Full mechanics live in `src/referrals.js` (see its header comment). Short
@@ -288,8 +293,25 @@ npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 
 npx wrangler deploy
 
-# 3. Tell Telegram where to send updates.
-curl "https://api.telegram.org/bot<TELEGRAM_BOT_TOKEN>/setWebhook?url=https://api.smesh.app/telegram/webhook&secret_token=<TELEGRAM_WEBHOOK_SECRET>"
+# 3. Tell Telegram where to send updates. ADMIN_SECRET is a separate Worker
+# secret; read it silently and pass it as a header so neither credential enters
+# a URL or shell history.
+read -s ADMIN_TOKEN
+curl -fsS -X POST \
+  -H "X-Admin-Token: $ADMIN_TOKEN" \
+  https://smeshapi.site/telegram/setup
+```
+
+The webhook fails closed with HTTP 503 when `TELEGRAM_WEBHOOK_SECRET` is not
+configured; a missing secret never disables authentication. Telegram operator
+helpers use `ADMIN_SECRET` through `X-Admin-Token`, never the webhook credential:
+
+```sh
+curl -fsS -H "X-Admin-Token: $ADMIN_TOKEN" https://smeshapi.site/telegram/info
+curl -fsS -X POST -H "X-Admin-Token: $ADMIN_TOKEN" \
+  "https://smeshapi.site/telegram/test?chat=<CHAT_ID>"
+curl -fsS -H "X-Admin-Token: $ADMIN_TOKEN" https://smeshapi.site/telegram/debug
+unset ADMIN_TOKEN
 ```
 
 Then set `SUPPORT_BOT_URL` in `src/lib/config.js` to your bot's `@username`.

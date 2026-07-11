@@ -2,10 +2,16 @@
  * One-time data-processing consent.
  *
  * This tool sends homework content — task text, page screenshots and the files
- * the user attaches (or that we auto-pull from Mesh) — to a third-party AI
- * provider (OpenRouter or Groq) to get an answer. Because the audience is
- * schoolchildren, that has to be disclosed plainly and accepted EXPLICITLY
- * before the first AI call, not buried in a footer link.
+ * the user attaches (or that we auto-pull from Mesh) — to third-party AI
+ * providers (OpenRouter, Groq, Qwen/Alibaba Model Studio, DeepSeek — the last
+ * two also via the licensed СМЭШ proxy at ai.smeshapi.site) to get an answer.
+ * The same consent covers the auxiliary AI features that ride the same data:
+ * remote task classification (what a homework card needs) and audio
+ * transcription of listening tasks (Groq Whisper). Anonymous usage statistics
+ * are a SEPARATE, additional opt-in (`telemetryEnabled`, see telemetry.js) —
+ * consent alone never turns them on. Because the audience is schoolchildren,
+ * all of that has to be disclosed plainly and accepted EXPLICITLY before the
+ * first AI call, not buried in a footer link.
  *
  * The record is stored in chrome.storage.local so it syncs nowhere and never
  * leaves the device. Bumping CONSENT_VERSION re-prompts everyone (use it if the
@@ -18,7 +24,9 @@
 const KEY = 'aiConsent';
 
 // Bump when the disclosure materially changes to force a re-acceptance.
-export const CONSENT_VERSION = 1;
+// v2 (2026-07): named all four providers + the licensed proxy, remote
+// classification, audio transcription and the separate statistics opt-in.
+export const CONSENT_VERSION = 2;
 
 // Surfaced verbatim by the service-worker backstop when an AI call is attempted
 // without consent (the popup onboarding normally collects it long before this).

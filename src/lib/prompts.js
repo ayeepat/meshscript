@@ -1,7 +1,6 @@
 /**
- * Subject-aware base prompts.
- * These are DEFAULTS. The Settings page lets the user override each one;
- * subject-router.js prefers stored overrides when present.
+ * Trusted subject-aware prompts packaged with the extension. Arbitrary stored
+ * text must never be promoted into the system role.
  */
 
 export const PROMPT_CATEGORIES = {

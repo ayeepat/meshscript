@@ -9,6 +9,8 @@ DOMAIN="${DOMAIN:-ai.smeshapi.site}"
 APP_DIR=/opt/smesh-proxy
 DATA_DIR=/var/lib/smesh-proxy
 ENV_FILE=/etc/smesh-proxy.env
+APP_USER=smeshai
+APP_GROUP=smeshai
 
 echo ">> Installing Node.js 20 + Caddy ..."
 sudo apt-get update -y
@@ -24,9 +26,19 @@ if ! command -v caddy >/dev/null 2>&1; then
   sudo apt-get install -y caddy
 fi
 
+echo ">> Creating unprivileged service account ..."
+if ! getent group "$APP_GROUP" >/dev/null; then
+  sudo groupadd --system "$APP_GROUP"
+fi
+if ! id -u "$APP_USER" >/dev/null 2>&1; then
+  sudo useradd --system --gid "$APP_GROUP" --home-dir "$APP_DIR" --no-create-home --shell /usr/sbin/nologin "$APP_USER"
+fi
+
 echo ">> Writing app to $APP_DIR ..."
-sudo install -d -m 755 "$APP_DIR"
-sudo install -d -m 750 "$DATA_DIR"
+# Code stays administrator-owned and read-only to the service. Only the quota
+# directory is writable; stdout/stderr already go to journald.
+sudo install -d -o root -g "$APP_GROUP" -m 750 "$APP_DIR"
+sudo install -d -o "$APP_USER" -g "$APP_GROUP" -m 750 "$DATA_DIR"
 sudo tee "$APP_DIR/server.js" >/dev/null <<'SMESH_SERVER_EOF'
 /**
  * СМЭШ AI proxy — the OFF-CLOUDFLARE half of the backend (AWS EC2 box).
@@ -94,6 +106,15 @@ const LICENSE_VERIFY_URL = (process.env.LICENSE_VERIFY_URL || 'https://smeshapi.
 // 302.AI (OpenAI-compatible). ai-proxy.js appends /chat/completions itself.
 const UPSTREAM_BASE_URL = (process.env.AI_PROXY_BASE_URL || 'https://api.302.ai/v1').replace(/\/+$/, '');
 const UPSTREAM_KEY = process.env.AI_PROXY_API_KEY || '';
+const ADMIN_KEY = process.env.ADMIN_KEY || '';
+
+// Server-side usage reporting → the license worker's POST /t/ai (see
+// backend/src/analytics.js handleServerIngest). This box is the only place
+// that sees EVERY real 302.AI call — client telemetry is opt-in — so it is
+// the ground truth the owner dashboard charts. Off unless INGEST_KEY is set
+// (must match the worker's INGEST_KEY secret).
+const INGEST_URL = (process.env.INGEST_URL || 'https://smeshapi.site/t/ai').replace(/\/+$/, '');
+const INGEST_KEY = process.env.INGEST_KEY || '';
 
 // Where the daily quota counters persist (survives restarts; best-effort).
 const QUOTA_FILE = process.env.QUOTA_FILE || '/var/lib/smesh-proxy/quota.json';
@@ -151,6 +172,15 @@ const MAX_TOKENS_OUT = 8192;
 // upstream so we stop paying 302.AI); finished jobs linger briefly so a
 // client can drain the tail even across a flaky poll or two.
 const MAX_ACTIVE_JOBS = 100;            // running upstream fetches at once
+const MAX_JOBS_PER_LICENSE = 2;
+const MAX_JOBS_PER_DEVICE = 2;
+const MAX_JOBS_PER_IP = 4;
+const JOB_START_RATE_LIMIT = 20;
+const JOB_START_RATE_WINDOW_MS = 10 * 60 * 1000;
+const UPSTREAM_CONNECT_TIMEOUT_MS = 20 * 1000;
+const UPSTREAM_IDLE_TIMEOUT_MS = 60 * 1000;
+const MAX_JOB_DURATION_MS = 5 * 60 * 1000;
+const MAX_JOB_OUTPUT_BYTES = 2 * 1024 * 1024;
 const JOB_ABANDON_MS = 90 * 1000;       // running + unpolled this long → dead client
 const JOB_LINGER_MS = 5 * 60 * 1000;    // done + unpolled this long → GC
 const JOB_GC_INTERVAL_MS = 30 * 1000;
@@ -194,21 +224,28 @@ const LICENSE_ERRORS = {
 };
 const TOO_BIG = 'Запрос слишком большой. Уберите часть вложений и попробуйте снова.';
 
-const CORS = {
-  'Access-Control-Allow-Origin': '*',
+// Extension fetches bypass CORS via host_permissions, and curl diagnostics do
+// not need ACAO. Keep only the generic transport/preflight headers here.
+const BASE_HEADERS = {
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type'
+  'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Key, X-Job-Token'
 };
 
 /* ------------------------------ helpers ------------------------------- */
 
 function sendJson(res, status, obj, extraHeaders = {}) {
   const body = JSON.stringify(obj);
-  res.writeHead(status, { 'Content-Type': 'application/json', ...CORS, ...extraHeaders });
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    'Referrer-Policy': 'no-referrer',
+    ...BASE_HEADERS,
+    ...extraHeaders
+  });
   res.end(body);
 }
-function sendErr(res, status, message) {
-  sendJson(res, status, { ok: false, error: { message } });
+function sendErr(res, status, message, extraHeaders = {}) {
+  sendJson(res, status, { ok: false, error: { message } }, extraHeaders);
 }
 
 // Moscow calendar day (UTC+3, no DST) — matches the worker's mskDay().
@@ -218,6 +255,30 @@ function mskDay() {
 
 function normalizeKey(k) {
   return String(k || '').trim().toUpperCase();
+}
+
+function readHeader(req, name) {
+  const raw = req.headers[name];
+  return Array.isArray(raw) ? raw[0] : String(raw || '');
+}
+
+// Shared constant-time compare for every secret header. Length check first is
+// deliberate: timingSafeEqual throws on different sizes, and a missing secret
+// must fail closed without turning into a distinct error path.
+function safeEqualSecret(expected, supplied) {
+  const expectedBytes = Buffer.from(String(expected || ''));
+  const suppliedBytes = Buffer.from(String(supplied || ''));
+  return expectedBytes.length === suppliedBytes.length &&
+    expectedBytes.length > 0 &&
+    crypto.timingSafeEqual(expectedBytes, suppliedBytes);
+}
+
+// Diagnostic routes are deliberately invisible unless an operator opted in.
+// Constant-time comparison avoids turning the shared secret into a timing
+// oracle; a missing or wrong key gets the same 404 as an absent route.
+function isAdmin(req) {
+  if (!ADMIN_KEY) return false;
+  return safeEqualSecret(ADMIN_KEY, readHeader(req, 'x-admin-key'));
 }
 
 function upstreamUrl() {
@@ -522,10 +583,9 @@ function handleBlob(req, res, rawBody) {
 }
 
 /* --------------------- shared request preparation --------------------- */
-// Everything /ai/chat and /ai/start have in common: parse, validate, verify
-// the license, charge the quota. Returns { err: { status, message } } or the
-// prepared context. Quota is charged HERE — by the time a job exists it has
-// already paid.
+// Everything /ai/chat and /ai/start have in common: parse, validate and verify
+// the license. Admission limits and quota charging happen synchronously after
+// this returns, while the pre-await accounting reservation is still held.
 
 async function prepareChat(rawBody) {
   if (!UPSTREAM_KEY) { console.error('AI_PROXY_API_KEY not set'); return { err: { status: 503, message: UNAVAILABLE } }; }
@@ -569,10 +629,7 @@ async function prepareChat(rawBody) {
   const hasImages = hasImageParts(messages);
   const hasPdfs = hasPdfParts(messages);
 
-  const q = chargeQuota(licenseKey, body.provider, provider);
-  if (!q.ok) return { err: { status: 429, message: q.message } };
-
-  return { provider, body, messages, hasImages, hasPdfs };
+  return { provider, providerId: body.provider, body, messages, hasImages, hasPdfs, licenseKey, deviceId };
 }
 
 /* ------------------------ upstream connection ------------------------- */
@@ -585,7 +642,7 @@ async function prepareChat(rawBody) {
 // level failure (reset connection, DNS hiccup, or this box's own CPU/network
 // briefly saturated re-serializing two multi-MB JSON bodies at once on a
 // t3.micro). Observed live: one of two concurrent PDF solves got exactly this
-// path while the other succeeded. The 45s connect timeout already rules out
+// path while the other succeeded. The job-wide 20s connect ceiling rules out
 // "just needs more time"; what actually helps is trying again a moment later,
 // once the other job has released whatever it was contending for. Retried
 // ONLY on a thrown fetch (this loop's catch) — an honest 4xx/5xx from 302.AI
@@ -618,18 +675,12 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
       if (signal?.aborted) return { err: { status: 499, message: UNAVAILABLE } };
       if (attempt > 0) await sleep(UPSTREAM_CONNECT_RETRY_DELAY_MS * attempt);
 
-      // Timeout the CONNECT only (getting response headers); the stream body
-      // then flows with no timeout so long answers aren't cut off.
-      const ctrl = new AbortController();
-      const connectTimer = setTimeout(() => ctrl.abort(), 45000);
-      const onAbort = () => ctrl.abort();
-      if (signal) signal.addEventListener('abort', onAbort, { once: true });
       try {
         upstream = await fetch(upstreamUrl(), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${UPSTREAM_KEY}` },
           body: upstreamPayload,
-          signal: ctrl.signal
+          signal
         });
         connectErr = null;
       } catch (e) {
@@ -639,9 +690,6 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
         }
         connectErr = e;
         console.error('upstream fetch failed', usedModel, 'attempt', attempt + 1, String(e));
-      } finally {
-        clearTimeout(connectTimer);
-        if (signal) signal.removeEventListener('abort', onAbort);
       }
     }
     if (connectErr) {
@@ -673,12 +721,123 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
 
 /* --------------------------- poll-job store --------------------------- */
 
-const jobs = new Map(); // job_id → { text, done, error, ctrl, lastAccess }
+const jobs = new Map(); // job_id → { text, done, error, ctrl, lastAccess, accounting }
 
-function activeJobCount() {
-  let n = 0;
-  for (const j of jobs.values()) if (!j.done) n += 1;
-  return n;
+// Admission is intentionally plain synchronous state: Node cannot interleave
+// another request between the checks and increments below. Reservations cover
+// license verification too, closing the old check-await-register race without
+// introducing a lock or disturbing the polling transport.
+let activeJobSlots = 0;
+const activeJobsByLicense = new Map();
+const activeJobsByDevice = new Map();
+const activeJobsByIp = new Map();
+const startsByLicense = new Map();
+const startsByDevice = new Map();
+
+function mapCount(map, key) {
+  return key ? (map.get(key) || 0) : 0;
+}
+
+function addMapCount(map, key) {
+  if (key) map.set(key, mapCount(map, key) + 1);
+}
+
+function removeMapCount(map, key) {
+  if (!key) return;
+  const next = mapCount(map, key) - 1;
+  if (next > 0) map.set(key, next);
+  else map.delete(key);
+}
+
+function requestIp(req) {
+  // Caddy is the only process that can reach this loopback listener and sets
+  // X-Forwarded-For, so the first hop is the student rather than 127.0.0.1.
+  const forwarded = req.headers['x-forwarded-for'];
+  const value = Array.isArray(forwarded) ? forwarded[0] : String(forwarded || '');
+  return (value.split(',')[0].trim() || req.socket.remoteAddress || 'unknown').slice(0, 128);
+}
+
+function identityFromBody(rawBody) {
+  try {
+    const body = JSON.parse(rawBody);
+    return {
+      licenseKey: normalizeKey(typeof body.license_key === 'string' ? body.license_key : ''),
+      deviceId: typeof body.device_id === 'string' ? body.device_id.slice(0, 64) : ''
+    };
+  } catch {
+    return { licenseKey: '', deviceId: '' };
+  }
+}
+
+function reserveJobAccounting(req, rawBody) {
+  const { licenseKey, deviceId } = identityFromBody(rawBody);
+  const ip = requestIp(req);
+  if (activeJobSlots >= MAX_ACTIVE_JOBS) {
+    console.error('MAX_ACTIVE_JOBS reached', MAX_ACTIVE_JOBS);
+    return { err: { status: 503, message: OVERLOADED } };
+  }
+  if ((licenseKey && mapCount(activeJobsByLicense, licenseKey) >= MAX_JOBS_PER_LICENSE) ||
+      (deviceId && mapCount(activeJobsByDevice, deviceId) >= MAX_JOBS_PER_DEVICE) ||
+      mapCount(activeJobsByIp, ip) >= MAX_JOBS_PER_IP) {
+    return { err: { status: 429, message: 'Слишком много одновременных ответов. Дождитесь завершения текущих запросов.' } };
+  }
+
+  activeJobSlots += 1;
+  addMapCount(activeJobsByLicense, licenseKey);
+  addMapCount(activeJobsByDevice, deviceId);
+  addMapCount(activeJobsByIp, ip);
+  return { licenseKey, deviceId, ip, released: false };
+}
+
+function recentStarts(map, key, now) {
+  const cutoff = now - JOB_START_RATE_WINDOW_MS;
+  const recent = (map.get(key) || []).filter((timestamp) => timestamp > cutoff);
+  if (recent.length) map.set(key, recent);
+  else map.delete(key);
+  return recent;
+}
+
+function admitJobStart(reservation, prep) {
+  // The verified identity must still be the one whose slot was reserved.
+  // This is cheap re-validation after the only await in admission.
+  if (reservation.licenseKey !== prep.licenseKey || reservation.deviceId !== prep.deviceId) {
+    return { err: { status: 400, message: 'Некорректный запрос.' } };
+  }
+
+  const now = Date.now();
+  const licenseStarts = recentStarts(startsByLicense, prep.licenseKey, now);
+  const deviceStarts = recentStarts(startsByDevice, prep.deviceId, now);
+  if (licenseStarts.length >= JOB_START_RATE_LIMIT || deviceStarts.length >= JOB_START_RATE_LIMIT) {
+    return { err: { status: 429, message: 'Слишком много запросов за короткое время. Подождите несколько минут и попробуйте снова.' } };
+  }
+
+  // Quota and sliding-window admission are committed together with no await,
+  // so a rejected burst neither slips through nor consumes extra daily quota.
+  const q = chargeQuota(prep.licenseKey, prep.providerId, prep.provider);
+  if (!q.ok) return { err: { status: 429, message: q.message } };
+  licenseStarts.push(now);
+  deviceStarts.push(now);
+  startsByLicense.set(prep.licenseKey, licenseStarts);
+  startsByDevice.set(prep.deviceId, deviceStarts);
+  return { ok: true };
+}
+
+function releaseJobAccounting(reservation) {
+  if (!reservation || reservation.released) return;
+  reservation.released = true;
+  activeJobSlots = Math.max(0, activeJobSlots - 1);
+  removeMapCount(activeJobsByLicense, reservation.licenseKey);
+  removeMapCount(activeJobsByDevice, reservation.deviceId);
+  removeMapCount(activeJobsByIp, reservation.ip);
+}
+
+function tripJobLimit(job, message) {
+  if (job.limitError) return;
+  job.limitError = message;
+  job.error = message;
+  job.done = true;
+  releaseJobAccounting(job.accounting);
+  try { job.ctrl.abort(); } catch { }
 }
 
 setInterval(() => {
@@ -687,6 +846,7 @@ setInterval(() => {
     if (!job.done && now - job.lastAccess > JOB_ABANDON_MS) {
       console.warn('job abandoned (client stopped polling), aborting upstream', id);
       try { job.ctrl.abort(); } catch { }
+      releaseJobAccounting(job.accounting);
       jobs.delete(id);
     } else if (job.done && now - job.lastAccess > JOB_LINGER_MS) {
       jobs.delete(id);
@@ -705,59 +865,189 @@ setInterval(() => {
       else uploadTickets.delete(token);
     }
   }
+  // Sliding windows only need their last ten minutes; pruning here bounds the
+  // attacker-controlled license/device keyspace even when traffic goes quiet.
+  for (const [key] of startsByLicense) recentStarts(startsByLicense, key, now);
+  for (const [key] of startsByDevice) recentStarts(startsByDevice, key, now);
 }, JOB_GC_INTERVAL_MS).unref();
+
+/* -------------------------- usage reporting --------------------------- */
+// Fire-and-forget after every poll job settles: reporting must never delay,
+// fail or resurrect a job. Content-free by design — device id, provider,
+// model, token counts, estimated cost; never messages or license keys.
+
+// List-rate estimates (USD per token) keyed by model prefix. 302.AI's
+// OpenAI-compatible usage frame carries token counts but no cost, so this is
+// a dashboard estimate at published rates — not a billing-grade figure (the
+// event is tagged est_rates so the dashboard can say so).
+const USAGE_RATES = [
+  [/^qwen/i,        { in: 0.32 / 1e6, out: 1.28 / 1e6 }],
+  [/^deepseek/i,    { in: 0.20 / 1e6, out: 0.40 / 1e6 }],
+  [/^gemini-2\.5/i, { in: 0.30 / 1e6, out: 2.50 / 1e6 }],
+  [/^gemini/i,      { in: 0.10 / 1e6, out: 0.40 / 1e6 }]
+];
+
+function estimateCost(model, tokensIn, tokensOut) {
+  for (const [re, rate] of USAGE_RATES) {
+    if (re.test(String(model || ''))) return tokensIn * rate.in + tokensOut * rate.out;
+  }
+  return 0;
+}
+
+// Pull the model id + final usage frame out of the buffered SSE text — the
+// same top-level `model` / `usage` fields the extension's SSE sink reads
+// (connectUpstream always asks for stream_options.include_usage).
+function extractSseUsage(text) {
+  let usage = null, model = null;
+  for (const rawLine of String(text || '').split('\n')) {
+    const line = rawLine.trim();
+    if (!line.startsWith('data:')) continue;
+    const data = line.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    let json;
+    try { json = JSON.parse(data); } catch { continue; }
+    if (!model && json && typeof json.model === 'string') model = json.model;
+    if (json && json.usage && typeof json.usage === 'object') usage = json.usage;
+  }
+  return { usage, model };
+}
+
+function reportJobUsage(job) {
+  if (!INGEST_KEY) return;
+  try {
+    const { usage, model } = extractSseUsage(job.text);
+    const tokensIn = Math.max(0, Math.round(Number(usage && usage.prompt_tokens) || 0));
+    const tokensOut = Math.max(0, Math.round(Number(usage && usage.completion_tokens) || 0));
+    const event = {
+      device_id: job.accounting ? job.accounting.deviceId : '',
+      ts: Date.now(),
+      provider: job.providerId || null,
+      model,
+      tokens_in: tokensIn,
+      tokens_out: tokensOut,
+      cost_usd: estimateCost(model, tokensIn, tokensOut),
+      meta: { src: 'vps', ok: !job.error, est_rates: true }
+    };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 8000);
+    fetch(INGEST_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Ingest-Key': INGEST_KEY },
+      body: JSON.stringify({ events: [event] }),
+      signal: ctrl.signal
+    }).catch((e) => console.error('usage report failed', String(e && e.message || e)))
+      .finally(() => clearTimeout(timer));
+  } catch (e) {
+    console.error('usage report failed', String(e));
+  }
+}
 
 // Background pump: open the upstream stream and accumulate its SSE bytes as
 // a string (StringDecoder so a chunk boundary can't split a multi-byte char).
 async function runJob(job, provider, body, messages, hasImages, hasPdfs) {
-  const conn = await connectUpstream(provider, body, messages, hasImages, hasPdfs, job.ctrl.signal);
-  if (!conn.upstream) {
-    job.error = conn.err.message;
-    job.done = true;
-    return;
-  }
   const dec = new StringDecoder('utf8');
+  let connectTimer = null;
+  let idleTimer = null;
+  let totalTimer = null;
+  let streamEnded = false;
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => tripJobLimit(
+      job,
+      'UPSTREAM_IDLE_TIMEOUT: ИИ-сервис не присылал данные 60 секунд; ответ остановлен.'
+    ), UPSTREAM_IDLE_TIMEOUT_MS);
+  };
+
   try {
+    totalTimer = setTimeout(() => tripJobLimit(
+      job,
+      'JOB_DURATION_LIMIT: ответ остановлен после максимальных 5 минут.'
+    ), MAX_JOB_DURATION_MS);
+    connectTimer = setTimeout(() => tripJobLimit(
+      job,
+      'UPSTREAM_CONNECT_TIMEOUT: ИИ-сервис не начал отвечать за 20 секунд.'
+    ), UPSTREAM_CONNECT_TIMEOUT_MS);
+
+    const conn = await connectUpstream(provider, body, messages, hasImages, hasPdfs, job.ctrl.signal);
+    clearTimeout(connectTimer);
+    connectTimer = null;
+    if (!conn.upstream) {
+      if (!job.limitError) job.error = conn.err.message;
+      return;
+    }
+
+    resetIdleTimer();
     for await (const chunk of Readable.fromWeb(conn.upstream.body)) {
+      const chunkBytes = Buffer.byteLength(chunk);
+      if (job.outputBytes + chunkBytes > MAX_JOB_OUTPUT_BYTES) {
+        tripJobLimit(job, 'JOB_OUTPUT_LIMIT: ответ превысил лимит 2 МБ и был остановлен.');
+        return;
+      }
+      job.outputBytes += chunkBytes;
       job.text += dec.write(chunk);
+      resetIdleTimer();
     }
     job.text += dec.end();
+    streamEnded = true;
   } catch (e) {
     // Either the client cancelled (abort — expected) or 302.AI dropped the
     // stream. With partial text we deliver what arrived (the old streaming
     // path behaved the same way); with NOTHING delivered, surface an error
     // instead of an empty answer.
-    if (!job.ctrl.signal.aborted) {
+    if (!job.ctrl.signal.aborted && !job.limitError) {
       console.error('job stream broke', String(e));
       if (!job.text) job.error = `${provider.name}: не удалось получить ответ. Попробуйте ещё раз.`;
     }
+  } finally {
+    clearTimeout(connectTimer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    if (!streamEnded) dec.end();
+    job.done = true;
+    releaseJobAccounting(job.accounting);
+    reportJobUsage(job); // fire-and-forget; runs exactly once per job
   }
-  job.done = true;
 }
 
 /* ---------------------- /ai/start /ai/poll /ai/cancel ----------------- */
 
 async function handleAiStart(req, res, rawBody) {
-  // Refuse BEFORE charging quota when we're at capacity.
-  if (activeJobCount() >= MAX_ACTIVE_JOBS) {
-    console.error('MAX_ACTIVE_JOBS reached', MAX_ACTIVE_JOBS);
-    return sendErr(res, 503, OVERLOADED);
+  const accounting = reserveJobAccounting(req, rawBody);
+  if (accounting.err) return sendErr(res, accounting.err.status, accounting.err.message);
+  let handedToRunner = false;
+  try {
+    const prep = await prepareChat(rawBody);
+    if (prep.err) return sendErr(res, prep.err.status, prep.err.message);
+    const admission = admitJobStart(accounting, prep);
+    if (admission.err) return sendErr(res, admission.err.status, admission.err.message);
+
+    const id = crypto.randomUUID();
+    const token = crypto.randomUUID();
+    const job = {
+      text: '', outputBytes: 0, done: false, error: null, limitError: null,
+      ctrl: new AbortController(), lastAccess: Date.now(), accounting, token,
+      providerId: prep.providerId // for the post-job usage report
+    };
+    jobs.set(id, job);
+    handedToRunner = true;
+
+    runJob(job, prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs).catch((e) => {
+      console.error('job runner crashed', e && e.stack || String(e));
+      job.error = job.error || UNAVAILABLE;
+      job.done = true;
+      releaseJobAccounting(job.accounting);
+    });
+
+    sendJson(res, 200, { ok: true, job_id: id, job_token: token });
+  } finally {
+    // Once registered, runJob owns the reservation; every pre-registration
+    // validation/error path releases it here, including rejected licenses.
+    if (!handedToRunner) releaseJobAccounting(accounting);
   }
+}
 
-  const prep = await prepareChat(rawBody);
-  if (prep.err) return sendErr(res, prep.err.status, prep.err.message);
-
-  const id = crypto.randomUUID();
-  const job = { text: '', done: false, error: null, ctrl: new AbortController(), lastAccess: Date.now() };
-  jobs.set(id, job);
-
-  runJob(job, prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs).catch((e) => {
-    console.error('job runner crashed', e && e.stack || String(e));
-    job.error = job.error || UNAVAILABLE;
-    job.done = true;
-  });
-
-  sendJson(res, 200, { ok: true, job_id: id });
+function hasJobToken(req, job) {
+  return safeEqualSecret(job?.token, readHeader(req, 'x-job-token'));
 }
 
 function handleAiPoll(req, res, url) {
@@ -765,6 +1055,7 @@ function handleAiPoll(req, res, url) {
   const cursor = Math.max(0, Math.floor(Number(url.searchParams.get('cursor')) || 0));
   const job = jobs.get(id);
   if (!job) return sendErr(res, 404, JOB_NOT_FOUND);
+  if (!hasJobToken(req, job)) return sendErr(res, 404, JOB_NOT_FOUND);
   job.lastAccess = Date.now();
 
   // Long-poll: return the moment there's new text (or the job finished),
@@ -797,8 +1088,10 @@ function handleAiCancel(req, res, rawBody) {
   let id = '';
   try { id = String(JSON.parse(rawBody).job || ''); } catch { /* idempotent */ }
   const job = jobs.get(id);
+  if (job && !hasJobToken(req, job)) return sendErr(res, 404, JOB_NOT_FOUND);
   if (job) {
     try { job.ctrl.abort(); } catch { }
+    releaseJobAccounting(job.accounting);
     jobs.delete(id);
   }
   sendJson(res, 200, { ok: true });
@@ -809,28 +1102,80 @@ function handleAiCancel(req, res, rawBody) {
 // kills long-lived connections to this SNI) — kept for curl diagnostics.
 
 async function handleAiChat(req, res, rawBody) {
-  const prep = await prepareChat(rawBody);
-  if (prep.err) return sendErr(res, prep.err.status, prep.err.message);
+  const accounting = reserveJobAccounting(req, rawBody);
+  if (accounting.err) return sendErr(res, accounting.err.status, accounting.err.message);
+  const ctrl = new AbortController();
+  let connectTimer = null;
+  let idleTimer = null;
+  let totalTimer = null;
+  let limitError = null;
+  let outputBytes = 0;
+  const tripLimit = (message) => {
+    if (limitError) return;
+    limitError = message;
+    try { ctrl.abort(); } catch { }
+  };
+  const resetIdleTimer = () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => tripLimit(
+      'UPSTREAM_IDLE_TIMEOUT: ИИ-сервис не присылал данные 60 секунд; ответ остановлен.'
+    ), UPSTREAM_IDLE_TIMEOUT_MS);
+  };
+  const onClose = () => { try { ctrl.abort(); } catch { } };
+  res.on('close', onClose);
 
-  const conn = await connectUpstream(prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs);
-  if (!conn.upstream) return sendErr(res, conn.err.status, conn.err.message);
-  const upstream = conn.upstream;
-
-  res.writeHead(200, {
-    'Content-Type': upstream.headers.get('content-type') || 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'X-Accel-Buffering': 'no',
-    ...CORS
-  });
   try {
-    const nodeStream = Readable.fromWeb(upstream.body);
-    nodeStream.on('error', () => { try { res.end(); } catch { } });
-    // If the student closes the tab, stop pulling from (and paying) upstream.
-    res.on('close', () => { try { nodeStream.destroy(); } catch { } });
-    nodeStream.pipe(res);
+    const prep = await prepareChat(rawBody);
+    if (prep.err) return sendErr(res, prep.err.status, prep.err.message);
+    const admission = admitJobStart(accounting, prep);
+    if (admission.err) return sendErr(res, admission.err.status, admission.err.message);
+
+    totalTimer = setTimeout(() => tripLimit(
+      'JOB_DURATION_LIMIT: ответ остановлен после максимальных 5 минут.'
+    ), MAX_JOB_DURATION_MS);
+    connectTimer = setTimeout(() => tripLimit(
+      'UPSTREAM_CONNECT_TIMEOUT: ИИ-сервис не начал отвечать за 20 секунд.'
+    ), UPSTREAM_CONNECT_TIMEOUT_MS);
+    const conn = await connectUpstream(
+      prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs, ctrl.signal
+    );
+    clearTimeout(connectTimer);
+    connectTimer = null;
+    if (!conn.upstream) {
+      return sendErr(res, limitError ? 504 : conn.err.status, limitError || conn.err.message);
+    }
+
+    res.writeHead(200, {
+      'Content-Type': conn.upstream.headers.get('content-type') || 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Referrer-Policy': 'no-referrer',
+      'X-Accel-Buffering': 'no',
+      ...BASE_HEADERS
+    });
+    resetIdleTimer();
+    for await (const chunk of Readable.fromWeb(conn.upstream.body)) {
+      const chunkBytes = Buffer.byteLength(chunk);
+      if (outputBytes + chunkBytes > MAX_JOB_OUTPUT_BYTES) {
+        tripLimit('JOB_OUTPUT_LIMIT: ответ превысил лимит 2 МБ и был остановлен.');
+        break;
+      }
+      outputBytes += chunkBytes;
+      resetIdleTimer();
+      res.write(chunk); // capped at 2 MB, so diagnostics cannot build an unbounded socket buffer
+    }
   } catch (e) {
-    console.error('stream pipe failed', String(e));
-    try { res.end(); } catch { }
+    if (!ctrl.signal.aborted) console.error('stream pipe failed', String(e));
+    if (!res.headersSent) sendErr(res, 502, limitError || UNAVAILABLE);
+  } finally {
+    clearTimeout(connectTimer);
+    clearTimeout(idleTimer);
+    clearTimeout(totalTimer);
+    res.removeListener('close', onClose);
+    try { ctrl.abort(); } catch { }
+    if (res.headersSent && !res.writableEnded) {
+      try { res.end(); } catch { }
+    }
+    releaseJobAccounting(accounting);
   }
 }
 
@@ -845,8 +1190,9 @@ function handleStreamTest(req, res, url) {
   res.writeHead(200, {
     'Content-Type': 'text/event-stream',
     'Cache-Control': 'no-cache',
+    'Referrer-Policy': 'no-referrer',
     'X-Accel-Buffering': 'no',
-    'Access-Control-Allow-Origin': '*'
+    ...BASE_HEADERS
   });
   const t0 = Date.now();
   let n = 0;
@@ -870,13 +1216,45 @@ function withBody(req, res, handler) {
   const chunks = [];
   let size = 0;
   let aborted = false;
+  let responded = false;
+  let discardAfterReply = false;
+  const declaredLength = Number(req.headers['content-length']);
+  const finishOverflow = () => {
+    if (!discardAfterReply) return;
+    discardAfterReply = false;
+    try { req.destroy(); } catch { }
+  };
+  const sendTooBigNow = () => {
+    if (responded) return;
+    responded = true;
+    discardAfterReply = true;
+    // The current request body is junk from our point of view. Force-close the
+    // connection after the 413 so HTTP/1.1 keep-alive cannot accidentally reuse
+    // a socket that still has unread overflow bytes queued behind it.
+    sendErr(res, 413, TOO_BIG, { 'Connection': 'close' });
+    if (res.writableFinished) finishOverflow();
+  };
+  res.on('finish', finishOverflow);
+  res.on('close', finishOverflow);
+  if (Number.isFinite(declaredLength) && declaredLength > MAX_BODY_BYTES) {
+    aborted = true;
+    sendTooBigNow();
+    req.resume(); // drain/discard the announced body so the client gets the 413 body cleanly
+    return;
+  }
   req.on('data', (c) => {
+    if (aborted) return;
     size += c.length;
-    if (size > MAX_BODY_BYTES) { aborted = true; req.destroy(); return; }
+    if (size > MAX_BODY_BYTES) {
+      aborted = true;
+      chunks.length = 0; // free the partial body immediately; the rest will be discarded
+      sendTooBigNow();
+      return;
+    }
     chunks.push(c);
   });
   req.on('end', () => {
-    if (aborted) return sendErr(res, 413, TOO_BIG);
+    if (aborted) return;
     Promise.resolve(handler(Buffer.concat(chunks).toString('utf8')))
       .catch((e) => { console.error('handler unexpected', e && e.stack || String(e)); if (!res.headersSent) sendErr(res, 503, UNAVAILABLE); });
   });
@@ -887,15 +1265,21 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
   const pathName = url.pathname;
 
-  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); return res.end(); }
+  if (req.method === 'OPTIONS') { res.writeHead(204, BASE_HEADERS); return res.end(); }
   if (pathName === '/health') return sendJson(res, 200, { ok: true });
-  if (pathName === '/ai/streamtest' && req.method === 'GET') return handleStreamTest(req, res, url);
+  if (pathName === '/ai/streamtest' && req.method === 'GET') {
+    if (!isAdmin(req)) return sendJson(res, 404, { ok: false, reason: 'not_found' });
+    return handleStreamTest(req, res, url);
+  }
   if (pathName === '/ai/poll' && req.method === 'GET') return handleAiPoll(req, res, url);
   if (pathName === '/ai/upload-ticket' && req.method === 'POST') return withBody(req, res, (raw) => handleUploadTicket(res, raw));
   if (pathName === '/ai/blob' && req.method === 'POST') return withBody(req, res, (raw) => handleBlob(req, res, raw));
   if (pathName === '/ai/start' && req.method === 'POST') return withBody(req, res, (raw) => handleAiStart(req, res, raw));
   if (pathName === '/ai/cancel' && req.method === 'POST') return withBody(req, res, (raw) => handleAiCancel(req, res, raw));
-  if (pathName === '/ai/chat' && req.method === 'POST') return withBody(req, res, (raw) => handleAiChat(req, res, raw));
+  if (pathName === '/ai/chat' && req.method === 'POST') {
+    if (!isAdmin(req)) return sendJson(res, 404, { ok: false, reason: 'not_found' });
+    return withBody(req, res, (raw) => handleAiChat(req, res, raw));
+  }
 
   sendJson(res, 404, { ok: false, reason: 'not_found' });
 });
@@ -904,6 +1288,10 @@ server.listen(PORT, HOST, () => {
   console.log(`smesh-proxy listening on ${HOST}:${PORT} → upstream ${upstreamUrl()} · verify ${LICENSE_VERIFY_URL}`);
 });
 SMESH_SERVER_EOF
+sudo chown root:"$APP_GROUP" "$APP_DIR/server.js"
+sudo chmod 640 "$APP_DIR/server.js"
+# A re-run may encounter quota.json from the former root-run service.
+sudo chown -R "$APP_USER:$APP_GROUP" "$DATA_DIR"
 
 echo ">> Writing env file (add your 302.AI key here) ..."
 if [ ! -f "$ENV_FILE" ]; then
@@ -911,12 +1299,18 @@ if [ ! -f "$ENV_FILE" ]; then
 # Paste your 302.AI key after the = (no quotes), then:
 #   sudo systemctl restart smesh-proxy
 AI_PROXY_API_KEY=
+# Required as x-admin-key for /ai/chat and /ai/streamtest. Empty disables both.
+ADMIN_KEY=
+# Server-truth usage reporting to the license worker's POST /t/ai. Must match
+# the worker secret (`npx wrangler secret put INGEST_KEY`). Empty disables it.
+INGEST_KEY=
 PORT=8080
 HOST=127.0.0.1
 QUOTA_FILE=/var/lib/smesh-proxy/quota.json
 # Optional overrides (defaults already match the Cloudflare worker):
 # AI_PROXY_BASE_URL=https://api.302.ai/v1
 # LICENSE_VERIFY_URL=https://smeshapi.site/verify
+# INGEST_URL=https://smeshapi.site/t/ai
 # PROXY_QWEN_DAILY=80
 # PROXY_DEEPSEEK_DAILY=150
 # PROXY_GLOBAL_DAILY=3000
@@ -939,7 +1333,32 @@ EnvironmentFile=/etc/smesh-proxy.env
 ExecStart=/usr/bin/node /opt/smesh-proxy/server.js
 Restart=always
 RestartSec=2
-User=root
+User=smeshai
+Group=smeshai
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=true
+RestrictRealtime=true
+RestrictNamespaces=true
+LockPersonality=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+# MemoryDenyWriteExecute is omitted because Node's V8 JIT needs writable-executable pages.
+# The app persists only its daily quota counters; logs stay in journald.
+ReadWritePaths=/var/lib/smesh-proxy
+MemoryMax=768M
+TasksMax=128
+LimitNOFILE=4096
 
 [Install]
 WantedBy=multi-user.target

@@ -1,8 +1,8 @@
 /**
  * Floating answer panel for in-page test answers.
  *
- * Lives in the content-script isolated world. Renders inside an open Shadow DOM
- * so the host page's CSS can never touch it. Idempotent: re-injecting the
+ * Lives in the content-script isolated world. Renders inside a closed Shadow DOM
+ * so the host page's CSS and scripts cannot reach it. Idempotent: re-injecting the
  * script (e.g. service worker calls executeScript every solve) is a no-op.
  *
  * Persists {x, y, minimized} to chrome.storage.session so a soft refresh
@@ -12,7 +12,6 @@
   if (window.__smeshPanel) return;
 
   const STORAGE_KEY = 'smeshAnswerPanel';
-  const HOST_ID = '__smesh-answer-panel-host';
   const DEFAULT_W = 400;
   const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
@@ -67,9 +66,11 @@
       : (darkMedia.matches ? 'dark' : 'light');
 
   function loadTheme() {
+    // storage.session, not local: local is trusted-contexts-only (it holds the
+    // API keys), so the worker mirrors just `theme` into session for us.
     return new Promise((resolve) => {
       try {
-        chrome.storage.local.get('theme', (v) => {
+        chrome.storage.session.get('theme', (v) => {
           if (!chrome.runtime.lastError && v?.theme) themePref = v.theme;
           resolve();
         });
@@ -103,12 +104,9 @@
   function ensureHost() {
     if (hostEl && document.documentElement.contains(hostEl)) return;
     hostEl = document.createElement('div');
-    hostEl.id = HOST_ID;
-    // The host is a 0×0 anchor; the panel inside positions itself fixed.
-    hostEl.style.cssText =
-      'all: initial; position: fixed; inset: 0 auto auto 0; width: 0; height: 0; ' +
-      'z-index: 2147483647; pointer-events: none;';
-    shadow = hostEl.attachShadow({ mode: 'open' });
+    // The module keeps the only root reference; the page gets no stable id and a
+    // closed root cannot be traversed to synthesize action-button clicks.
+    shadow = hostEl.attachShadow({ mode: 'closed' });
     document.documentElement.appendChild(hostEl);
   }
 
@@ -148,6 +146,16 @@
     shadow.innerHTML = `
       <style>
         ${fontFaceCss()}
+        /* The host is a 0×0 anchor; the panel inside positions itself fixed. */
+        :host {
+          all: initial;
+          position: fixed;
+          inset: 0 auto auto 0;
+          width: 0;
+          height: 0;
+          z-index: 2147483647;
+          pointer-events: none;
+        }
         :host, * { box-sizing: border-box; }
 
         /* Brand tokens — mirror src/common/theme.css, toggled live via
@@ -468,39 +476,43 @@
   // test players), which the panel's own frame can't reach — so ask the service
   // worker to run the fill in EVERY frame of the tab and merge the result. If
   // the worker is unreachable, fall back to filling this frame directly.
-  function requestFill(qs) {
+  async function requestFill(qs) {
+    const resp = await sendMsg('FILL_ANSWERS_ALL', { questions: qs }, 8000);
+    if (!resp || !resp.ok || !resp.summary) {
+      // Worker error / no receiver → fill this frame only.
+      return localFill(qs) || (resp && resp.summary) || null;
+    }
+    return resp.summary;
+  }
+
+  // The trusted click is checked at the handler. The worker separately requires
+  // a short-lived, single-use capability tied to this tab and exact action.
+  function requestActionToken(action) {
     return new Promise((resolve) => {
-      let settled = false;
-      const finish = (s) => { if (!settled) { settled = true; resolve(s); } };
-      // Safety net: never let the button hang if no reply ever comes.
-      const t = setTimeout(() => finish(localFill(qs)), 8000);
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), 5000);
       try {
-        chrome.runtime.sendMessage({ type: 'FILL_ANSWERS_ALL', payload: { questions: qs } }, (resp) => {
+        chrome.runtime.sendMessage({ type: 'GET_ACTION_TOKEN', action }, (r) => {
           clearTimeout(t);
-          if (chrome.runtime.lastError || !resp || !resp.ok || !resp.summary) {
-            // Worker error / no receiver → fill this frame only.
-            const local = localFill(qs);
-            finish(local || (resp && resp.summary) || null);
-          } else {
-            finish(resp.summary);
-          }
+          if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+          else finish(r || { ok: false, error: 'no response' });
         });
-      } catch {
-        clearTimeout(t);
-        finish(localFill(qs));
-      }
+      } catch (e) { clearTimeout(t); finish({ ok: false, error: String(e) }); }
     });
   }
 
-  // Promise-wrapped sendMessage with a hard timeout so a recycled service
-  // worker (dropped reply) never leaves a line spinning forever.
-  function sendMsg(type, payload, timeoutMs) {
+  // Promise-wrapped privileged sendMessage with a hard timeout so a recycled
+  // service worker (dropped reply) never leaves a line spinning forever.
+  async function sendMsg(type, payload, timeoutMs) {
+    const grant = await requestActionToken(type);
+    if (!grant?.ok || !grant.token) return grant || { ok: false, error: 'no action token' };
     return new Promise((resolve) => {
       let done = false;
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
       const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs);
       try {
-        chrome.runtime.sendMessage({ type, payload }, (r) => {
+        chrome.runtime.sendMessage({ type, token: grant.token, payload }, (r) => {
           clearTimeout(t);
           if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
           else finish(r || { ok: false, error: 'no response' });
@@ -571,12 +583,16 @@
     const fillBtn = panel.querySelector('.btn-fill');
 
     panel.querySelectorAll('.btn-resolve').forEach((b) => {
-      b.addEventListener('click', () => resolveOne(b));
+      b.addEventListener('click', (event) => {
+        if (!event.isTrusted) return;
+        resolveOne(b);
+      });
     });
 
     closeBtn.addEventListener('click', hide);
 
-    fillBtn.addEventListener('click', async () => {
+    fillBtn.addEventListener('click', async (event) => {
+      if (!event.isTrusted) return;
       const qs = (lastPayload && lastPayload.questions) || questions || [];
       const orig = fillBtn.textContent;
       fillBtn.disabled = true;
@@ -645,7 +661,7 @@
   // dashboard, popup). An open panel repaints instantly, no re-solve needed.
   try {
     chrome.storage.onChanged.addListener((changes, area) => {
-      if (area === 'local' && changes.theme) {
+      if (area === 'session' && changes.theme) {
         themePref = changes.theme.newValue || 'system';
         applyTheme();
       }

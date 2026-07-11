@@ -40,6 +40,14 @@ export function utf8ToBase64(str) {
 
 /* ---------- minimal ZIP reader ---------- */
 
+const MAX_ZIP_ENTRIES = 4096;
+
+function sameBytes(a, b) {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
 // Read the central directory: it carries reliable compression methods, sizes
 // and offsets (local headers may defer sizes to a trailing data descriptor).
 function readZip(buf) {
@@ -49,49 +57,148 @@ function readZip(buf) {
   let eocd = -1;
   const min = Math.max(0, buf.length - 22 - 0xffff);
   for (let i = buf.length - 22; i >= min; i--) {
-    if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    if (dv.getUint32(i, true) === 0x06054b50 &&
+        i + 22 + dv.getUint16(i + 20, true) === buf.length) { eocd = i; break; }
   }
   if (eocd < 0) return null;
+  const disk = dv.getUint16(eocd + 4, true);
+  const centralDisk = dv.getUint16(eocd + 6, true);
+  const diskCount = dv.getUint16(eocd + 8, true);
   const count = dv.getUint16(eocd + 10, true);
-  let off = dv.getUint32(eocd + 16, true);
+  const centralSize = dv.getUint32(eocd + 12, true);
+  const centralOffset = dv.getUint32(eocd + 16, true);
+  const commentLength = dv.getUint16(eocd + 20, true);
+  // This reader intentionally supports one ordinary (non-ZIP64) disk only.
+  // Requiring the directory to end exactly at EOCD makes every offset/length
+  // below relative to one validated region rather than attacker-chosen bytes.
+  if (disk !== 0 || centralDisk !== 0 || diskCount !== count ||
+      count > MAX_ZIP_ENTRIES || count === 0xffff ||
+      centralSize === 0xffffffff || centralOffset === 0xffffffff ||
+      eocd + 22 + commentLength !== buf.length ||
+      centralOffset > eocd || centralSize !== eocd - centralOffset) return null;
+
+  const centralEnd = centralOffset + centralSize;
+  let off = centralOffset;
   const entries = [];
-  for (let n = 0; n < count && off + 46 <= buf.length; n++) {
-    if (dv.getUint32(off, true) !== 0x02014b50) break;
+  const localOffsets = new Set();
+  const names = new Set();
+  for (let n = 0; n < count; n++) {
+    if (off + 46 > centralEnd || dv.getUint32(off, true) !== 0x02014b50) return null;
+    const flags = dv.getUint16(off + 8, true);
     const method = dv.getUint16(off + 10, true);
+    const crc = dv.getUint32(off + 16, true);
     const compSize = dv.getUint32(off + 20, true);
+    const outSize = dv.getUint32(off + 24, true);
     const fnLen = dv.getUint16(off + 28, true);
     const extraLen = dv.getUint16(off + 30, true);
     const commentLen = dv.getUint16(off + 32, true);
+    const startDisk = dv.getUint16(off + 34, true);
     const localOff = dv.getUint32(off + 42, true);
-    const name = new TextDecoder().decode(buf.subarray(off + 46, off + 46 + fnLen));
-    entries.push({ name, method, compSize, localOff });
-    off += 46 + fnLen + extraLen + commentLen;
+    const next = off + 46 + fnLen + extraLen + commentLen;
+    if (next > centralEnd || startDisk !== 0 || (flags & 1) !== 0 ||
+        localOff === 0xffffffff || localOffsets.has(localOff) || localOff + 30 > centralOffset) return null;
+
+    const nameBytes = buf.subarray(off + 46, off + 46 + fnLen);
+    const localFlags = dv.getUint16(localOff + 6, true);
+    const localMethod = dv.getUint16(localOff + 8, true);
+    const localNameLen = dv.getUint16(localOff + 26, true);
+    const localExtraLen = dv.getUint16(localOff + 28, true);
+    const dataStart = localOff + 30 + localNameLen + localExtraLen;
+    const dataEnd = dataStart + compSize;
+    if (dv.getUint32(localOff, true) !== 0x04034b50 || localFlags !== flags ||
+        localMethod !== method || dataStart > centralOffset || dataEnd > centralOffset ||
+        !sameBytes(nameBytes, buf.subarray(localOff + 30, localOff + 30 + localNameLen))) return null;
+    // Without a data descriptor the local CRC/sizes must corroborate the
+    // central directory. Stored entries cannot change size by definition.
+    if ((flags & 0x08) === 0 &&
+        (dv.getUint32(localOff + 14, true) !== crc ||
+         dv.getUint32(localOff + 18, true) !== compSize ||
+         dv.getUint32(localOff + 22, true) !== outSize)) return null;
+    if (method === 0 && compSize !== outSize) return null;
+
+    const name = new TextDecoder().decode(nameBytes);
+    if (names.has(name)) return null;
+    entries.push({ name, method, compSize, outSize, crc, localOff, dataStart, localEnd: dataEnd });
+    names.add(name);
+    localOffsets.add(localOff);
+    off = next;
+  }
+  if (off !== centralEnd) return null;
+  const localRanges = [...entries].sort((a, b) => a.localOff - b.localOff);
+  for (let i = 1; i < localRanges.length; i++) {
+    if (localRanges[i - 1].localEnd > localRanges[i].localOff) return null;
   }
   return { buf, dv, entries };
 }
 
-async function inflateRaw(bytes) {
+// ZIP-bomb guards: a real OOXML text part is a few MB at worst, but DEFLATE
+// happily expands a kilobyte of input into gigabytes. Cap each entry's
+// decompressed size AND the ratio against its compressed size, plus one shared
+// budget across all entries of a document — homework never legitimately gets
+// near these numbers.
+const MAX_ENTRY_OUT_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_OUT_BYTES = 48 * 1024 * 1024;
+const MAX_INFLATE_RATIO = 400; // vs compSize, for entries over ~4 KB
+
+const CRC32_TABLE = Uint32Array.from({ length: 256 }, (_, value) => {
+  let crc = value;
+  for (let bit = 0; bit < 8; bit++) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  return crc >>> 0;
+});
+
+function crc32(bytes) {
+  let crc = 0xffffffff;
+  for (const byte of bytes) crc = (crc >>> 8) ^ CRC32_TABLE[(crc ^ byte) & 0xff];
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+// Bounded streaming inflate: count output bytes as they arrive and abort the
+// stream the moment the cap is crossed — never buffer an unbounded body.
+async function inflateRaw(bytes, maxOut) {
   const ds = new DecompressionStream('deflate-raw');
-  const stream = new Blob([bytes]).stream().pipeThrough(ds);
-  return new Uint8Array(await new Response(stream).arrayBuffer());
+  const reader = new Blob([bytes]).stream().pipeThrough(ds).getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxOut) {
+        try { await reader.cancel('zip entry too large'); } catch { /* closed */ }
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch { return null; }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) { out.set(c, off); off += c.byteLength; }
+  return out;
 }
 
-// Decompressed bytes for one central-directory entry, or null.
-async function readEntry(zip, entry) {
-  const { buf, dv } = zip;
-  if (dv.getUint32(entry.localOff, true) !== 0x04034b50) return null;
-  const fnLen = dv.getUint16(entry.localOff + 26, true);
-  const extraLen = dv.getUint16(entry.localOff + 28, true);
-  const start = entry.localOff + 30 + fnLen + extraLen;
-  const data = buf.subarray(start, start + entry.compSize);
-  if (entry.method === 0) return data;            // stored
-  if (entry.method === 8) return inflateRaw(data); // deflate
-  return null;
+// Decompressed bytes for one central-directory entry, or null. `budget` is the
+// per-document remaining-output allowance ({ left }) shared across entries.
+async function readEntry(zip, entry, budget) {
+  const { buf } = zip;
+  if (entry.outSize > MAX_ENTRY_OUT_BYTES || entry.outSize > (budget?.left ?? MAX_TOTAL_OUT_BYTES)) return null;
+  const data = buf.subarray(entry.dataStart, entry.dataStart + entry.compSize);
+  const ratioCap = entry.compSize > 4096 ? entry.compSize * MAX_INFLATE_RATIO : MAX_ENTRY_OUT_BYTES;
+  if (entry.outSize > ratioCap) return null;
+  const maxOut = Math.min(MAX_ENTRY_OUT_BYTES, ratioCap, entry.outSize, budget?.left ?? MAX_TOTAL_OUT_BYTES);
+  if (maxOut <= 0) return null;
+  let out = null;
+  if (entry.method === 0) out = data.byteLength <= maxOut ? data : null; // stored
+  else if (entry.method === 8) out = await inflateRaw(data, maxOut);     // deflate
+  if (out && (out.byteLength !== entry.outSize || crc32(out) !== entry.crc)) out = null;
+  if (out && budget) budget.left -= out.byteLength;
+  return out;
 }
 
-function readNamed(zip, name) {
+function readNamed(zip, name, budget) {
   const e = zip.entries.find((x) => x.name === name);
-  return e ? readEntry(zip, e) : Promise.resolve(null);
+  return e ? readEntry(zip, e, budget) : Promise.resolve(null);
 }
 
 /* ---------- XML -> text ---------- */
@@ -193,10 +300,13 @@ export async function extractOfficeText(file) {
 
   const name = (file.name || '').toLowerCase();
   const mime = (file.mimeType || '').toLowerCase();
+  // Shared decompressed-output budget for every entry of this document — the
+  // per-entry and ratio caps live in readEntry (zip-bomb guard).
+  const budget = { left: MAX_TOTAL_OUT_BYTES };
   let text = '';
 
   if (name.endsWith('.docx') || mime.includes('wordprocessingml')) {
-    const bytes = await readNamed(zip, 'word/document.xml');
+    const bytes = await readNamed(zip, 'word/document.xml', budget);
     if (bytes) text = docxToText(decodeBytes(bytes));
   } else if (name.endsWith('.pptx') || mime.includes('presentationml')) {
     const slides = zip.entries
@@ -204,7 +314,7 @@ export async function extractOfficeText(file) {
       .sort((a, b) => (+a.name.match(/(\d+)/)[1]) - (+b.name.match(/(\d+)/)[1]));
     const chunks = [];
     for (let i = 0; i < slides.length; i++) {
-      const bytes = await readEntry(zip, slides[i]);
+      const bytes = await readEntry(zip, slides[i], budget);
       const t = bytes && slideToText(decodeBytes(bytes));
       if (t) chunks.push(`[Слайд ${i + 1}]\n${t}`);
     }
@@ -214,14 +324,14 @@ export async function extractOfficeText(file) {
     // in the sheet, not in sharedStrings — see sheetToText). A purely-numeric
     // spreadsheet has an empty/absent sharedStrings.xml, so worksheet parsing is
     // what makes numeric data extractable at all.
-    const ssBytes = await readNamed(zip, 'xl/sharedStrings.xml');
+    const ssBytes = await readNamed(zip, 'xl/sharedStrings.xml', budget);
     const shared = parseSharedStrings(ssBytes ? decodeBytes(ssBytes) : '');
     const sheets = zip.entries
       .filter((e) => /^xl\/worksheets\/sheet\d+\.xml$/.test(e.name))
       .sort((a, b) => (+a.name.match(/(\d+)/)[1]) - (+b.name.match(/(\d+)/)[1]));
     const chunks = [];
     for (let i = 0; i < sheets.length; i++) {
-      const bytes = await readEntry(zip, sheets[i]);
+      const bytes = await readEntry(zip, sheets[i], budget);
       const t = bytes && sheetToText(decodeBytes(bytes), shared);
       if (t) chunks.push(sheets.length > 1 ? `[Лист ${i + 1}]\n${t}` : t);
     }

@@ -49,3 +49,13 @@ export const RUNTIME_CONFIG_URL = 'https://www.smeshai.xyz/extension-config.json
 // Refresh the cached runtime config at most this often (6h). Long enough to be
 // nearly free, short enough that a hot-fix reaches users the same day.
 export const RUNTIME_CONFIG_TTL_MS = 6 * 60 * 60 * 1000;
+
+// P-256 verification key for signed runtime-config envelopes. The matching
+// private key is deployment-only and is ignored under .secrets/; never copy it
+// into extension source or the hosted config directory.
+export const RUNTIME_CONFIG_PUBLIC_KEY_JWK = Object.freeze({
+  kty: 'EC',
+  crv: 'P-256',
+  x: '5dbL_3E1XGPyPiVDRrls-W-FIiEbEkKdhO5Z3Xezu2U',
+  y: '0LNIwC5bqMAJa-wljhC4CeyjuQhfds0EJge2HkvSDQU'
+});

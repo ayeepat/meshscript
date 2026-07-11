@@ -6,11 +6,13 @@
  * Storage:
  *   rateLimits:  { openrouter: number, groq: number, ... }   // user-set caps
  *   rateUsage:   { openrouter: { day, count }, groq: { day, count }, ... }
+ *   rateAttempts: { openrouter: { day, count }, groq: { day, count }, ... }
+ *   rateReservations: { [id]: { provider, day, expiresAt } }
  *   rateHistory: { 'YYYY-MM-DD': { openrouter: number, groq: number, ... } }  // per-day, last 14 days
  *
  * `day` is a local-time YYYY-MM-DD string; when it rolls over, the counter
  * resets implicitly (no background sweep needed). rateHistory keeps a short
- * append-only trail so Settings can chart requests/day; it's pruned on write.
+ * trail so Settings can chart successful requests/day; it's pruned on write.
  */
 
 export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, qwen: 80, deepseek: 150 };
@@ -18,10 +20,11 @@ export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, qwen: 80, deepseek: 1
 // Human-readable provider names for the over-limit error message.
 const PROVIDER_NAMES = { openrouter: 'OpenRouter', groq: 'Groq', qwen: 'Qwen', deepseek: 'DeepSeek' };
 const HISTORY_DAYS = 14;
+const RESERVATION_TTL_MS = 15 * 60 * 1000;
 
-// chrome.storage.local has no compare-and-swap. Serialising read-modify-write
-// charges inside this service-worker prevents simultaneous solves from each
-// reading the same count and then overwriting one another's increment.
+// chrome.storage.local has no compare-and-swap. Serialising every reservation
+// transition inside this service worker prevents simultaneous solves from
+// overwriting one another's state.
 let chargeQueue = Promise.resolve();
 
 function todayKey() {
@@ -52,9 +55,11 @@ function pruneHistory(hist) {
 }
 
 async function load() {
-  const { rateLimits = {}, rateUsage = {}, rateHistory = {} } =
-    await chrome.storage.local.get(['rateLimits', 'rateUsage', 'rateHistory']);
-  return { rateLimits, rateUsage, rateHistory };
+  const { rateLimits = {}, rateUsage = {}, rateAttempts = {}, rateHistory = {}, rateReservations = {} } =
+    await chrome.storage.local.get(
+      ['rateLimits', 'rateUsage', 'rateAttempts', 'rateHistory', 'rateReservations']
+    );
+  return { rateLimits, rateUsage, rateAttempts, rateHistory, rateReservations };
 }
 
 function limitFor(rateLimits, provider) {
@@ -69,34 +74,89 @@ function currentCount(slot, day) {
 }
 
 /**
- * Charge one call against `provider`'s daily budget. Throws a Russian-language
- * Error when over the cap so the existing service-worker try/catch surfaces it
- * to the UI verbatim.
+ * Reserve one slot against `provider`'s daily budget. A reservation is not a
+ * charge: only commitOne() moves it into usage/history. This makes a failed call
+ * unchargeable even if its cleanup write fails or the worker is torn down; the
+ * orphan can only block a slot until its short expiry.
  */
-async function chargeOneInner(provider) {
-  const { rateLimits, rateUsage, rateHistory } = await load();
+async function reserveOneInner(provider) {
+  const { rateLimits, rateUsage, rateAttempts, rateReservations } = await load();
   const limit = limitFor(rateLimits, provider);
   const day = todayKey();
   const used = currentCount(rateUsage[provider], day);
-  if (used >= limit) {
+  const now = Date.now();
+  const reservations = {};
+  let pending = 0;
+  for (const [id, reservation] of Object.entries(rateReservations || {})) {
+    if (!reservation || !Number.isFinite(reservation.expiresAt) || reservation.expiresAt <= now) continue;
+    reservations[id] = reservation;
+    if (reservation.provider === provider && reservation.day === day) pending++;
+  }
+  if (used + pending >= limit) {
     const name = PROVIDER_NAMES[provider] || provider;
     throw new Error(
-      `Дневной лимит ${name} исчерпан (${used}/${limit}). ` +
+      `Дневной лимит ${name} исчерпан (${used + pending}/${limit}). ` +
       `Изменить лимит можно в настройках расширения, либо дождитесь завтра — счётчик сбросится.`
     );
   }
-  const next = { ...rateUsage, [provider]: { day, count: used + 1 } };
-  // Mirror the charge into the per-day trail (pruned) so Settings can chart it.
+  const attempts = currentCount(rateAttempts[provider], day);
+  if (attempts >= limit * 3) {
+    throw new Error(
+      `Слишком много попыток за сегодня (${attempts}). ` +
+      `Попробуйте завтра или измените лимит в настройках.`
+    );
+  }
+  const nextAttempts = { ...rateAttempts, [provider]: { day, count: attempts + 1 } };
+  const id = crypto.randomUUID();
+  reservations[id] = { provider, day, expiresAt: now + RESERVATION_TTL_MS };
+  await chrome.storage.local.set({ rateAttempts: nextAttempts, rateReservations: reservations });
+  return id;
+}
+
+export function reserveOne(provider) {
+  const run = chargeQueue.then(() => reserveOneInner(provider));
+  // Keep later reservations usable after an over-limit error while preserving that
+  // error for this caller.
+  chargeQueue = run.catch(() => {});
+  return run;
+}
+
+async function commitOneInner(id) {
+  const { rateUsage, rateHistory, rateReservations } = await load();
+  const reservation = rateReservations?.[id];
+  if (!reservation) throw new Error('Rate-limit reservation expired before commit.');
+
+  const reservations = { ...rateReservations };
+  delete reservations[id];
+  const { provider, day } = reservation;
+  const usage = { ...rateUsage };
+  // rateUsage is only today's compact snapshot. An old reservation completing
+  // after midnight belongs in history but must not overwrite the new day's slot.
+  if (day === todayKey()) {
+    usage[provider] = { day, count: currentCount(rateUsage[provider], day) + 1 };
+  }
   const hist = pruneHistory(rateHistory);
   const row = hist[day] || {};
   hist[day] = { ...row, [provider]: (Number(row[provider]) || 0) + 1 };
-  await chrome.storage.local.set({ rateUsage: next, rateHistory: hist });
+  await chrome.storage.local.set({ rateUsage: usage, rateHistory: hist, rateReservations: reservations });
 }
 
-export function chargeOne(provider) {
-  const run = chargeQueue.then(() => chargeOneInner(provider));
-  // Keep later charges usable after an over-limit error while preserving that
-  // error for this caller.
+export function commitOne(id) {
+  const run = chargeQueue.then(() => commitOneInner(id));
+  chargeQueue = run.catch(() => {});
+  return run;
+}
+
+async function cancelOneInner(id) {
+  const { rateReservations } = await load();
+  if (!rateReservations || !Object.hasOwn(rateReservations, id)) return;
+  const reservations = { ...rateReservations };
+  delete reservations[id];
+  await chrome.storage.local.set({ rateReservations: reservations });
+}
+
+export function cancelOne(id) {
+  const run = chargeQueue.then(() => cancelOneInner(id));
   chargeQueue = run.catch(() => {});
   return run;
 }
@@ -119,7 +179,7 @@ export async function getUsage() {
  * Per-day request counts for the last `days` days (ascending, today last).
  * Gaps are zero-filled so the Settings chart always has a full axis. Every
  * provider is first-class (its own cap + today's-usage tile), so each gets
- * charted alongside the others — chargeOne already records them all.
+ * charted alongside the others — commitOne records every successful call.
  * @returns {Promise<Array<{day:string, openrouter:number, groq:number, qwen:number, deepseek:number}>>}
  */
 export async function getUsageHistory(days = HISTORY_DAYS) {

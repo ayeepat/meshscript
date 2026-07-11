@@ -1,0 +1,14 @@
+{
+  "name": "therealmesh",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node scripts/run-regressions.mjs",
+    "test:vps-parity": "node tests/vps-setup-parity.mjs",
+    "sync:vps": "node scripts/sync-vps-server.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

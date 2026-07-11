@@ -15,7 +15,7 @@ import { askOpenRouter } from './openrouter.js';
 import { askGroq } from './groq.js';
 import { askQwen } from './qwen.js';
 import { askDeepseek } from './deepseek.js';
-import { isImageFile } from './file-kinds.js';
+import { isImageFile, isPdfFile } from './file-kinds.js';
 import { SECURITY_GUARD } from './security-prompt.js';
 
 export const AI_PROVIDERS = ['openrouter', 'groq', 'qwen', 'deepseek'];
@@ -25,11 +25,9 @@ export function normalizeAIProvider(provider, fallback = 'openrouter') {
 }
 
 export async function askAI(systemPrompt, userText, files = [], history = [], opts = {}) {
-  // SECURITY_GUARD always leads the system message — it's the sole source of
-  // authority the model is told to trust. Everything else (this systemPrompt,
-  // the user's task text, files, history) is data by comparison, and the
-  // guard explicitly instructs the model to never let user-role content
-  // override it. See security-prompt.js.
+  // SECURITY_GUARD always leads the system message. `systemPrompt` is assembled
+  // only from packaged constants and allowlisted modes; all page/user content
+  // stays in user-role task data and history.
   const hardenedSystemPrompt = `${SECURITY_GUARD}\n\n${systemPrompt}`;
   const { aiProvider } = await chrome.storage.local.get('aiProvider');
   // opts.provider forces a backend regardless of the setting. The solver uses
@@ -45,7 +43,12 @@ export async function askAI(systemPrompt, userText, files = [], history = [], op
   if (chosen === 'deepseek') {
     const hasImages = files.some(isImageFile) ||
       history.some((m) => m.role !== 'assistant' && m.files?.some(isImageFile));
-    if (hasImages) chosen = 'qwen';
+    // A PDF in a replayed turn is still part of this provider request. Looking
+    // only at the current turn silently routed follow-ups to a text-only model,
+    // which then guessed about the document it could not read.
+    const hasPdfs = files.some(isPdfFile) ||
+      history.some((m) => m.role !== 'assistant' && m.files?.some(isPdfFile));
+    if (hasImages || hasPdfs) chosen = 'qwen';
   }
   // Tag the usage frame with the provider we actually routed to, so callers
   // (telemetry) don't have to re-derive it. Pure pass-through when no onUsage.

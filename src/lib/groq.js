@@ -2,7 +2,10 @@
  * Groq API wrapper (OpenAI-compatible chat completions).
  * Free tier, no card / no deposit required. Runs ONLY in the background
  * service worker. Key is entered in Settings and stored in
- * chrome.storage.local. Never hardcoded, never exposed to content scripts.
+ * chrome.storage.local, which the worker locks to TRUSTED_CONTEXTS at startup
+ * (service-worker.js) — extension pages can read it, content scripts cannot
+ * on Chrome ≥130 (older builds accept the residual risk), and page scripts
+ * never could. Never hardcoded.
  *
  * Groq is the cheap workhorse: classification and other menial tasks go here
  * so the paid OpenRouter budget is spent only on real solving.
@@ -19,7 +22,7 @@
 import { postStream, httpError } from './http.js';
 import { isImageFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8, base64ToBytes } from './extract.js';
-import { chargeOne } from './rate-limit.js';
+import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -85,10 +88,6 @@ function historyToMessage(m) {
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null, signal = null, onUsage = null } = opts;
   const key = await getKey();
-  // Charge the daily budget BEFORE the network round-trip — same reasoning as
-  // openrouter.js. classify-ai imports askGroq directly, so charging here
-  // covers every Groq call path, not just the dispatcher's.
-  await chargeOne('groq');
   // Pick the vision model if EITHER the current message OR a replayed history
   // turn carries an image — otherwise a follow-up would route to the text model
   // and lose the original photo.
@@ -130,7 +129,15 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
   // returns the full text. (On the vision path response_format is intentionally
   // dropped above, so the streamed text may be plain prose; the popup's tiered
   // parser salvages it.)
-  return postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, onUsage, signal });
+  const reservation = await reserveOne('groq');
+  try {
+    const result = await postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, onUsage, signal });
+    await commitOne(reservation);
+    return result;
+  } catch (e) {
+    try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }
+    throw e;
+  }
 }
 
 /**
@@ -149,40 +156,45 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
 export async function transcribeAudio(file, opts = {}) {
   const { language = null, prompt = null, signal = null } = opts;
   const key = await getKey();
-  // Charge BEFORE the round-trip, same as askGroq — a transcription is a real
-  // Groq call and counts against the daily cap.
-  await chargeOne('groq');
+  const reservation = await reserveOne('groq');
 
-  const bytes = base64ToBytes(file.dataBase64 || '');
-  const blob = new Blob([bytes], { type: file.mimeType || 'audio/mpeg' });
-  const form = new FormData();
-  // The filename's extension is how Groq infers the codec, so keep a real one.
-  form.append('file', blob, file.name || 'audio.mp3');
-  form.append('model', WHISPER_MODEL);
-  form.append('response_format', 'json');
-  if (language) form.append('language', language);
-  if (prompt) form.append('prompt', prompt);
-
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TRANSCRIBE_TIMEOUT_MS);
-  const onAbort = () => ctrl.abort();
-  if (signal) signal.addEventListener('abort', onAbort, { once: true });
   try {
-    const res = await fetch(TRANSCRIBE_ENDPOINT, {
-      method: 'POST',
-      // Authorization only — let fetch set the multipart Content-Type boundary.
-      headers: { Authorization: `Bearer ${key}` },
-      body: form,
-      signal: ctrl.signal
-    });
-    if (!res.ok) {
-      const text = await res.text().catch(() => '');
-      throw httpError('Groq (расшифровка аудио)', res.status, text);
+    const bytes = base64ToBytes(file.dataBase64 || '');
+    const blob = new Blob([bytes], { type: file.mimeType || 'audio/mpeg' });
+    const form = new FormData();
+    // The filename's extension is how Groq infers the codec, so keep a real one.
+    form.append('file', blob, file.name || 'audio.mp3');
+    form.append('model', WHISPER_MODEL);
+    form.append('response_format', 'json');
+    if (language) form.append('language', language);
+    if (prompt) form.append('prompt', prompt);
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), TRANSCRIBE_TIMEOUT_MS);
+    const onAbort = () => ctrl.abort();
+    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    try {
+      const res = await fetch(TRANSCRIBE_ENDPOINT, {
+        method: 'POST',
+        // Authorization only — let fetch set the multipart Content-Type boundary.
+        headers: { Authorization: `Bearer ${key}` },
+        body: form,
+        signal: ctrl.signal
+      });
+      if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw httpError('Groq (расшифровка аудио)', res.status, text);
+      }
+      const json = await res.json().catch(() => null);
+      const text = (json && typeof json.text === 'string') ? json.text.trim() : '';
+      await commitOne(reservation);
+      return text;
+    } finally {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener('abort', onAbort);
     }
-    const json = await res.json().catch(() => null);
-    return (json && typeof json.text === 'string') ? json.text.trim() : '';
-  } finally {
-    clearTimeout(timer);
-    if (signal) signal.removeEventListener('abort', onAbort);
+  } catch (e) {
+    try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }
+    throw e;
   }
 }

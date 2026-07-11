@@ -37,6 +37,7 @@ const autoFetchFailures = new Map(); // upKey -> visible Russian reason
 // Upload buttons of the current render, in card order, so the async Groq
 // classification can refine their labels after the instant regex pass.
 let cardDrops = [];
+let weekSavePromise = Promise.resolve();
 
 // Only the caption span is touched so the hidden <input> inside the label
 // survives relabeling.
@@ -66,36 +67,11 @@ function setDropAttached(drop, files) {
     files.length === 1 ? files[0].name : `${files.length} файла из МЭШ`;
 }
 
-/**
- * Ask the background to classify all scanned tasks in one batched call to
- * Groq (free tier; cached). Falls back silently — the regex-based labels
- * already on screen are a fine answer when Groq isn't configured.
- */
-function refineDropLabels() {
-  if (!cardDrops.length) return;
-  const drops = cardDrops; // snapshot: a re-render replaces the array
-  chrome.runtime.sendMessage(
-    { type: 'CLASSIFY_TASKS', payload: { tasks: drops.map((c) => c.task) } },
-    (resp) => {
-      if (chrome.runtime.lastError || !resp?.ok || drops !== cardDrops) return;
-      resp.kinds.forEach((kind, i) => {
-        const card = drops[i];
-        if (!card) return;
-        setDropKind(card.drop, kind);
-        if (kind === 'attachment') {
-          if (card.fetchPromise) {
-            card.fetchPromise = card.fetchPromise.then((ok) => {
-              if (!ok) showStoredAutoFetchFailure(card);
-              return ok;
-            });
-          } else {
-            card.fetchPromise = startAutoFetch(card);
-          }
-        }
-      });
-    }
-  );
-}
+// Scanning the week is a passive act: no homework text leaves the device and
+// no files are pulled until the user explicitly acts on a specific row. Card
+// badges therefore come ONLY from the local regex classifier
+// (task-classifier.js); the remote CLASSIFY_TASKS refinement and the Mesh
+// attachment auto-fetch both moved into the per-row «Решить» click.
 
 function fileToInline(file) {
   assertUploadAllowed(file);
@@ -187,8 +163,11 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     type: 'MESH_LIST_MATERIALS',
     homeworkId,
     homeworkItemId,
+    rowToken: card.rowToken,
     task: card.task
   });
+  card.candidates = Array.isArray(found?.candidates) ? found.candidates : [];
+  card.candidateAuth = { headers: found?.headers || null, token: found?.token || null };
   // Same-origin attachments are already downloaded by the content script; any
   // cross-origin URLs come back for the service worker to fetch.
   let files = found?.files || [];
@@ -208,12 +187,19 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     return true;
   }
 
+  if (card.candidates.length) {
+    autoFetchFailures.set(upKey, `найдено ${card.candidates.length} — требуется выбор`);
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
+
   // Nothing usable — surface WHY so it's debuggable, then fall back to manual
   // upload (which always works). Stages come from listMaterialUrls.
   const why = {
     no_lesson_id: 'нет id задания',
     no_token: 'нет входа в МЭШ',
     no_student_id: 'не нашёл student_id',
+    ambiguous_student: 'не выбран активный ученик',
     api_error: 'МЭШ API ' + (found?.status || ''),
     no_urls: 'файла нет в задании',
     auth_redirect: 'нужна авторизация',
@@ -223,6 +209,43 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
   autoFetchFailures.set(upKey, why);
   if (!quiet) showStoredAutoFetchFailure(card);
   return false;
+}
+
+// Ambiguous DOM/API links are never downloaded automatically. Ask at the
+// moment the user presses «Решить», when the action is explicit and the popup
+// can bind the chosen URL to this exact row token.
+async function chooseCandidateForCard(card) {
+  if (uploads[card.upKey]?.length || !card.candidates?.length) return;
+  const labels = card.candidates.map((candidate, i) =>
+    `${i + 1}. ${candidate.name || 'Файл'}`);
+  let index = -1;
+  if (labels.length === 1) {
+    const name = card.candidates[0].name || 'Файл';
+    if (window.confirm(`МЭШ нашёл файл «${name}», но не смог однозначно подтвердить его строку. Прикрепить его к этому заданию?`)) index = 0;
+  } else {
+    const answer = window.prompt(
+      'МЭШ нашёл несколько файлов, но их принадлежность строке неоднозначна. Введите номер нужного файла:\n\n' + labels.join('\n')
+    );
+    const n = Number(answer);
+    if (Number.isInteger(n) && n >= 1 && n <= labels.length) index = n - 1;
+  }
+  if (index < 0) return;
+  setDropLoading(card.drop, 'Скачиваю выбранный файл…');
+  const dl = await sendToBackground({
+    type: 'DOWNLOAD_FILES',
+    payload: {
+      urls: [card.candidates[index].url],
+      headers: card.candidateAuth?.headers,
+      token: card.candidateAuth?.token
+    }
+  });
+  if (dl?.ok && dl.files?.length) {
+    uploads[card.upKey] = dl.files;
+    setDropAttached(card.drop, dl.files);
+  } else {
+    autoFetchFailures.set(card.upKey, 'выбранный файл не скачался');
+    showStoredAutoFetchFailure(card);
+  }
 }
 
 function startAutoFetch(card, opts = {}) {
@@ -349,7 +372,7 @@ function buildCard(day, item) {
   // made them share/overwrite each other's uploads — the source of the
   // "sometimes the file is there, sometimes not" bug. Add the homework id (or
   // task) so every card owns its own attachment slot.
-  const rowKey = item.homeworkItemId ||
+  const rowKey = item.rowToken || item.homeworkItemId ||
     `${item.homeworkId || 'noid'}:${(item.task || '').replace(/\s+/g, ' ').trim().slice(0, 80)}`;
   const upKey = `${day || '?'}||${item.subject}||${rowKey}`;
 
@@ -357,19 +380,30 @@ function buildCard(day, item) {
   solveBtn.className = 'solve';
   solveBtn.textContent = 'Решить';
   solveBtn.onclick = async () => {
-    // Wait for an in-flight auto-fetch so a quick click doesn't open the solve
+    // The explicit per-row action is what authorizes pulling this row's files
+    // from Mesh — nothing was pre-downloaded during the passive week scan.
+    if (!cardObj.fetchPromise && item.homeworkId && !uploads[upKey]?.length) {
+      setDropLoading(drop, 'Ищу файл в МЭШ…');
+      cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
+    }
+    // Wait for the in-flight fetch so a quick click doesn't open the solve
     // with no file attached (the other half of the intermittency).
     if (cardObj.fetchPromise) { try { await cardObj.fetchPromise; } catch { /* manual fallback */ } }
+    await chooseCandidateForCard(cardObj);
+    await weekSavePromise;
     // Hand any attached files (manual or auto-fetched) to the dashboard. Include
-    // the task so the dashboard matches THIS homework, not another same-subject one.
+    // the task so the dashboard matches THIS homework, not another same-subject
+    // one. `ts` feeds the retention sweep: an unconsumed handoff dies in 1 h.
     if (uploads[upKey]?.length) {
       await chrome.storage.local.set({
         pendingUpload: {
+          ts: Date.now(),
           day,
           subject: item.subject,
           task: item.task,
           homeworkId: item.homeworkId,
           homeworkItemId: item.homeworkItemId,
+          rowToken: item.rowToken,
           files: uploads[upKey]
         }
       });
@@ -383,7 +417,8 @@ function buildCard(day, item) {
         task: item.task,
         day,
         homeworkId: item.homeworkId,
-        homeworkItemId: item.homeworkItemId
+        homeworkItemId: item.homeworkItemId,
+        rowToken: item.rowToken
       }
     });
   };
@@ -403,15 +438,17 @@ function buildCard(day, item) {
     drop,
     homeworkId: item.homeworkId,
     homeworkItemId: item.homeworkItemId,
+    rowToken: item.rowToken,
     upKey,
-    fetchPromise: null
+    fetchPromise: null,
+    candidates: [],
+    candidateAuth: null
   };
   cardDrops.push(cardObj);
-  // Try to pull the file straight from Mesh for every homework row. Teachers
-  // don't always write "файл" in the text, so attachment detection must not
-  // depend on wording. Non-file-looking tasks do this quietly and leave the UI
-  // alone if Mesh has nothing attached.
-  if (item.homeworkId) cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
+  // No auto-fetch here: pulling files from Mesh for every scanned row would
+  // download attachments the user never asked about. The fetch starts inside
+  // the row's «Решить» click (see solveBtn.onclick above) — same coverage for
+  // rows the user actually opens, nothing for rows they don't.
   const input = document.createElement('input');
   input.type = 'file';
   input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*,audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.aac';
@@ -454,7 +491,7 @@ function render(data) {
 
   dayEl.textContent = 'Домашние задания на неделю';
   // Save the week scan so the dashboard sidebar can show it.
-  chrome.storage.local.set({ weekHomework: { days, scannedAt: Date.now() } });
+  weekSavePromise = chrome.storage.local.set({ weekHomework: { days, scannedAt: Date.now() } });
 
   days.forEach((group, idx) => {
     const details = document.createElement('details');
@@ -474,8 +511,6 @@ function render(data) {
     }
     listEl.appendChild(details);
   });
-
-  refineDropLabels();
 }
 
 /* ---------- Тест tab: screenshot + page text -> «№N: ответ» ---------- */
@@ -622,6 +657,27 @@ function withTimeout(promise, ms, message) {
   return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
+const CAPTURE_TARGET_CHANGED = 'Переключилась вкладка — попробуйте ещё раз.';
+
+function captureTargetMatches(active, target) {
+  return active?.id === target?.id && active?.url === target?.url;
+}
+
+async function requireActiveCaptureTarget(target) {
+  const [active] = await chrome.tabs.query({ active: true, windowId: target.windowId });
+  if (!captureTargetMatches(active, target)) throw new Error(CAPTURE_TARGET_CHANGED);
+}
+
+// captureVisibleTab targets the active tab, not the tab whose id we pass to the
+// text extractor. Re-check immediately on both sides and discard any image raced
+// by a tab switch, so the solve can never pair Mesh text with another page.
+async function captureVisibleTarget(target) {
+  await requireActiveCaptureTarget(target);
+  const dataUrl = await chrome.tabs.captureVisibleTab(target.windowId, { format: 'jpeg', quality: 90 });
+  await requireActiveCaptureTarget(target);
+  return dataUrl;
+}
+
 /**
  * Capture the visible test page: top-frame text + a JPEG screenshot. Page text
  * is best-effort (some pages/iframes forbid injection). JPEG (q90), not PNG: a
@@ -630,14 +686,14 @@ function withTimeout(promise, ms, message) {
  * lib/smesh-proxy.js); q90 keeps test text and formulas perfectly readable.
  * @returns {Promise<{pageText:string, screenshot:object}>}
  */
-async function capturePage(tabId) {
+async function capturePage(tab) {
   const [pageText, dataUrl] = await withTimeout(
     Promise.all([
       chrome.scripting
-        .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
+        .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
         .then(([inj]) => inj?.result || '')
         .catch(() => ''),
-      chrome.tabs.captureVisibleTab(undefined, { format: 'jpeg', quality: 90 })
+      captureVisibleTarget(tab)
     ]),
     20000,
     'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
@@ -695,7 +751,7 @@ async function solveTestOnScreen() {
     const tab = await getActiveTab();
     requireMeshTestTab(tab);
 
-    const { pageText, screenshot } = await capturePage(tab.id);
+    const { pageText, screenshot } = await capturePage(tab);
 
     // Live status: a shifting verb + elapsed seconds so a long reasoning pass
     // never looks frozen. Stopped the moment the answer lands or an error fires.
@@ -760,6 +816,7 @@ async function advancePage(tabId, beforeSig) {
     const r = await sendToBackground({ type: 'TEST_NEXT_PAGE', payload: { tabId } });
     const status = r?.status || 'none';
     if (status === 'finish') return 'finish';
+    if (status === 'ambiguous') return 'ambiguous';
     if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
     // status === 'clicked': wait for the new page. Be generous on the first try
     // (slow loads), then re-click once before giving up.
@@ -780,6 +837,9 @@ function renderPaginationSummary(box, outcome, solved) {
       break;
     case 'stuck':
       msg = `${pages} Страница не сменилась после нажатия «Дальше» — остановился. Проверь оставшиеся вопросы вручную.`;
+      break;
+    case 'ambiguous':
+      msg = `${pages} Нашёл несколько неоднозначных кнопок «Дальше» — ничего не нажал. Продолжите вручную.`;
       break;
     case 'max':
       msg = `${pages} Достигнут предел в 30 страниц — остановился. Проверь и отправь сам.`;
@@ -818,7 +878,7 @@ async function solveAllPages() {
     for (let page = 1; page <= MAX_PAGES; page++) {
       // Solve the visible page. Progress reads «Страница N · Решаю… 12s».
       ticker = startThinking(box, { prefix: `Страница ${page}` });
-      const { pageText, screenshot } = await capturePage(tab.id);
+      const { pageText, screenshot } = await capturePage(tab);
       const resp = await requestSolve(tab.id, screenshot, pageText);
       if (!resp.ok) throw new Error(resp.error || 'нет ответа');
       ticker.stop();
@@ -841,6 +901,7 @@ async function solveAllPages() {
       const nav = await advancePage(tab.id, beforeSig);
       if (nav === 'finish') { outcome = 'finish'; break; }
       if (nav === 'none') { outcome = 'none'; break; }
+      if (nav === 'ambiguous') { outcome = 'ambiguous'; break; }
       if (nav === 'stuck') { outcome = 'stuck'; break; }
       if (page === MAX_PAGES) { outcome = 'max'; break; }
       await sleep(500); // small settle before solving the new page

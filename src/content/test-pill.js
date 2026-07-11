@@ -12,7 +12,7 @@
  * worker runs the whole capture → solve → fill (+ pagination) loop and renders
  * the results through the existing floating answer panel (answer-panel.js).
  *
- * Modeled on answer-panel.js: open Shadow DOM (CSS isolation), draggable,
+ * Modeled on answer-panel.js: closed Shadow DOM (CSS + DOM isolation), draggable,
  * position persisted to chrome.storage.session, live theme sync, idempotent
  * injection, z-index 2147483647, brand fonts + tokens.
  *
@@ -38,35 +38,56 @@
   /* ---------- Test-page detection (single source of truth) ---------- */
   // The manifest matches both МЭШ hosts broadly (uchebnik.mos.ru + school.mos.ru
   // minus /diary). This decides whether the CURRENT page is actually a test
-  // before we show anything (stealth-first). Tests appear as:
-  //   • a launch URL carrying xAPI params (activityId / cwork_id / registration),
-  //   • a path under /exam, /challenge, /cwork, /test, …, OR
-  //   • a host page that embeds the uchebnik test player in an <iframe>
-  //     (Библиотека МЭШ / Цифровой учитель shell the player this way).
-  // Any one signal is enough — designed to err toward showing on a real test.
-  function hasTestIframe() {
+  // before we show anything (stealth-first). The signals are TIERED on purpose:
+  //   • STRONG (any one is enough): the documented xAPI launch signature
+  //     (activityId / cwork_id / registration / scorm_id / endpoint=...lrs),
+  //     a known МЭШ test route family (/exam, /challenge, /cwork,
+  //     /control-work, /01math/maths/test), or an iframe whose src itself
+  //     carries a test-player marker (activityId, /lrs, /exam, /launch, cwork).
+  //   • WEAK (need TWO distinct weak hits if no strong one fired): lesson_id,
+  //     generic words like /test or /training in the path, or a bare
+  //     uchebnik.mos.ru iframe with no stronger marker in its src.
+  // WHY the split exists: lesson_id and generic "test"/"training" words show
+  // up on ordinary МЭШ lesson/library surfaces too, so the old "any one weak
+  // hint shows the pill" logic produced false positives outside real tests.
+  function iframeSignal() {
     try {
-      return !!document.querySelector(
-        'iframe[src*="uchebnik.mos.ru"], iframe[src*="/lrs"], iframe[src*="/exam"], ' +
-        'iframe[src*="/launch"], iframe[src*="activityId"], iframe[src*="cwork"]'
-      );
-    } catch { return false; }
+      let weak = false;
+      for (const frame of document.querySelectorAll('iframe[src]')) {
+        const src = frame.getAttribute('src') || '';
+        if (!src) continue;
+        if (/[?&]activityId=/i.test(src) || /\/(lrs|exam|launch)(\/|$|\?)/i.test(src) || /cwork/i.test(src)) {
+          return 'strong';
+        }
+        if (/uchebnik\.mos\.ru/i.test(src)) weak = true;
+      }
+      if (weak) return 'weak';
+    } catch { /* no iframe access / malformed DOM — treat as absent */ }
+    return '';
+  }
+  function hasTestIframe() {
+    return !!iframeSignal();
   }
   function looksLikeTest() {
     const { pathname, search } = location;
-    // xAPI launch params — the strongest signal; any one is decisive.
-    if (/[?&](activityId|cwork_id|registration|lesson_id|scorm_id)=/i.test(search)) return true;
-    if (/[?&]endpoint=[^&]*lrs/i.test(search)) return true;
-    // Path markers across МЭШ test surfaces.
-    if (/\/(exam|challenge|cwork|control[-_]?work|test|testing|training|diagnostic|quiz)(\/|$|\?)/i.test(pathname)) return true;
-    // A page that embeds the test player as an iframe.
-    if (hasTestIframe()) return true;
-    return false;
+    const iframe = iframeSignal();
+    const strongQuery = /[?&](activityId|cwork_id|registration|scorm_id)=/i.test(search) || /[?&]endpoint=[^&]*lrs/i.test(search);
+    const strongPath = /\/(exam|challenge|cwork|control[-_]?work)(\/|$|\?)/i.test(pathname) ||
+      /^\/01math\/maths\/test(?:\/|$)/i.test(pathname);
+    if (strongQuery || strongPath || iframe === 'strong') {
+      log('test detect strong', { pathname, search, iframe });
+      return true;
+    }
+
+    let weakHits = 0;
+    if (/[?&]lesson_id=/i.test(search)) weakHits += 1;
+    if (/\/(test|testing|training|diagnostic|quiz)(\/|$|\?)/i.test(pathname)) weakHits += 1;
+    if (iframe === 'weak') weakHits += 1;
+    log('test detect weak', { pathname, search, iframe, weakHits });
+    return weakHits >= 2;
   }
 
   const STORAGE_KEY = 'smeshTestPill2'; // bumped: reset stale positions to the new top-right default
-  const HOST_ID = '__smesh-test-pill-host';
-
   // Mark loaded immediately so a re-inject is a no-op even if the page isn't a
   // test yet (SPA route may turn into one — see the URL watcher at the bottom).
   let built = false;
@@ -209,9 +230,11 @@
     try { chrome.storage.session.set({ [STORAGE_KEY]: state }); } catch { /* session blocked */ }
   }
   function loadTheme() {
+    // storage.session, not local: local is trusted-contexts-only (it holds the
+    // API keys), so the worker mirrors just `theme`/`aiProvider` into session.
     return new Promise((resolve) => {
       try {
-        chrome.storage.local.get('theme', (v) => {
+        chrome.storage.session.get('theme', (v) => {
           if (!chrome.runtime.lastError && v?.theme) themePref = v.theme;
           resolve();
         });
@@ -225,7 +248,7 @@
   function loadProvider() {
     return new Promise((resolve) => {
       try {
-        chrome.storage.local.get('aiProvider', (v) => {
+        chrome.storage.session.get('aiProvider', (v) => {
           if (!chrome.runtime.lastError) setProvider(v?.aiProvider);
           resolve();
         });
@@ -241,11 +264,9 @@
   function ensureHost() {
     if (hostEl && document.documentElement.contains(hostEl)) return;
     hostEl = document.createElement('div');
-    hostEl.id = HOST_ID;
-    hostEl.style.cssText =
-      'all: initial; position: fixed; inset: 0 auto auto 0; width: 0; height: 0; ' +
-      'z-index: 2147483647; pointer-events: none;';
-    shadow = hostEl.attachShadow({ mode: 'open' });
+    // No stable id and no open root: page scripts should have neither a selector
+    // nor a DOM handle they can use to reach the privileged action buttons.
+    shadow = hostEl.attachShadow({ mode: 'closed' });
     document.documentElement.appendChild(hostEl);
   }
 
@@ -253,6 +274,15 @@
     shadow.innerHTML = `
       <style>
         ${fontFaceCss()}
+        :host {
+          all: initial;
+          position: fixed;
+          inset: 0 auto auto 0;
+          width: 0;
+          height: 0;
+          z-index: 2147483647;
+          pointer-events: none;
+        }
         :host, * { box-sizing: border-box; }
 
         /* Brand tokens — mirror theme.css surfaces (card + pop shadow + accent),
@@ -575,15 +605,35 @@
   }
 
   /* ---------- Actions ---------- */
-  // One long-lived message to the worker. A generous guard so a recycled service
-  // worker (dropped reply) never leaves the pill spinning forever.
-  function send(type, timeoutMs) {
+  // A page click proves intent locally; the worker also requires a fresh,
+  // single-use capability bound to this tab + exact action. Keeping the token
+  // request separate means a recycled MV3 worker simply makes us ask again.
+  function requestActionToken(action) {
+    return new Promise((resolve) => {
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; resolve(r); } };
+      const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), 5000);
+      try {
+        chrome.runtime.sendMessage({ type: 'GET_ACTION_TOKEN', action }, (r) => {
+          clearTimeout(t);
+          if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+          else finish(r || { ok: false, error: 'нет ответа' });
+        });
+      } catch (e) { clearTimeout(t); finish({ ok: false, error: String(e) }); }
+    });
+  }
+
+  // One long-lived privileged message to the worker. A generous guard so a
+  // recycled service worker (dropped reply) never leaves the pill spinning.
+  async function send(type, timeoutMs) {
+    const grant = await requestActionToken(type);
+    if (!grant?.ok || !grant.token) return grant || { ok: false, error: 'нет токена действия' };
     return new Promise((resolve) => {
       let done = false;
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
       const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs);
       try {
-        chrome.runtime.sendMessage({ type, payload: { provider: providerId } }, (r) => {
+        chrome.runtime.sendMessage({ type, token: grant.token, payload: { provider: providerId } }, (r) => {
           clearTimeout(t);
           if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
           else finish(r || { ok: false, error: 'нет ответа' });
@@ -636,8 +686,14 @@
   }
 
   function wireButtons(pill) {
-    pill.querySelector('.act-page').addEventListener('click', solvePage);
-    pill.querySelector('.act-all').addEventListener('click', solveAll);
+    pill.querySelector('.act-page').addEventListener('click', (event) => {
+      if (!event.isTrusted) return;
+      solvePage();
+    });
+    pill.querySelector('.act-all').addEventListener('click', (event) => {
+      if (!event.isTrusted) return;
+      solveAll();
+    });
     pill.querySelector('.close').addEventListener('click', () => panicHide());
   }
 
@@ -671,10 +727,11 @@
       });
     } catch { /* messaging unavailable */ }
 
-    // Live theme sync from any extension page (settings/dashboard/popup).
+    // Live theme sync from any extension page (settings/dashboard/popup) —
+    // via the worker's storage.session mirror; local is trusted-only now.
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
-        if (area !== 'local') return;
+        if (area !== 'session') return;
         if (changes.theme) {
           themePref = changes.theme.newValue || 'system';
           applyTheme();

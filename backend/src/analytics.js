@@ -19,6 +19,10 @@ import { cleanDeviceId } from './referrals.js';
 
 const MSK_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_INGEST_BODY_BYTES = 64 * 1024;
+const MAX_DELETE_BODY_BYTES = 4 * 1024;
+const INGEST_IP_DAILY_LIMIT = 500;
+const INGEST_DEVICE_DAILY_LIMIT = 300;
 
 export function mskDay(ts = Date.now()) {
   return new Date(ts + MSK_OFFSET_MS).toISOString().slice(0, 10);
@@ -51,29 +55,93 @@ const USE_TYPES = "('solve','test_solve','test_requestion','gdz_pull')";
 const clampStr = (v, max) => (typeof v === 'string' ? v.slice(0, max) : null);
 const clampInt = (v, max) => Math.max(0, Math.min(max, Math.round(num(v))));
 
-// Cheap per-IP daily budget (KV, approximate — same pattern as referrals).
-// Only has to stop dumb flooding of an open endpoint; 3000 events/day is far
-// beyond any real device.
-async function bumpIngestBudget(env, ip, n) {
-  if (!ip) return true;
-  const key = `tstat:${ip}:${mskDay()}`;
-  const used = num(await env.LICENSES.get(key));
-  if (used >= 3000) return false;
-  await env.LICENSES.put(key, String(used + n), { expirationTtl: 2 * 24 * 60 * 60 });
-  return true;
+async function readJsonBounded(request, maxBytes) {
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { ok: false, reason: 'too_large', status: 413 };
+  }
+  if (typeof request.body?.getReader !== 'function') {
+    return { ok: false, reason: 'bad_body', status: 400 };
+  }
+
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel('request body too large'); } catch { /* already closed */ }
+        return { ok: false, reason: 'too_large', status: 413 };
+      }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+    return { ok: true, value: JSON.parse(text) };
+  } catch {
+    return { ok: false, reason: 'bad_json', status: 400 };
+  }
+}
+
+// Admission counters live in D1, not KV. The UPSERT is one authoritative,
+// atomic increment, so synchronized requests cannot all observe the same old
+// value and overwrite one another. IP limits bound device-id rotation; device
+// limits keep one install from consuming the whole shared IP allowance.
+async function chargeIngestBudget(env, ip, device, n) {
+  const day = mskDay();
+  const bump = (scope, key) => env.DB.prepare(
+    `INSERT INTO telemetry_budget (day, scope, budget_key, count) VALUES (?, ?, ?, ?)
+     ON CONFLICT(day, scope, budget_key) DO UPDATE SET count = count + excluded.count
+     RETURNING count`
+  ).bind(day, scope, key, n).first('count');
+
+  const ipUsed = await bump('ip', ip || 'unknown');
+  if (ipUsed > INGEST_IP_DAILY_LIMIT) return false;
+  const deviceUsed = await bump('device', device);
+  return deviceUsed <= INGEST_DEVICE_DAILY_LIMIT;
+}
+
+/**
+ * Pseudonymize a license key: HMAC-SHA256 keyed by the ANALYTICS_SALT worker
+ * secret (`wrangler secret put ANALYTICS_SALT`). Current clients send only
+ * license_type; if a LEGACY client still posts the raw key, this is the only
+ * form that may touch D1 — same key ⇒ same ref, so joins still work, but the
+ * stored value can't be redeemed or matched back to a purchase without the
+ * salt. No salt configured ⇒ store nothing.
+ */
+async function licenseRef(env, rawKey) {
+  if (!rawKey || typeof rawKey !== 'string' || !env.ANALYTICS_SALT) return null;
+  const enc = new TextEncoder();
+  const hmacKey = await crypto.subtle.importKey(
+    'raw', enc.encode(env.ANALYTICS_SALT), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const sig = await crypto.subtle.sign('HMAC', hmacKey, enc.encode(rawKey.slice(0, 64)));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
 /**
  * POST /t — body:
- * { device_id, browser, ua, version, provider, license_key, license_type,
+ * { device_id, browser, version, provider, license_type,
  *   events: [{ ts, type, subject, provider, model, tokens_in, tokens_out,
  *              cost_usd, files_pdf, files_img, meta }] }
+ * (legacy clients may still send license_key/ua — the key is stored only as
+ * its HMAC pseudonym, the UA is discarded)
  * Returns {ok:true, accepted:N}. Never throws on bad fields — they're clamped
  * or dropped, because a telemetry write must never break the extension.
  */
 export async function handleIngest(request, env) {
-  let body;
-  try { body = await request.json(); } catch { return { ok: false, reason: 'bad_json', status: 400 }; }
+  const parsed = await readJsonBounded(request, MAX_INGEST_BODY_BYTES);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, reason: 'bad_json', status: 400 };
+  }
 
   const device = cleanDeviceId(body.device_id);
   if (!device) return { ok: false, reason: 'bad_device', status: 400 };
@@ -108,27 +176,32 @@ export async function handleIngest(request, env) {
   }
 
   const ip = request.headers.get('cf-connecting-ip') || '';
-  if (!(await bumpIngestBudget(env, ip, Math.max(1, events.length)))) {
+  if (!(await chargeIngestBudget(env, ip, device, Math.max(1, events.length)))) {
     return { ok: false, reason: 'rate_limited', status: 429 };
   }
 
   const browser = BROWSERS.has(body.browser) ? body.browser : 'other';
+  // Data minimization (2026-07): the raw UA is never stored (browser family is
+  // enough), and a raw license key — legacy clients only — is reduced to its
+  // HMAC pseudonym before it can reach a bind. license_key stays NULL for all
+  // new rows; the column survives only for pre-migration data.
+  const ref = await licenseRef(env, body.license_key);
   const stmts = [
     env.DB.prepare(
-      `INSERT INTO devices (device_id, first_seen, last_seen, browser, ua, version, provider, license_key, license_type)
-       VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+      `INSERT INTO devices (device_id, first_seen, last_seen, browser, ua, version, provider, license_ref, license_type)
+       VALUES (?1, ?2, ?2, ?3, NULL, ?4, ?5, ?6, ?7)
        ON CONFLICT(device_id) DO UPDATE SET
          last_seen   = excluded.last_seen,
          browser     = excluded.browser,
-         ua          = excluded.ua,
+         ua          = NULL,
          version     = excluded.version,
          provider    = COALESCE(excluded.provider, devices.provider),
-         license_key = COALESCE(excluded.license_key, devices.license_key),
+         license_ref = COALESCE(excluded.license_ref, devices.license_ref),
          license_type= COALESCE(excluded.license_type, devices.license_type)`
     ).bind(
       device, now, browser,
-      clampStr(body.ua, 240), clampStr(body.version, 24), clampStr(body.provider, 24),
-      clampStr(body.license_key, 40), clampStr(body.license_type, 16)
+      clampStr(body.version, 24), clampStr(body.provider, 24),
+      ref, clampStr(body.license_type, 16)
     )
   ];
   for (const e of events) {
@@ -143,6 +216,92 @@ export async function handleIngest(request, env) {
   }
   await env.DB.batch(stmts);
   return { ok: true, accepted: events.length };
+}
+
+/**
+ * POST /t/delete — { device_id }: erase every analytics row for one device
+ * (events + the device row itself). User-initiated from Settings; the device
+ * id is the caller's own unguessable UUID, so no further auth is needed —
+ * a forged request can only erase its own pseudonymous data. Idempotent.
+ */
+export async function handleDeleteDevice(request, env) {
+  const parsed = await readJsonBounded(request, MAX_DELETE_BODY_BYTES);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, reason: 'bad_json', status: 400 };
+  }
+  const device = cleanDeviceId(body.device_id);
+  if (!device) return { ok: false, reason: 'bad_device', status: 400 };
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM events  WHERE device_id = ?').bind(device),
+    env.DB.prepare('DELETE FROM devices WHERE device_id = ?').bind(device)
+  ]);
+  return { ok: true };
+}
+
+/* --------------------------- server ingest ---------------------------- */
+
+/**
+ * POST /t/ai — SERVER-observed AI calls from the VPS proxy (INGEST_KEY-gated
+ * in worker.js; never reachable from a browser). Ground truth for 302.AI
+ * usage: the VPS sees every real upstream call regardless of the client's
+ * telemetry opt-in. Stored under their own type ('ai_call') — which the open
+ * /t endpoint refuses (EVENT_TYPES), so clients cannot forge server rows —
+ * and aggregated separately from client-reported stats (see usageRollup).
+ * Content-free like /t: device id, provider, model, token counts, estimated
+ * cost. No license key, no task text.
+ *
+ * Body: { events: [{ device_id, ts, provider, model, tokens_in, tokens_out,
+ *                    cost_usd, meta }] } → { ok:true, accepted:N }
+ */
+const MAX_SERVER_EVENTS = 50;
+
+export async function handleServerIngest(request, env) {
+  const parsed = await readJsonBounded(request, MAX_INGEST_BODY_BYTES);
+  if (!parsed.ok) return parsed;
+  const body = parsed.value;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return { ok: false, reason: 'bad_json', status: 400 };
+  }
+  const rawEvents = Array.isArray(body.events) ? body.events.slice(0, MAX_SERVER_EVENTS) : [];
+  const now = Date.now();
+  const stmts = [];
+  let accepted = 0;
+  for (const e of rawEvents) {
+    const device = cleanDeviceId(e?.device_id);
+    if (!device) continue;
+    let ts = num(e.ts) || now;
+    if (ts > now + 5 * 60 * 1000 || ts < now - 7 * DAY_MS) ts = now;
+    let meta = null;
+    if (e.meta != null) {
+      try { meta = JSON.stringify(e.meta).slice(0, 400); } catch { meta = null; }
+    }
+    // The device row may not exist yet — server events arrive even for
+    // installs that never opted into client telemetry. Create a minimal row
+    // so per-user drilldowns and the users table can join; never move
+    // first_seen forward or clobber client-reported fields.
+    stmts.push(env.DB.prepare(
+      `INSERT INTO devices (device_id, first_seen, last_seen)
+       VALUES (?1, ?2, ?2)
+       ON CONFLICT(device_id) DO UPDATE SET
+         last_seen = MAX(devices.last_seen, excluded.last_seen)`
+    ).bind(device, ts));
+    stmts.push(env.DB.prepare(
+      `INSERT INTO events (ts, day, device_id, type, subject, provider, model,
+                           tokens_in, tokens_out, cost_usd, files_pdf, files_img, meta)
+       VALUES (?, ?, ?, 'ai_call', NULL, ?, ?, ?, ?, ?, 0, 0, ?)`
+    ).bind(
+      ts, mskDay(ts), device,
+      clampStr(e.provider, 24), clampStr(e.model, 80),
+      clampInt(e.tokens_in, 5_000_000), clampInt(e.tokens_out, 5_000_000),
+      Math.max(0, Math.min(50, num(e.cost_usd))),
+      meta
+    ));
+    accepted++;
+  }
+  if (stmts.length) await env.DB.batch(stmts);
+  return { ok: true, accepted };
 }
 
 /* ------------------------- license mirroring -------------------------- */
@@ -198,6 +357,11 @@ export async function backfillLicenses(env) {
 /* ----------------------------- aggregates ---------------------------- */
 
 // Shared usage rollup over an events window (day >= from, or all time).
+// Two disjoint series live in `events`: client-reported telemetry (opt-in;
+// solve/test/gdz/…) and SERVER-observed 'ai_call' rows from the VPS proxy.
+// A student with telemetry ON produces BOTH a 'solve' and an 'ai_call' for
+// the same request, so token/cost sums must never mix the two: the classic
+// fields stay client-only, and the server truth comes back as api_*.
 async function usageRollup(env, from, to = null) {
   const where = from
     ? (to ? 'WHERE day >= ?1 AND day < ?2' : 'WHERE day >= ?1')
@@ -205,7 +369,7 @@ async function usageRollup(env, from, to = null) {
   const binds = from ? (to ? [from, to] : [from]) : [];
   const row = await env.DB.prepare(
     `SELECT
-       COUNT(*)                                        AS events,
+       SUM(type != 'ai_call')                          AS events,
        SUM(type IN ${USE_TYPES})                       AS uses,
        SUM(type = 'solve')                             AS solves,
        SUM(type = 'test_solve')                        AS tests,
@@ -216,11 +380,16 @@ async function usageRollup(env, from, to = null) {
        SUM(CASE WHEN files_img > 0 THEN 1 ELSE 0 END)  AS img_solves,
        SUM(files_img)                                  AS img_files,
        SUM(type = 'error')                             AS errors,
-       SUM(tokens_in)                                  AS tokens_in,
-       SUM(tokens_out)                                 AS tokens_out,
-       SUM(cost_usd)                                   AS cost_usd,
-       COUNT(DISTINCT device_id)                       AS active_devices,
-       COUNT(DISTINCT device_id || ':' || day)         AS device_days
+       SUM(CASE WHEN type != 'ai_call' THEN tokens_in  ELSE 0 END) AS tokens_in,
+       SUM(CASE WHEN type != 'ai_call' THEN tokens_out ELSE 0 END) AS tokens_out,
+       SUM(CASE WHEN type != 'ai_call' THEN cost_usd   ELSE 0 END) AS cost_usd,
+       COUNT(DISTINCT CASE WHEN type != 'ai_call' THEN device_id END)              AS active_devices,
+       COUNT(DISTINCT CASE WHEN type != 'ai_call' THEN device_id || ':' || day END) AS device_days,
+       SUM(type = 'ai_call')                           AS api_calls,
+       SUM(CASE WHEN type = 'ai_call' THEN tokens_in  ELSE 0 END) AS api_tokens_in,
+       SUM(CASE WHEN type = 'ai_call' THEN tokens_out ELSE 0 END) AS api_tokens_out,
+       SUM(CASE WHEN type = 'ai_call' THEN cost_usd   ELSE 0 END) AS api_cost_usd,
+       COUNT(DISTINCT CASE WHEN type = 'ai_call' THEN device_id END) AS api_devices
      FROM events ${where}`
   ).bind(...binds).first();
   const out = {};
@@ -338,9 +507,11 @@ export async function statsTimeseries(env, days) {
               SUM(type = 'gdz_pull')                 AS gdz,
               SUM(CASE WHEN files_pdf > 0 THEN 1 ELSE 0 END) AS pdf,
               SUM(type = 'error')                    AS errors,
-              SUM(tokens_in)                         AS tokens_in,
-              SUM(tokens_out)                        AS tokens_out,
-              SUM(cost_usd)                          AS cost_usd
+              SUM(CASE WHEN type != 'ai_call' THEN tokens_in  ELSE 0 END) AS tokens_in,
+              SUM(CASE WHEN type != 'ai_call' THEN tokens_out ELSE 0 END) AS tokens_out,
+              SUM(CASE WHEN type != 'ai_call' THEN cost_usd   ELSE 0 END) AS cost_usd,
+              SUM(type = 'ai_call')                  AS api_calls,
+              SUM(CASE WHEN type = 'ai_call' THEN cost_usd ELSE 0 END) AS api_cost_usd
        FROM events WHERE day >= ? GROUP BY day`
     ).bind(from).all(),
     env.DB.prepare(
@@ -359,13 +530,17 @@ export async function statsTimeseries(env, days) {
   for (const d of dayRange(from)) {
     byDay[d] = {
       day: d, active: 0, uses: 0, solves: 0, tests: 0, gdz: 0, pdf: 0, errors: 0,
-      tokens_in: 0, tokens_out: 0, cost_usd: 0, new_devices: 0, purchases: 0, revenue_rub: 0
+      tokens_in: 0, tokens_out: 0, cost_usd: 0, api_calls: 0, api_cost_usd: 0,
+      new_devices: 0, purchases: 0, revenue_rub: 0
     };
   }
   for (const r of ev?.results || []) {
     const row = byDay[r.day];
     if (!row) continue;
-    for (const k of ['active', 'uses', 'solves', 'tests', 'gdz', 'pdf', 'errors', 'tokens_in', 'tokens_out', 'cost_usd']) {
+    // `active` deliberately counts devices across BOTH series — a device whose
+    // only trace that day is a server-observed ai_call was still really active.
+    for (const k of ['active', 'uses', 'solves', 'tests', 'gdz', 'pdf', 'errors',
+                     'tokens_in', 'tokens_out', 'cost_usd', 'api_calls', 'api_cost_usd']) {
       row[k] = num(r[k]);
     }
   }
@@ -425,6 +600,8 @@ export async function statsUsers(env, p) {
             COALESCE(a.pdf, 0)         AS pdf,
             COALESCE(a.tokens, 0)      AS tokens,
             COALESCE(a.cost_usd, 0)    AS cost_usd,
+            COALESCE(a.api_calls, 0)   AS api_calls,
+            COALESCE(a.api_cost_usd, 0) AS api_cost_usd,
             COALESCE(a.active_days, 0) AS active_days
      FROM devices d
      LEFT JOIN (
@@ -434,8 +611,10 @@ export async function statsUsers(env, p) {
               SUM(type IN ('test_solve','test_requestion')) AS tests,
               SUM(type = 'gdz_pull')        AS gdz,
               SUM(CASE WHEN files_pdf > 0 THEN 1 ELSE 0 END) AS pdf,
-              SUM(tokens_in + tokens_out)   AS tokens,
-              SUM(cost_usd)                 AS cost_usd,
+              SUM(CASE WHEN type != 'ai_call' THEN tokens_in + tokens_out ELSE 0 END) AS tokens,
+              SUM(CASE WHEN type != 'ai_call' THEN cost_usd ELSE 0 END)               AS cost_usd,
+              SUM(type = 'ai_call')                                                   AS api_calls,
+              SUM(CASE WHEN type = 'ai_call' THEN cost_usd ELSE 0 END)                AS api_cost_usd,
               COUNT(DISTINCT day)           AS active_days
        FROM events WHERE day >= ? GROUP BY device_id
      ) a ON a.device_id = d.device_id
@@ -482,8 +661,12 @@ export async function statsUserDetail(env, deviceId) {
        FROM events WHERE device_id = ? ORDER BY ts DESC LIMIT 60`
     ).bind(device).all(),
     env.DB.prepare(
-      `SELECT COUNT(*) AS events, SUM(type IN ${USE_TYPES}) AS uses,
-              SUM(tokens_in + tokens_out) AS tokens, SUM(cost_usd) AS cost_usd,
+      `SELECT SUM(type != 'ai_call') AS events, SUM(type IN ${USE_TYPES}) AS uses,
+              SUM(CASE WHEN type != 'ai_call' THEN tokens_in + tokens_out ELSE 0 END) AS tokens,
+              SUM(CASE WHEN type != 'ai_call' THEN cost_usd ELSE 0 END) AS cost_usd,
+              SUM(type = 'ai_call') AS api_calls,
+              SUM(CASE WHEN type = 'ai_call' THEN tokens_in + tokens_out ELSE 0 END) AS api_tokens,
+              SUM(CASE WHEN type = 'ai_call' THEN cost_usd ELSE 0 END) AS api_cost_usd,
               COUNT(DISTINCT day) AS active_days
        FROM events WHERE device_id = ?`
     ).bind(device).first()
@@ -650,38 +833,38 @@ export async function statsReferrals(env) {
 }
 
 /**
- * GET /admin/stats/rate — live USD→RUB from exchangerate-api.com, cached in KV
- * for 12h so the free tier (1500 req/mo) is never stressed. The API key stays
- * a Cloudflare secret and never reaches the public dashboard.
+ * GET /admin/stats/rate — official USD→RUB from the Central Bank of Russia
+ * (cbr-xml-daily.ru, a keyless mirror of cbr.ru), cached in KV for 12h. No API
+ * key, no quota, no activation — it's the authoritative rate for a RUB business
+ * and the number RU accounting/tax actually uses. The CBR sets one rate per
+ * business day; on weekends/holidays it holds the last published value.
  *
- *   { ok:true, rate:Number, fetched_at:ISO, stale:false, source:'exchangerate-api' }
+ *   { ok:true, rate:Number, fetched_at:ISO, stale:false, source:'cbr' }
  * On a fetch failure we return the last cached rate with stale:true; with no
- * cache and no key we return ok:false so the dashboard can flag it 'unverified'.
+ * cache and no reachable source we return ok:false so the dashboard flags it
+ * 'unverified'.
  */
 const FX_KEY = 'fx:usdrub';
 const FX_TTL_MS = 12 * 60 * 60 * 1000;
+const FX_URL = 'https://www.cbr-xml-daily.ru/daily_json.js';
 
 export async function statsRate(env, force = false) {
   let cached = null;
   try { cached = JSON.parse((await env.LICENSES.get(FX_KEY)) || 'null'); } catch { cached = null; }
   const fresh = cached && Number.isFinite(cached.rate) && (Date.now() - Date.parse(cached.fetched_at) < FX_TTL_MS);
-  if (fresh && !force) return { ok: true, ...cached, stale: false, source: 'exchangerate-api' };
+  if (fresh && !force) return { ok: true, ...cached, stale: false, source: 'cbr' };
 
-  if (!env.EXCHANGERATE_API_KEY) {
-    if (cached) return { ok: true, ...cached, stale: true, source: 'cache' };
-    return { ok: false, reason: 'no_key' };
-  }
   try {
-    const res = await fetch(`https://v6.exchangerate-api.com/v6/${env.EXCHANGERATE_API_KEY}/latest/USD`);
+    const res = await fetch(FX_URL, { headers: { accept: 'application/json' } });
     const data = await res.json().catch(() => null);
-    const rate = Number(data?.conversion_rates?.RUB);
-    if (data?.result !== 'success' || !Number.isFinite(rate) || rate <= 0) {
+    const rate = Number(data?.Valute?.USD?.Value);
+    if (!res.ok || !Number.isFinite(rate) || rate <= 0) {
       if (cached) return { ok: true, ...cached, stale: true, source: 'cache' };
-      return { ok: false, reason: data?.['error-type'] || 'bad_response' };
+      return { ok: false, reason: 'bad_response' };
     }
     const fresh_rec = { rate, fetched_at: new Date().toISOString() };
     await env.LICENSES.put(FX_KEY, JSON.stringify(fresh_rec));
-    return { ok: true, ...fresh_rec, stale: false, source: 'exchangerate-api' };
+    return { ok: true, ...fresh_rec, stale: false, source: 'cbr' };
   } catch (e) {
     if (cached) return { ok: true, ...cached, stale: true, source: 'cache' };
     return { ok: false, reason: 'network' };

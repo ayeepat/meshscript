@@ -8,7 +8,8 @@
  * the server holds the one real Model Studio key and enforces quotas.
  *
  * HIDDEN BYO PATH — if a `qwenApiKey` sits in chrome.storage.local (owner /
- * power users; the Settings field is gone, set it via the console), calls go
+ * power users; the Settings field is gone, set it via the console; the area
+ * is locked to TRUSTED_CONTEXTS so content scripts can't read it), calls go
  * straight to DashScope with it. The SAME key also authenticates DeepSeek
  * (see deepseek.js): Model Studio is one account/key across its whole
  * catalogue, Qwen's own models and hosted third-party ones alike.
@@ -34,7 +35,7 @@ import { postStream } from './http.js';
 import { askViaProxy } from './smesh-proxy.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
-import { chargeOne } from './rate-limit.js';
+import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 import { getLicenseStatus } from './license.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
@@ -139,23 +140,34 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   ];
   const wantJson = responseFormat === 'json_object' && !hasImages;
 
-  if (!skipLocalCharge) await chargeOne('qwen');
+  const reservation = skipLocalCharge ? null : await reserveOne('qwen');
 
-  if (!key) {
-    return askViaProxy('qwen', messages, {
-      label: 'Qwen', onDelta, onUsage, signal,
-      responseFormat: wantJson ? 'json_object' : null
-    });
+  try {
+    if (!key) {
+      const result = await askViaProxy('qwen', messages, {
+        label: 'Qwen', onDelta, onUsage, signal,
+        responseFormat: wantJson ? 'json_object' : null
+      });
+      if (reservation) await commitOne(reservation);
+      return result;
+    }
+
+    const body = {
+      model: MODEL,
+      messages,
+      temperature: 0.3,
+      stream_options: { include_usage: true }
+    };
+    if (wantJson) body.response_format = { type: 'json_object' };
+
+    const headers = { Authorization: `Bearer ${key}` };
+    const result = await postStream(ENDPOINT, { headers, body, label: 'Qwen', onDelta, onUsage, signal });
+    if (reservation) await commitOne(reservation);
+    return result;
+  } catch (e) {
+    if (reservation) {
+      try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }
+    }
+    throw e;
   }
-
-  const body = {
-    model: MODEL,
-    messages,
-    temperature: 0.3,
-    stream_options: { include_usage: true }
-  };
-  if (wantJson) body.response_format = { type: 'json_object' };
-
-  const headers = { Authorization: `Bearer ${key}` };
-  return postStream(ENDPOINT, { headers, body, label: 'Qwen', onDelta, onUsage, signal });
 }

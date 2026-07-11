@@ -2,10 +2,18 @@
  * Anonymous usage telemetry → the license backend's /t endpoint (analytics.js
  * on the worker; the admin dashboard reads the aggregates).
  *
+ * OPT-IN: nothing is ever sent unless the user has BOTH accepted the data-
+ * processing consent AND enabled the separate «Анонимная статистика» toggle in
+ * Settings (`telemetryEnabled`, default off). track() still queues in memory —
+ * the double gate is enforced at flush time, so a toggle flipped mid-session
+ * takes effect on the very next batch.
+ *
  * CONTENT-FREE by design: never sends task text, answers, files or anything a
  * student typed — only event types, subject names, token counts, provider
  * costs and coarse device facts (browser family, extension version, the same
- * anonymous device_id that /verify and /referral/* already use).
+ * anonymous device_id that /verify and /referral/* already use). The license
+ * KEY is never transmitted — only its type (lifetime/subscription/none) — and
+ * errors travel as fixed codes, never as raw message text.
  *
  * Fire-and-forget everywhere: telemetry must never slow down or break a
  * solve, so every path swallows its own failures and drops events on error.
@@ -14,6 +22,7 @@
 
 import { BACKEND_URL } from './config.js';
 import { getDeviceId } from './history.js';
+import { hasConsent } from './consent.js';
 
 const FLUSH_DELAY_MS = 1500;   // short: MV3 service workers die young
 const MAX_QUEUE = 20;
@@ -67,6 +76,24 @@ export function usageFields(provider, usage) {
   };
 }
 
+/**
+ * Fixed error vocabulary — the ONLY error signal telemetry may carry. Raw
+ * error strings can embed task fragments, file names or provider echoes, so
+ * they never leave the device; the dashboard only needs the failure class.
+ */
+export function errorCode(err) {
+  const m = String(err?.message || err || '').toLowerCase();
+  if (/согласи|consent/.test(m)) return 'consent_required';
+  if (/лиценз|license/.test(m)) return 'license_invalid';
+  if (/ключ.*не задан|api.?key/.test(m)) return 'key_missing';
+  if (/переключилась вкладка|скриншот|capture/.test(m)) return 'capture_failed';
+  if (/лимит|limit|quota|429/.test(m)) return 'rate_limited';
+  if (/таймаут|timeout|timed out|abort/.test(m)) return 'provider_timeout';
+  if (/http|код \d{3}|\b\d{3}\b.*(ошибк|error)|сервер/.test(m)) return 'provider_http';
+  if (/сеть|network|fetch|offline|соединен/.test(m)) return 'network';
+  return 'other';
+}
+
 let queue = [];
 let timer = null;
 
@@ -89,17 +116,18 @@ async function flush() {
   const events = queue.splice(0, 25);
   if (!events.length) return;
   try {
-    // Kill switch for a future settings toggle; unset = on.
-    const { telemetryDisabled, aiProvider = 'openrouter', licenseStatus } =
-      await chrome.storage.local.get(['telemetryDisabled', 'aiProvider', 'licenseStatus']);
-    if (telemetryDisabled) return;
+    // Double opt-in gate: the general data-processing consent AND the separate
+    // statistics toggle (Settings → «Анонимная статистика», default OFF).
+    const { telemetryEnabled, aiProvider = 'openrouter', licenseStatus } =
+      await chrome.storage.local.get(['telemetryEnabled', 'aiProvider', 'licenseStatus']);
+    if (!telemetryEnabled || !(await hasConsent())) return;
     const body = {
       device_id: await getDeviceId(),
       browser: detectBrowser(),
-      ua: (navigator.userAgent || '').slice(0, 240),
       version: chrome.runtime.getManifest().version,
       provider: aiProvider,
-      license_key: licenseStatus?.ok ? licenseStatus.key : null,
+      // Type only — the raw key never rides a telemetry request (the backend
+      // hashes any legacy-client key it still receives; see analytics.js).
       license_type: licenseStatus?.ok ? (licenseStatus.type || null) : 'none',
       events
     };

@@ -1,5 +1,6 @@
 # macOS
 .DS_Store
+.secrets/
 
 # Chrome-generated DNR artifact (regenerated on load — must not be committed)
 _metadata/

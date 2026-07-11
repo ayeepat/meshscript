@@ -51,6 +51,7 @@ import { createSseSink } from './http.js';
 import { AI_BACKEND_URL } from './config.js';
 import { getLicenseStatus } from './license.js';
 import { getDeviceId } from './history.js';
+import { validateProxyMessagesBudget } from './upload-limits.js';
 
 const START_URL = `${AI_BACKEND_URL}/ai/start`;
 const POLL_URL = `${AI_BACKEND_URL}/ai/poll`;
@@ -302,7 +303,12 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   // a tiny start that references the blob instead.
   let payload = JSON.stringify(body);
   if (payload.length > START_INLINE_MAX_CHARS) {
-    const messagesJson = JSON.stringify(messages);
+    // This is the exact object the VPS reassembles under MAX_BLOB_CHARS. Check
+    // its serialized length before obtaining a ticket or uploading any chunk;
+    // the attachment-only budget cannot account for long prompts/history.
+    const messagesBudget = validateProxyMessagesBudget(messages);
+    if (!messagesBudget.ok) throw new Error(`${label}: ${messagesBudget.error}`);
+    const messagesJson = messagesBudget.json;
     dbg('start body', payload.length + 'ch — externalizing messages (' + messagesJson.length + 'ch) via /ai/blob');
     let blobId;
     try {
@@ -341,14 +347,17 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   let started;
   try { started = JSON.parse(startText); } catch { started = null; }
   const jobId = started?.ok && typeof started.job_id === 'string' ? started.job_id : '';
+  const jobToken = started?.ok && typeof started.job_token === 'string' ? started.job_token : '';
   if (!jobId) throw new Error(`${label}: некорректный ответ сервера. Попробуйте ещё раз.`);
   dbg('START ok', res.status, 'job', jobId.slice(0, 8));
 
   // Fire-and-forget: free the job / stop the upstream spend. Idempotent.
   const cancelJob = () => {
+    const headers = { 'Content-Type': 'application/json' };
+    if (jobToken) headers['X-Job-Token'] = jobToken;
     fetch(CANCEL_URL, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ job: jobId })
     }).catch(() => { });
   };
@@ -368,7 +377,13 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
       let poll = null; // parsed poll body, or null on any transport hiccup
       let notFound = null;
       try {
-        const r = await fetchText(`${POLL_URL}?job=${encodeURIComponent(jobId)}&cursor=${cursor}`, { method: 'GET' }, signal, POLL_TIMEOUT_MS);
+        const headers = jobToken ? { 'X-Job-Token': jobToken } : undefined;
+        const r = await fetchText(
+          `${POLL_URL}?job=${encodeURIComponent(jobId)}&cursor=${cursor}`,
+          { method: 'GET', headers },
+          signal,
+          POLL_TIMEOUT_MS
+        );
         if (r.status === 404) {
           // The job is gone server-side (GC'd / restart) — not transient.
           notFound = proxyMessage(r.text, `${label}: сессия ответа устарела. Попробуйте ещё раз.`);

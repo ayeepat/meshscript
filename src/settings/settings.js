@@ -1,5 +1,4 @@
-/** Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks, prompts, 7-day history. */
-import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
+/** Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks, 7-day history. */
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
@@ -7,7 +6,9 @@ import { DEFAULT_LIMITS, getUsage, getUsageHistory } from '../lib/rate-limit.js'
 import { setLicenseKey, getLicenseStatus, reasonMessage } from '../lib/license.js';
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
-import { SUPPORT_BOT_URL } from '../lib/config.js';
+import { getDeviceId, deleteAllLocalData } from '../lib/history.js';
+import { SUPPORT_BOT_URL, BACKEND_URL } from '../lib/config.js';
+import { isGdzCoverUrl } from '../lib/gdz-hosts.js';
 
 initTheme();
 
@@ -19,25 +20,13 @@ if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 // key (see lib/smesh-proxy.js) — students never handle an Alibaba key. A BYO
 // key set directly in storage still works as a hidden power-user path.
 const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
-const CATS = Object.values(PROMPT_CATEGORIES);
-const SAVE_SECTIONS = new Set(['general', 'analytics', 'prompts']);
+const SAVE_SECTIONS = new Set(['general', 'analytics']);
 
 let activeSection = 'general';
 let showSection = null;
 let usageDashboardLoaded = false;
 let gdzLoaded = false;
 let historyLoaded = false;
-
-// Display metadata for each prompt category: an icon, a title and the subjects
-// it covers. Keeps the markup DRY — the editors are generated, not hand-written.
-const PROMPT_META = {
-  [PROMPT_CATEGORIES.WORKED_SOLUTION]: { icon: 'flask', title: 'Точные науки', sub: 'Алгебра · Геометрия · Физика · Химия' },
-  [PROMPT_CATEGORIES.DIRECT_ANSWER]: { icon: 'globe', title: 'Языки', sub: 'Английский — только ответы' },
-  [PROMPT_CATEGORIES.PARAGRAPH_SUMMARY]: { icon: 'map', title: 'Гуманитарные параграфы', sub: 'История · Обществознание · География' },
-  [PROMPT_CATEGORIES.RUSSIAN_FULL]: { icon: 'pen', title: 'Русский язык', sub: 'Полное упражнение со вставками' },
-  [PROMPT_CATEGORIES.LITERATURE]: { icon: 'book', title: 'Литература', sub: 'Анализ произведений' },
-  [PROMPT_CATEGORIES.TEST_ANSWER]: { icon: 'listChecks', title: 'Тесты МЭШ', sub: 'Только номер и ответ' }
-};
 
 /* ---------- Theme segmented control ---------- */
 
@@ -50,37 +39,6 @@ for (const b of segButtons) {
 }
 getThemePref().then(markActivePref);
 document.addEventListener('themechange', async () => markActivePref(await getThemePref()));
-
-/* ---------- Build the prompt editors ---------- */
-
-function buildPromptEditors() {
-  const list = document.getElementById('promptList');
-  for (const cat of CATS) {
-    const meta = PROMPT_META[cat] || { icon: 'fileText', title: cat, sub: '' };
-    const field = document.createElement('div');
-    field.className = 'field promptfield';
-    field.innerHTML = `
-      <div class="field-head">
-        <span class="subj-ic">${iconSvg(meta.icon, 16)}</span>
-        <label for="p_${cat}">${meta.title}<span class="sub">${meta.sub}</span></label>
-        <button class="resetbtn" type="button" data-reset="${cat}">${iconSvg('reset', 12)}Сброс</button>
-      </div>
-      <textarea id="p_${cat}"></textarea>
-      <div class="charcount" data-count="${cat}"></div>`;
-    list.appendChild(field);
-
-    const ta = field.querySelector(`#p_${cat}`);
-    const counter = field.querySelector(`[data-count="${cat}"]`);
-    const resetBtn = field.querySelector(`[data-reset="${cat}"]`);
-    const refresh = () => {
-      counter.textContent = `${ta.value.length} символов`;
-      resetBtn.disabled = ta.value.trim() === DEFAULT_PROMPTS[cat].trim();
-    };
-    ta.addEventListener('input', refresh);
-    resetBtn.onclick = () => { ta.value = DEFAULT_PROMPTS[cat]; refresh(); };
-    ta._refresh = refresh;
-  }
-}
 
 /* ---------- Reveal (show/hide) toggles for secret fields ---------- */
 
@@ -95,24 +53,35 @@ function wireReveals() {
 
 /* ---------- Load / save ---------- */
 
+// The visible dropdown offers two paths — OpenRouter (BYO keys) and 302.AI
+// (СМЭШ-licensed). Internally the four provider values still exist: 302.AI maps
+// to `deepseek`, which auto-upgrades to Qwen for images/PDFs (see lib/ai.js), so
+// the single «302.AI» choice = DeepSeek on text, Qwen on media. Legacy stored
+// values (groq / qwen) fold onto whichever path owns them.
+const PROVIDER_TO_OPTION = { openrouter: 'openrouter', groq: 'openrouter', qwen: 'deepseek', deepseek: 'deepseek' };
+
+// Show the OpenRouter+Groq key fields only on the OpenRouter path; the 302.AI
+// path needs no keys, so it shows the license note instead.
+function syncProviderKeys() {
+  const isOpenRouter = document.getElementById('aiProvider').value === 'openrouter';
+  document.getElementById('orKeyFields').hidden = !isOpenRouter;
+  document.getElementById('licenseKeyNote').hidden = isOpenRouter;
+}
+
 async function load() {
-  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'promptOverrides', 'aiProvider', 'rateLimits']);
+  const stored = await chrome.storage.local.get([...KEY_FIELDS, 'aiProvider', 'rateLimits']);
   for (const f of KEY_FIELDS) document.getElementById(f).value = stored[f] || '';
-  document.getElementById('aiProvider').value = stored.aiProvider || 'openrouter';
+  document.getElementById('aiProvider').value = PROVIDER_TO_OPTION[stored.aiProvider] || 'openrouter';
+  syncProviderKeys();
   const limits = stored.rateLimits || {};
   document.getElementById('limitOpenrouter').value = limits.openrouter ?? DEFAULT_LIMITS.openrouter;
   document.getElementById('limitGroq').value = limits.groq ?? DEFAULT_LIMITS.groq;
   document.getElementById('limitQwen').value = limits.qwen ?? DEFAULT_LIMITS.qwen;
   document.getElementById('limitDeepseek').value = limits.deepseek ?? DEFAULT_LIMITS.deepseek;
-  const overrides = stored.promptOverrides || {};
-  for (const cat of CATS) {
-    const ta = document.getElementById('p_' + cat);
-    ta.value = overrides[cat] || DEFAULT_PROMPTS[cat];
-    ta._refresh?.();
-  }
   await refreshUsage();
   await loadLicenseUi();
   await loadConsentUi();
+  await loadPrivacyUi();
   loadReferralUi(); // network-backed, deliberately not awaited
 }
 
@@ -233,6 +202,56 @@ function wireConsent() {
   document.getElementById('consentToggle').onchange = async (e) => {
     await setConsent(e.target.checked);
     renderConsentStatus(e.target.checked);
+  };
+}
+
+/* ---------- Privacy: statistics opt-in + data deletion ---------- */
+
+async function loadPrivacyUi() {
+  const { telemetryEnabled = false } = await chrome.storage.local.get('telemetryEnabled');
+  document.getElementById('telemetryToggle').checked = !!telemetryEnabled;
+}
+
+function privacyFlash(text, state = 'ok') {
+  const pill = document.getElementById('privacyStatus');
+  pill.hidden = false;
+  pill.textContent = text;
+  pill.dataset.state = state;
+  setTimeout(() => { pill.hidden = true; }, 4000);
+}
+
+function wirePrivacy() {
+  // Statistics are OPT-IN (default off) and additionally gated on the general
+  // consent at flush time — see lib/telemetry.js.
+  document.getElementById('telemetryToggle').onchange = (e) => {
+    chrome.storage.local.set({ telemetryEnabled: e.target.checked });
+  };
+  // Server-side erasure: removes this device's pseudonymous rows from the
+  // analytics DB. The device id is the only identifier the backend has.
+  document.getElementById('deleteStats').onclick = async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true;
+    try {
+      const res = await fetch(new URL('/t/delete', BACKEND_URL).toString(), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: await getDeviceId() })
+      });
+      const data = await res.json().catch(() => null);
+      if (data?.ok) privacyFlash('Статистика удалена');
+      else privacyFlash('Не удалось удалить — попробуйте позже', 'err');
+    } catch {
+      privacyFlash('Нет связи с сервером', 'err');
+    } finally { btn.disabled = false; }
+  };
+  document.getElementById('deleteLocal').onclick = async () => {
+    if (!window.confirm(
+      'Удалить все локальные данные: историю решений, скан недели, кэш и черновики вложений? ' +
+      'Лицензия, ключи API и настройки останутся.'
+    )) return;
+    await deleteAllLocalData();
+    historyLoaded = false;
+    privacyFlash('Локальные данные удалены');
   };
 }
 
@@ -406,17 +425,11 @@ async function save() {
   const qwenLimit = Math.max(1, parseInt(document.getElementById('limitQwen').value, 10) || DEFAULT_LIMITS.qwen);
   const deepseekLimit = Math.max(1, parseInt(document.getElementById('limitDeepseek').value, 10) || DEFAULT_LIMITS.deepseek);
   data.rateLimits = { openrouter: orLimit, groq: groqLimit, qwen: qwenLimit, deepseek: deepseekLimit };
-  const promptOverrides = {};
-  for (const cat of CATS) {
-    const v = document.getElementById('p_' + cat).value.trim();
-    if (v && v !== DEFAULT_PROMPTS[cat]) promptOverrides[cat] = v;
-  }
-  data.promptOverrides = promptOverrides;
   await chrome.storage.local.set(data);
   await refreshUsage();
   if (usageDashboardLoaded) refreshUsageDashboard(); // reflect the new limit in the «Сегодня · N / лимит» tile
   // Verify license against the backend ONLY when the key changed — saves a
-  // network round-trip when the user is just editing prompts or limits.
+  // network round-trip when the user is just editing settings or limits.
   const newKey = document.getElementById('licenseKey').value.trim().toUpperCase();
   const priorStatus = await getLicenseStatus();
   if ((priorStatus?.key || '') !== newKey) {
@@ -494,8 +507,10 @@ function classesLabel(classes) {
   return (c.length === 1 ? `${c[0]}` : contiguous ? `${c[0]}–${c[c.length - 1]}` : c.join(', ')) + ' класс';
 }
 // No inline onerror handler — MV3's page CSP blocks inline JS. A missing cover
-// just shows the empty framed box, which is fine.
-const coverHtml = (url, cls) => (url
+// just shows the empty framed box, which is fine. Also only render remote
+// covers from the known GDZ hosts — storage is user-writable, so a tampered
+// book record must not turn Settings into a blind third-party image embedder.
+const coverHtml = (url, cls) => (isGdzCoverUrl(url)
   ? `<img class="cover ${cls}" src="${esc(url)}" alt="" loading="lazy">`
   : `<span class="cover ${cls} ph">${iconSvg('book', 16)}</span>`);
 
@@ -730,14 +745,15 @@ function wireTabs() {
 
 /* ---------- Init ---------- */
 
-buildPromptEditors();
 wireReveals();
 wireTabs();
 applyConsentGate(false);
 wireGdz();
 wireConsent();
+wirePrivacy();
 wireReferral();
 wireUsageDashboard();
 document.getElementById('save').onclick = save;
+document.getElementById('aiProvider').addEventListener('change', syncProviderKeys);
 document.getElementById('reload').onclick = () => { historyLoaded = true; loadHistory(); };
 load();

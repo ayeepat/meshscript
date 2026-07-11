@@ -20,6 +20,67 @@ const MAX_SIDE = 1800;            // longest side after downscale — plenty to 
 const JPEG_QUALITY = 0.8;
 const SKIP_UNDER_B64_CHARS = 300_000; // ~220 KB raw: already cheap to ship, not worth a re-encode
 
+// Decompression-bomb guard: a tiny PNG can declare absurd dimensions and blow
+// up RAM at DECODE time (w*h*4 bytes), long before any canvas work. Read the
+// dimensions straight from the container headers first — cheap, no decode —
+// and skip the whole recompression when they're implausible for homework.
+const MAX_DECODE_PIXELS = 50_000_000; // ~50 MP ≈ 200 MB RGBA
+const MAX_DECODE_SIDE = 20_000;
+
+// Header-level dimensions for the formats we deliberately decode. Returning
+// null is a security decision: unknown or malformed formats are never handed to
+// createImageBitmap(), because their decoded allocation cannot be bounded first.
+export function imageDimensions(bytes) {
+  try {
+    const dv = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    // PNG: 8-byte signature, then the IHDR chunk carries width/height first.
+    if (bytes.length > 24 && dv.getUint32(0) === 0x89504e47 &&
+        dv.getUint32(4) === 0x0d0a1a0a && dv.getUint32(8) === 13 &&
+        dv.getUint32(12) === 0x49484452) {
+      return { w: dv.getUint32(16), h: dv.getUint32(20) };
+    }
+    // GIF87a/89a: little-endian logical screen size right after "GIF87a"/"GIF89a".
+    if (bytes.length > 10 && dv.getUint32(0) === 0x47494638 &&
+        ((bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61)) {
+      return { w: dv.getUint16(6, true), h: dv.getUint16(8, true) };
+    }
+    // WebP: all three bitstream forms expose dimensions before pixel decode.
+    // Simple files start with VP8 / VP8L; extended/animated files use VP8X.
+    if (bytes.length >= 30 && dv.getUint32(0) === 0x52494646 && dv.getUint32(8) === 0x57454250) {
+      const chunk = dv.getUint32(12);
+      if (chunk === 0x56503858) { // VP8X
+        const w = 1 + bytes[24] + (bytes[25] << 8) + (bytes[26] << 16);
+        const h = 1 + bytes[27] + (bytes[28] << 8) + (bytes[29] << 16);
+        return { w, h };
+      }
+      if (chunk === 0x5650384c && bytes[20] === 0x2f && bytes.length >= 25) { // VP8L
+        const bits = dv.getUint32(21, true);
+        return { w: 1 + (bits & 0x3fff), h: 1 + ((bits >>> 14) & 0x3fff) };
+      }
+      if (chunk === 0x56503820 && bytes.length >= 30 &&
+          bytes[23] === 0x9d && bytes[24] === 0x01 && bytes[25] === 0x2a) { // VP8
+        return { w: dv.getUint16(26, true) & 0x3fff, h: dv.getUint16(28, true) & 0x3fff };
+      }
+    }
+    // JPEG: walk the marker chain to the first SOF0–SOF15 frame header.
+    if (bytes.length > 4 && dv.getUint16(0) === 0xffd8) {
+      let off = 2;
+      while (off + 9 < bytes.length) {
+        if (bytes[off] !== 0xff) { off++; continue; }
+        const marker = bytes[off + 1];
+        if (marker === 0xd8 || (marker >= 0xd0 && marker <= 0xd9)) { off += 2; continue; }
+        const len = dv.getUint16(off + 2);
+        if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) {
+          return { h: dv.getUint16(off + 5), w: dv.getUint16(off + 7) };
+        }
+        if (len < 2) break;
+        off += 2 + len;
+      }
+    }
+  } catch { /* malformed header — fall through */ }
+  return null;
+}
+
 function base64ToBytes(b64) {
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
@@ -42,13 +103,28 @@ function bytesToBase64(bytes) {
  * (createImageBitmap can't size it in a worker), or on any failure.
  */
 export async function compressImageFile(f) {
+  let bmp = null;
   try {
     const mime = f?.mimeType || '';
     if (!mime.startsWith('image/') || mime === 'image/svg+xml') return f;
     if (!f.dataBase64 || f.dataBase64.length < SKIP_UNDER_B64_CHARS) return f;
 
-    const blob = new Blob([base64ToBytes(f.dataBase64)], { type: mime });
-    const bmp = await createImageBitmap(blob);
+    const bytes = base64ToBytes(f.dataBase64);
+    // Decode only formats whose dimensions were authenticated by a recognized
+    // container header. Unsupported/spoofed formats still ship unchanged, but
+    // can no longer trigger an unbounded local bitmap allocation.
+    const dim = imageDimensions(bytes);
+    if (!dim || dim.w * dim.h > MAX_DECODE_PIXELS ||
+        Math.max(dim.w, dim.h) > MAX_DECODE_SIDE || dim.w < 1 || dim.h < 1) {
+      return f;
+    }
+    const blob = new Blob([bytes], { type: mime });
+    bmp = await createImageBitmap(blob);
+    // Backstop against a decoder/container disagreement.
+    if (bmp.width * bmp.height > MAX_DECODE_PIXELS ||
+        Math.max(bmp.width, bmp.height) > MAX_DECODE_SIDE || bmp.width < 1 || bmp.height < 1) {
+      return f;
+    }
     const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
     const w = Math.max(1, Math.round(bmp.width * scale));
     const h = Math.max(1, Math.round(bmp.height * scale));
@@ -60,7 +136,6 @@ export async function compressImageFile(f) {
     ctx.fillStyle = '#fff';
     ctx.fillRect(0, 0, w, h);
     ctx.drawImage(bmp, 0, 0, w, h);
-    bmp.close();
 
     const out = await canvas.convertToBlob({ type: 'image/jpeg', quality: JPEG_QUALITY });
     const outB64 = bytesToBase64(new Uint8Array(await out.arrayBuffer()));
@@ -69,6 +144,8 @@ export async function compressImageFile(f) {
     return { ...f, mimeType: 'image/jpeg', dataBase64: outB64 };
   } catch {
     return f;
+  } finally {
+    try { bmp?.close(); } catch { /* already closed */ }
   }
 }
 

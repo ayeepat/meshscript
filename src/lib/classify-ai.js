@@ -39,7 +39,14 @@ const SYSTEM =
   'Ответь ТОЛЬКО JSON-массивом строк, по одной на каждое задание, в том же порядке. ' +
   'Пример ответа: ["none","textbook","attachment"]';
 
-const cacheKeyFor = (task) => (task || '').trim().toLowerCase().slice(0, 200);
+async function cacheKeyFor(task) {
+  // The old 200-character prefix made distinct long assignments share a cache
+  // entry. Hash the complete normalized text so storage keys stay compact while
+  // classification identity still covers every character of the homework.
+  const bytes = new TextEncoder().encode((task || '').trim().toLowerCase());
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
 
 // Serialise cache writes (read-modify-write on one storage.local object) so
 // overlapping classify calls can't clobber each other's entries. Each write
@@ -48,7 +55,8 @@ let classCacheWrite = Promise.resolve();
 function mergeClassCache(entries) {
   classCacheWrite = classCacheWrite.then(async () => {
     const { [CACHE_KEY]: cache = {} } = await chrome.storage.local.get(CACHE_KEY);
-    Object.assign(cache, entries);
+    const at = Date.now();
+    for (const [key, value] of Object.entries(entries)) cache[key] = { v: value, at };
     const keys = Object.keys(cache);
     if (keys.length > CACHE_MAX) {
       for (const k of keys.slice(0, keys.length - CACHE_MAX)) delete cache[k];
@@ -65,6 +73,7 @@ function mergeClassCache(entries) {
 export async function classifyTasksAI(tasks) {
   // Instant heuristic pass — also the final answer if no cheap model is available.
   const result = tasks.map((t) => classifyTask(t).kind || 'none');
+  const taskKeys = await Promise.all(tasks.map(cacheKeyFor));
 
   const { groqApiKey, qwenApiKey, licenseStatus, [CACHE_KEY]: cache = {} } =
     await chrome.storage.local.get(['groqApiKey', 'qwenApiKey', 'licenseStatus', CACHE_KEY]);
@@ -78,7 +87,8 @@ export async function classifyTasksAI(tasks) {
 
   const pending = [];
   tasks.forEach((t, i) => {
-    const cached = cache[cacheKeyFor(t)];
+    const entry = cache[taskKeys[i]];
+    const cached = (entry && typeof entry === 'object' && 'v' in entry) ? entry.v : entry;
     if (KINDS.has(cached)) result[i] = cached;
     else if ((t || '').trim()) pending.push(i);
   });
@@ -93,7 +103,7 @@ export async function classifyTasksAI(tasks) {
     pending.forEach((i, n) => {
       if (KINDS.has(arr[n])) {
         result[i] = arr[n];
-        newEntries[cacheKeyFor(tasks[i])] = arr[n];
+        newEntries[taskKeys[i]] = arr[n];
       }
     });
     // Persist via a serialised read-merge-write so concurrent calls don't

@@ -69,6 +69,21 @@ const NOISE_RE = new RegExp(
 // URL shape, the remote config can ship a new selector same-day. Built-in is the
 // fallback, and any override is validated before it reaches this script.
 let HOMEWORK_ANCHOR_SEL = 'a[href*="/diary/homeworks/homeworks/"]';
+const APPROVED_HOMEWORK_SELECTORS = Object.freeze([
+  'a[href*="/diary/homeworks/homeworks/"]',
+  'a[href*="/diary/homeworks/"]',
+  'a[href*="/diary/homework/"]'
+]);
+
+// A row token exists only for one scan of this live DOM. It lets later
+// attachment discovery return to the exact card/anchor the popup rendered,
+// instead of re-identifying a row by subject text or scanning the whole page.
+const homeworkRowContexts = new Map();
+function mintRowToken(root = null) {
+  const token = crypto.randomUUID();
+  if (root) homeworkRowContexts.set(token, root);
+  return token;
+}
 
 function normalize(text) {
   return (text || '').replace(/\s+/g, ' ').trim();
@@ -85,9 +100,13 @@ function applyScanConfig(cfg) {
     if (list.length) SUBJECT_VOCABULARY = list;
   }
   if (typeof cfg.homeworkAnchorSelector === 'string' && cfg.homeworkAnchorSelector.trim()) {
+    const selector = cfg.homeworkAnchorSelector.trim();
+    // Mirrors remote-config.js. Keep the check here too because content-script
+    // messages cross a less-trusted boundary than extension storage.
+    if (!APPROVED_HOMEWORK_SELECTORS.includes(selector)) return;
     try {
-      document.querySelector(cfg.homeworkAnchorSelector); // throws on an invalid selector
-      HOMEWORK_ANCHOR_SEL = cfg.homeworkAnchorSelector;
+      document.querySelector(selector); // throws on an invalid selector
+      HOMEWORK_ANCHOR_SEL = selector;
     } catch { /* invalid selector — keep the built-in */ }
   }
 }
@@ -182,7 +201,7 @@ function collectCardsFromDom() {
     }
     if (cardRoot === document.body) cardRoot = null;
 
-    const addCard = (task, href) => {
+    const addCard = (task, href, rowRoot = null) => {
       const cleanTask = task || '(текст задания не виден — откройте задание или загрузите фото)';
       const key = `${subject}||${href || ''}||${cleanTask.slice(0, 120)}`;
       if (seen.has(key)) return;
@@ -193,7 +212,8 @@ function collectCardsFromDom() {
         task: cleanTask,
         href,
         homeworkId: homeworkIdFromHref(href),
-        homeworkItemId: homeworkItemIdFromHref(href)
+        homeworkItemId: homeworkItemIdFromHref(href),
+        rowToken: mintRowToken(rowRoot)
       });
     };
 
@@ -217,7 +237,10 @@ function collectCardsFromDom() {
           if (t && !TIME_RE.test(t) && !isNoise(t)) task = t;
         }
         if (task) {
-          addCard(task, href);
+          // With exactly one homework row, the lesson card is an unambiguous
+          // ownership subtree. With several, only the row anchor itself is safe;
+          // sibling material links become explicit candidates later.
+          addCard(task, href, links.length === 1 ? cardRoot : link);
           cardHasTaskRow = true;
         }
       }
@@ -243,7 +266,7 @@ function collectCardsFromDom() {
         sib = sib.nextElementSibling;
         scanned++;
       }
-      addCard(task, fallbackHref);
+      addCard(task, fallbackHref, null);
     }
   }
   return cards;
@@ -282,7 +305,8 @@ function scanFromDom() {
       task: c.task,
       href: c.href,
       homeworkId: c.homeworkId,
-      homeworkItemId: c.homeworkItemId
+      homeworkItemId: c.homeworkItemId,
+      rowToken: c.rowToken
     });
   }
 
@@ -460,31 +484,103 @@ function jwtPayload(token) {
   } catch { return null; }
 }
 
-/** student_id isn't in the token — scan localStorage/cookies values for it. */
+const STUDENT_ID_RE = /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{4,})$/i;
+const ACTIVE_STUDENT_KEYS = [
+  'student_id', 'studentId', 'profile_id', 'profileId',
+  'selected_student_id', 'selectedStudentId', 'selected_profile_id', 'selectedProfileId',
+  'current_student_id', 'currentStudentId', 'current_profile_id', 'currentProfileId',
+  'aupd_current_profile_id'
+];
+
+function cleanStudentId(value) {
+  const id = String(value ?? '').replace(/^"|"$/g, '').trim();
+  return STUDENT_ID_RE.test(id) ? id : null;
+}
+
+function oneActiveSignal(values, source) {
+  const ids = [...new Set(values.map(cleanStudentId).filter(Boolean))];
+  if (ids.length === 1) return { id: ids[0], source };
+  if (ids.length > 1) {
+    return {
+      id: null,
+      source,
+      error: 'Не удалось однозначно определить активного ученика. Переключитесь на нужный профиль в дневнике МЭШ и обновите страницу.'
+    };
+  }
+  return null;
+}
+
+function storageSignal(storage, source) {
+  const values = [];
+  try {
+    for (const key of ACTIVE_STUDENT_KEYS) {
+      const raw = storage.getItem(key);
+      if (raw != null) values.push(raw);
+    }
+    // Mesh builds occasionally wrap the selection in one JSON record. Only
+    // inspect records whose STORAGE KEY itself says current/selected/active;
+    // scanning every cached profile record is what previously picked child #1.
+    for (let i = 0; i < storage.length; i++) {
+      const key = storage.key(i) || '';
+      if (!/(?:current|selected|active).*(?:student|profile)|aupd_current_profile/i.test(key)) continue;
+      const raw = storage.getItem(key) || '';
+      try {
+        const parsed = JSON.parse(raw);
+        for (const field of ACTIVE_STUDENT_KEYS) if (parsed?.[field] != null) values.push(parsed[field]);
+        if (parsed?.id != null) values.push(parsed.id);
+      } catch { values.push(raw); }
+    }
+  } catch { return null; }
+  return oneActiveSignal(values, source);
+}
+
+/** Resolve only CURRENT-selection signals; never scan arbitrary profile lists. */
 function findStudentId() {
   try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const v = localStorage.getItem(localStorage.key(i)) || '';
-      // Match a numeric id OR a GUID — `contingent_guid` is a GUID, so a digits-
-      // only pattern would silently skip it despite being listed here.
-      const m = v.match(/"(?:student_id|studentId|profile_id|profileId|contingent_guid)"\s*:\s*"?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d{4,})"?/i);
-      if (m) return m[1];
+    const url = new URL(location.href);
+    const fromUrl = oneActiveSignal(ACTIVE_STUDENT_KEYS.map((key) => url.searchParams.get(key)), 'diary_url');
+    if (fromUrl) return fromUrl;
+  } catch { /* malformed/location unavailable */ }
+
+  // `aupd_current_profile_id` is Mesh's explicit selected-profile cookie. It is
+  // authoritative for the diary currently open, unlike /students[0].
+  const cookieValues = [];
+  let currentProfileCookie = null;
+  try {
+    for (const part of document.cookie.split(';')) {
+      const [rawKey, ...rest] = part.trim().split('=');
+      const value = decodeURIComponent(rest.join('='));
+      if (rawKey === 'aupd_current_profile_id') currentProfileCookie = value;
+      else if (ACTIVE_STUDENT_KEYS.includes(rawKey)) cookieValues.push(value);
     }
-  } catch { /* storage blocked */ }
-  const c = document.cookie.match(/(?:student_id|profile_id|aupd_current_profile_id)=(\d{4,})/);
-  return c ? c[1] : null;
+  } catch { /* cookies blocked */ }
+  const cookie = oneActiveSignal(
+    currentProfileCookie != null ? [currentProfileCookie] : cookieValues,
+    'aupd_current_profile_cookie'
+  );
+  if (cookie) return cookie;
+
+  const session = storageSignal(sessionStorage, 'session_selected_profile');
+  if (session) return session;
+
+  const local = storageSignal(localStorage, 'local_selected_profile');
+  if (local) return local;
+  return { id: null, source: 'none' };
 }
 
 /**
  * Resolve the numeric student_id the family API requires (it 400s without it).
- * Local storage first; if absent, ask the family profile API — for a student
- * login the profile's own `id` IS the student_id; for a parent it's a child id.
+ * Current diary selection first; if absent, ask the family profile APIs. A
+ * single returned student is safe, but a multi-child list without a selection
+ * is an error — never an invitation to take index zero.
  * @returns {Promise<{id:string|null, source:string, debug?:object}>}
  */
 async function resolveStudentId(headers) {
-  const local = findStudentId();
-  if (local) return { id: local, source: 'storage' };
+  const active = findStudentId();
+  if (active.id || active.error) return active;
   const tried = [];
+  const listed = new Set();
+  const direct = new Set();
   for (const url of [
     'https://school.mos.ru/api/family/web/v1/profile',
     'https://school.mos.ru/api/family/web/v1/students',
@@ -495,11 +591,29 @@ async function resolveStudentId(headers) {
       tried.push({ url, status: res.status });
       if (!res.ok) continue;
       const j = await res.json();
-      const id = j?.profile?.id ?? j?.children?.[0]?.id ?? (Array.isArray(j) ? j[0]?.id : j?.id) ??
-                 j?.students?.[0]?.id ?? j?.contingent_guid;
-      if (id != null) return { id: String(id), source: url };
+      const addIds = (items, target) => {
+        for (const item of (Array.isArray(items) ? items : [])) {
+          const id = cleanStudentId(item?.id ?? item?.student_id ?? item?.studentId ?? item?.contingent_guid);
+          if (id) target.add(id);
+        }
+      };
+      if (Array.isArray(j)) addIds(j, listed);
+      addIds(j?.children, listed);
+      addIds(j?.students, listed);
+      const own = cleanStudentId(j?.profile?.id ?? j?.id ?? j?.contingent_guid);
+      if (own) direct.add(own);
       tried[tried.length - 1].keys = j && typeof j === 'object' ? Object.keys(j) : typeof j;
     } catch (e) { tried.push({ url, error: String(e) }); }
+  }
+  const candidates = listed.size ? [...listed] : [...direct];
+  if (candidates.length === 1) return { id: candidates[0], source: listed.size ? 'single_student_from_api' : 'single_profile_from_api', debug: tried };
+  if (candidates.length > 1) {
+    return {
+      id: null,
+      source: 'ambiguous_profiles',
+      error: 'В аккаунте несколько учеников, а активный профиль дневника не определён. Выберите нужного ученика в МЭШ, обновите страницу и повторите.',
+      debug: tried
+    };
   }
   return { id: null, source: 'none', debug: tried };
 }
@@ -526,6 +640,24 @@ function normalizeUrl(s) {
   try { return encodeURI(decodeURI(s)); } catch { return s; }
 }
 
+const ATTACHMENT_HOSTS = new Set(['school.mos.ru', 'uchebnik.mos.ru']);
+function isIpLiteralHost(hostname) {
+  const host = String(hostname || '').replace(/^\[|\]$/g, '');
+  if (host.includes(':')) return true;
+  const parts = host.split('.');
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function allowedAttachmentUrl(raw, base = location.href) {
+  try {
+    const url = new URL(raw, base);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
+    const host = url.hostname.toLowerCase();
+    if (isIpLiteralHost(host) || !ATTACHMENT_HOSTS.has(host)) return null;
+    return url;
+  } catch { return null; }
+}
+
 /** Recursively collect file-looking URLs from an arbitrary JSON value. */
 function collectFileUrls(node, out = new Set(), depth = 0) {
   if (depth > 8 || out.size >= 8) return out;
@@ -534,7 +666,8 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
     // Mesh often stores attachment paths relative ("/ej/attachments/…"); absolutise.
     if (s[0] === '/' && MESH_FILE_HINT_RE.test(s)) s = 'https://school.mos.ru' + s;
     if (FILE_URL_RE.test(s) || (/^https?:\/\//.test(s) && MESH_FILE_HINT_RE.test(s))) {
-      out.add(normalizeUrl(s));
+      const safe = allowedAttachmentUrl(s);
+      if (safe) out.add(normalizeUrl(safe.href));
     }
   } else if (Array.isArray(node)) {
     for (const v of node) collectFileUrls(v, out, depth + 1);
@@ -549,7 +682,7 @@ function collectFileUrls(node, out = new Set(), depth = 0) {
  * bundle several homeworks (e.g. a retelling «Charles Dickens.docx» AND an OGE
  * «Вариант 10 … .pdf»); attaching the unrelated file confuses the solver and
  * made results flaky. Match the homework whose text matches the card task and
- * take ONLY its files; fall back to the whole lesson if nothing matches.
+ * take ONLY its files; whole-lesson fallback is allowed only for one row.
  */
 function idLooksLike(value, targetId) {
   if (!targetId || value == null) return false;
@@ -613,12 +746,14 @@ function urlsRelevantToTask(urls, taskText) {
 function urlsForHomework(json, taskText, homeworkItemId) {
   const homeworks = Array.isArray(json?.lesson_homeworks) ? json.lesson_homeworks : [];
   const allLessonUrls = [...collectFileUrls(json)];
-  let scope = homeworks;
+  // Multiple rows are not a safe default scope. Start empty unless the lesson
+  // has exactly one homework; id/text matching below may narrow it to one.
+  let scope = homeworks.length === 1 ? homeworks : [];
   let matchedSpecificHomework = false;
 
   if (homeworkItemId && homeworks.length) {
     const byId = homeworks.filter((h) => homeworkHasItemId(h, homeworkItemId));
-    if (byId.length) {
+    if (byId.length === 1) {
       scope = byId;
       matchedSpecificHomework = true;
     }
@@ -632,7 +767,7 @@ function urlsForHomework(json, taskText, homeworkItemId) {
       if (score > bestScore) { bestScore = score; best = [h]; }
       else if (score && score === bestScore) best.push(h);
     }
-    if (bestScore >= 0.35 || bestScore >= 8) {
+    if ((bestScore >= 0.35 || bestScore >= 8) && best.length === 1) {
       scope = best;
       matchedSpecificHomework = true;
     }
@@ -647,13 +782,16 @@ function urlsForHomework(json, taskText, homeworkItemId) {
   if (!out.size && matchedSpecificHomework) {
     for (const url of urlsRelevantToTask(allLessonUrls, taskText)) out.add(url);
   }
-  // No specific row was matched: fall back to the whole lesson. With one
-  // homework row this is safe; with several rows it is still better than
-  // returning nothing when Mesh's API omitted row ids.
-  if (!out.size && !matchedSpecificHomework) {
+  // Whole-lesson fallback is ownership-safe only when the response contains
+  // exactly one homework. With zero/several rows the URLs are candidates for an
+  // explicit popup choice, never automatic attachments.
+  if (!out.size && !matchedSpecificHomework && homeworks.length === 1) {
     for (const url of allLessonUrls) out.add(url);
   }
-  return [...out];
+  const candidates = !out.size && !matchedSpecificHomework && homeworks.length !== 1
+    ? allLessonUrls.map((url) => ({ name: fileNameFromUrl(url), url }))
+    : [];
+  return { urls: [...out], candidates };
 }
 
 // STRICT matcher for DOM links: only a real attachment, never an auth/SSO link.
@@ -674,21 +812,43 @@ function looksLikeFileLink(s) {
  * a download button) we can read directly — no private-API guessing. Also used
  * as a fallback when the family API doesn't surface the file URL.
  */
-function scanPageForFileLinks() {
-  const out = new Set();
-  const push = (raw) => {
+function collectDomFileLinks(root) {
+  const out = new Map();
+  const push = (el, raw) => {
     if (!raw) return;
     let s = String(raw).trim();
     if (s[0] === '/') s = location.origin + s; // absolutise relative paths
-    if (/^https?:\/\//.test(s) && looksLikeFileLink(s)) out.add(normalizeUrl(s));
+    const safe = allowedAttachmentUrl(s);
+    if (safe && looksLikeFileLink(safe.href)) {
+      const url = normalizeUrl(safe.href);
+      if (!out.has(url)) out.set(url, { el, url, name: fileNameFromUrl(url) });
+    }
   };
-  for (const a of document.querySelectorAll('a[href]')) push(a.getAttribute('href'));
+  for (const a of root.querySelectorAll('a[href]')) push(a, a.getAttribute('href'));
   // Mesh sometimes renders downloads as buttons carrying the URL in a data-attr.
-  for (const el of document.querySelectorAll('[download],[data-href],[data-url],[data-file-url],[data-link]')) {
-    push(el.getAttribute('href') || el.getAttribute('data-href') ||
+  for (const el of root.querySelectorAll('[download],[data-href],[data-url],[data-file-url],[data-link]')) {
+    push(el, el.getAttribute('href') || el.getAttribute('data-href') ||
          el.getAttribute('data-url') || el.getAttribute('data-file-url') || el.getAttribute('data-link'));
   }
-  return [...out].slice(0, 8);
+  return [...out.values()].slice(0, 8);
+}
+
+/**
+ * Auto-attach only links inside the exact row subtree registered by MESH_SCAN.
+ * When that subtree is missing or has no owned link, whole-page discoveries are
+ * returned as explicit candidates; none is silently assigned to this homework.
+ */
+function scanPageForFileLinks({ rowToken } = {}) {
+  const all = collectDomFileLinks(document);
+  const root = rowToken ? homeworkRowContexts.get(rowToken) : null;
+  if (root?.isConnected) {
+    const owned = all.filter((item) => item.el === root || root.contains(item.el));
+    if (owned.length) return { urls: owned.map((item) => item.url), candidates: [] };
+  }
+  return {
+    urls: [],
+    candidates: all.map(({ name, url }) => ({ name, url }))
+  };
 }
 
 /** Last path segment of a URL, decoded — used as the attachment filename. */
@@ -729,6 +889,53 @@ function isAudioAttachment(name, mimeType) {
     ['mp3', 'mpga', 'm4a', 'wav', 'ogg', 'oga', 'opus', 'flac', 'aac'].includes(ext);
 }
 
+const MAX_STANDARD_UPLOAD_BYTES = 6 * 1024 * 1024; // mirrors lib/upload-limits.js
+const MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024;   // content scripts cannot import ESM
+const ATTACHMENT_FETCH_TIMEOUT_MS = 30 * 1000;
+
+function bytesToBase64(bytes) {
+  let bin = '';
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+async function readBoundedBody(response, maxBytes, controller) {
+  const length = response.headers.get('content-length');
+  if (length && /^\d+$/.test(length.trim()) && Number(length) > maxBytes) {
+    controller.abort();
+    return null;
+  }
+  if (!response.body?.getReader) { controller.abort(); return null; }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel('attachment too large'); } catch { /* already closed */ }
+        controller.abort();
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (e) {
+    if (!controller.signal.aborted) throw e;
+    return null;
+  }
+  if (!total) return null;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
 /**
  * Download a SAME-ORIGIN attachment from inside the page. The content script
  * carries the user's real session cookies, so school.mos.ru/ej/attachments
@@ -737,33 +944,38 @@ function isAudioAttachment(name, mimeType) {
  * still got an auth/login redirect, so we reject it instead of attaching junk.
  */
 async function fetchInlineFile(url) {
+  const safe = allowedAttachmentUrl(url);
+  if (!safe || safe.origin !== location.origin) return null;
+  const ctrl = new AbortController();
+  // Covers response headers and every reader.read(), not only fetch().
+  const timer = setTimeout(() => ctrl.abort(), ATTACHMENT_FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(url, { credentials: 'include' });
+    // Same-origin inline downloads do not need redirects. Rejecting one avoids
+    // forwarding diary cookies to a target selected by an attachment response.
+    const res = await fetch(safe.href, { credentials: 'include', redirect: 'error', signal: ctrl.signal });
     if (!res.ok) { dbg('[СМЭШ AI] cs-download http', res.status, url); return null; }
     const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
       dbg('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
       return { __auth: true };
     }
-    const name = fileNameFromUrl(url);
-    const blob = await res.blob();
-    const mimeType = inferMime(name, ct || blob.type);
+    const name = fileNameFromUrl(safe.href);
+    const mimeType = inferMime(name, ct);
     // Keep the same normal-file ceiling as manual/background uploads: after
     // base64 expansion the licensed proxy has only 9 MB for its messages blob.
-    const maxBytes = isAudioAttachment(name, mimeType) ? 25 * 1024 * 1024 : 6 * 1024 * 1024;
-    if (!blob.size || blob.size > maxBytes) return null;
-    const dataUrl = await new Promise((resolve, reject) => {
-      const r = new FileReader();
-      r.onload = () => resolve(r.result);
-      r.onerror = reject;
-      r.readAsDataURL(blob);
-    });
+    const maxBytes = isAudioAttachment(name, mimeType) ? MAX_AUDIO_UPLOAD_BYTES : MAX_STANDARD_UPLOAD_BYTES;
+    const bytes = await readBoundedBody(res, maxBytes, ctrl);
+    if (!bytes) return null;
     return {
       mimeType,
-      dataBase64: String(dataUrl).split(',')[1],
+      dataBase64: bytesToBase64(bytes),
       name
     };
   } catch (e) { dbg('[СМЭШ AI] cs-download exception', String(e), url); return null; }
+  finally {
+    clearTimeout(timer);
+    ctrl.abort();
+  }
 }
 
 /**
@@ -775,9 +987,9 @@ async function fetchInlineFile(url) {
  * Returns a `stage` so failures are VISIBLE instead of silently falling back to
  * manual upload. `files` are already-inlined same-origin attachments; `urls` are
  * leftover cross-origin ones for the service worker.
- * @returns {Promise<{ok:boolean, files:object[], urls:string[], token:string|null, headers:object, stage:string, status?:number}>}
+ * @returns {Promise<{ok:boolean, files:object[], urls:string[], candidates:object[], token:string|null, headers:object, stage:string, status?:number}>}
  */
-async function listMaterialUrls(lessonId, taskText, homeworkItemId) {
+async function listMaterialUrls(lessonId, taskText, homeworkItemId, rowToken) {
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => dbg('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
@@ -786,24 +998,33 @@ async function listMaterialUrls(lessonId, taskText, homeworkItemId) {
   // prefer it whenever we have a lesson id. The DOM scan is only a fallback for
   // when there's no id (it can't tell which of several files belongs to the task).
   let urls = [];
+  let candidates = [];
   let stage = '';
   if (lessonId && token) {
     try {
       const personId = jwtPayload(token)?.msh || null;
-      const studentId = (await resolveStudentId(headers)).id;
-      if (!studentId) { log('no_student_id'); return { ok: false, files: [], urls: [], token, headers, stage: 'no_student_id' }; }
+      const student = await resolveStudentId(headers);
+      if (!student.id) {
+        const ambiguous = !!student.error;
+        const studentStage = ambiguous ? 'ambiguous_student' : 'no_student_id';
+        log(studentStage, student.error);
+        return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: studentStage, error: student.error };
+      }
+      const studentId = student.id;
       const apiUrl = LESSON_API(lessonId, studentId, personId);
       log('request', { lessonId, studentId, personId, apiUrl });
       const res = await fetch(apiUrl, { credentials: 'include', headers });
       if (!res.ok) {
         log('api_error', res.status);
-        return { ok: false, files: [], urls: [], token, headers, stage: 'api_error', status: res.status };
+        return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: 'api_error', status: res.status };
       }
-      urls = urlsForHomework(await res.json(), taskText, homeworkItemId).slice(0, 5);
+      const matched = urlsForHomework(await res.json(), taskText, homeworkItemId);
+      urls = matched.urls.slice(0, 5);
+      candidates = matched.candidates.slice(0, 8);
       stage = urls.length ? 'found_api' : 'no_urls';
     } catch (e) {
       log('exception', String(e));
-      return { ok: false, files: [], urls: [], token, headers, stage: 'exception' };
+      return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: 'exception' };
     }
   }
 
@@ -811,13 +1032,20 @@ async function listMaterialUrls(lessonId, taskText, homeworkItemId) {
   // a lesson id). It can't tell which homework a file belongs to, so it's the
   // second choice — used only when the API surfaced nothing.
   if (!urls.length) {
-    const domUrls = scanPageForFileLinks();
-    if (domUrls.length) { urls = domUrls; stage = 'found_dom'; }
+    const dom = scanPageForFileLinks({ rowToken });
+    if (dom.urls.length) { urls = dom.urls; stage = 'found_dom'; }
+    else if (dom.candidates.length) {
+      const seen = new Set(candidates.map((candidate) => candidate.url));
+      for (const candidate of dom.candidates) {
+        if (!seen.has(candidate.url)) { candidates.push(candidate); seen.add(candidate.url); }
+      }
+      candidates = candidates.slice(0, 8);
+    }
   }
   if (!urls.length) {
     const why = !lessonId ? 'no_lesson_id' : !token ? 'no_token' : 'no_urls';
     log(why);
-    return { ok: false, files: [], urls: [], token, headers, stage: why };
+    return { ok: false, files: [], urls: [], candidates, token, headers, stage: why };
   }
 
   // Download same-origin attachments inline (real cookies); leave cross-origin
@@ -834,10 +1062,10 @@ async function listMaterialUrls(lessonId, taskText, homeworkItemId) {
   }
   if (!files.length && !crossOrigin.length) {
     log(sawAuth ? 'auth_redirect' : 'download_failed', urls);
-    return { ok: false, files: [], urls: [], token, headers, stage: sawAuth ? 'auth_redirect' : 'download_failed' };
+    return { ok: false, files: [], urls: [], candidates, token, headers, stage: sawAuth ? 'auth_redirect' : 'download_failed' };
   }
   log('ok', { files: files.map((f) => f.name), crossOrigin });
-  return { ok: true, files, urls: crossOrigin, token, headers, stage };
+  return { ok: true, files, urls: crossOrigin, candidates, token, headers, stage };
 }
 
 /**
@@ -872,7 +1100,10 @@ async function debugFetch(lessonId) {
       } catch { /* blocked */ }
       return hints.slice(0, 12);
     })(),
-    domFileLinks: scanPageForFileLinks(),
+    domFileLinks: (() => {
+      const found = scanPageForFileLinks();
+      return [...found.urls, ...found.candidates.map((candidate) => candidate.url)];
+    })(),
     domAnchorCount: document.querySelectorAll('a[href]').length
   };
   let apiUrls = [];
@@ -912,11 +1143,36 @@ async function debugFetch(lessonId) {
   for (const url of candidates) {
     const p = { url, sameOrigin: isSameOrigin(url) };
     try {
-      const res = await fetch(url, { credentials: 'include' });
+      const safe = allowedAttachmentUrl(url);
+      if (!safe) { p.error = 'URL rejected'; out.probes.push(p); continue; }
+      const ctrl = new AbortController();
+      const res = await fetch(safe.href, { credentials: 'include', redirect: 'error', signal: ctrl.signal });
       p.status = res.status;
       p.contentType = (res.headers.get('content-type') || '').split(';')[0];
-      const blob = await res.blob();
-      p.sizeKB = Math.round(blob.size / 102.4) / 10;
+      // Diagnostics must not become a bypass around the production streaming
+      // cap. Count bytes without retaining chunks, and stop at the largest
+      // per-file ceiling used by automatic downloads.
+      let total = 0;
+      const declared = res.headers.get('content-length');
+      if (declared && /^\d+$/.test(declared.trim()) && Number(declared) > MAX_AUDIO_UPLOAD_BYTES) {
+        p.tooLarge = true;
+        ctrl.abort();
+      } else {
+        const reader = res.body?.getReader();
+        if (!reader) { p.error = 'response body unavailable'; out.probes.push(p); continue; }
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value?.byteLength || 0;
+          if (total > MAX_AUDIO_UPLOAD_BYTES) {
+            p.tooLarge = true;
+            try { await reader.cancel('diagnostic size cap'); } catch { /* already closed */ }
+            ctrl.abort();
+            break;
+          }
+        }
+      }
+      p.sizeKB = Math.round(total / 102.4) / 10;
       p.looksHtml = (p.contentType || '').includes('html');
     } catch (e) { p.error = String(e); }
     out.probes.push(p);
@@ -927,9 +1183,16 @@ async function debugFetch(lessonId) {
 /* ---------- Entry point ---------- */
 
 function scanHomeworks() {
+  homeworkRowContexts.clear();
   const dom = scanFromDom();
-  if (dom) return dom;
-  return scanFromText() || { day: null, subjects: [], days: [] };
+  const result = dom || scanFromText() || { day: null, subjects: [], days: [] };
+  // Older text-only layouts have no safe DOM ownership subtree, but still need
+  // a unique row identity for popup → dashboard matching. Their attachment DOM
+  // fallback therefore yields candidates only.
+  for (const group of result.days || []) {
+    for (const item of group.subjects || []) if (!item.rowToken) item.rowToken = mintRowToken();
+  }
+  return result;
 }
 
 function debugScan() {
@@ -1545,16 +1808,40 @@ function boxInfo(el) {
   };
 }
 
-// Read-back honesty check: did a write actually populate the box? Returns true
-// only when the box now holds SOME content. A МЭШ MyScript formula box silently
-// drops a value-set (its canvas model is separate), leaving the box empty — this
-// catches that so it's reported as skipped (⚠), not a false «filled» (✓). Lenient
-// on the exact text so a widget that reformats the value isn't a false negative.
-function valueTook(el) {
+// This is the explicitly allowed set of reformatted equivalents for an answer:
+// normalised case/ё/dashes/decimal separator, whitespace-free equality, or the
+// same finite number. Anything looser (the old any-non-empty check) lets a
+// controlled widget revert to a stale wrong value and still report a false ✓.
+function answerValueMatches(got, want) {
+  const comparable = (value) => normalize(String(value ?? ''))
+    .toLowerCase().replace(/ё/g, 'е').replace(/[−–—]/g, '-');
+  const gotNorm = comparable(got);
+  const wantNorm = comparable(want);
+  if (gotNorm === wantNorm) return true;
+  const gotCompact = gotNorm.replace(/\s/g, '');
+  const wantCompact = wantNorm.replace(/\s/g, '');
+  if (gotCompact === wantCompact) return true;
+  if (!gotCompact || !wantCompact) return false;
+  // Decimal comma is an allowed equivalent for numeric answers only. Applying
+  // it to arbitrary text would incorrectly equate punctuation ("да, нет" and
+  // "да. нет"). Invalid/multi-separator forms remain NaN and fail closed.
+  const gotNumber = Number(gotCompact.replace(',', '.'));
+  const wantNumber = Number(wantCompact.replace(',', '.'));
+  return Number.isFinite(gotNumber) && Number.isFinite(wantNumber) && gotNumber === wantNumber;
+}
+
+function answerBoxValue(el) {
   let got = '';
   try { got = String(el.value ?? '').trim(); } catch { /* not a value element */ }
   if (!got) { try { got = normalize(el.textContent || ''); } catch { /* */ } }
-  return got.length > 0;
+  return got;
+}
+
+// Read-back honesty check after the framework's settle window. Success means
+// the intended answer (or one of answerValueMatches' explicit equivalents) is
+// actually present. A merely changed non-empty value is not evidence of that.
+function valueTook(el, want) {
+  return answerValueMatches(answerBoxValue(el), want);
 }
 
 // Don't act on a "not visible, scroll" sentinel or an empty answer.
@@ -1563,28 +1850,41 @@ function isUnfillableAnswer(ans) {
 }
 
 // Fill one discovered unit from one question. Returns true only on a real edit.
-function fillUnit(unit, question) {
+function fillUnit(unit, question, pendingVerify) {
   const ans = String(question.answer ?? '').trim();
   if (isUnfillableAnswer(ans)) return false;
 
   if (unit.type === 'text') {
     const inputs = unit.inputs.filter((i) => i && document.documentElement.contains(i));
     if (!inputs.length) return false;
-    // One box — the whole answer goes in. Report ✓ only if it actually took, so a
-    // MyScript formula box that silently drops the value shows ⚠, not a false ✓.
-    if (inputs.length === 1) { setNativeValue(inputs[0], ans); return valueTook(inputs[0]); }
+    // One box — the whole answer goes in. Verification is deliberately deferred
+    // until React/MyScript has had one settle window in which to accept or revert.
+    if (inputs.length === 1) {
+      setNativeValue(inputs[0], ans);
+      pendingVerify.push({ el: inputs[0], want: ans });
+      return true;
+    }
     // Several boxes for ONE question (system, multiple roots, several blanks):
     // spread the per-field values across them by label, then screen order.
     const values = distributeFieldValues(question, inputs);
     let wrote = false;
     inputs.forEach((inp, k) => {
-      if (values[k] != null && values[k] !== '') { setNativeValue(inp, values[k]); wrote = true; }
+      if (values[k] != null && values[k] !== '') {
+        setNativeValue(inp, values[k]);
+        pendingVerify.push({ el: inp, want: values[k] });
+        wrote = true;
+      }
     });
     // Couldn't split (no parts, unparseable) → put the full answer in the first
     // box so something still lands, matching the legacy single-box fallback.
-    if (!wrote) setNativeValue(inputs[0], ans);
-    // Honest result: ✓ only if at least one box actually ended up populated.
-    return inputs.some(valueTook);
+    if (!wrote) {
+      setNativeValue(inputs[0], ans);
+      pendingVerify.push({ el: inputs[0], want: ans });
+      wrote = true;
+    }
+    // Optimistic only for unit ownership; the delayed every-box check below
+    // decides whether this question remains ✓ or is honestly demoted to ⚠.
+    return wrote;
   }
 
   if (unit.type === 'select') {
@@ -1630,7 +1930,9 @@ function fillUnit(unit, question) {
       if (options[idx]) targets.add(options[idx].input);
     }
     if (!targets.size) return false;
-    for (const o of options) if (targets.has(o.input)) setCheckbox(o.input, true);
+    // Re-solving must also turn stale earlier choices OFF; otherwise МЭШ grades
+    // the old wrong checks alongside new targets despite our better answer.
+    for (const o of options) setCheckbox(o.input, targets.has(o.input));
     return true;
   }
 
@@ -1644,10 +1946,10 @@ function fillUnit(unit, question) {
 /**
  * Fill the Mesh test form from the model's answers. Matches each question to a
  * discovered unit by its number first, then by position. Never guesses past the
- * confidence threshold and never submits. Returns { filled, skipped } as lists
- * of question identifiers (the `index` field, or 1-based position when absent).
+ * confidence threshold and never submits. Returns a Promise resolving to
+ * { filled, skipped, diag }, with identifiers from `index` or 1-based position.
  */
-function fillTestAnswers(questions) {
+async function fillTestAnswers(questions) {
   const summary = { filled: [], skipped: [] };
   if (!Array.isArray(questions) || !questions.length) return summary;
 
@@ -1689,6 +1991,7 @@ function fillTestAnswers(questions) {
   const acceptable = (u, id) =>
     u && !used.has(u) && (!pageHasNumbers || u.number == null || String(u.number) === String(id));
 
+  const pendingVerify = [];
   questions.forEach((q, qi) => {
     const id = idFor(q, qi);
     let unit = byNumber.get(String(id));
@@ -1702,10 +2005,32 @@ function fillTestAnswers(questions) {
     if (!unit || used.has(unit)) { summary.skipped.push(id); return; }
 
     let ok = false;
-    try { ok = fillUnit(unit, q); } catch { ok = false; }
-    if (ok) { used.add(unit); summary.filled.push(id); }
+    const writes = [];
+    try { ok = fillUnit(unit, q, writes); } catch { ok = false; }
+    if (ok) {
+      used.add(unit);
+      summary.filled.push(id);
+      if (writes.length) pendingVerify.push({ id, writes });
+    }
     else summary.skipped.push(id);
   });
+
+  if (pendingVerify.length) {
+    // One shared window is enough: controlled components revert on the next
+    // tick/frame, and per-box sleeps would make large forms needlessly slow.
+    await __smeshSleep(80);
+    const demoted = pendingVerify
+      .filter((group) => !group.writes.every(({ el, want }) => valueTook(el, want)))
+      .map((group) => group.id);
+    for (const id of demoted) {
+      const at = summary.filled.indexOf(id);
+      if (at !== -1) summary.filled.splice(at, 1);
+      if (!summary.skipped.includes(id)) summary.skipped.push(id);
+    }
+    if (demoted.length && SMESH_DEBUG) try {
+      console.log('[СМЭШ AI fill] verification demoted:', demoted);
+    } catch { /* console unavailable */ }
+  }
 
   dbg('[СМЭШ AI fill] result:', summary);
   // Attach a per-unit diagnostic so the worker can log it from ITS console
@@ -1782,9 +2107,9 @@ window.__smeshDebugUnits = debugUnits;
  *   • ARIA radio groups — role=radiogroup → role=radio rendered from <div>s;
  *   • MUI toggle groups — role=group → <button aria-pressed> (single/multi choice).
  *
- * These need an ASYNC interaction (open the popper, wait a frame, click the
- * option), so they CAN'T live in the synchronous fillTestAnswers. They run as a
- * SEPARATE pass AFTER it (worker: fillInteractiveAllFrames), and are told which
+ * These need a multi-step ASYNC interaction (open the popper, wait a frame,
+ * click the option), so they stay out of the native write/settle pass. They run
+ * as a SEPARATE pass AFTER it (worker: fillInteractiveAllFrames), and are told which
  * question ids an earlier pass already filled so we never re-open / toggle one
  * back off. Best-effort throughout: anything not confidently matched is left for
  * the copy-paste panel, and the form is NEVER submitted.
@@ -1800,7 +2125,7 @@ function findDropdownTriggers() {
   const seen = new Set();
   const add = (el) => {
     if (!el || seen.has(el)) return;
-    if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;     // native: sync fill owns it
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName)) return;     // native fill owns it
     if (el.closest && el.closest('select')) return;
     if (!isVisible(el)) return;
     if (el.getAttribute && el.getAttribute('aria-disabled') === 'true') return;
@@ -2020,7 +2345,9 @@ async function fillInteractiveUnit(unit, question) {
     for (const o of opts) {
       const want = targets.has(o.el);
       const isOn = o.el.getAttribute('aria-pressed') === 'true';
-      if (want && !isOn) { try { o.el.click(); } catch { /* */ } }
+      // Re-solving must clear stale buttons from our earlier attempt as well as
+      // enable new targets, or МЭШ grades both the old wrong and new choices.
+      if (want !== isOn) { try { o.el.click(); } catch { /* */ } }
     }
     return true;
   }
@@ -2082,8 +2409,8 @@ window.__smeshFillInteractive = fillInteractiveAnswers;
  * these two globals in each frame:
  *   __smeshPageSig — a signature of THIS frame's current question, so the loop
  *                    can tell whether a click actually advanced the page;
- *   __smeshNext    — finds and clicks a forward control, and NEVER a submit /
- *                    finish one (that's the user's call, not ours).
+ *   __smeshNextDiscovery — reports forward controls without mutating the page;
+ *   __smeshNextClick     — re-validates and clicks one enabled control only.
  * ===================================================================== */
 
 // Forward ("next") vs finish ("submit the whole test"). Matched against text
@@ -2154,34 +2481,54 @@ function pageSignature() {
 }
 
 /**
- * Find and click a forward control in THIS frame. Returns:
- *   { status: 'clicked' } — a «Далее»-style control was clicked (page advances)
- *   { status: 'finish'  } — only a submit/finish control is present; NOT clicked
- *   { status: 'none'    } — no forward control in this frame
- * Never clicks a finish/submit control.
+ * Read-only discovery for THIS frame. The worker compares these counts across
+ * frames before it targets the separate clickDiscoveredPagination phase.
  */
-function paginateNext() {
+function discoverPagination() {
+  const sel = 'button, a[href], [role="button"], input[type="button"], input[type="submit"], [tabindex]';
+  let candidates = [];
+  try { candidates = Array.from(document.querySelectorAll(sel)); }
+  catch { return { candidateCount: 0, enabledCount: 0, disabledState: [], finishCount: 0, signature: '' }; }
+  const next = [];
+  let finishCount = 0;
+  for (const el of candidates) {
+    if (!isVisible(el)) continue;
+    const c = classifyNavControl(el);
+    if (c === 'finish') finishCount++;
+    else if (c === 'next') next.push(el);
+  }
+  const enabled = next.filter(isNavClickable);
+  let hasTestSignature = false;
+  try {
+    hasTestSignature = collectQuestionMarkers().length > 0 || collectUnits().length > 0 ||
+      /(?:вопрос|задани[ея])\s*[№#]?\s*\d{1,3}/i.test(document.body?.innerText || '');
+  } catch { /* a frame without readable test state gets no preference */ }
+  return {
+    candidateCount: next.length,
+    enabledCount: enabled.length,
+    disabledState: next.map((el) => !isNavClickable(el)),
+    finishCount,
+    signature: hasTestSignature ? pageSignature() : ''
+  };
+}
+
+function clickDiscoveredPagination() {
   const sel = 'button, a[href], [role="button"], input[type="button"], input[type="submit"], [tabindex]';
   let candidates = [];
   try { candidates = Array.from(document.querySelectorAll(sel)); } catch { return { status: 'none' }; }
-  let nextEl = null;
-  let sawFinish = false;
-  for (const el of candidates) {
-    if (!isNavClickable(el)) continue;
-    const c = classifyNavControl(el);
-    if (c === 'finish') sawFinish = true;
-    else if (c === 'next' && !nextEl) nextEl = el; // first forward control in DOM order
-  }
-  if (nextEl) {
-    try { nextEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch { /* */ }
-    try { nextEl.click(); } catch { return { status: 'none' }; }
-    return { status: 'clicked' };
-  }
-  return { status: sawFinish ? 'finish' : 'none' };
+  const enabled = candidates.filter((el) => isNavClickable(el) && classifyNavControl(el) === 'next');
+  // DOM may have changed between discovery and click. Requiring exactly one
+  // candidate again makes that race fail closed instead of clicking a guess.
+  if (enabled.length !== 1) return { status: 'none' };
+  const nextEl = enabled[0];
+  try { nextEl.scrollIntoView({ block: 'center', inline: 'center' }); } catch { /* */ }
+  try { nextEl.click(); } catch { return { status: 'none' }; }
+  return { status: 'clicked' };
 }
 
 window.__smeshPageSig = pageSignature;
-window.__smeshNext = paginateNext;
+window.__smeshNextDiscovery = discoverPagination;
+window.__smeshNextClick = clickDiscoveredPagination;
 
 // Guard against duplicate listeners: the manifest auto-injects this script,
 // and popup.js falls back to chrome.scripting.executeScript on a race. Without
@@ -2212,9 +2559,9 @@ if (!window.__smeshListenerAdded) {
         // Async: keep the channel open until the API call resolves. Only
         // discovers URLs — the service worker downloads them (see comment above
         // listMaterialUrls for the MV3 CORS reason).
-        listMaterialUrls(msg.homeworkId, msg.task, msg.homeworkItemId)
+        listMaterialUrls(msg.homeworkId, msg.task, msg.homeworkItemId, msg.rowToken)
           .then((r) => sendResponse(r))
-          .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], token: null }));
+          .catch((e) => sendResponse({ ok: false, error: String(e), urls: [], candidates: [], token: null }));
         return true;
       }
       if (msg && msg.type === 'SHOW_ANSWERS') {

@@ -1,6 +1,6 @@
 /**
  * Routes a detected subject to a prompt category, and assembles the final
- * system prompt (preferring user overrides stored in chrome.storage.local).
+ * system prompt exclusively from trusted, packaged instructions.
  *
  * Routing is keyword/substring-based, not exact-match. Mesh exposes subject
  * names in several forms ("Английский язык" vs "Иностранный (английский)
@@ -29,11 +29,10 @@ export function categoryForSubject(subject) {
   return PROMPT_CATEGORIES.WORKED_SOLUTION;
 }
 
-/** Get the base prompt text for a subject (override-aware). */
+/** Get the packaged base prompt for a subject. Stored text is never consulted. */
 export async function basePromptForSubject(subject) {
   const category = categoryForSubject(subject);
-  const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
-  return promptOverrides[category] || DEFAULT_PROMPTS[category];
+  return DEFAULT_PROMPTS[category];
 }
 
 // Universal guard appended to every solve. Rides along in the same call —
@@ -75,12 +74,14 @@ const MODE_INSTRUCTIONS = {
 };
 
 /**
- * Build the system prompt for a subject, using overrides if available.
+ * Build the system prompt for a subject from packaged, allowlisted values only.
  * @param {string} subject
  * @param {string} [mode] one of ANSWER_MODES (defaults to brief)
  */
 export async function buildSystemPrompt(subject, mode = ANSWER_MODES.BRIEF) {
   const base = await basePromptForSubject(subject);
   const modeText = MODE_INSTRUCTIONS[mode] || MODE_INSTRUCTIONS[ANSWER_MODES.BRIEF];
-  return `${base}\n\n${CONTEXT_GUARD}\n\n${modeText}\n\nПредмет: ${subject}.`;
+  // `subject` selects a category but is deliberately not interpolated here:
+  // it originates on the page and therefore belongs in user-role task data.
+  return `${base}\n\n${CONTEXT_GUARD}\n\n${modeText}`;
 }

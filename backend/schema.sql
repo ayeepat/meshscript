@@ -7,15 +7,24 @@
 
 -- One row per extension install. device_id is the same anonymous UUID the
 -- extension already sends to /verify and /referral/*.
+--
+-- Data minimization (2026-07): `ua` and `license_key` are DEAD columns — the
+-- ingest writes NULL to ua and never binds a raw key anymore. New installs get
+-- `license_ref` instead: HMAC-SHA256(license_key, ANALYTICS_SALT secret),
+-- computed server-side ONLY when a legacy client still posts the raw key.
+-- Migration on an existing DB:
+--   ALTER TABLE devices ADD COLUMN license_ref TEXT;
+--   UPDATE devices SET ua = NULL, license_key = NULL;  -- purge collected raws
 CREATE TABLE IF NOT EXISTS devices (
   device_id    TEXT PRIMARY KEY,
   first_seen   INTEGER NOT NULL,          -- ms epoch
   last_seen    INTEGER NOT NULL,          -- ms epoch
   browser      TEXT,                      -- chrome | yandex | opera | edge | firefox | other
-  ua           TEXT,                      -- raw UA, for debugging odd browsers
+  ua           TEXT,                      -- LEGACY, always NULL now (raw UA is not stored)
   version      TEXT,                      -- extension version
   provider     TEXT,                      -- last selected AI provider
-  license_key  TEXT,                      -- last known key on this device (may be null)
+  license_key  TEXT,                      -- LEGACY, never written (see license_ref)
+  license_ref  TEXT,                      -- HMAC pseudonym of the license key (may be null)
   license_type TEXT                       -- lifetime | subscription | none
 );
 
@@ -71,4 +80,15 @@ CREATE TABLE IF NOT EXISTS proxy_quota (
   provider    TEXT    NOT NULL,           -- qwen | deepseek | 'all' (global row)
   count       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, license_key, provider)
+);
+
+-- Atomic abuse budgets for the anonymous telemetry endpoint. KV read-modify-
+-- write counters lose increments under concurrency; this table makes every
+-- admission decision against one authoritative row. Old days can be pruned.
+CREATE TABLE IF NOT EXISTS telemetry_budget (
+  day        TEXT    NOT NULL,
+  scope      TEXT    NOT NULL,          -- ip | device
+  budget_key TEXT    NOT NULL,
+  count      INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (day, scope, budget_key)
 );

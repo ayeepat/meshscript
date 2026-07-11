@@ -113,3 +113,67 @@ export async function listMessages(sessionId) {
     return [...msgs].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
   });
 }
+
+/* ---------------------- scheduled retention sweep ---------------------- */
+
+// prune() only runs when someone touches the history. A student who stops
+// using the extension would keep week scans and (base64-heavy) pendingUpload
+// handoffs plus lookup caches forever — so the service worker also calls this
+// on an alarm.
+const WEEK_HOMEWORK_TTL_MS = 24 * 60 * 60 * 1000;
+const PENDING_UPLOAD_TTL_MS = 60 * 60 * 1000;
+const USER_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+// These storage-owned shapes avoid imports from their feature modules:
+// taskClassCache and gdzTaskCache both map opaque keys to {v:<value>,at:number}.
+// Bare legacy values have no defensible age, so the sweep deliberately drops them.
+function pruneTimestampedCache(cache, cutoff) {
+  if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return null;
+  const fresh = {};
+  for (const [key, entry] of Object.entries(cache)) {
+    if (entry && typeof entry === 'object' && Number.isFinite(entry.at) && entry.at >= cutoff) {
+      fresh[key] = entry;
+    }
+  }
+  return fresh;
+}
+
+export async function cleanupLocalData() {
+  // Rewriting the history object through the mutation queue applies the 7-day
+  // prune even when nothing else reads it.
+  await mutateState(() => null).catch(() => {});
+  try {
+    const { weekHomework, pendingUpload, taskClassCache, gdzTaskCache } =
+      await chrome.storage.local.get(['weekHomework', 'pendingUpload', 'taskClassCache', 'gdzTaskCache']);
+    const stale = [];
+    const updates = {};
+    const age = (ts) => (Number.isFinite(ts) ? Date.now() - ts : Infinity);
+    if (weekHomework && age(weekHomework.scannedAt) > WEEK_HOMEWORK_TTL_MS) stale.push('weekHomework');
+    // pendingUpload is a one-use popup→dashboard handoff carrying base64 file
+    // bodies; anything older than its TTL is an orphan (the dashboard deletes
+    // it on read).
+    if (pendingUpload && age(pendingUpload.ts) > PENDING_UPLOAD_TTL_MS) stale.push('pendingUpload');
+    const cacheCutoff = Date.now() - USER_CACHE_TTL_MS;
+    for (const [key, cache] of [['taskClassCache', taskClassCache], ['gdzTaskCache', gdzTaskCache]]) {
+      if (cache == null) continue;
+      const fresh = pruneTimestampedCache(cache, cacheCutoff);
+      if (fresh) updates[key] = fresh;
+      else stale.push(key); // malformed storage is no more usable than a legacy entry
+    }
+    if (Object.keys(updates).length) await chrome.storage.local.set(updates);
+    if (stale.length) await chrome.storage.local.remove(stale);
+  } catch { /* storage hiccup — next sweep retries */ }
+}
+
+/**
+ * The settings «Удалить все локальные данные» button. Wipes everything the
+ * extension accumulated about the student's usage; deliberately KEEPS the
+ * license key, API keys, consent record and preferences — those are settings,
+ * not collected data. Public GDZ catalog/link metadata is also kept because it
+ * describes books, not which exercises the student looked up.
+ */
+export async function deleteAllLocalData() {
+  await chrome.storage.local.remove([
+    STORAGE_KEY, 'weekHomework', 'pendingUpload', 'taskClassCache', 'gdzTaskCache', 'tmLastHb'
+  ]);
+}

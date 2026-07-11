@@ -54,8 +54,10 @@ replayed history), the client slices the whole `messages` JSON into **8 KB**
   verified reading PDFs on 302.AI), since neither Qwen nor DeepSeek can.
 - `setup.sh` — one-shot installer for Ubuntu 22.04/24.04. Installs Node +
   Caddy, drops `server.js`, a systemd unit, and a Caddyfile, and starts it.
-  **Embeds a copy of `server.js`** — keep them in sync (re-splice the heredoc
-  if you edit `server.js`).
+  **Embeds a generated copy of `server.js`** — after editing `server.js`, run
+  `npm run sync:vps`. `npm test` and the push/pull-request CI workflow run
+  `tests/vps-setup-parity.mjs`, so the deployable copy cannot drift from the
+  canonical file unnoticed.
 
 ## Caddy: HTTP/1.1-only + `Connection: close` — load-bearing, do not "fix"
 The DPI clamp is per-CONNECTION: Chrome pools one TLS connection per origin,
@@ -74,7 +76,7 @@ GCP project `project-2bc53756-d2a7-40e9-be4` (account ermd219@gmail.com), instan
 3. Cloudflare DNS: point `ai.smeshapi.site` → static IP, **DNS only (grey cloud)**.
 4. `gcloud compute scp setup.sh smesh-ai-proxy:/tmp/ --zone=europe-west3-a`, then
    `gcloud compute ssh smesh-ai-proxy --zone=europe-west3-a --command="bash /tmp/setup.sh"`.
-5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key → `sudo systemctl restart smesh-proxy`.
+5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key AND `INGEST_KEY` (same value as the worker secret `npx wrangler secret put INGEST_KEY`; enables server-truth usage reporting to POST /t/ai for the owner dashboard) → `sudo systemctl restart smesh-proxy`.
 6. Verify: `curl -s https://ai.smeshapi.site/health` → `{"ok":true}`.
 7. Update deploy: `gcloud compute scp server.js smesh-ai-proxy:/tmp/ --zone=europe-west3-a`, then
    `sudo install -m 644 /tmp/server.js /opt/smesh-proxy/server.js && sudo systemctl restart smesh-proxy`.

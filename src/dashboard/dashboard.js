@@ -10,7 +10,13 @@ import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge } from '../common/provider-badge.js';
 import { isPdfFile } from '../lib/file-kinds.js';
-import { assertUploadAllowed } from '../lib/upload-limits.js';
+import { isGdzApiUrl, isGdzHumanUrl } from '../lib/gdz-hosts.js';
+import {
+  assertUploadAllowed,
+  deduplicateRequestFiles,
+  MAX_AUDIO_UPLOAD_BYTES,
+  validateRequestFileBudget
+} from '../lib/upload-limits.js';
 
 // Tiny "which AI service is active" tag next to the theme switch in the header.
 mountProviderBadge('provBadge');
@@ -22,21 +28,34 @@ document.addEventListener('themechange', (e) => {
 initTheme();
 
 const params = new URLSearchParams(location.search);
-const initialSubject = params.get('subject') || '';
-const initialTask = params.get('task') || '';
-const initialDay = params.get('day') || '';
-const initialHomeworkId = params.get('homeworkId') || '';
-const initialHomeworkItemId = params.get('homeworkItemId') || '';
+const launchPayload = await (async () => {
+  const launch = params.get('launch');
+  if (!launch) return {};
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'CONSUME_DASH_LAUNCH',
+      payload: { id: launch }
+    });
+    return response?.ok && response.payload ? response.payload : {};
+  } catch { return {}; }
+})();
+const initialSubject = launchPayload.subject || '';
+const initialTask = launchPayload.task || '';
+const initialDay = launchPayload.day || '';
+const initialHomeworkId = launchPayload.homeworkId || '';
+const initialHomeworkItemId = launchPayload.homeworkItemId || '';
+const initialRowToken = launchPayload.rowToken || '';
 
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
 const weekEl = document.getElementById('week');
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
-// key -> { key, day, subject, task, homeworkId, homeworkItemId, sessionId, history, started, pending }
+// key -> { key, day, subject, task, homeworkId, homeworkItemId, rowToken, sessionId, history, started, pending }
 const chats = new Map();
 let activeKey = null;
 let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
+let weekDataError = '';
 
 function taskPrefix(task, len = 40) {
   return (task || '').replace(/\s+/g, ' ').trim().slice(0, len);
@@ -44,27 +63,17 @@ function taskPrefix(task, len = 40) {
 
 // Task plus Mesh row ids are part of the key: one subject/lesson can have
 // several homework rows in a day, and their first 40 chars can be similar.
-const keyFor = (day, subject, task, homeworkId = '', homeworkItemId = '') => {
-  const row = homeworkItemId || `${homeworkId || 'noid'}:${taskPrefix(task, 80)}`;
+const keyFor = (day, subject, task, homeworkId = '', homeworkItemId = '', rowToken = '') => {
+  const row = rowToken || homeworkItemId || `${homeworkId || 'noid'}:${taskPrefix(task, 80)}`;
   return `${day || '?'}||${subject}||${row}`;
 };
 const activeChat = () => chats.get(activeKey);
 
-// The task string scraped into the week can differ from the one passed via the
-// Solve URL by whitespace or truncation. Compare on a normalized 40-char prefix
-// only as a fallback when Mesh row ids are missing, so a file the user attached
-// for THIS solve isn't silently dropped over a trivial text mismatch.
-const normTask = (t) => taskPrefix(t, 40);
-
 function sameMeshRow(upload, chat) {
-  if (upload?.homeworkItemId && chat.homeworkItemId) {
-    return String(upload.homeworkItemId) === String(chat.homeworkItemId);
-  }
-  if (upload?.homeworkId && chat.homeworkId) {
-    return String(upload.homeworkId) === String(chat.homeworkId) &&
-      (!upload.task || normTask(upload.task) === normTask(chat.task));
-  }
-  return !upload?.task || normTask(upload.task) === normTask(chat.task);
+  // pendingUpload may contain another lesson/child's file. A scan-generated row
+  // token is the only identity accepted; subject/task similarity is display
+  // data, not ownership evidence.
+  return !!upload?.rowToken && !!chat.rowToken && upload.rowToken === chat.rowToken;
 }
 
 /* ---------- Minimal safe markdown renderer (no external libs) ---------- */
@@ -415,7 +424,10 @@ function gdzCardEl(chat) {
       });
       block.appendChild(im);
     }
-    if (a.link) {
+    // Defense in depth: the background resolver already builds the GDZ link,
+    // but chat history / storage are mutable. Never render an arbitrary href
+    // from stored answer data into a prominent "Открыть на ГДЗ" action.
+    if (a.link && (isGdzHumanUrl(a.link) || isGdzApiUrl(a.link))) {
       const link = document.createElement('a');
       link.href = a.link;
       link.target = '_blank';
@@ -486,11 +498,22 @@ function fileToInline(file) {
  * runs again over a fresh port.
  */
 function runSolveAttempt(chat, task, files, history) {
+  const deduped = deduplicateRequestFiles(files, history);
+  files = deduped.files;
+  history = deduped.history;
+  const budget = validateRequestFileBudget(deduped.allFiles);
+  if (!budget.ok) {
+    chat.history.push({ role: 'assistant', content: budget.error, error: false });
+    if (activeKey === chat.key) bubble('assistant', budget.error);
+    renderSidebar();
+    return Promise.resolve();
+  }
   chat.pending = true;
   if (activeKey === chat.key) chat.thinkingEl = thinkingBubble();
   // PDFs are the slowest attachments to solve — a quick, kind heads-up so the
   // wait doesn't read as a stuck/broken UI.
-  if (activeKey === chat.key && (files || []).some(isPdfFile)) {
+  const replayHasPdf = history.some((m) => m?.files?.some(isPdfFile));
+  if (activeKey === chat.key && ((files || []).some(isPdfFile) || replayHasPdf)) {
     showToast('Извините, PDF иногда решается дольше обычного — не закрывайте вкладку, я продолжаю решать в фоне.');
   }
   renderSidebar();
@@ -636,15 +659,19 @@ async function startLesson(chat) {
   let files = [];
   try {
     const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
+    // One-use handoff: consume it on FIRST read no matter what — an unmatched
+    // or expired payload must not linger (base64 file bodies) waiting for a
+    // future lesson to mis-claim it. The retention alarm is only the backstop.
+    if (pendingUpload) await chrome.storage.local.remove('pendingUpload');
     // Files come from the popup: manually attached OR auto-fetched from Mesh.
-    // Match on Mesh row ids when available, then fall back to task text. A
-    // subject can have several homeworks on one day, sometimes in one lesson.
+    // The scan-generated row token is the ownership boundary; stale subject/day
+    // text must never make another row's file look like a match.
+    const fresh = Number.isFinite(pendingUpload?.ts)
+      ? Date.now() - pendingUpload.ts <= 60 * 60 * 1000
+      : true; // legacy handoff without ts — honour it once, it's gone now anyway
     const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
-    if (pending.length && pendingUpload.subject === chat.subject &&
-        (!pendingUpload.day || pendingUpload.day === chat.day) &&
-        sameMeshRow(pendingUpload, chat)) {
+    if (fresh && pending.length && sameMeshRow(pendingUpload, chat)) {
       files = pending; // the attachment chip (added by bubble) shows the file
-      await chrome.storage.local.remove('pendingUpload');
     }
   } catch (_e) { /* upload is best-effort */ }
 
@@ -677,7 +704,10 @@ async function activateLesson(key) {
 function renderSidebar() {
   weekEl.innerHTML = '';
   if (!chats.size) {
-    weekEl.innerHTML = '<p class="hintmsg">Нет данных о неделе. Откройте попап на странице дневника, чтобы просканировать домашние задания.</p>';
+    const hint = document.createElement('p');
+    hint.className = 'hintmsg';
+    hint.textContent = weekDataError || 'Нет данных о неделе. Откройте попап на странице дневника, чтобы просканировать домашние задания.';
+    weekEl.appendChild(hint);
     return;
   }
   // Group lessons by day (first-seen order) so a lesson added out of insertion
@@ -781,12 +811,16 @@ document.addEventListener('paste', async (e) => {
 // is attached like any file; the service worker runs Groq Whisper on it
 // (transcribeAudioFiles) and the normal solve path answers from the transcript.
 const micBtn = document.getElementById('mic');
+const MAX_REC_MS = 10 * 60 * 1000;
+const MAX_REC_BYTES = Math.floor(MAX_AUDIO_UPLOAD_BYTES * 0.95);
 let mediaRecorder = null;
 let recChunks = [];
+let recBytes = 0;
 let recStream = null;
 let recTimer = null;
 let recStart = 0;
 let discardRec = false;
+let recLimitMessage = '';
 
 // Prefer a codec Groq Whisper accepts; fall back to the browser default.
 function pickRecMime() {
@@ -802,9 +836,21 @@ function fmtTime(ms) {
 }
 
 function tickRecording() {
+  const elapsed = Date.now() - recStart;
+  if (elapsed >= MAX_REC_MS) {
+    stopRecordingForLimit('Запись остановлена: достигнут лимит 10 минут.');
+    return;
+  }
   fileChip.classList.add('recording');
   fileChip.hidden = false;
-  fileNameEl.textContent = `● Запись… ${fmtTime(Date.now() - recStart)}`;
+  fileNameEl.textContent = `● Запись… ${fmtTime(elapsed)} / ${fmtTime(MAX_REC_MS)}`;
+}
+
+function stopRecordingForLimit(message) {
+  if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
+  recLimitMessage = message;
+  try { mediaRecorder.stop(); }
+  catch { resetMicUi(); }
 }
 
 function resetMicUi() {
@@ -823,9 +869,13 @@ function flashChipError(text) {
 
 async function onRecordingStop() {
   const baseMime = ((mediaRecorder && mediaRecorder.mimeType) || 'audio/webm').split(';')[0];
+  const limitMessage = recLimitMessage;
+  recLimitMessage = '';
   resetMicUi();
   const chunks = recChunks;
   recChunks = [];
+  recBytes = 0;
+  if (limitMessage && !discardRec) showToast(limitMessage);
   if (discardRec || !chunks.length) {
     discardRec = false;
     pendingFile = null;
@@ -871,15 +921,27 @@ async function startRecording() {
   }
   const mimeType = pickRecMime();
   recChunks = [];
+  recBytes = 0;
   discardRec = false;
+  recLimitMessage = '';
   try {
     mediaRecorder = mimeType ? new MediaRecorder(recStream, { mimeType }) : new MediaRecorder(recStream);
   } catch {
     mediaRecorder = new MediaRecorder(recStream);
   }
-  mediaRecorder.ondataavailable = (ev) => { if (ev.data && ev.data.size) recChunks.push(ev.data); };
+  mediaRecorder.ondataavailable = (ev) => {
+    if (!ev.data?.size || recLimitMessage) return;
+    const nextBytes = recBytes + ev.data.size;
+    if (nextBytes <= MAX_AUDIO_UPLOAD_BYTES) {
+      recChunks.push(ev.data);
+      recBytes = nextBytes;
+    }
+    if (nextBytes >= MAX_REC_BYTES) {
+      stopRecordingForLimit('Запись остановлена: достигнут лимит размера.');
+    }
+  };
   mediaRecorder.onstop = onRecordingStop;
-  mediaRecorder.start();
+  mediaRecorder.start(1000);
   recStart = Date.now();
   micBtn.classList.add('recording');
   micBtn.title = 'Остановить запись';
@@ -894,6 +956,14 @@ micBtn.onclick = () => {
     startRecording();
   }
 };
+
+window.addEventListener('pagehide', () => {
+  if (mediaRecorder?.state === 'recording') {
+    discardRec = true;
+    try { mediaRecorder.stop(); } catch { /* already stopping */ }
+  }
+  resetMicUi();
+});
 
 async function sendFromComposer() {
   const chat = activeChat();
@@ -946,11 +1016,19 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
 
 /* ---------- Init: load week from the last popup scan ---------- */
 
+const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
+
 (async function init() {
   const { weekHomework } = await chrome.storage.local.get('weekHomework');
-  for (const group of weekHomework?.days || []) {
+  const scannedAt = weekHomework?.scannedAt;
+  const scanAge = Date.now() - scannedAt;
+  const freshWeek = Number.isFinite(scannedAt) && scanAge >= 0 && scanAge <= WEEK_SCAN_MAX_AGE_MS;
+  if (!freshWeek && weekHomework) {
+    weekDataError = 'Скан недели устарел. Откройте попап на текущей странице дневника и просканируйте задания заново.';
+  }
+  for (const group of freshWeek ? (weekHomework?.days || []) : []) {
     for (const item of group.subjects || []) {
-      const key = keyFor(group.day, item.subject, item.task, item.homeworkId, item.homeworkItemId);
+      const key = keyFor(group.day, item.subject, item.task, item.homeworkId, item.homeworkItemId, item.rowToken);
       if (!chats.has(key)) {
         chats.set(key, {
           key,
@@ -959,47 +1037,42 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
           task: item.task,
           homeworkId: item.homeworkId || '',
           homeworkItemId: item.homeworkItemId || '',
+          rowToken: item.rowToken || '',
           sessionId: null, history: [], started: false, pending: false
         });
       }
     }
   }
 
-  // Lesson the user pressed "Solve" on. Match it against the saved week,
-  // loosening the criteria step by step; if it's missing entirely (e.g.
-  // opened from an old link), add it so it still works.
+  // Lesson the user pressed "Solve" on. The row token was minted by this exact
+  // week scan and is the only accepted match. If it is absent/stale/missing we
+  // stop visibly instead of guessing by subject (which crossed rows/children).
   let startKey = null;
+  let openError = '';
   if (initialSubject) {
     const all = [...chats.values()];
-    const match =
-      (initialHomeworkItemId && all.find((c) =>
-        String(c.homeworkItemId || '') === String(initialHomeworkItemId) &&
-        c.subject === initialSubject
-      )) ||
-      (initialHomeworkId && all.find((c) =>
-        String(c.homeworkId || '') === String(initialHomeworkId) &&
-        c.day === initialDay && c.subject === initialSubject && normTask(c.task) === normTask(initialTask)
-      )) ||
-      all.find((c) => c.day === initialDay && c.subject === initialSubject && c.task === initialTask) ||
-      all.find((c) => c.subject === initialSubject && c.task === initialTask) ||
-      all.find((c) => c.subject === initialSubject);
+    const match = initialRowToken && freshWeek
+      ? all.find((c) => c.rowToken === initialRowToken)
+      : null;
     if (match) {
       startKey = match.key;
+    } else if (!freshWeek) {
+      openError = 'Скан домашних заданий устарел. Вернитесь в дневник, откройте попап СМЭШ AI и запустите свежий скан.';
+    } else if (!initialRowToken) {
+      openError = 'Не найден идентификатор строки задания. Откройте его заново из свежего списка в попапе СМЭШ AI.';
     } else {
-      startKey = keyFor(initialDay, initialSubject, initialTask, initialHomeworkId, initialHomeworkItemId);
-      chats.set(startKey, {
-        key: startKey,
-        day: initialDay,
-        subject: initialSubject,
-        task: initialTask,
-        homeworkId: initialHomeworkId,
-        homeworkItemId: initialHomeworkItemId,
-        sessionId: null, history: [], started: false, pending: false
-      });
+      openError = 'Задание не найдено в свежем скане недели. Откройте попап на текущей странице дневника и просканируйте задания заново.';
     }
   }
 
   renderSidebar();
   if (startKey) await activateLesson(startKey);
-  else renderChat(null);
+  else if (openError) {
+    titleEl.textContent = 'Задание не найдено';
+    chatEl.innerHTML = '';
+    const hint = document.createElement('p');
+    hint.className = 'hintmsg';
+    hint.textContent = openError;
+    chatEl.appendChild(hint);
+  } else renderChat(null);
 })();

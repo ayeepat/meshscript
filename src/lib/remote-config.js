@@ -1,50 +1,43 @@
 /**
- * Remote runtime config (background service worker only).
+ * Authenticated remote runtime config (background service worker only).
  *
- * Mesh (school.mos.ru) is a living React app — its DOM shifts without notice,
- * and a store re-publish to fix a broken scrape takes days of review. This lets
- * you push a hot-fix the SAME day: host a tiny JSON file on your site and the
- * extension picks it up within RUNTIME_CONFIG_TTL_MS, overriding the few values
- * most likely to break, plus an optional "please update" notice.
- *
- * Hard rules:
- *  - EVERYTHING is optional and validated. A 404, a wrong host, malformed JSON
- *    or a junk field changes nothing — the extension falls back to the values
- *    baked into this build. The remote file can only ever *narrow* the blast
- *    radius of a Mesh change, never widen it.
- *  - The config is data, not code. We never eval it; the selector is only ever
- *    passed to querySelector (which can't execute anything) and is length- and
- *    shape-checked first.
- *
- * Expected JSON shape (all keys optional):
- *   {
- *     "configVersion": 3,
- *     "homeworkAnchorSelector": "a[href*=\"/diary/homeworks/homeworks/\"]",
- *     "subjectVocabulary": ["Алгебра", "Геометрия", ...],
- *     "minExtensionVersion": "0.6.0",      // below this → popup shows update notice
- *     "notice": { "text": "…", "url": "https://…" }   // optional banner
- *   }
+ * The hosted document is a signed envelope, not bare config JSON:
+ *   { "payload": "<base64url UTF-8 JSON>", "signature": "<base64url P-256 signature>" }
+ * Signature verification happens before sanitization and on every cache read.
+ * Unsigned legacy caches and malformed/tampered envelopes fail closed.
  */
 
-import { RUNTIME_CONFIG_URL, RUNTIME_CONFIG_TTL_MS } from './config.js';
+import {
+  RUNTIME_CONFIG_URL,
+  RUNTIME_CONFIG_TTL_MS,
+  RUNTIME_CONFIG_PUBLIC_KEY_JWK
+} from './config.js';
+import { fetchBounded } from './bounded-fetch.js';
 
 const CACHE_KEY = 'runtimeConfig';
 const FETCH_TIMEOUT_MS = 8000;
+const FETCH_MAX_BYTES = 64 * 1024;
+const SIGNATURE_BYTES = 64; // WebCrypto ECDSA P-256 uses IEEE-P1363 r || s.
 
-// What the popup/scraper actually consume. Overrides default to null/empty so a
-// missing field cleanly means "use the value compiled into the extension".
+// Finite policy, deliberately duplicated in the classic content script as a
+// second trust-boundary check. Remote config may select a pre-reviewed DOM path;
+// it cannot invent a new querySelector program.
+export const APPROVED_HOMEWORK_SELECTORS = Object.freeze([
+  'a[href*="/diary/homeworks/homeworks/"]',
+  'a[href*="/diary/homeworks/"]',
+  'a[href*="/diary/homework/"]'
+]);
+
 function emptyConfig() {
   return {
     configVersion: 0,
-    subjectVocabulary: null,        // string[] | null
-    homeworkAnchorSelector: null,   // string | null
-    minExtensionVersion: null,      // "x.y.z" | null
-    notice: null,                   // { text, url? } | null
+    subjectVocabulary: null,
+    homeworkAnchorSelector: null,
+    minExtensionVersion: null,
+    notice: null,
     fetchedAt: 0
   };
 }
-
-/* ---------- validation (remote data is untrusted) ---------- */
 
 function cleanVocabulary(v) {
   if (!Array.isArray(v)) return null;
@@ -54,15 +47,10 @@ function cleanVocabulary(v) {
   return out.length ? out : null;
 }
 
-// A CSS selector, not arbitrary anything. Keep it short and restricted to the
-// character set real attribute/tag selectors use, so a hostile string can't even
-// be an interesting payload (querySelector can't execute, but defence in depth).
 function cleanSelector(s) {
   if (typeof s !== 'string') return null;
-  const t = s.trim();
-  if (!t || t.length > 200) return null;
-  if (!/^[\w\s.#>~+:*\[\]"'=^$|()\-\/,]+$/.test(t)) return null;
-  return t;
+  const selector = s.trim();
+  return APPROVED_HOMEWORK_SELECTORS.includes(selector) ? selector : null;
 }
 
 function cleanVersion(s) {
@@ -73,70 +61,131 @@ function cleanNotice(n) {
   if (!n || typeof n !== 'object') return null;
   const text = typeof n.text === 'string' ? n.text.trim().slice(0, 300) : '';
   if (!text) return null;
-  // Parse with URL() and keep the normalized href so a stray quote/space can't
-  // survive into the banner's href attribute. https only.
   let url = null;
   if (typeof n.url === 'string') {
     try { const u = new URL(n.url.trim()); if (u.protocol === 'https:') url = u.href; }
-    catch { /* not a valid URL — drop it */ }
+    catch { /* invalid URL — omit it */ }
   }
   return url ? { text, url } : { text };
 }
 
-function sanitize(raw) {
+export function sanitizeRuntimeConfig(raw, fetchedAt = Date.now()) {
   const cfg = emptyConfig();
-  if (raw && typeof raw === 'object') {
-    if (Number.isFinite(raw.configVersion)) cfg.configVersion = raw.configVersion;
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    if (Number.isSafeInteger(raw.configVersion) && raw.configVersion >= 0) {
+      cfg.configVersion = raw.configVersion;
+    }
     cfg.subjectVocabulary = cleanVocabulary(raw.subjectVocabulary);
     cfg.homeworkAnchorSelector = cleanSelector(raw.homeworkAnchorSelector);
     cfg.minExtensionVersion = cleanVersion(raw.minExtensionVersion);
     cfg.notice = cleanNotice(raw.notice);
   }
-  cfg.fetchedAt = Date.now();
+  cfg.fetchedAt = fetchedAt;
   return cfg;
 }
 
-/* ---------- fetch + cache ---------- */
+function decodeBase64Url(value, maxBytes) {
+  if (typeof value !== 'string' || !value || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  if (value.length > Math.ceil(maxBytes * 4 / 3) + 4) return null;
+  try {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - value.length % 4) % 4);
+    const binary = atob(padded);
+    if (binary.length > maxBytes) return null;
+    return Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  } catch { return null; }
+}
+
+let verificationKeyPromise = null;
+function verificationKey(publicJwk) {
+  if (publicJwk !== RUNTIME_CONFIG_PUBLIC_KEY_JWK) {
+    return crypto.subtle.importKey('jwk', publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']);
+  }
+  if (!verificationKeyPromise) {
+    verificationKeyPromise = crypto.subtle.importKey(
+      'jwk', publicJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['verify']
+    ).catch((error) => {
+      verificationKeyPromise = null;
+      throw error;
+    });
+  }
+  return verificationKeyPromise;
+}
+
+export async function verifySignedConfigEnvelope(envelope, {
+  publicJwk = RUNTIME_CONFIG_PUBLIC_KEY_JWK,
+  fetchedAt = Date.now()
+} = {}) {
+  if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return null;
+  const payloadBytes = decodeBase64Url(envelope.payload, FETCH_MAX_BYTES);
+  const signature = decodeBase64Url(envelope.signature, SIGNATURE_BYTES);
+  if (!payloadBytes || !signature || signature.byteLength !== SIGNATURE_BYTES) return null;
+  try {
+    const key = await verificationKey(publicJwk);
+    const valid = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' }, key, signature, payloadBytes
+    );
+    if (!valid) return null;
+    const raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes));
+    return sanitizeRuntimeConfig(raw, fetchedAt);
+  } catch { return null; }
+}
+
+async function validateCached(cached) {
+  if (!cached || typeof cached !== 'object') return null;
+  const fetchedAt = Number(cached.fetchedAt);
+  if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || fetchedAt > Date.now()) return null;
+  const config = await verifySignedConfigEnvelope(cached.envelope, { fetchedAt });
+  return config ? { config, envelope: cached.envelope, fetchedAt } : null;
+}
 
 async function fetchFresh() {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
   try {
-    const res = await fetch(RUNTIME_CONFIG_URL, { cache: 'no-store', credentials: 'omit', signal: ctrl.signal });
+    const { res, bytes } = await fetchBounded(RUNTIME_CONFIG_URL, {
+      maxBytes: FETCH_MAX_BYTES,
+      timeoutMs: FETCH_TIMEOUT_MS,
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error'
+    });
     if (!res.ok) return null;
-    const raw = await res.json();
-    return sanitize(raw);
-  } catch {
-    return null; // unreachable / not hosted yet / bad JSON — fall back to defaults
-  } finally {
-    clearTimeout(timer);
-  }
+    const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    const fetchedAt = Date.now();
+    const config = await verifySignedConfigEnvelope(envelope, { fetchedAt });
+    return config ? { config, envelope, fetchedAt } : null;
+  } catch { return null; }
 }
 
-/**
- * Return the runtime config, refreshing from the network at most once per TTL.
- * Never throws and never blocks longer than the fetch timeout; on any failure
- * it returns the last good cache, or the empty (all-fallback) config.
- *
- * @param {{force?:boolean}} [opts]
- */
+/** Return a verified config, refreshing at most once per TTL. Never throws. */
 export async function getRuntimeConfig({ force = false } = {}) {
-  const { [CACHE_KEY]: cached } = await chrome.storage.local.get(CACHE_KEY);
-  if (!force && cached && Date.now() - (cached.fetchedAt || 0) < RUNTIME_CONFIG_TTL_MS) {
-    return cached;
+  let cachedRaw = null;
+  try { ({ [CACHE_KEY]: cachedRaw = null } = await chrome.storage.local.get(CACHE_KEY)); }
+  catch { return emptyConfig(); }
+
+  const cached = await validateCached(cachedRaw);
+  if (cachedRaw && !cached) {
+    try { await chrome.storage.local.remove(CACHE_KEY); } catch { /* revalidation still failed closed */ }
   }
+  if (!force && cached && Date.now() - cached.fetchedAt < RUNTIME_CONFIG_TTL_MS) {
+    return cached.config;
+  }
+
   const fresh = await fetchFresh();
   if (fresh) {
-    await chrome.storage.local.set({ [CACHE_KEY]: fresh });
-    return fresh;
+    if (cached && fresh.config.configVersion < cached.config.configVersion) {
+      const refreshed = { envelope: cached.envelope, fetchedAt: Date.now() };
+      try { await chrome.storage.local.set({ [CACHE_KEY]: refreshed }); } catch { /* signed cache remains usable */ }
+      return { ...cached.config, fetchedAt: refreshed.fetchedAt };
+    }
+    try {
+      await chrome.storage.local.set({
+        [CACHE_KEY]: { envelope: fresh.envelope, fetchedAt: fresh.fetchedAt }
+      });
+    } catch { /* verified in-memory config remains safe for this call */ }
+    return fresh.config;
   }
-  return cached || emptyConfig();
+  return cached?.config || emptyConfig();
 }
 
-/**
- * Compare two dotted version strings. Returns true when `version` is strictly
- * older than `min` (i.e. an update is required). Lenient: missing parts = 0.
- */
 export function isVersionBelow(version, min) {
   if (!min) return false;
   const a = String(version || '0').split('.').map((n) => parseInt(n, 10) || 0);

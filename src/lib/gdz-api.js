@@ -4,8 +4,8 @@
  * The host is the gdz.ru mobile-app backend (NOT the public gdz.ru website,
  * which sits behind a JS challenge). DDoS-Guard allowlists the User-Agent:
  * only an okhttp UA returns 200; a browser UA gets 403. MV3 fetch() cannot
- * set User-Agent, so a static declarativeNetRequest rule (rules/gdz-ua.json,
- * wired in the manifest) rewrites the UA on every gdz-ru.com request.
+ * set User-Agent, so a session declarativeNetRequest rule scoped to this
+ * extension rewrites the UA on its own gdz-ru.com requests.
  *
  * Public surface:
  *   - getCatalog()           : trimmed { books, subjects, classes } (cached)
@@ -18,6 +18,11 @@
  */
 
 import { parseRefs } from './gdz-match.js';
+import { fetchBounded } from './bounded-fetch.js';
+import { buildGdzUaRule, GDZ_UA_RULE_ID } from './gdz-ua-rule.js';
+import { isGdzApiUrl, isGdzHumanUrl } from './gdz-hosts.js';
+import { MAX_STANDARD_UPLOAD_BYTES } from './upload-limits.js';
+import { imageDimensions } from './image-compress.js';
 
 const BASE = 'https://gdz-ru.com';
 const CATALOG_PATH = '/full-book-list?country_id=1';
@@ -54,23 +59,41 @@ const TASK_LIST_TTL_MS = 30 * 60 * 1000;
 // blank chat. Abort every GDZ request after a fixed ceiling so a wedged
 // connection surfaces as a throw (caller falls back to the AI / skips the image).
 const FETCH_TIMEOUT_MS = 15000;
-async function fetchWithTimeout(url, opts = {}, timeoutMs = FETCH_TIMEOUT_MS) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ctrl.signal });
-  } finally {
-    clearTimeout(timer);
+const JSON_MAX_BYTES = 4 * 1024 * 1024;
+const CATALOG_MAX_BYTES = 24 * 1024 * 1024;
+const HUMAN_PAGE_MAX_BYTES = 3 * 1024 * 1024;
+export const GDZ_IMAGE_MAX_PIXELS = 25_000_000;
+const GDZ_IMAGE_MAX_SIDE = 12_000;
+
+// Session rules vanish on browser restart. This promise is memoized only for
+// the current service-worker lifetime, so every new worker registers it again.
+let uaRulePromise = null;
+function ensureUaRule() {
+  if (!uaRulePromise) {
+    uaRulePromise = chrome.declarativeNetRequest.updateSessionRules({
+      removeRuleIds: [GDZ_UA_RULE_ID],
+      addRules: [buildGdzUaRule(chrome.runtime.id)]
+    }).catch((error) => {
+      uaRulePromise = null;
+      throw error;
+    });
   }
+  return uaRulePromise;
 }
 
-// All requests rely on the DNR rule to rewrite User-Agent. We don't set it
-// here (and can't — it's a forbidden header).
-async function getJson(url) {
-  const res = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' });
+// API requests rely on the DNR rule to rewrite User-Agent. We don't set it
+// directly (and can't — it's a forbidden header).
+async function getJson(url, { maxBytes = JSON_MAX_BYTES } = {}) {
+  await ensureUaRule();
+  const { res, bytes } = await fetchBounded(url, {
+    maxBytes,
+    timeoutMs: FETCH_TIMEOUT_MS,
+    credentials: 'omit',
+    cache: 'no-store'
+  });
   if (!res.ok) throw new Error(`GDZ ${res.status} ${url}`);
   try {
-    return await res.json();
+    return JSON.parse(new TextDecoder().decode(bytes));
   } catch {
     // A 200 with a non-JSON (HTML) body means DDoS-Guard served a challenge
     // page instead of data — almost always the UA-rewrite rule didn't apply.
@@ -84,6 +107,7 @@ function nameFromUrl(url) {
 }
 
 async function getBlobAsBase64(url) {
+  await ensureUaRule();
   // Name the host on failure. Answer images may be served from a different
   // gdz-ru.com host than the API; if that host is missing from host_permissions
   // (network fail) or from the DNR UA rule (403), the error must say WHICH host
@@ -91,27 +115,51 @@ async function getBlobAsBase64(url) {
   // silently.
   let host = url;
   try { host = new URL(url).host; } catch { /* keep raw url */ }
-  let res;
+  if (!isGdzApiUrl(url)) throw new Error(`GDZ image: bad host ${host}`);
+  let res, bytes;
   try {
-    res = await fetchWithTimeout(url, { credentials: 'omit', cache: 'no-store' });
+    ({ res, bytes } = await fetchBounded(url, {
+      maxBytes: MAX_STANDARD_UPLOAD_BYTES,
+      timeoutMs: FETCH_TIMEOUT_MS,
+      credentials: 'omit',
+      cache: 'no-store',
+      redirect: 'follow'
+    }));
   } catch (e) {
     throw new Error(`GDZ image: network fail for ${host} (missing host permission or UA rule?) — ${e}`);
   }
   if (!res.ok) throw new Error(`GDZ image ${res.status} ${host}`);
-  const buf = await res.arrayBuffer();
+  let finalHost = res.url;
+  try { finalHost = new URL(res.url).host; } catch { /* error names the raw final URL */ }
+  if (!isGdzApiUrl(res.url)) throw new Error(`GDZ image: redirect left allowlist for ${finalHost}`);
+  const mimeType = (res.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
+  // DDoS-Guard and off-origin redirects can still return 200 HTML. Only real
+  // images may cross into the dashboard as inline attachments.
+  if (!['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(mimeType)) {
+    throw new Error(`GDZ image: unsupported content type from ${finalHost}`);
+  }
+  // Unlike the general upload compressor (which is fail-open), GDZ is a remote
+  // trust boundary. Require parseable container dimensions and reject before
+  // any decoder/model sees a decompression bomb.
+  const dimensions = imageDimensions(bytes);
+  if (!dimensions || dimensions.w < 1 || dimensions.h < 1 ||
+      dimensions.w * dimensions.h > GDZ_IMAGE_MAX_PIXELS ||
+      Math.max(dimensions.w, dimensions.h) > GDZ_IMAGE_MAX_SIDE) {
+    throw new Error(`GDZ image: unsafe dimensions from ${finalHost}`);
+  }
   // Shape matches the rest of the codebase's inline-file objects {mimeType,
   // dataBase64, name} so a resolved answer can be attached like any upload.
   return {
-    mimeType: res.headers.get('content-type') || 'image/jpeg',
-    dataBase64: abToBase64(buf),
-    name: nameFromUrl(url)
+    mimeType,
+    dataBase64: abToBase64(bytes),
+    name: nameFromUrl(res.url)
   };
 }
 
 // Chunked btoa: a one-shot String.fromCharCode on a multi-megabyte JPEG
 // blows the JS stack.
 function abToBase64(buf) {
-  const bytes = new Uint8Array(buf);
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let bin = '';
   const CHUNK = 0x8000;
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -161,7 +209,7 @@ export async function getCatalog({ force = false } = {}) {
   }
   if (catalogInFlight) return catalogInFlight; // a load is already running — join it
   catalogInFlight = (async () => {
-    const raw = await getJson(BASE + CATALOG_PATH);
+    const raw = await getJson(BASE + CATALOG_PATH, { maxBytes: CATALOG_MAX_BYTES });
     if (!raw || raw.success === false) throw new Error('GDZ catalog: bad payload');
     const trimmed = trimCatalog(raw);
     await chrome.storage.local.set({ [CATALOG_KEY]: trimmed });
@@ -247,7 +295,7 @@ let taskCacheWrite = Promise.resolve();
 function updateTaskCache(cacheKey, result) {
   taskCacheWrite = taskCacheWrite.then(async () => {
     const { [TASK_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(TASK_CACHE_KEY);
-    cache[cacheKey] = result;
+    cache[cacheKey] = { v: result, at: Date.now() };
     const keys = Object.keys(cache);
     if (keys.length > TASK_CACHE_MAX) {
       for (const k of keys.slice(0, keys.length - TASK_CACHE_MAX)) delete cache[k];
@@ -285,11 +333,16 @@ async function resolveHumanRef(bookUrl) {
 
   const ref = { base: null, suffix: null };
   try {
-    const res = await fetchWithTimeout(HUMAN + bookUrl, { credentials: 'omit', redirect: 'follow' });
-    if (res.ok) {
+    const { res, bytes } = await fetchBounded(HUMAN + bookUrl, {
+      maxBytes: HUMAN_PAGE_MAX_BYTES,
+      timeoutMs: FETCH_TIMEOUT_MS,
+      credentials: 'omit',
+      redirect: 'follow'
+    });
+    if (res.ok && isGdzHumanUrl(res.url)) {
       ref.base = res.url.endsWith('/') ? res.url : res.url + '/';   // canonical book page
       const rel = ref.base.replace(HUMAN, '');
-      const html = await res.text();
+      const html = new TextDecoder().decode(bytes);
       // Tally `{base}{digits}-{letters}/` links; the most common suffix is the
       // book's main exercise numbering (Виленкин "-nom", Макарычев "-task"…).
       const re = new RegExp('href="' + escapeRe(rel) + '(\\d+)-([a-z]+)/"', 'gi');
@@ -325,7 +378,8 @@ export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
   const cacheKey = `v2|${bookUrl}|${mode}|${num}`;
 
   const { [TASK_CACHE_KEY]: cache = {} } = await chrome.storage.local.get(TASK_CACHE_KEY);
-  if (cache[cacheKey]) return cache[cacheKey];
+  const cached = cache[cacheKey];
+  if (cached) return (typeof cached === 'object' && 'v' in cached) ? cached.v : cached;
 
   const tasks = await listTasks(bookUrl);
   const exact = tasks.filter((t) => t.num === num);
@@ -346,7 +400,9 @@ export async function resolveTask(bookUrl, number, { mode = 'exercise' } = {}) {
 
   const taskData = await getJson(BASE + match.url);
   const editions = taskData.editions || [];
-  const images = editions.flatMap((e) => (e.images || []).map((i) => i.url)).filter(Boolean);
+  const images = editions
+    .flatMap((e) => (e.images || []).map((i) => i.url))
+    .filter((url) => isGdzApiUrl(url));
   if (!images.length) return null;
 
   // Build a link to the exact exercise. For a plain numbered exercise we can

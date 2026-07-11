@@ -9,7 +9,7 @@
 
 import { postStream } from './http.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
-import { chargeOne } from './rate-limit.js';
+import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
 const CREDITS_ENDPOINT = 'https://openrouter.ai/api/v1/credits';
@@ -163,10 +163,6 @@ function historyToMessage(m) {
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
   const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null } = opts;
   const key = await getKey();
-  // Charge the daily budget BEFORE the network round-trip so a runaway loop
-  // can't drain credit; chargeOne throws a Russian-language error past the
-  // cap which the existing error path surfaces verbatim to the UI.
-  await chargeOne('openrouter');
 
   const content = buildContent(userText, files);
 
@@ -222,5 +218,13 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   // mode — postStream just accumulates and returns the full text, which is
   // exactly what solveTest/the popup parse. response_format stays in the body,
   // so the streamed content is still a JSON object.
-  return postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, onUsage, signal });
+  const reservation = await reserveOne('openrouter');
+  try {
+    const result = await postStream(ENDPOINT, { headers, body, label: 'OpenRouter', onDelta, onUsage, signal });
+    await commitOne(reservation);
+    return result;
+  } catch (e) {
+    try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }
+    throw e;
+  }
 }

@@ -8,24 +8,37 @@ import { getByoKey } from '../lib/qwen.js';
 import { fetchOpenRouterCredits, getSpendHistory } from '../lib/openrouter.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
-import { createSession, addMessage, listSessions, listMessages } from '../lib/history.js';
+import { createSession, addMessage, listSessions, listMessages, cleanupLocalData } from '../lib/history.js';
 import { ensureLicensed } from '../lib/license.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
 import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { classifyTasksAI } from '../lib/classify-ai.js';
 import { isReadableFile, hasPdf, isAudioFile, isPdfFile, isImageFile } from '../lib/file-kinds.js';
-import { track, heartbeat, usageFields } from '../lib/telemetry.js';
+import { track, heartbeat, usageFields, errorCode } from '../lib/telemetry.js';
 import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } from '../lib/gdz-api.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 import { transcribeAudioFiles } from '../lib/transcribe.js';
 import { compressImageFiles } from '../lib/image-compress.js';
+import {
+  storeDashboardLaunch,
+  consumeDashboardLaunch,
+  cleanupDashboardLaunches
+} from '../lib/dashboard-launch.js';
+import {
+  MAX_STANDARD_UPLOAD_BYTES,
+  MAX_AUDIO_UPLOAD_BYTES,
+  MAX_REQUEST_FILE_BYTES,
+  deduplicateRequestFiles,
+  validateRequestFileBudget
+} from '../lib/upload-limits.js';
 
 // Diagnostic logging. OFF in shipped builds — flip to true to trace attachment
 // downloads and the cross-frame test fill in the service-worker console.
 const DEBUG = false;
 const dbg = (...a) => { if (DEBUG) { try { console.log(...a); } catch { /* no console */ } } };
+const ATTACHMENT_FETCH_TIMEOUT_MS = 30 * 1000;
 
 // Follow-ups re-send prior context. Cap how many MESSAGES we replay: full
 // worked solutions are long, and on a paid provider every re-sent message is
@@ -33,13 +46,48 @@ const dbg = (...a) => { if (DEBUG) { try { console.log(...a); } catch { /* no co
 // up without re-sending the whole chat. (Bump to 16 for ~8 full turns.)
 const MAX_HISTORY_MESSAGES = 8;
 
-// chrome.storage.session defaults to extension-only access; the floating
-// answer panel (content-script context) needs to remember its position and
-// minimized state across page interactions. Opening the access level is reset
-// on every SW restart, so we re-apply it at module top — cheap and idempotent.
+// Storage trust split. storage.LOCAL holds the secrets (API keys, license) —
+// lock it to trusted contexts so a compromised mos.ru renderer can't read them
+// through our content scripts (supported since Chrome 130; older builds throw
+// and keep the historical behaviour). storage.SESSION is the deliberately
+// UNTRUSTED-readable area: it must only ever hold UI state (panel positions)
+// plus the non-sensitive `theme`/`aiProvider` mirror below — never a secret.
+try {
+  chrome.storage.local.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' })
+    ?.catch?.(() => { /* pre-130 Chrome — accepted residual risk */ });
+} catch { /* pre-130 Chrome */ }
 try {
   chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
 } catch { /* old Chrome — content script falls back to defaults each time */ }
+
+// The pill/answer panel read only `theme` and `aiProvider`. With storage.local
+// now trusted-only they can't read (or receive onChanged events for) the
+// originals, so the worker mirrors just these two keys into storage.session.
+async function mirrorUiPrefsToSession() {
+  try {
+    const { theme = null, aiProvider = null } = await chrome.storage.local.get(['theme', 'aiProvider']);
+    await chrome.storage.session.set({ theme, aiProvider });
+  } catch { /* session unavailable — pill falls back to defaults */ }
+}
+mirrorUiPrefsToSession();
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && (changes.theme || changes.aiProvider)) mirrorUiPrefsToSession();
+});
+
+// Retention sweep: history (7 d), weekHomework (24 h), pendingUpload (1 h,
+// base64-heavy), taskClassCache + gdzTaskCache lookup caches (30 d). Alarm
+// survives SW teardown; the startup call covers the gap after a browser
+// restart before the alarm first fires.
+try {
+  chrome.alarms.create('smesh-retention', { periodInMinutes: 6 * 60 });
+  chrome.alarms.create('smesh-launch-retention', { periodInMinutes: 1 });
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === 'smesh-retention') void cleanupLocalData();
+    if (alarm.name === 'smesh-launch-retention') void cleanupDashboardLaunches();
+  });
+} catch { /* alarms unavailable — startup sweep below still runs */ }
+void cleanupLocalData();
+void cleanupDashboardLaunches();
 
 // Warm the remote runtime config on every SW spin-up (cheap: a single cached
 // fetch at most once per TTL). Fire-and-forget — a failure is a silent no-op and
@@ -76,15 +124,12 @@ async function migrateNararouter() {
   }
 }
 
-// Open the full-window dashboard when the popup asks to "Solve".
+// Open the full-window dashboard when the popup asks to "Solve". The payload
+// itself lives in short-lived storage.session and can only be consumed once by
+// the dashboard through the serialized worker handler below.
 async function openDashboard(payload) {
-  const url = chrome.runtime.getURL(
-    `src/dashboard/dashboard.html?subject=${encodeURIComponent(payload.subject)}` +
-    `&task=${encodeURIComponent(payload.task || '')}` +
-    `&day=${encodeURIComponent(payload.day || '')}` +
-    `&homeworkId=${encodeURIComponent(payload.homeworkId || '')}` +
-    `&homeworkItemId=${encodeURIComponent(payload.homeworkItemId || '')}`
-  );
+  const id = await storeDashboardLaunch(payload);
+  const url = chrome.runtime.getURL(`src/dashboard/dashboard.html?launch=${encodeURIComponent(id)}`);
   await chrome.tabs.create({ url });
 }
 
@@ -202,6 +247,16 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   if (!(await hasConsent())) return { answer: CONSENT_REQUIRED_MESSAGE, needsConsent: true, sessionId };
   const category = categoryForSubject(subject);
 
+  // Apply the replay cap before calculating the request-wide file budget: old
+  // turns outside this window are not sent at all. Current files win duplicate
+  // fingerprints, so an attachment repeated in history is shipped only once.
+  history = history.slice(-MAX_HISTORY_MESSAGES);
+  const deduped = deduplicateRequestFiles(files, history);
+  files = deduped.files;
+  history = deduped.history;
+  const fileBudget = validateRequestFileBudget(deduped.allFiles);
+  if (!fileBudget.ok) throw new Error(fileBudget.error);
+
   // Extract Office files (.docx/.pptx/.xlsx) to inline text RIGHT HERE, locally
   // and for free — no API call. This both lets the model actually solve from
   // them and lets the gate below see them as readable material.
@@ -246,6 +301,11 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   files = await compressImageFiles(files);
   history = await Promise.all(history.map(async (m) =>
     m?.files?.length ? { ...m, files: await compressImageFiles(m.files) } : m));
+  const finalAttachments = deduplicateRequestFiles(files, history);
+  files = finalAttachments.files;
+  history = finalAttachments.history;
+  const finalBudget = validateRequestFileBudget(finalAttachments.allFiles);
+  if (!finalBudget.ok) throw new Error(finalBudget.error);
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
   // PDFs require a PDF-capable backend. The СМЭШ proxy (Qwen/DeepSeek without
@@ -254,7 +314,8 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // untouched. Everyone else (Groq, OpenRouter, BYO DashScope) is forced to
   // OpenRouter, whose Gemini reads PDFs natively.
   let provider;
-  if (hasPdf(files)) {
+  const requestHasPdf = hasPdf(files) || history.some((m) => m?.files?.some(isPdfFile));
+  if (requestHasPdf) {
     const { aiProvider } = await chrome.storage.local.get('aiProvider');
     const chosen = normalizeAIProvider(aiProvider);
     const proxyReadsPdf = (chosen === 'qwen' || chosen === 'deepseek') && !(await getByoKey());
@@ -287,7 +348,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   let usage = null, usedProvider = null;
   const answer = await askAI(
     systemPrompt, userTask, files,
-    history.slice(-MAX_HISTORY_MESSAGES),
+    history,
     { onDelta, provider, signal, onUsage: (u, prov) => { usage = u; usedProvider = prov; } }
   );
 
@@ -330,9 +391,7 @@ async function solveTest({ text, screenshot, provider } = {}) {
   // Same privacy backstop as solve(): no consent → no provider call. Thrown so
   // the popup's requestSolve surfaces it as a clear error instead of a "result".
   if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
-  const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
-  const systemPrompt =
-    promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
+  const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
   const userText = 'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
     (text || '(текст не извлечён, смотри скриншот)');
   // JSON mode: the model returns {answers:[{n,a}]} — no fragile marker parsing.
@@ -377,13 +436,11 @@ async function solveTest({ text, screenshot, provider } = {}) {
  * confirm or correct. Same licence/consent gate as solveTest. Returns the fresh
  * answer string ('' if nothing parseable came back).
  */
-async function resolveOneQuestion(tabId, windowId, { index, prevAnswer, questionText } = {}) {
+async function resolveOneQuestion(tabId, windowId, tabUrl, { index, prevAnswer, questionText } = {}) {
   await ensureLicensed();
   if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
-  const { pageText, screenshot } = await capturePageForPill(tabId, windowId);
-  const { promptOverrides = {} } = await chrome.storage.local.get('promptOverrides');
-  const systemPrompt =
-    promptOverrides[PROMPT_CATEGORIES.TEST_ANSWER] || DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
+  const { pageText, screenshot } = await capturePageForPill(tabId, windowId, tabUrl);
+  const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
   const n = String(index ?? '').trim();
   const focus =
     `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (текст страницы ниже + скриншот).` +
@@ -505,10 +562,10 @@ async function showAnswersInTab(tabId, questions) {
 // The content script discovers the file URLs (same-origin API call), but the
 // download must run HERE: only the service worker gets the extension's
 // host_permissions for cross-origin hosts like uchebnik.mos.ru. There is no
-// FileReader in a service worker, so base64 is encoded from an ArrayBuffer.
+// FileReader in a service worker, so base64 is encoded from the bounded stream.
 
 function abToBase64(buf) {
-  const bytes = new Uint8Array(buf);
+  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
   let bin = '';
   const CHUNK = 0x8000; // chunk so String.fromCharCode args don't overflow the stack
   for (let i = 0; i < bytes.length; i += CHUNK) {
@@ -552,31 +609,125 @@ function inferMime(name, contentType) {
   return 'application/octet-stream';
 }
 
-async function downloadFile(url, headers, { credentials = 'include' } = {}) {
+// Attachment discovery only has two concrete Mesh origins in this codebase:
+// family-web files under school.mos.ru and digital-textbook files under
+// uchebnik.mos.ru. Paths containing generic words like /files/ or /storage/
+// are NOT a reason to turn an arbitrary host into a privileged fetch target.
+const ATTACHMENT_HOSTS = new Set(['school.mos.ru', 'uchebnik.mos.ru']);
+const ATTACHMENT_REDIRECT_LIMIT = 3;
+
+function isIpLiteralHost(hostname) {
+  const host = String(hostname || '').replace(/^\[|\]$/g, '');
+  if (host.includes(':')) return true; // URL.hostname keeps IPv6 brackets in Chrome
+  const parts = host.split('.');
+  return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) <= 255);
+}
+
+function parseAttachmentUrl(raw, base) {
   try {
-    const res = await fetch(url, { credentials, headers });
-    if (!res.ok) { dbg('[СМЭШ AI] download http', res.status, url); return null; }
-    // An HTML response is an auth/login redirect, not the attachment — reject it
-    // so we never hand the model (or the chat chip) a fake "file".
-    const ct = (res.headers.get('content-type') || '').toLowerCase();
-    if (ct.includes('text/html') || ct.includes('text/xml')) {
-      dbg('[СМЭШ AI] download got HTML (auth redirect?)', url);
-      return null;
+    const url = base ? new URL(raw, base) : new URL(raw);
+    if (url.protocol !== 'https:' || url.username || url.password || url.port) return null;
+    const host = url.hostname.toLowerCase();
+    if (isIpLiteralHost(host) || !ATTACHMENT_HOSTS.has(host)) return null;
+    return url;
+  } catch { return null; }
+}
+
+function isAllowedAttachmentUrl(raw) {
+  return !!parseAttachmentUrl(raw);
+}
+
+async function readBoundedBody(response, maxBytes, controller) {
+  const length = response.headers.get('content-length');
+  if (length && /^\d+$/.test(length.trim()) && Number(length) > maxBytes) {
+    controller.abort();
+    return null;
+  }
+  if (!response.body?.getReader) {
+    controller.abort();
+    return null;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        try { await reader.cancel('attachment too large'); } catch { /* already closed */ }
+        controller.abort();
+        return null;
+      }
+      chunks.push(value);
     }
-    const buf = await res.arrayBuffer();
-    const name = nameFromUrl(url);
-    const mimeType = inferMime(name, res.headers.get('content-type'));
-    // Audio (listening clips) gets a higher cap — Whisper accepts up to ~25 MB —
-    // while other attachments stay at 6 MB. Base64 inflates files by ~33%, and
-    // the licensed proxy stores the resulting messages JSON under a 9 MB cap.
-    const maxBytes = isAudioFile({ name, mimeType }) ? 25 * 1024 * 1024 : 6 * 1024 * 1024;
-    if (!buf.byteLength || buf.byteLength > maxBytes) {
-      dbg('[СМЭШ AI] download size skip', buf.byteLength, url);
-      return null;
+  } catch (e) {
+    if (!controller.signal.aborted) throw e;
+    return null;
+  }
+  if (!total) return null;
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return bytes;
+}
+
+async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
+  const original = parseAttachmentUrl(rawUrl);
+  if (!original) { dbg('[СМЭШ AI] rejected attachment URL', rawUrl); return null; }
+  let current = original;
+  const ctrl = new AbortController();
+  // One deadline covers every redirect, response headers and the full streamed
+  // body. A timer cleared immediately after fetch() would still let read() hang.
+  const timer = setTimeout(() => ctrl.abort(), ATTACHMENT_FETCH_TIMEOUT_MS);
+  try {
+    for (let redirects = 0; redirects <= ATTACHMENT_REDIRECT_LIMIT; redirects++) {
+      const sameOriginalOrigin = current.origin === original.origin;
+      // Redirects are never delegated to fetch(): that would make validation of
+      // intermediate targets impossible. Mesh credentials exist only on the
+      // original origin; an allowlisted cross-origin hop gets an empty header
+      // set and no ambient cookies.
+      const res = await fetch(current.href, {
+        redirect: 'manual',
+        headers: sameOriginalOrigin ? headers : {},
+        credentials: sameOriginalOrigin ? 'include' : 'omit',
+        signal: ctrl.signal
+      });
+      if ([301, 302, 303, 307, 308].includes(res.status)) {
+        if (redirects >= ATTACHMENT_REDIRECT_LIMIT) return null;
+        const next = parseAttachmentUrl(res.headers.get('location'), current);
+        if (!next) return null;
+        try { await res.body?.cancel('following validated redirect'); } catch { /* already closed */ }
+        current = next;
+        continue;
+      }
+      if (!res.ok) { dbg('[СМЭШ AI] download http', res.status, current.href); return null; }
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      if (ct.includes('text/html') || ct.includes('text/xml')) {
+        dbg('[СМЭШ AI] download got HTML (auth redirect?)', current.href);
+        return null;
+      }
+      const name = nameFromUrl(current.href);
+      const mimeType = inferMime(name, ct);
+      const typeMaxBytes = isAudioFile({ name, mimeType })
+        ? MAX_AUDIO_UPLOAD_BYTES
+        : MAX_STANDARD_UPLOAD_BYTES;
+      const maxBytes = Math.min(typeMaxBytes, maxBytesCap);
+      const bytes = await readBoundedBody(res, maxBytes, ctrl);
+      if (!bytes) { dbg('[СМЭШ AI] download size/empty skip', current.href); return null; }
+      dbg('[СМЭШ AI] downloaded', name, mimeType, bytes.byteLength + 'b');
+      return { mimeType, dataBase64: abToBase64(bytes), name, byteLength: bytes.byteLength };
     }
-    dbg('[СМЭШ AI] downloaded', name, mimeType, buf.byteLength + 'b');
-    return { mimeType, dataBase64: abToBase64(buf), name };
-  } catch (e) { dbg('[СМЭШ AI] download exception', String(e), url); return null; }
+  } catch (e) {
+    dbg('[СМЭШ AI] download exception', String(e), current.href);
+    return null;
+  } finally {
+    clearTimeout(timer);
+    ctrl.abort();
+  }
+  return null;
 }
 
 // Reconstruct Mesh's required family-web headers from a bare token. Mirrors the
@@ -593,33 +744,30 @@ function meshHeadersFromToken(token) {
   };
 }
 
-// The Mesh auth set (Bearer token + X-mes-*) is sensitive — it's the user's
-// live session credential. It may ride along ONLY to a *.mos.ru host. A
-// homework page is Mesh-controlled, but a stray non-Mesh link in its DOM (a
-// teacher's comment, an embed) would otherwise have the user's Mesh token
-// fetched straight to a third-party server. Gate the header set on the host.
-function isMeshHost(url) {
-  try {
-    const h = new URL(url).hostname.toLowerCase();
-    return h === 'mos.ru' || h.endsWith('.mos.ru');
-  } catch { return false; }
+function attachmentHeaders(headers) {
+  const allowed = new Set(['accept', 'authorization', 'x-mes-subsystem', 'x-mes-role', 'x-mes-roleid']);
+  return Object.fromEntries(Object.entries(headers || {}).filter(([key, value]) =>
+    allowed.has(key.toLowerCase()) && typeof value === 'string'));
 }
 
 // `headers` come straight from the content script's discovery (Bearer token +
 // Mesh's X-mes-* set). A bare `token` is still accepted for backward-compat.
 async function downloadFiles({ urls = [], headers = null, token = null }) {
-  const hdrs = headers || (token ? meshHeadersFromToken(token) : {});
+  const hdrs = attachmentHeaders(headers || (token ? meshHeadersFromToken(token) : {}));
   const files = [];
+  let totalBytes = 0;
+  // Mirror validateRequestFileBudget here so local decoded allocation cannot
+  // exceed the provider request-wide budget the downloaded files must fit.
   for (const url of urls.slice(0, 5)) {
-    // Never hand the Mesh credential to a non-Mesh host (see isMeshHost). Beyond
-    // the explicit X-mes-*/Bearer header set, also withhold the AMBIENT cookie
-    // jar: a stray non-Mesh link in a homework's DOM would otherwise be fetched
-    // with the user's cookies for THAT third party (a confused-deputy fetch that
-    // leaks the user's session/IP). Mesh hosts keep credentials:'include' so the
-    // authed file store still serves the attachment; everyone else gets 'omit'.
-    const mesh = isMeshHost(url);
-    const f = await downloadFile(url, mesh ? hdrs : {}, { credentials: mesh ? 'include' : 'omit' });
-    if (f) files.push(f);
+    const remainingBytes = MAX_REQUEST_FILE_BYTES - totalBytes;
+    if (remainingBytes <= 0) break;
+    if (!isAllowedAttachmentUrl(url)) continue;
+    const f = await downloadFile(url, hdrs, remainingBytes);
+    if (f) {
+      totalBytes += f.byteLength;
+      const { byteLength, ...file } = f;
+      files.push(file);
+    }
   }
   return files;
 }
@@ -891,7 +1039,7 @@ async function fillInteractiveAllFrames(tabId, questions, alreadyFilled = []) {
 }
 
 /* ---------- Multi-page test pagination ---------- */
-// Drive a scraper.js global (e.g. __smeshPageSig / __smeshNext) in EVERY frame
+// Drive a read-only scraper.js global (currently __smeshPageSig) in EVERY frame
 // and collect the non-null results. Mirrors fillAllFrames: the test player is
 // often inside an iframe, so per-frame is the only thing that reaches it. Frames
 // that disallow scripting are skipped silently.
@@ -913,6 +1061,25 @@ async function runInAllFrames(tabId, fnName, arg = null) {
   return (results || []).map((r) => r && r.result).filter((v) => v != null);
 }
 
+async function runInAllFramesWithIds(tabId, fnName) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
+  } catch { /* inaccessible frames are simply absent from discovery */ }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: (name) => {
+        try { return (typeof window[name] === 'function') ? window[name]() : null; }
+        catch { return null; }
+      },
+      args: [fnName]
+    });
+    return (results || [])
+      .filter((entry) => entry?.result != null && Number.isInteger(entry.frameId))
+      .map((entry) => ({ frameId: entry.frameId, result: entry.result }));
+  } catch { return []; }
+}
+
 // Combined signature of the visible test page across all frames — lets the
 // popup detect whether clicking «Далее» actually advanced the page.
 async function testPageSig(tabId) {
@@ -921,19 +1088,33 @@ async function testPageSig(tabId) {
   return sigs.join('||');
 }
 
-// Click the forward control wherever it lives (top frame or an iframe) and merge
-// the per-frame results: any frame that advanced wins; else any frame that saw
-// ONLY a finish/submit control reports 'finish' (so the popup stops without ever
-// submitting the test); else 'none'.
+// Pagination is deliberately two-phase. Discovery runs in every frame and is
+// read-only; only after one unambiguous frame is selected do we inject a click
+// into that exact frame. The old allFrames click raced duplicate «Далее» buttons
+// and could skip multiple pages at once.
 async function testNextPage(tabId) {
   if (!tabId) return 'none';
-  const res = await runInAllFrames(tabId, '__smeshNext');
-  let clicked = false, finish = false;
-  for (const r of res) {
-    if (r?.status === 'clicked') clicked = true;
-    else if (r?.status === 'finish') finish = true;
+  const discovery = await runInAllFramesWithIds(tabId, '__smeshNextDiscovery');
+  const exact = discovery.filter(({ result }) => result?.enabledCount === 1);
+  const withSignature = exact.filter(({ result }) => !!result?.signature);
+  const eligible = withSignature.length ? withSignature : exact;
+  if (eligible.length !== 1) {
+    const enabledTotal = discovery.reduce((sum, entry) => sum + (entry.result?.enabledCount || 0), 0);
+    const candidateTotal = discovery.reduce((sum, entry) => sum + (entry.result?.candidateCount || 0), 0);
+    const finishTotal = discovery.reduce((sum, entry) => sum + (entry.result?.finishCount || 0), 0);
+    if (!candidateTotal && finishTotal) return 'finish';
+    return enabledTotal || candidateTotal ? 'ambiguous' : 'none';
   }
-  return clicked ? 'clicked' : (finish ? 'finish' : 'none');
+  try {
+    const [{ result } = {}] = await chrome.scripting.executeScript({
+      target: { tabId, frameIds: [eligible[0].frameId] },
+      func: () => {
+        try { return (typeof window.__smeshNextClick === 'function') ? window.__smeshNextClick() : null; }
+        catch { return null; }
+      }
+    });
+    return result?.status === 'clicked' ? 'clicked' : 'none';
+  } catch { return 'none'; }
 }
 
 /* ---------- Floating "Solve" pill (page-triggered test solving) ---------- */
@@ -946,13 +1127,27 @@ async function testNextPage(tabId) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PILL_MAX_PAGES = 30; // same cap as the popup's solveAllPages
+const CAPTURE_TARGET_CHANGED = 'Переключилась вкладка — попробуйте ещё раз.';
+
+function captureTargetMatches(tab, tabId, tabUrl) {
+  return tab?.id === tabId && tab?.url === tabUrl;
+}
+
+// captureVisibleTab has no tabId argument: it always photographs whichever tab
+// is active at that instant. Pin both sides of the call to the tab selected when
+// the solve began; the second check makes a raced capture unusable rather than
+// accidentally sending a different page to the model.
+async function requireActiveCaptureTarget(tabId, windowId, tabUrl) {
+  const [active] = await chrome.tabs.query({ active: true, windowId });
+  if (!captureTargetMatches(active, tabId, tabUrl)) throw new Error(CAPTURE_TARGET_CHANGED);
+}
 
 /**
- * Capture the visible test page: top-frame text + a PNG screenshot. Mirrors
+ * Capture the visible test page: top-frame text + a JPEG screenshot. Mirrors
  * popup.js capturePage, but runs in the worker (the pill can't reach these APIs).
  * windowId pins captureVisibleTab to the pill's own window.
  */
-async function capturePageForPill(tabId, windowId) {
+async function capturePageForPill(tabId, windowId, tabUrl) {
   const textPromise = chrome.scripting
     .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
     .then(([inj]) => inj?.result || '')
@@ -969,9 +1164,13 @@ async function capturePageForPill(tabId, windowId) {
   // whole thing rides ONE /ai/start POST — too slow for the RU DPI clamp
   // window (see smesh-proxy.js). q90 JPEG is 5–10× smaller and test text /
   // formulas stay perfectly readable for the vision model.
-  const shotPromise = chrome.tabs
-    .captureVisibleTab(windowId, { format: 'jpeg', quality: 90 })
-    .catch((e) => {
+  const shotPromise = (async () => {
+    try {
+      await requireActiveCaptureTarget(tabId, windowId, tabUrl);
+      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'jpeg', quality: 90 });
+      await requireActiveCaptureTarget(tabId, windowId, tabUrl);
+      return dataUrl;
+    } catch (e) {
       const m = String(e?.message || e);
       if (/all_urls|activeTab|permission|cannot be captured/i.test(m)) {
         throw new Error(
@@ -982,7 +1181,8 @@ async function capturePageForPill(tabId, windowId) {
         );
       }
       throw e;
-    });
+    }
+  })();
   const [pageText, dataUrl] = await Promise.all([textPromise, shotPromise]);
   const b64 = (dataUrl || '').split(',')[1];
   if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
@@ -994,8 +1194,8 @@ async function capturePageForPill(tabId, windowId) {
  * the in-page panel (showAnswersInTab) and autofill the form across every frame
  * (fillAllFrames). Returns the parsed questions + fill summary.
  */
-async function pillSolveOnePage(tabId, windowId, provider) {
-  const { pageText, screenshot } = await capturePageForPill(tabId, windowId);
+async function pillSolveOnePage(tabId, windowId, tabUrl, provider) {
+  const { pageText, screenshot } = await capturePageForPill(tabId, windowId, tabUrl);
   const answer = await solveTest({ text: pageText, screenshot, provider });
   const questions = parseTestAnswers(answer);
   if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
@@ -1023,6 +1223,7 @@ async function advancePillPage(tabId, beforeSig) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const status = await testNextPage(tabId);
     if (status === 'finish') return 'finish';
+    if (status === 'ambiguous') return 'none';
     if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
     if (await waitForPillPageChange(tabId, beforeSig, attempt === 0 ? 8000 : 4000)) return 'ok';
   }
@@ -1042,12 +1243,12 @@ function notifyPill(tabId, payload) {
  * end. NEVER submits; mirrors popup.js solveAllPages exactly. Returns
  * { outcome, solved } so the pill can render the same Russian summary.
  */
-async function pillSolveAllPages(tabId, windowId, provider) {
+async function pillSolveAllPages(tabId, windowId, tabUrl, provider) {
   let solved = 0;
   let outcome = 'done';
   for (let page = 1; page <= PILL_MAX_PAGES; page++) {
     notifyPill(tabId, { phase: 'solve', page });
-    const { questions } = await pillSolveOnePage(tabId, windowId, provider);
+    const { questions } = await pillSolveOnePage(tabId, windowId, tabUrl, provider);
     if (questions.length) solved++;
     // Let the fill's React re-render settle so the signature reflects the filled
     // state — otherwise a late repaint could look like a navigation.
@@ -1064,7 +1265,241 @@ async function pillSolveAllPages(tabId, windowId, provider) {
   return { outcome, solved };
 }
 
+// One screen-solve operation per tab: the pill and popup drive capture →
+// solve → autofill → pagination loops that mutate the page, so two running
+// interleaved on one tab click and fill against each other's state.
+const tabSolveOps = new Set();
+async function withTabSolveLock(tabId, fn) {
+  if (tabSolveOps.has(tabId)) {
+    throw new Error('Решение уже выполняется на этой вкладке. Дождитесь завершения текущего.');
+  }
+  tabSolveOps.add(tabId);
+  try {
+    return await fn();
+  } finally {
+    tabSolveOps.delete(tabId);
+  }
+}
+
+/* ---------- Runtime message trust boundary ---------- */
+
+const EXTENSION_PAGE_PREFIX = `chrome-extension://${chrome.runtime.id}/`;
+const ACTION_TOKEN_TTL_MS = 30000;
+const MAX_TEXT_CHARS = 200 * 1024;
+const MAX_URL_CHARS = 4096;
+const MAX_ARRAY_ITEMS = 100;
+const MAX_BASE64_CHARS = 40 * 1024 * 1024;
+const MAX_FILES_TOTAL_CHARS = 100 * 1024 * 1024;
+
+const CONTENT_ACTIONS = new Set([
+  'FILL_ANSWERS_ALL',
+  'PILL_SOLVE_PAGE',
+  'PILL_SOLVE_ALL',
+  'RESOLVE_QUESTION'
+]);
+
+// This is intentionally exhaustive. Adding a switch case without assigning it
+// to a sender class leaves it unreachable instead of silently widening access.
+const SENDER_MESSAGE_TYPES = {
+  content: new Set(['GET_ACTION_TOKEN', ...CONTENT_ACTIONS]),
+  extension: new Set([
+    'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
+    'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG', 'CLASSIFY_TASKS',
+    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES',
+    'GDZ_CATALOG', 'GDZ_SEARCH', 'GDZ_RESOLVE', 'GDZ_FOR_TASK', 'GDZ_SELFTEST',
+    'CONSUME_DASH_LAUNCH'
+  ])
+};
+
+const actionTokens = new Map();
+const isRecord = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const isString = (v, max = MAX_TEXT_CHARS) => typeof v === 'string' && v.length <= max;
+const isOptionalString = (v, max = MAX_TEXT_CHARS) => v == null || isString(v, max);
+const isSafeId = (v) => Number.isSafeInteger(v) && v >= 0;
+const isOpaqueId = (v) => v == null || isSafeId(v) || isString(v, 512);
+const isBoolean = (v) => typeof v === 'boolean';
+const isOptionalBoolean = (v) => v == null || isBoolean(v);
+const hasOnlyKeys = (obj, allowed) => isRecord(obj) && Object.keys(obj).every((k) => allowed.includes(k));
+const validArray = (v, check) => Array.isArray(v) && v.length <= MAX_ARRAY_ITEMS && v.every(check);
+
+function isHttpUrl(v) {
+  if (!isString(v, MAX_URL_CHARS)) return false;
+  try { return ['http:', 'https:'].includes(new URL(v).protocol); }
+  catch { return false; }
+}
+
+function validFile(file) {
+  return hasOnlyKeys(file, ['mimeType', 'dataBase64', 'name']) &&
+    isString(file.mimeType, 256) &&
+    isString(file.name, MAX_URL_CHARS) &&
+    isString(file.dataBase64, MAX_BASE64_CHARS);
+}
+
+function validFiles(files) {
+  if (!validArray(files, validFile)) return false;
+  return files.reduce((n, file) => n + file.dataBase64.length, 0) <= MAX_FILES_TOTAL_CHARS;
+}
+
+function validPart(part) {
+  return hasOnlyKeys(part, ['label', 'value']) &&
+    isOptionalString(part.label) && isOptionalString(part.value);
+}
+
+function validQuestion(q) {
+  return hasOnlyKeys(q, ['index', 'text', 'answer', 'choice', 'parts']) &&
+    (q.index == null || isSafeId(q.index) || isString(q.index, 512)) &&
+    isOptionalString(q.text) && isOptionalString(q.answer) &&
+    isOptionalString(q.choice, 512) &&
+    (q.parts == null || validArray(q.parts, validPart));
+}
+
+const validQuestions = (v) => validArray(v, validQuestion);
+
+function validHistoryMessage(item) {
+  return hasOnlyKeys(item, ['role', 'content', 'files', 'needsUpload', 'error']) &&
+    isString(item.role, 32) && isString(item.content) &&
+    (item.files == null || validFiles(item.files)) &&
+    isOptionalBoolean(item.needsUpload) && isOptionalBoolean(item.error);
+}
+
+function validHeaders(headers) {
+  return headers == null || (isRecord(headers) && Object.keys(headers).length <= 50 &&
+    Object.entries(headers).every(([k, v]) => isString(k, 256) && isString(v, 8192)));
+}
+
+const noPayload = (msg) => msg.payload == null;
+const payloadRecord = (msg, keys) => hasOnlyKeys(msg.payload, keys);
+
+// Each handler validates only what it consumes, but rejects unknown payload keys
+// so an ignored field cannot be used to smuggle an unbounded object through the
+// privileged boundary.
+const MESSAGE_SCHEMAS = {
+  GET_ACTION_TOKEN: (msg) => noPayload(msg) && CONTENT_ACTIONS.has(msg.action),
+  OPEN_DASHBOARD: (msg) => payloadRecord(msg, ['subject', 'task', 'day', 'homeworkId', 'homeworkItemId', 'rowToken']) &&
+    isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task) &&
+    isOptionalString(msg.payload.day, 1024) && isOpaqueId(msg.payload.homeworkId) &&
+    isOpaqueId(msg.payload.homeworkItemId) && isOptionalString(msg.payload.rowToken, 128),
+  SOLVE: (msg) => payloadRecord(msg, ['subject', 'task', 'files', 'sessionId', 'history', 'mode']) &&
+    isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task) &&
+    (msg.payload.files == null || validFiles(msg.payload.files)) &&
+    isOptionalString(msg.payload.sessionId, 512) &&
+    (msg.payload.history == null || validArray(msg.payload.history, validHistoryMessage)) &&
+    isOptionalString(msg.payload.mode, 64),
+  SOLVE_TEST: (msg) => payloadRecord(msg, ['text', 'screenshot', 'tabId', 'provider']) &&
+    isOptionalString(msg.payload.text) && (msg.payload.screenshot == null || validFile(msg.payload.screenshot)) &&
+    isSafeId(msg.payload.tabId) && isOptionalString(msg.payload.provider, 64),
+  FILL_ANSWERS_ALL: (msg) => payloadRecord(msg, ['questions']) && validQuestions(msg.payload.questions),
+  FILL_ANSWERS_TAB: (msg) => payloadRecord(msg, ['tabId', 'questions']) &&
+    isSafeId(msg.payload.tabId) && validQuestions(msg.payload.questions),
+  TEST_PAGE_SIG: (msg) => payloadRecord(msg, ['tabId']) && isSafeId(msg.payload.tabId),
+  TEST_NEXT_PAGE: (msg) => payloadRecord(msg, ['tabId']) && isSafeId(msg.payload.tabId),
+  PILL_SOLVE_PAGE: (msg) => payloadRecord(msg, ['provider']) && isOptionalString(msg.payload.provider, 64),
+  PILL_SOLVE_ALL: (msg) => payloadRecord(msg, ['provider']) && isOptionalString(msg.payload.provider, 64),
+  RESOLVE_QUESTION: (msg) => payloadRecord(msg, ['index', 'prevAnswer', 'questionText']) &&
+    (isSafeId(msg.payload.index) || isString(msg.payload.index, 512)) &&
+    isOptionalString(msg.payload.prevAnswer) && isOptionalString(msg.payload.questionText),
+  GET_RUNTIME_CONFIG: (msg) => noPayload(msg) ||
+    (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
+  CONSUME_DASH_LAUNCH: (msg) => payloadRecord(msg, ['id']) &&
+    isString(msg.payload.id, 128) && /^[0-9a-f-]{36}$/i.test(msg.payload.id),
+  CLASSIFY_TASKS: (msg) => payloadRecord(msg, ['tasks']) &&
+    validArray(msg.payload.tasks, (task) => isString(task)),
+  OPENROUTER_CREDITS: noPayload,
+  DOWNLOAD_FILES: (msg) => payloadRecord(msg, ['urls', 'headers', 'token']) &&
+    validArray(msg.payload.urls, isAllowedAttachmentUrl) && validHeaders(msg.payload.headers) &&
+    isOptionalString(msg.payload.token, 8192),
+  LIST_SESSIONS: noPayload,
+  LIST_MESSAGES: (msg) => noPayload(msg) && isString(msg.sessionId, 512),
+  GDZ_CATALOG: (msg) => noPayload(msg) ||
+    (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
+  GDZ_SEARCH: (msg) => payloadRecord(msg, ['grade', 'subjectId', 'subtype', 'query']) &&
+    (msg.payload.grade == null || isSafeId(msg.payload.grade) || isString(msg.payload.grade, 32)) &&
+    (msg.payload.subjectId == null || isSafeId(msg.payload.subjectId) || isString(msg.payload.subjectId, 32)) &&
+    isOptionalString(msg.payload.subtype, 256) && isOptionalString(msg.payload.query),
+  GDZ_RESOLVE: (msg) => payloadRecord(msg, ['bookUrl', 'number']) &&
+    isHttpUrl(msg.payload.bookUrl) && (isSafeId(msg.payload.number) || isString(msg.payload.number, 512)),
+  GDZ_FOR_TASK: (msg) => payloadRecord(msg, ['subject', 'task']) &&
+    isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task),
+  GDZ_SELFTEST: noPayload
+};
+
+function isMeshContentUrl(url) {
+  return typeof url === 'string' &&
+    (url.startsWith('https://school.mos.ru/') || url.startsWith('https://uchebnik.mos.ru/'));
+}
+
+function classifyMessageSender(sender) {
+  if (sender?.id !== chrome.runtime.id) return null;
+  // Dashboard pages have sender.tab too, so the extension origin must win first.
+  if (typeof sender.url === 'string' && sender.url.startsWith(EXTENSION_PAGE_PREFIX)) return 'extension';
+  if (sender.tab && isSafeId(sender.tab.id) && isMeshContentUrl(sender.tab.url)) return 'content';
+  return null;
+}
+
+function validateMessage(senderClass, msg) {
+  if (!isRecord(msg)) return 'Некорректное сообщение.';
+  if (!isString(msg.type, 64) || !msg.type) return 'Некорректный тип сообщения.';
+  if (!SENDER_MESSAGE_TYPES[senderClass]?.has(msg.type)) return 'Действие недоступно для этого источника.';
+  const allowedTopKeys = msg.type === 'GET_ACTION_TOKEN'
+    ? ['type', 'action']
+    : (msg.type === 'LIST_MESSAGES' ? ['type', 'sessionId'] : ['type', 'payload', 'token']);
+  if (!hasOnlyKeys(msg, allowedTopKeys)) return 'Некорректная структура сообщения.';
+  if (msg.token != null && !isString(msg.token, 128)) return 'Некорректный токен действия.';
+  const schema = MESSAGE_SCHEMAS[msg.type];
+  if (!schema || !schema(msg)) return 'Некорректные параметры сообщения.';
+  if (msg.type === 'SOLVE') {
+    const deduped = deduplicateRequestFiles(msg.payload?.files || [], msg.payload?.history || []);
+    const budget = validateRequestFileBudget(deduped.allFiles);
+    if (!budget.ok) return budget.error;
+  }
+  return null;
+}
+
+function clearExpiredActionTokens(now = Date.now()) {
+  for (const [token, grant] of actionTokens) if (grant.expiresAt <= now) actionTokens.delete(token);
+}
+
+function issueActionToken(tabId, action) {
+  const now = Date.now();
+  clearExpiredActionTokens(now);
+  const token = crypto.randomUUID();
+  const expiresAt = now + ACTION_TOKEN_TTL_MS;
+  actionTokens.set(token, { tabId, action, expiresAt });
+  return { token, expiresAt };
+}
+
+function consumeActionToken(token, tabId, action) {
+  const grant = actionTokens.get(token);
+  // Any presentation burns the capability, including a mismatched one. That
+  // keeps it single-use and prevents repeated probing of its binding.
+  if (grant) actionTokens.delete(token);
+  if (!grant || grant.expiresAt <= Date.now() || grant.tabId !== tabId || grant.action !== action) {
+    return false;
+  }
+  return true;
+}
+
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const senderClass = classifyMessageSender(sender);
+  if (!senderClass) {
+    sendResponse({ ok: false, error: 'Недоверенный источник сообщения.' });
+    return false;
+  }
+  const validationError = validateMessage(senderClass, msg);
+  if (validationError) {
+    sendResponse({ ok: false, error: validationError });
+    return false;
+  }
+  if (msg.type === 'GET_ACTION_TOKEN') {
+    const grant = issueActionToken(sender.tab.id, msg.action);
+    sendResponse({ ok: true, ...grant });
+    return false;
+  }
+  if (senderClass === 'content' && CONTENT_ACTIONS.has(msg.type) &&
+      !consumeActionToken(msg.token, sender.tab.id, msg.type)) {
+    sendResponse({ ok: false, error: 'Токен действия недействителен или истёк.' });
+    return false;
+  }
   (async () => {
     try {
       switch (msg?.type) {
@@ -1077,14 +1512,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, result: await withKeepAlive(() => solve(msg.payload)) });
           break;
         case 'SOLVE_TEST': {
-          const answer = await withKeepAlive(() => solveTest(msg.payload));
+          const tabId = msg.payload?.tabId;
+          const answer = await (tabId
+            ? withTabSolveLock(tabId, () => withKeepAlive(() => solveTest(msg.payload)))
+            : withKeepAlive(() => solveTest(msg.payload)));
           // Parse once: the panel needs it now, and the popup's «Решить все
           // страницы» loop needs the structured questions to auto-fill the page.
           const questions = parseTestAnswers(answer);
           // Fire-and-forget: surfacing the panel must NOT delay the popup reply.
           // The popup is also where errors get rendered, so a panel failure has
           // no user-visible impact beyond "no on-page panel this time".
-          const tabId = msg.payload?.tabId;
           if (tabId && questions.length) showAnswersInTab(tabId, questions);
           sendResponse({ ok: true, answer, questions });
           break;
@@ -1126,7 +1563,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { questions, summary } = await withKeepAlive(() => pillSolveOnePage(tabId, windowId, msg.payload?.provider));
+          const { questions, summary } = await withTabSolveLock(tabId, () =>
+            withKeepAlive(() => pillSolveOnePage(tabId, windowId, sender.tab.url, msg.payload?.provider)));
           sendResponse({ ok: true, count: questions.length, summary });
           break;
         }
@@ -1136,7 +1574,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { outcome, solved } = await withKeepAlive(() => pillSolveAllPages(tabId, windowId, msg.payload?.provider));
+          const { outcome, solved } = await withTabSolveLock(tabId, () =>
+            withKeepAlive(() => pillSolveAllPages(tabId, windowId, sender.tab.url, msg.payload?.provider)));
           sendResponse({ ok: true, outcome, solved });
           break;
         }
@@ -1146,7 +1585,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           const tabId = sender?.tab?.id;
           const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const resolved = await withKeepAlive(() => resolveOneQuestion(tabId, windowId, msg.payload || {}));
+          const resolved = await withTabSolveLock(tabId, () =>
+            withKeepAlive(() => resolveOneQuestion(tabId, windowId, sender.tab.url, msg.payload || {})));
           sendResponse({ ok: true, answer: resolved.answer, parts: resolved.parts });
           break;
         }
@@ -1155,7 +1595,19 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // with built-in fallback. Never throws; cached for RUNTIME_CONFIG_TTL_MS.
           sendResponse({ ok: true, config: await getRuntimeConfig({ force: !!msg.payload?.force }) });
           break;
+        case 'CONSUME_DASH_LAUNCH': {
+          const dashboardUrl = chrome.runtime.getURL('src/dashboard/dashboard.html');
+          if (sender?.id !== chrome.runtime.id || sender?.url?.split('?')[0] !== dashboardUrl) {
+            sendResponse({ ok: false, error: 'dashboard context required' });
+            break;
+          }
+          sendResponse({ ok: true, payload: await consumeDashboardLaunch(msg.payload?.id) });
+          break;
+        }
         case 'CLASSIFY_TASKS':
+          // Remote classification ships homework text to an AI provider — the
+          // same consent gate as a solve, not a free pass because it's "meta".
+          if (!(await hasConsent())) { sendResponse({ ok: false, error: CONSENT_REQUIRED_MESSAGE }); break; }
           sendResponse({ ok: true, kinds: await classifyTasksAI(msg.payload?.tasks || []) });
           break;
         case 'OPENROUTER_CREDITS': {
@@ -1281,9 +1733,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // streaming port below. The prefix would otherwise leak into the popup's
       // "Ошибка: …" line and defeat the pill errText's Cyrillic-passthrough.
       const emsg = String(e?.message || e);
-      // Content-free error signal for the dashboard: the message is our own
-      // (mostly Russian) phrasing or a provider error, never user text.
-      track('error', { meta: { msg: emsg.slice(0, 160), op: msg?.type || null } });
+      // Content-free error signal for the dashboard: a fixed code from the
+      // errorCode() vocabulary — raw message text (which can echo provider
+      // output or file names) never leaves the device.
+      track('error', { meta: { code: errorCode(e), op: msg?.type || null } });
       sendResponse({ ok: false, error: emsg });
     }
   })();
@@ -1336,6 +1789,13 @@ async function withKeepAlive(fn) {
 // for the duration of the (possibly long) streamed answer.
 chrome.runtime.onConnect.addListener((port) => {
   if (port.name !== 'solve') return;
+  const dashboardUrl = chrome.runtime.getURL('src/dashboard/dashboard.html');
+  if (port.sender?.id !== chrome.runtime.id ||
+      typeof port.sender?.url !== 'string' ||
+      !port.sender.url.startsWith(dashboardUrl)) {
+    try { port.disconnect(); } catch { /* already closed */ }
+    return;
+  }
   // Abort the in-flight provider call if the dashboard tab is closed/reloaded
   // mid-stream. Without this the upstream fetch keeps streaming (and getting
   // charged) until the 60-s idle timeout, even though no UI is listening.
@@ -1346,11 +1806,23 @@ chrome.runtime.onConnect.addListener((port) => {
     activeCtrl = null;
   });
   port.onMessage.addListener(async (msg) => {
-    if (msg?.type !== 'SOLVE') return;
+    const safePost = (m) => { try { port.postMessage(m); } catch { /* port closed */ } };
+    // Check the per-port lock before parsing another SOLVE payload: even a bad
+    // overlapping request must not disconnect the port and thereby abort the
+    // legitimate solve that already owns it.
+    if (activeCtrl && msg?.type === 'SOLVE') {
+      safePost({ type: 'error', error: 'Решение уже выполняется. Дождитесь текущего ответа.' });
+      return;
+    }
+    const validationError = msg?.type === 'SOLVE' ? validateMessage('extension', msg) : 'Недопустимый тип сообщения.';
+    if (validationError) {
+      safePost({ type: 'error', error: validationError });
+      try { port.disconnect(); } catch { /* already closed */ }
+      return;
+    }
     const ctrl = new AbortController();
     activeCtrl = ctrl;
     const t0 = Date.now();
-    const safePost = (m) => { try { port.postMessage(m); } catch { /* port closed */ } };
     acquireKeepAlive();
     console.log('[solve] SOLVE received');
     try {
@@ -1361,7 +1833,7 @@ chrome.runtime.onConnect.addListener((port) => {
       console.log('[solve] threw +' + (Date.now() - t0) + 'ms:', e?.name, String(e?.message || e), 'aborted=' + ctrl.signal.aborted);
       // Caller-initiated abort: the port is already gone, no point posting.
       if (e?.name !== 'AbortError' && !ctrl.signal.aborted) {
-        track('error', { meta: { msg: String(e?.message || e).slice(0, 160), op: 'solve_stream' } });
+        track('error', { meta: { code: errorCode(e), op: 'solve_stream' } });
         safePost({ type: 'error', error: String(e?.message || e) });
       }
     } finally {

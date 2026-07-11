@@ -32,10 +32,35 @@ const VERIFY_CORS = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
   // Public extension endpoints accept JSON only. Admin routes are deliberately
-  // CLI/server-to-server only and must not be callable by a static website.
+  // CLI/server-to-server only and must not be callable by a static website —
+  // with ONE exception: the owner analytics dashboard (see statsCors below).
   'Access-Control-Allow-Headers': 'Content-Type',
   'Access-Control-Max-Age': '86400'
 };
+
+// The owner analytics dashboard is a static GitHub Pages site — the ONLY
+// browser origin allowed to call the read-only stats endpoints. Everything
+// else under /admin/* stays CLI/server-to-server (no Origin header at all).
+const DEFAULT_DASHBOARD_ORIGIN = 'https://ayeepat.github.io';
+const dashboardOrigin = (env) =>
+  String(env.DASHBOARD_ORIGIN || DEFAULT_DASHBOARD_ORIGIN).replace(/\/+$/, '');
+
+// CORS headers for a stats request, or null when the caller is not the
+// dashboard origin (absent Origin ⇒ null too: CLI callers need no CORS).
+function statsCors(request, env) {
+  const origin = request.headers.get('origin') || '';
+  if (!origin || origin !== dashboardOrigin(env)) return null;
+  return {
+    'Access-Control-Allow-Origin': origin,
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Admin-Token',
+    'Access-Control-Max-Age': '86400',
+    'Vary': 'Origin'
+  };
+}
+
+// The exact route set the dashboard is allowed to reach from a browser.
+const isStatsPath = (path) => path.startsWith('/admin/stats/') || path === '/admin/backfill-licenses';
 
 const json = (body, init = {}) => new Response(JSON.stringify(body), {
   status: init.status || 200,
@@ -44,13 +69,36 @@ const json = (body, init = {}) => new Response(JSON.stringify(body), {
 
 const error = (status, reason, headers = {}) => json({ ok: false, reason }, { status, headers });
 
+const SECRET_ENCODER = new TextEncoder();
+
+async function constantTimeStringEqual(expected, supplied) {
+  const expectedText = String(expected || '');
+  if (!expectedText) return false;
+
+  // Hash both values to the same fixed width before invoking the runtime's
+  // native constant-time primitive. This avoids leaking the configured
+  // secret's length and keeps comparison semantics out of optimizable JS.
+  if (typeof crypto.subtle.timingSafeEqual !== 'function') return false;
+  const [expectedHash, suppliedHash] = await Promise.all([
+    crypto.subtle.digest('SHA-256', SECRET_ENCODER.encode(expectedText)),
+    crypto.subtle.digest('SHA-256', SECRET_ENCODER.encode(String(supplied || '')))
+  ]);
+  return crypto.subtle.timingSafeEqual(expectedHash, suppliedHash);
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const method = request.method;
     const path = url.pathname;
 
-    if (method === 'OPTIONS') return new Response(null, { headers: VERIFY_CORS });
+    if (method === 'OPTIONS') {
+      // Stats preflights from the dashboard origin must whitelist the
+      // X-Admin-Token header; every other preflight keeps the public set
+      // (which deliberately does NOT allow the admin header).
+      const cors = isStatsPath(path) ? statsCors(request, env) : null;
+      return new Response(null, { headers: cors || VERIFY_CORS });
+    }
 
     try {
       if (path === '/health') return json({ ok: true });
@@ -66,6 +114,8 @@ export default {
       if (path === '/referral/status' && method === 'GET') return await handleReferralStatus(request, env);
 
       if (path === '/t' && method === 'POST') return await handleTelemetry(request, env);
+      if (path === '/t/ai' && method === 'POST') return await handleServerTelemetry(request, env);
+      if (path === '/t/delete' && method === 'POST') return await handleTelemetryDelete(request, env);
       if (path.startsWith('/admin/stats/') && method === 'GET') return await handleAdminStats(request, env, path);
       if (path === '/admin/backfill-licenses' && method === 'POST') return await handleAdminBackfill(request, env);
 
@@ -75,9 +125,9 @@ export default {
       if (path === '/admin/referral' && method === 'GET') return await handleAdminReferral(request, env);
 
       if (path === '/telegram/webhook' && method === 'POST') return await handleTelegramWebhook(request, env, ctx);
-      if (path === '/telegram/setup' && method === 'GET') return await handleTelegramSetup(request, env);
+      if (path === '/telegram/setup' && method === 'POST') return await handleTelegramSetup(request, env);
       if (path === '/telegram/info' && method === 'GET') return await handleTelegramInfo(request, env);
-      if (path === '/telegram/test' && method === 'GET') return await handleTelegramTest(request, env);
+      if (path === '/telegram/test' && method === 'POST') return await handleTelegramTest(request, env);
       if (path === '/telegram/debug' && method === 'GET') return await handleTelegramDebug(request, env);
 
       return error(404, 'not_found');
@@ -132,10 +182,15 @@ async function handleTelegramWebhook(request, env, ctx) {
   // Telegram authenticates itself with the secret token registered at
   // setWebhook time (sent back in this header). Reject anything else so a
   // leaked URL can't be used to puppet the bot.
-  if (env.TELEGRAM_WEBHOOK_SECRET) {
-    const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
-    if (got !== env.TELEGRAM_WEBHOOK_SECRET) return error(401, 'unauthorized');
+  // Fail closed on a missing secret. Treating "secret not configured" as
+  // "authentication disabled" lets anyone forge Telegram update objects,
+  // including an owner reply that makes the bot DM an arbitrary chat.
+  if (!env.TELEGRAM_WEBHOOK_SECRET) {
+    console.error('telegram webhook disabled: TELEGRAM_WEBHOOK_SECRET is not set');
+    return error(503, 'webhook_not_configured');
   }
+  const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
+  if (!(await constantTimeStringEqual(env.TELEGRAM_WEBHOOK_SECRET, got))) return error(401, 'unauthorized');
 
   let update;
   try { update = await request.json(); }
@@ -167,16 +222,16 @@ function summarizeUpdate(u = {}) {
 }
 
 // One-time helper: registers this worker's own URL as the bot's webhook, using
-// the token it already has stored. Lets you (re)connect the bot without ever
-// handling the token by hand. Guarded by the webhook secret.
-//   GET /telegram/setup?secret=<TELEGRAM_WEBHOOK_SECRET>
+// the tokens it already has stored. Operator helpers use the independent
+// ADMIN_SECRET header; the webhook credential never appears in a URL.
+//   POST /telegram/setup  (X-Admin-Token: <ADMIN_SECRET>)
 async function handleTelegramSetup(request, env) {
-  const url = new URL(request.url);
-  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
-    return error(401, 'unauthorized');
-  }
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
+  if (!env.TELEGRAM_WEBHOOK_SECRET) return error(400, 'no_webhook_secret');
   if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
 
+  const url = new URL(request.url);
   const webhookUrl = `${url.origin}/telegram/webhook`;
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/setWebhook`, {
     method: 'POST',
@@ -203,30 +258,29 @@ async function handleTelegramSetup(request, env) {
   });
   const commands = await cmdRes.json();
 
-  return json({ ok: data.ok === true, webhook: webhookUrl, telegram: data, commands });
+  return json({ ok: data.ok === true, webhook: webhookUrl, telegram: data, commands }, {
+    headers: { 'Cache-Control': 'no-store' }
+  });
 }
 
 // Diagnostics: returns Telegram's view of the webhook (url, pending count, last
-// error). Guarded by the webhook secret.
-//   GET /telegram/info?secret=<TELEGRAM_WEBHOOK_SECRET>
+// error). Guarded by the independent administrator credential.
+//   GET /telegram/info  (X-Admin-Token: <ADMIN_SECRET>)
 async function handleTelegramInfo(request, env) {
-  const url = new URL(request.url);
-  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
-    return error(401, 'unauthorized');
-  }
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getWebhookInfo`);
-  return json(await res.json());
+  return json(await res.json(), { headers: { 'Cache-Control': 'no-store' } });
 }
 
 // Diagnostics: sends a real "ping" message to a chat via the stored token and
 // returns Telegram's raw reply — proves whether the bot can DM that user.
-//   GET /telegram/test?secret=<TELEGRAM_WEBHOOK_SECRET>&chat=<id>
+//   POST /telegram/test?chat=<id>  (X-Admin-Token: <ADMIN_SECRET>)
 async function handleTelegramTest(request, env) {
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   const url = new URL(request.url);
-  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
-    return error(401, 'unauthorized');
-  }
   if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
   const chat = url.searchParams.get('chat') || env.SUPPORT_CHAT_ID;
   const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
@@ -234,19 +288,19 @@ async function handleTelegramTest(request, env) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chat, text: '✅ Проверка связи: бот СМЭШ AI работает.' })
   });
-  return json(await res.json());
+  return json(await res.json(), { headers: { 'Cache-Control': 'no-store' } });
 }
 
 // Diagnostics: returns the last update the webhook processed and what the bot
-// did with it. Guarded by the webhook secret.
-//   GET /telegram/debug?secret=<TELEGRAM_WEBHOOK_SECRET>
+// did with it. Guarded by the independent administrator credential.
+//   GET /telegram/debug  (X-Admin-Token: <ADMIN_SECRET>)
 async function handleTelegramDebug(request, env) {
-  const url = new URL(request.url);
-  if (!env.TELEGRAM_WEBHOOK_SECRET || url.searchParams.get('secret') !== env.TELEGRAM_WEBHOOK_SECRET) {
-    return error(401, 'unauthorized');
-  }
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   const last = await env.LICENSES.get('tgdebug:last');
-  return json({ ok: true, last: last ? JSON.parse(last) : null });
+  return json({ ok: true, last: last ? JSON.parse(last) : null }, {
+    headers: { 'Cache-Control': 'no-store' }
+  });
 }
 
 /* ------------------------- /webhook/robokassa ------------------------ */
@@ -473,6 +527,32 @@ async function handleTelemetry(request, env) {
   return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
 }
 
+// POST /t/ai — SERVER-observed AI usage from the VPS proxy (ai.smeshapi.site).
+// This is the ground truth for 302.AI spend: the VPS sees every real upstream
+// call regardless of the client's opt-in telemetry toggle. Guarded by the
+// INGEST_KEY shared secret; browser callers are rejected outright, so the
+// open /t endpoint can never be used to forge server-truth rows.
+async function handleServerTelemetry(request, env) {
+  if (request.headers.get('origin')) return error(401, 'unauthorized');
+  if (!env.INGEST_KEY) return error(401, 'unauthorized');
+  if (!(await constantTimeStringEqual(env.INGEST_KEY, request.headers.get('x-ingest-key') || ''))) {
+    return error(401, 'unauthorized');
+  }
+  if (!env.DB) return error(503, 'no_db');
+  const result = await analytics.handleServerIngest(request, env);
+  return json(result, { status: result.status || (result.ok ? 200 : 400) });
+}
+
+// POST /t/delete — user-initiated erasure of one device's analytics rows
+// (settings «Удалить мои данные статистики»). Open like /t itself: the device
+// id is an unguessable UUID only that installation knows, and the worst a
+// forged call can do is delete the caller's OWN pseudonymous rows.
+async function handleTelemetryDelete(request, env) {
+  if (!env.DB) return error(503, 'no_db', VERIFY_CORS);
+  const result = await analytics.handleDeleteDevice(request, env);
+  return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
+}
+
 /* --------------------------- /admin/stats/* --------------------------- */
 
 const STATS_ROUTES = {
@@ -488,46 +568,88 @@ const STATS_ROUTES = {
   rate:       (env, q) => analytics.statsRate(env, q.get('force') === '1')
 };
 
-// GET /admin/stats/<name> — CLI/server-to-server aggregation endpoints.
+// GET /admin/stats/<name> — aggregation endpoints for the owner dashboard
+// (browser, dashboard origin only) and CLI/server-to-server callers.
 async function handleAdminStats(request, env, path) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
-  if (!env.DB) return error(503, 'no_db');
+  const cors = statsCors(request, env);
+  const gate = await adminGate(request, env, cors);
+  if (gate) return gate;
+  if (!env.DB) return error(503, 'no_db', cors || {});
   const name = path.slice('/admin/stats/'.length);
   const route = STATS_ROUTES[name];
-  if (!route) return error(404, 'not_found');
+  if (!route) return error(404, 'not_found', cors || {});
   const result = await route(env, new URL(request.url).searchParams);
-  return json(result, { status: result.status || (result.ok ? 200 : 400) });
+  return json(result, { status: result.status || (result.ok ? 200 : 400), headers: cors || {} });
 }
 
 // POST /admin/backfill-licenses — re-mirror every KV license into D1.
 async function handleAdminBackfill(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
-  if (!env.DB) return error(503, 'no_db');
+  const cors = statsCors(request, env);
+  const gate = await adminGate(request, env, cors);
+  if (gate) return gate;
+  if (!env.DB) return error(503, 'no_db', cors || {});
   const result = await analytics.backfillLicenses(env);
-  return json({ ok: true, ...result });
+  return json({ ok: true, ...result }, { headers: cors || {} });
 }
 
 /* ------------------------------- /admin ------------------------------ */
 
-function adminGuard(request, env) {
-  // A static dashboard has no safe place to keep an administrator secret.
-  // Browser fetches send Origin, so reject them before checking the token.
-  // CLI/server-to-server callers have no Origin header and remain supported.
-  if (request.headers.get('origin')) return false;
+async function adminGuard(request, env, dashboardCors = null) {
+  // Browser fetches send Origin; reject them before checking the token —
+  // UNLESS the route explicitly allowed the owner dashboard origin
+  // (dashboardCors is non-null only when Origin matched it exactly).
+  if (request.headers.get('origin') && !dashboardCors) return false;
   const token = request.headers.get('x-admin-token') || '';
   if (!env.ADMIN_SECRET) return false;
-  // Constant-time compare to avoid timing leaks. Equal-length check first;
-  // mismatched lengths can short-circuit safely (no secret leakage).
-  if (token.length !== env.ADMIN_SECRET.length) return false;
-  let diff = 0;
-  for (let i = 0; i < token.length; i++) {
-    diff |= token.charCodeAt(i) ^ env.ADMIN_SECRET.charCodeAt(i);
+  return constantTimeStringEqual(env.ADMIN_SECRET, token);
+}
+
+// Brute-force bound on the admin token: failed attempts per IP per Moscow day,
+// counted in the same atomic D1 budget table telemetry uses. Once over the
+// limit the endpoint answers 429 BEFORE the token is even compared, so a
+// guessing loop is capped regardless of outcome. No DB ⇒ no limiter (the
+// token check itself still gates; never fail the owner open OR closed on a
+// D1 hiccup).
+const ADMIN_FAIL_DAILY_LIMIT = 50;
+
+async function adminFailures(env, ip, bump) {
+  if (!env.DB) return 0;
+  try {
+    if (bump) {
+      const count = await env.DB.prepare(
+        `INSERT INTO telemetry_budget (day, scope, budget_key, count) VALUES (?, ?, ?, 1)
+         ON CONFLICT(day, scope, budget_key) DO UPDATE SET count = count + 1
+         RETURNING count`
+      ).bind(analytics.mskDay(), 'admin_fail', ip).first('count');
+      return Number(count) || 0;
+    }
+    const row = await env.DB.prepare(
+      'SELECT count FROM telemetry_budget WHERE day = ? AND scope = ? AND budget_key = ?'
+    ).bind(analytics.mskDay(), 'admin_fail', ip).first();
+    return Number(row?.count) || 0;
+  } catch (e) {
+    console.error('admin fail counter unavailable', String(e));
+    return 0;
   }
-  return diff === 0;
+}
+
+// Returns an error Response (401/429) or null when the caller may proceed.
+async function adminGate(request, env, dashboardCors = null) {
+  const headers = dashboardCors || {};
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  if ((await adminFailures(env, ip, false)) >= ADMIN_FAIL_DAILY_LIMIT) {
+    return error(429, 'too_many_attempts', headers);
+  }
+  if (!(await adminGuard(request, env, dashboardCors))) {
+    await adminFailures(env, ip, true);
+    return error(401, 'unauthorized', headers);
+  }
+  return null;
 }
 
 async function handleAdminIssue(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   let body;
   try { body = await request.json(); }
   catch { return error(400, 'bad_json'); }
@@ -551,7 +673,8 @@ async function handleAdminIssue(request, env) {
 }
 
 async function handleAdminRevoke(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   let body;
   try { body = await request.json(); }
   catch { return error(400, 'bad_json'); }
@@ -565,7 +688,8 @@ async function handleAdminRevoke(request, env) {
 }
 
 async function handleAdminLicense(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   const url = new URL(request.url);
   const key = normalizeKey(url.searchParams.get('key') || '');
   if (!key) return error(400, 'missing_key');
@@ -577,7 +701,8 @@ async function handleAdminLicense(request, env) {
 // Inspect a referral: ?code=REF-XXXX-XXXX or ?device_id=<uuid> (the referrer's
 // device resolves to its code).
 async function handleAdminReferral(request, env) {
-  if (!adminGuard(request, env)) return error(401, 'unauthorized');
+  const gate = await adminGate(request, env);
+  if (gate) return gate;
   const url = new URL(request.url);
   const result = await referrals.adminReferralLookup(env, {
     code: url.searchParams.get('code') || '',

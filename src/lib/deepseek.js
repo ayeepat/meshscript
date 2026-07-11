@@ -23,7 +23,7 @@ import { postStream } from './http.js';
 import { askViaProxy } from './smesh-proxy.js';
 import { isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
-import { chargeOne } from './rate-limit.js';
+import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 import { getByoKey } from './qwen.js';
 import { getLicenseStatus } from './license.js';
 
@@ -100,31 +100,42 @@ export async function askDeepseek(systemPrompt, userText, files = [], history = 
   ];
   const wantJson = responseFormat === 'json_object';
 
-  if (!skipLocalCharge) await chargeOne('deepseek');
+  const reservation = skipLocalCharge ? null : await reserveOne('deepseek');
 
-  if (!key) {
-    // The solver's reasoning {effort} rides along; the proxy maps it to
-    // DeepSeek V4's reasoning_effort (verified live on 302.AI — the model
-    // provably reasons longer on 'high'). The model thinks by default either
-    // way; postStream ignores the reasoning_content deltas, so students only
-    // ever see the final answer.
-    return askViaProxy('deepseek', messages, {
-      label: 'DeepSeek', onDelta, onUsage, signal, reasoning,
-      responseFormat: wantJson ? 'json_object' : null
-    });
+  try {
+    if (!key) {
+      // The solver's reasoning {effort} rides along; the proxy maps it to
+      // DeepSeek V4's reasoning_effort (verified live on 302.AI — the model
+      // provably reasons longer on 'high'). The model thinks by default either
+      // way; postStream ignores the reasoning_content deltas, so students only
+      // ever see the final answer.
+      const result = await askViaProxy('deepseek', messages, {
+        label: 'DeepSeek', onDelta, onUsage, signal, reasoning,
+        responseFormat: wantJson ? 'json_object' : null
+      });
+      if (reservation) await commitOne(reservation);
+      return result;
+    }
+
+    // BYO path goes to DashScope (a real Alibaba key), where reasoning_effort
+    // support is unverified — deliberately NOT forwarded here to avoid 400ing
+    // power users on an untestable param.
+    const body = {
+      model: MODEL,
+      messages,
+      temperature: 0.3,
+      stream_options: { include_usage: true }
+    };
+    if (wantJson) body.response_format = { type: 'json_object' };
+
+    const headers = { Authorization: `Bearer ${key}` };
+    const result = await postStream(ENDPOINT, { headers, body, label: 'DeepSeek', onDelta, onUsage, signal });
+    if (reservation) await commitOne(reservation);
+    return result;
+  } catch (e) {
+    if (reservation) {
+      try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }
+    }
+    throw e;
   }
-
-  // BYO path goes to DashScope (a real Alibaba key), where reasoning_effort
-  // support is unverified — deliberately NOT forwarded here to avoid 400ing
-  // power users on an untestable param.
-  const body = {
-    model: MODEL,
-    messages,
-    temperature: 0.3,
-    stream_options: { include_usage: true }
-  };
-  if (wantJson) body.response_format = { type: 'json_object' };
-
-  const headers = { Authorization: `Bearer ${key}` };
-  return postStream(ENDPOINT, { headers, body, label: 'DeepSeek', onDelta, onUsage, signal });
 }
