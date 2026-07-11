@@ -30,8 +30,7 @@ body.compact .answer { font-size: 12.5px; padding: 11px 12px; }
 }
 .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .brandtext { display: flex; flex-direction: column; line-height: 1.05; min-width: 0; }
-/* Wordmark stays in the geometric sans, never the display face. */
-.brandtext h1 { font-family: var(--font-sans); font-size: 17px; font-weight: 800; letter-spacing: -0.4px; margin: 0; }
+.brandtext h1 { font-family: var(--font-display); font-size: 17px; font-weight: 800; letter-spacing: -0.4px; margin: 0; }
 .brandsub { font-size: 11px; font-weight: 500; color: var(--tertiary); margin-top: 2px; }
 
 .iconbtn {

@@ -20,8 +20,7 @@ body {
   border-bottom: 1px solid var(--separator);
 }
 .sidebar-head .brandtext { display: flex; flex-direction: column; line-height: 1.1; }
-/* Wordmark stays in the geometric sans, never the display face. */
-.sidebar-head .brandname { font-family: var(--font-sans); font-size: 15px; font-weight: 800; letter-spacing: -0.4px; }
+.sidebar-head .brandname { font-family: var(--font-display); font-size: 15px; font-weight: 800; letter-spacing: -0.4px; }
 .sidebar-head .brandsub { font-size: 11px; color: var(--tertiary); margin-top: 1px; }
 .sidebar h2 {
   font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px;

@@ -3,8 +3,8 @@
    Warm off-white ground + crisp white cards + a calm teal accent in light mode;
    deep teal-ink with a brighter mint accent in dark mode. Flat surfaces,
    hairline separators, 16px cards, no gradients. Display type is Unbounded
-   (titles, headings, numbers); body/UI type is Manrope — both bundled locally
-   with full Cyrillic. The "СМЭШ AI" wordmark stays in Manrope.
+   (titles, headings, numbers, and the "СМЭШ AI" wordmark); body/UI type is
+   Manrope — both bundled locally with full Cyrillic.
    `data-theme` on <html> is set by src/common/theme.js. A matching block lives
    under prefers-color-scheme so dark mode never flashes light before JS runs.
    ========================================================================== */
@@ -35,9 +35,9 @@
     U+2113, U+2C60-2C7F, U+A720-A7FF;
 }
 
-/* Unbounded — rounded display face for titles, headings and numbers. Bundled
-   locally, variable weight 600–800. Same script subsets as Manrope so Cyrillic
-   renders correctly offline. The "СМЭШ AI" wordmark stays in Manrope. ------- */
+/* Unbounded — rounded display face for titles, headings, numbers and the
+   "СМЭШ AI" wordmark. Bundled locally, variable weight 600–800. Same script
+   subsets as Manrope so Cyrillic renders correctly offline. --------------- */
 @font-face {
   font-family: "Unbounded"; font-style: normal; font-weight: 600 800; font-display: swap;
   src: url("../../assets/fonts/unbounded-cyrillic.woff2") format("woff2");
