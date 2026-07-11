@@ -31,6 +31,19 @@ assert.equal(productionPromptSources.includes('frameEditablePrompt'), false,
   'prompt framing must not substitute for an enforcement boundary');
 assert.doesNotMatch(source('../src/settings/settings.html'), /data-(?:tab|panel)="prompts"/);
 
+// Opening a saved history card must be a local read, never another solve/API
+// request. Keep the assertion scoped to the History UI so unrelated settings
+// actions are free to use their own message types.
+const settingsJs = source('../src/settings/settings.js');
+const historyUi = settingsJs.slice(
+  settingsJs.indexOf('/* ---------- History ---------- */'),
+  settingsJs.indexOf('/* ---------- Textbooks (GDZ) ---------- */')
+);
+assert.match(historyUi, /type:\s*'LIST_MESSAGES'/,
+  'history cards must load their saved messages');
+assert.doesNotMatch(historyUi, /type:\s*'SOLVE'/,
+  'opening history must never issue another AI solve request');
+
 // Execute the actual verification helpers from the classic content script in a
 // small VM context, without duplicating their implementation in the test.
 const scraper = source('../src/content/scraper.js');
