@@ -22,14 +22,12 @@
  * KV layout (shared LICENSES namespace):
  *   ref:<CODE>            — the referrer's record (stats + where days land)
  *   refowner:<device_id>  — device → its own code (idempotent code creation)
- *   refpaid:<license_key> — marker: this purchase already paid the referrer
- *                           (idempotent across Robokassa webhook retries)
+ *   refpaid:<license_key> — legacy mirror of the authoritative D1 claim
  *   refip:<ip>:<date>     — daily per-IP counter for /referral/code
  *
- * KV is eventually consistent with no transactions. Every path here is
- * idempotent per purchased license, so webhook retries never double-credit;
- * only two *truly simultaneous* first-time deliveries of the same InvId could
- * race, which Robokassa does not do.
+ * KV is eventually consistent with no transactions. D1 referral_credits is
+ * therefore the authority for one payout per purchased license; the KV marker
+ * remains only for compatibility and operator visibility.
  */
 
 import { getLicense, putLicense, issueLicense, normalizeKey } from './licenses.js';
@@ -199,9 +197,20 @@ export async function creditReferrerForPurchase(env, ref, licenseKey) {
   if (!ref?.code || !licKey) return { credited: false, reason: 'bad_input' };
 
   const marker = `refpaid:${licKey}`;
-  if (await env.LICENSES.get(marker)) return { credited: false, reason: 'already' };
-  // Claim the marker BEFORE crediting: a rare mid-failure loses one credit,
-  // which is far better than a retry double-paying a free reward.
+  if (env.DB) {
+    const claim = await env.DB.prepare(
+      `INSERT OR IGNORE INTO referral_credits
+         (license_key, ref_code, claimed_at)
+       VALUES (?1, ?2, ?3)`
+    ).bind(licKey, ref.code, Date.now()).run();
+    if ((claim?.meta?.changes || 0) === 0) return { credited: false, reason: 'already' };
+  } else {
+    // Compatibility for non-payment/manual environments. Paid issuance itself
+    // now requires D1, so production referral payouts always use the atomic path.
+    if (await env.LICENSES.get(marker)) return { credited: false, reason: 'already' };
+  }
+  // Mirror the claim before crediting. As before, failure prefers one missed
+  // free reward over a duplicate; D1 closes the simultaneous-delivery race.
   await env.LICENSES.put(marker, ref.code);
 
   const fresh = (await getJson(env, `ref:${ref.code}`)) || ref;

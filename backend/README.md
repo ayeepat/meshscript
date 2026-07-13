@@ -23,7 +23,7 @@ are set, both fire and the buyer gets the key in both places.
 
 | Route                     | Auth                                      | Purpose                                  |
 |---------------------------|-------------------------------------------|------------------------------------------|
-| `GET /verify`             | none (CORS open — rate-limit at the edge) | Extension calls this to validate a key. |
+| `POST /verify`            | none (CORS open — rate-limit at the edge) | Extension validates a key using a bounded JSON body. |
 | `POST /ai/chat`           | license key + device id (verified server-side) | Qwen/DeepSeek AI proxy — see below.      |
 | `POST /webhook/robokassa` | `SignatureValue` with password #2         | Auto-issue on a successful ResultURL.    |
 | `GET /webhook/robokassa`  | same as POST                              | Accepted for dashboards configured as GET. |
@@ -150,8 +150,13 @@ settings. `MD5` is Robokassa's default and is supported by the Worker.
 ### 4. Deploy
 
 ```sh
+npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
 npx wrangler deploy
 ```
+
+Apply the schema first. Paid issuance deliberately fails closed unless the
+atomic `payment_issuance` registry exists; `referral_credits` closes the same
+concurrent-retry race for referral rewards.
 
 Wrangler prints your worker URL, for example
 `https://smesh-licenses.<account>.workers.dev`. Hit `GET /health` to confirm
@@ -272,7 +277,9 @@ fires — useful for seeding your own dev-bypass key.
 ## Verify A Key
 
 ```sh
-curl 'https://api.smesh.app/verify?key=SMESH-XXXX-XXXX-XXXX&device_id=test'
+curl -X POST 'https://smeshapi.site/verify' \
+  -H 'Content-Type: application/json' \
+  -d '{"key":"SMESH-XXXX-XXXX-XXXX","device_id":"test-device"}'
 # → { "ok": true, "type": "lifetime", "expires_at": null }
 ```
 

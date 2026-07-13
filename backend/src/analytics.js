@@ -243,10 +243,10 @@ export async function handleDeleteDevice(request, env) {
 /* --------------------------- server ingest ---------------------------- */
 
 /**
- * POST /t/ai — SERVER-observed AI calls from the VPS proxy (INGEST_KEY-gated
- * in worker.js; never reachable from a browser). Ground truth for 302.AI
- * usage: the VPS sees every real upstream call regardless of the client's
- * telemetry opt-in. Stored under their own type ('ai_call') — which the open
+ * POST /t/ai — opted-in SERVER-observed AI calls from the VPS proxy
+ * (INGEST_KEY-gated in worker.js; never reachable from a browser). The proxy
+ * emits these only when the request carries the extension's strict telemetry
+ * opt-in. Stored under their own type ('ai_call') — which the open
  * /t endpoint refuses (EVENT_TYPES), so clients cannot forge server rows —
  * and aggregated separately from client-reported stats (see usageRollup).
  * Content-free like /t: device id, provider, model, token counts, estimated

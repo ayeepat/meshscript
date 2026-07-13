@@ -70,6 +70,27 @@ CREATE TABLE IF NOT EXISTS purchases (
 );
 CREATE INDEX IF NOT EXISTS idx_purchases_issued ON purchases(issued_at);
 
+-- Authoritative payment idempotency registry. KV cannot atomically perform
+-- "create if absent", so simultaneous gateway deliveries could mint two keys.
+-- license_json makes a committed claim recoverable when an invocation dies
+-- before it materializes the corresponding KV license row.
+CREATE TABLE IF NOT EXISTS payment_issuance (
+  gateway      TEXT    NOT NULL,
+  payment_id   TEXT    NOT NULL,
+  license_key  TEXT    NOT NULL UNIQUE,
+  license_json TEXT    NOT NULL,
+  created_at   INTEGER NOT NULL,
+  PRIMARY KEY (gateway, payment_id)
+);
+
+-- One atomic referral payout claim per purchased license. The reward remains
+-- mirrored in KV, but concurrent webhook deliveries cannot both credit it.
+CREATE TABLE IF NOT EXISTS referral_credits (
+  license_key TEXT    PRIMARY KEY,
+  ref_code    TEXT    NOT NULL,
+  claimed_at  INTEGER NOT NULL
+);
+
 -- AI-proxy daily quota counters (see src/ai-proxy.js). One row per Moscow
 -- day × license × provider, bumped atomically per request. The special row
 -- (license_key='*', provider='all') is the global circuit-breaker counter.
@@ -80,6 +101,20 @@ CREATE TABLE IF NOT EXISTS proxy_quota (
   provider    TEXT    NOT NULL,           -- qwen | deepseek | 'all' (global row)
   count       INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, license_key, provider)
+);
+
+-- Authoritative device registry for the per-license device cap (DEVICE_LIMIT).
+-- KV device_ids stays the display/admin mirror, but the CAP DECISION lives here
+-- because KV has no compare-and-swap: two concurrent /verify calls with distinct
+-- devices could both read `device_ids.length < limit` and both push, exceeding
+-- the cap. verifyLicense (licenses.js) claims a slot with one conditional INSERT
+-- whose WHERE re-counts under SQLite's write lock, so the race cannot slip past.
+-- Seeded lazily from KV device_ids on the first new-device verify per license.
+CREATE TABLE IF NOT EXISTS license_devices (
+  license_key TEXT    NOT NULL,
+  device_id   TEXT    NOT NULL,
+  added_at    INTEGER NOT NULL,           -- ms epoch
+  PRIMARY KEY (license_key, device_id)
 );
 
 -- Atomic abuse budgets for the anonymous telemetry endpoint. KV read-modify-

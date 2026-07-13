@@ -3,7 +3,7 @@
  *
  * Routes:
  *   POST/GET /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
- *   GET  /verify             Extension calls this; returns active|expired|...
+ *   POST /verify             Extension calls this; returns active|expired|...
  *   POST /ai/chat            License-gated Qwen/DeepSeek proxy (see ai-proxy.js)
  *   POST /referral/code      Get/create this device's referral code
  *   GET  /referral/check     Validate a code at checkout (before charging)
@@ -64,7 +64,11 @@ const isStatsPath = (path) => path.startsWith('/admin/stats/') || path === '/adm
 
 const json = (body, init = {}) => new Response(JSON.stringify(body), {
   status: init.status || 200,
-  headers: { 'Content-Type': 'application/json', ...(init.headers || {}) }
+  // Every response here is a dynamic API verdict (license status, referral,
+  // admin stats) — none should be cached. Default no-store so a license verdict
+  // can't be served stale by a heuristic browser/intermediary cache; callers may
+  // still override via init.headers.
+  headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...(init.headers || {}) }
 });
 
 const error = (status, reason, headers = {}) => json({ ok: false, reason }, { status, headers });
@@ -103,7 +107,7 @@ export default {
     try {
       if (path === '/health') return json({ ok: true });
 
-      if (path === '/verify' && method === 'GET') return await handleVerify(request, env);
+      if (path === '/verify' && method === 'POST') return await handleVerify(request, env);
       if (path === '/ai/chat' && method === 'POST') return await handleAiChat(request, env);
       if (path === '/webhook/robokassa' && (method === 'POST' || method === 'GET')) {
         return await handleRobokassa(request, env, ctx);
@@ -142,9 +146,18 @@ export default {
 /* ------------------------------ /verify ------------------------------ */
 
 async function handleVerify(request, env) {
-  const url = new URL(request.url);
-  const key = url.searchParams.get('key') || '';
-  const deviceId = url.searchParams.get('device_id') || '';
+  const declared = Number(request.headers.get('content-length') || 0);
+  if (declared > 4096) return error(413, 'body_too_large', VERIFY_CORS);
+  let text;
+  try { text = await request.text(); }
+  catch { return error(400, 'bad_json', VERIFY_CORS); }
+  if (SECRET_ENCODER.encode(text).byteLength > 4096) return error(413, 'body_too_large', VERIFY_CORS);
+  let body;
+  try { body = JSON.parse(text); }
+  catch { return error(400, 'bad_json', VERIFY_CORS); }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return error(400, 'bad_json', VERIFY_CORS);
+  const key = typeof body.key === 'string' ? body.key : '';
+  const deviceId = typeof body.device_id === 'string' ? body.device_id : '';
   const result = await verifyLicense(env, key, deviceId);
   return json(result, { headers: VERIFY_CORS });
 }
@@ -334,11 +347,18 @@ async function handleRobokassa(request, env, ctx) {
   }
 
   const floor = minPaymentRub(env);
-  if (floor > 0 && n.amount_rub < floor) {
+  if (floor <= 0) {
+    // Fail CLOSED. With no floor configured, planFromAmount falls back to the
+    // default (lifetime) plan for ANY paid amount — a 1₽ test payment would mint
+    // a lifetime key. A payment webhook must never issue on misconfiguration, so
+    // ack Robokassa (no retries) but issue nothing until a floor is set.
+    console.error('robokassa: NO payment floor configured — refusing to issue. Set MIN_PAYMENT_RUB (or a plan floor) before the pay page goes live.');
+    return robokassa.okResponse(n.invoice_id);
+  }
+  if (n.amount_rub < floor) {
     console.warn('robokassa: amount below floor, not issuing', n.payment_id, n.amount_rub);
     return robokassa.okResponse(n.invoice_id);
   }
-  if (floor <= 0) console.warn('robokassa: NO payment floor configured — set MIN_PAYMENT_RUB or any paid amount can issue a license');
 
   // The order page should thread signed delivery data + any referral code
   // through Shp_* params, or pre-register order:<InvId> in KV. EMail from
@@ -527,11 +547,11 @@ async function handleTelemetry(request, env) {
   return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
 }
 
-// POST /t/ai — SERVER-observed AI usage from the VPS proxy (ai.smeshapi.site).
-// This is the ground truth for 302.AI spend: the VPS sees every real upstream
-// call regardless of the client's opt-in telemetry toggle. Guarded by the
-// INGEST_KEY shared secret; browser callers are rejected outright, so the
-// open /t endpoint can never be used to forge server-truth rows.
+// POST /t/ai — opted-in SERVER-observed AI usage from the VPS proxy
+// (ai.smeshapi.site). The VPS emits only when the extension request carries
+// strict telemetry_opt_in:true. Guarded by the INGEST_KEY shared secret;
+// browser callers are rejected outright, so the open /t endpoint can never
+// be used to forge server-observed rows.
 async function handleServerTelemetry(request, env) {
   if (request.headers.get('origin')) return error(401, 'unauthorized');
   if (!env.INGEST_KEY) return error(401, 'unauthorized');

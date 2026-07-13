@@ -71,15 +71,52 @@ export async function putLicense(env, license) {
 }
 
 /**
- * Idempotent issuance. If a payment_id already produced a license, return that
- * one — protects against payment gateway replays and our own retries.
- *
- * We index by payment_id in a parallel KV key so the lookup is O(1).
+ * Look up the authoritative D1 payment claim, falling back to the historical
+ * KV index for licenses issued before the payment_issuance migration.
  */
 export async function findByPayment(env, gateway, paymentId) {
   if (!paymentId) return null;
+  if (env.DB) {
+    try {
+      const row = await env.DB.prepare(
+        'SELECT license_json FROM payment_issuance WHERE gateway = ?1 AND payment_id = ?2'
+      ).bind(String(gateway), String(paymentId)).first();
+      if (row?.license_json) {
+        const license = JSON.parse(row.license_json);
+        if (license?.key) return license;
+      }
+    } catch (e) {
+      console.warn('payment issuance lookup failed', String(e));
+    }
+  }
   const key = await env.LICENSES.get(`payment:${gateway}:${paymentId}`);
   return key ? getLicense(env, key) : null;
+}
+
+// Atomically choose one license row for a gateway payment. The complete JSON
+// is stored in D1 so a retry can recover and materialize the same KV row even
+// if the winning invocation died after the SQL commit but before LICENSES.put.
+async function claimPaymentLicense(env, gateway, paymentId, candidate) {
+  if (!env.DB) throw new Error('payment issuance registry unavailable');
+  const gatewayId = String(gateway);
+  const payment = String(paymentId);
+  const serialized = JSON.stringify(candidate);
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO payment_issuance
+       (gateway, payment_id, license_key, license_json, created_at)
+     VALUES (?1, ?2, ?3, ?4, ?5)`
+  ).bind(gatewayId, payment, candidate.key, serialized, Date.now()).run();
+  const row = await env.DB.prepare(
+    'SELECT license_json FROM payment_issuance WHERE gateway = ?1 AND payment_id = ?2'
+  ).bind(gatewayId, payment).first();
+  if (!row?.license_json) throw new Error('payment issuance claim failed');
+  let winner;
+  try { winner = JSON.parse(row.license_json); }
+  catch { throw new Error('payment issuance registry is corrupt'); }
+  if (!winner?.key || winner.gateway !== gateway || String(winner.payment_id) !== payment) {
+    throw new Error('payment issuance registry mismatch');
+  }
+  return winner;
 }
 
 export async function issueLicense(env, params) {
@@ -95,10 +132,19 @@ export async function issueLicense(env, params) {
     note = null
   } = params;
 
-  // Idempotency: same payment_id → same license, never a duplicate.
+  // D1, not KV, is the authority for paid issuance. KV has no compare-and-swap:
+  // two concurrent webhook deliveries could both miss its payment index and
+  // mint different keys. Requiring D1 makes a missing migration/outage retryable
+  // instead of silently issuing twice.
   if (payment_id) {
+    if (!env.DB) throw new Error('payment issuance registry unavailable');
     const existing = await findByPayment(env, gateway, payment_id);
-    if (existing) return existing;
+    if (existing) {
+      const winner = await claimPaymentLicense(env, gateway, payment_id, existing);
+      await putLicense(env, winner);
+      await env.LICENSES.put(`payment:${gateway}:${payment_id}`, winner.key);
+      return winner;
+    }
   }
 
   // Collision-avoid loop. With 28^12 keyspace and preorder volumes this
@@ -126,11 +172,62 @@ export async function issueLicense(env, params) {
     device_ids: [],
     note
   };
-  await putLicense(env, license);
   if (payment_id) {
-    await env.LICENSES.put(`payment:${gateway}:${payment_id}`, key);
+    const winner = await claimPaymentLicense(env, gateway, payment_id, license);
+    await putLicense(env, winner);
+    await env.LICENSES.put(`payment:${gateway}:${payment_id}`, winner.key);
+    return winner;
   }
+  await putLicense(env, license);
   return license;
+}
+
+/**
+ * Atomically claim a device slot for a license in D1 (the `license_devices`
+ * table). Cloudflare KV has no compare-and-swap, so the historical
+ * read-`device_ids`-then-write path let two concurrent /verify calls with
+ * distinct devices both observe `length < limit` and both push — quietly
+ * exceeding DEVICE_LIMIT. SQLite serializes writers, so a single conditional
+ * INSERT whose `WHERE` re-counts the table under the write lock cannot race:
+ * the second insert sees the first's committed row.
+ *
+ * Returns:
+ *   { ok:true,  added:bool }   device is (now) claimed — added on first-seen
+ *   { ok:false, reason:'device_limit' }  cap reached, device not present
+ *   null                       D1 unavailable — caller MUST fall back to the KV
+ *                              check so a D1 hiccup never fails an otherwise
+ *                              valid verify (KV stays the source of truth).
+ *
+ * `knownDevices` (the KV license row's device_ids) are seeded first so the
+ * count is authoritative even for licenses created before this table existed;
+ * INSERT OR IGNORE keeps the seed idempotent and never widens the cap.
+ */
+async function claimDeviceSlot(env, key, deviceId, limit, knownDevices) {
+  if (!env.DB) return null;
+  try {
+    const now = Date.now();
+    if (knownDevices?.length) {
+      await env.DB.batch(knownDevices.slice(0, 64).map((d) =>
+        env.DB.prepare('INSERT OR IGNORE INTO license_devices (license_key, device_id, added_at) VALUES (?, ?, ?)')
+          .bind(key, d, now)));
+    }
+    const res = await env.DB.prepare(
+      `INSERT OR IGNORE INTO license_devices (license_key, device_id, added_at)
+       SELECT ?1, ?2, ?3
+       WHERE (SELECT COUNT(*) FROM license_devices WHERE license_key = ?1) < ?4`
+    ).bind(key, deviceId, now, limit).run();
+    if ((res?.meta?.changes || 0) > 0) return { ok: true, added: true };
+    // No row inserted: the device already holds a slot (allowed), or the cap is
+    // full (rejected). One cheap existence check disambiguates.
+    const existing = await env.DB.prepare(
+      'SELECT 1 FROM license_devices WHERE license_key = ?1 AND device_id = ?2'
+    ).bind(key, deviceId).first();
+    return existing ? { ok: true, added: false } : { ok: false, reason: 'device_limit' };
+  } catch (e) {
+    // Missing table (pre-migration) or a D1 outage — fail OPEN to the KV path.
+    console.warn('device slot registry unavailable, falling back to KV cap', String(e));
+    return null;
+  }
 }
 
 /**
@@ -169,12 +266,24 @@ export async function verifyLicense(env, rawKey, deviceId) {
     if (!/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) {
       return { ok: false, reason: 'bad_device' };
     }
-    if (!license.device_ids.includes(deviceId)) {
-      if (license.device_ids.length >= limit) {
-        return { ok: false, reason: 'device_limit', limit };
+    const known = Array.isArray(license.device_ids) ? license.device_ids : [];
+    // An already-accepted device needs no cap decision — the slot was claimed
+    // when it was first seen — so the atomic D1 path only runs for a genuinely
+    // NEW device (the sole contended operation), keeping hot re-verifies free.
+    if (!known.includes(deviceId)) {
+      const claim = await claimDeviceSlot(env, key, deviceId, limit, known);
+      if (claim) {
+        if (!claim.ok) return { ok: false, reason: 'device_limit', limit };
+        // Mirror into the KV row for admin/display; D1 is authoritative for the
+        // cap, so a failed/racing KV write can't reopen the slot.
+        license.device_ids = [...known, deviceId];
+        await putLicense(env, license);
+      } else {
+        // D1 unavailable — best-effort KV cap (the pre-existing behaviour).
+        if (known.length >= limit) return { ok: false, reason: 'device_limit', limit };
+        license.device_ids = [...known, deviceId];
+        await putLicense(env, license);
       }
-      license.device_ids.push(deviceId);
-      await putLicense(env, license);
     }
   }
   return { ok: true, type: license.type, expires_at: license.expires_at };

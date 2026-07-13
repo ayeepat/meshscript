@@ -15,10 +15,12 @@
 #        npx wrangler secret put SUPPORT_CHAT_ID             # your numeric Telegram id (support bot)
 #        npx wrangler secret put TELEGRAM_WEBHOOK_SECRET     # random string (support bot webhook auth)
 #        npx wrangler secret put AI_PROXY_API_KEY            # 302.AI key (AI proxy, ai-proxy.js)
-#        npx wrangler secret put INGEST_KEY                  # shared with the VPS: server-truth usage -> POST /t/ai
+#        npx wrangler secret put INGEST_KEY                  # shared with the VPS: opted-in usage -> POST /t/ai
 #        npx wrangler secret put ANALYTICS_SALT              # license-key pseudonymization (analytics.js)
-#  4. `npx wrangler deploy`
-#  5. Confirm smeshapi.site is bound to this worker (Cloudflare → Workers → Triggers).
+#  4. Apply every schema migration BEFORE deploying payment code:
+#        npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
+#  5. `npx wrangler deploy`
+#  6. Confirm smeshapi.site is bound to this worker (Cloudflare → Workers → Triggers).
 
 name = "smesh-licenses"
 main = "src/worker.js"
