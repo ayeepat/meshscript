@@ -93,15 +93,15 @@ ROBOKASSA_REFUND_HASH_ALGO = "HS256"
 # sent to the classic ResultURL handler.
 ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
 ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/?payment=cancelled"
-# REQUIRED before launch: choose `provider` or `external`. Provider mode also
-# requires ROBOKASSA_RECEIPT_TAX, ROBOKASSA_RECEIPT_PAYMENT_METHOD and
-# ROBOKASSA_RECEIPT_PAYMENT_OBJECT (plus optional ROBOKASSA_RECEIPT_SNO).
-# Do not copy a tax treatment from a sample; have the merchant's accountant set
-# the actual values. Leaving the choice absent intentionally keeps health red.
-# ROBOKASSA_FISCALIZATION_MODE = "provider"
-# ROBOKASSA_RECEIPT_TAX = "none"
-# ROBOKASSA_RECEIPT_PAYMENT_METHOD = "full_payment"
-# ROBOKASSA_RECEIPT_PAYMENT_OBJECT = "service"
+# The cabinet confirms Robocheki SMZ for this NPD shop. Send itemized receipt
+# data to Robokassa; omit SNO so the confirmed cabinet profile remains the
+# authority. The offer grants a non-exclusive software licence and access is
+# issued immediately after payment confirmation, so the receipt uses RIA/full
+# settlement rather than an advance or a generic physical-good classification.
+ROBOKASSA_FISCALIZATION_MODE = "provider"
+ROBOKASSA_RECEIPT_TAX = "none"
+ROBOKASSA_RECEIPT_PAYMENT_METHOD = "full_payment"
+ROBOKASSA_RECEIPT_PAYMENT_OBJECT = "intellectual_activity"
 # Optional hard IP filter for ResultURL. Signature verification remains required.
 ROBOKASSA_ENFORCE_IP_ALLOWLIST = "true"
 # Email "from" address. Must be a verified sender in your Resend account.
