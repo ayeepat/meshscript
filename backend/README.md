@@ -236,11 +236,11 @@ Configure the authoritative standard ResultURL in the Robokassa cabinet as
 `https://smeshapi.site/webhook/robokassa` with method `POST`. The
 Worker deliberately does not send `ResultUrl2`: that option uses Robokassa's
 separate JWS notification format, while `/webhook/robokassa` verifies the
-classic Password #2 `SignatureValue`. `ROBOKASSA_SUCCESS_URL2` and
-`ROBOKASSA_FAIL_URL2` are raw browser-return URLs. Checkout signs their
-percent-encoded representations, returns the raw values as form fields, and
-lets the browser apply the one transport-encoding pass. Do not pre-encode them
-on the site.
+classic Password #2 `SignatureValue`. Success and failure redirects are owned
+by the Robokassa cabinet. Checkout does not send the optional `SuccessUrl2`,
+`FailUrl2`, or `Shp_*` modifiers; its Password #1 signature is the documented
+minimal receipt form `MerchantLogin:OutSum:InvId:Receipt:Password#1`. The
+signed invoice and amount are then matched to the authoritative D1 order.
 
 `ROBOKASSA_MERCHANT_LOGIN` is required and must exactly match the shop's
 MerchantLogin. It is not a password, but this repository deliberately does not

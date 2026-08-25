@@ -143,25 +143,6 @@ function checkoutBotUsername(env) {
   return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(username) ? username : '';
 }
 
-function checkoutUrl(raw) {
-  try {
-    const url = new URL(String(raw || ''));
-    if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.href.length > 2048) {
-      return '';
-    }
-    return url.href;
-  } catch {
-    return '';
-  }
-}
-
-function checkoutReturnUrls(env) {
-  return {
-    successUrl2: checkoutUrl(env.ROBOKASSA_SUCCESS_URL2),
-    failUrl2: checkoutUrl(env.ROBOKASSA_FAIL_URL2)
-  };
-}
-
 export function telegramWebhookSecretValid(env) {
   const secret = String(env?.TELEGRAM_WEBHOOK_SECRET || '');
   // Telegram accepts only this alphabet for secret_token. Requiring 32+
@@ -254,12 +235,10 @@ export function checkoutConfigValid(env) {
   const school = checkoutCatalogPlan(env, 'school');
   const promoCode = checkoutPromoCode(env);
   const promoPrice = rublesToKopecks(env.CHECKOUT_PROMO_MONTH_PRICE_RUB);
-  const urls = checkoutReturnUrls(env);
   return !!(
     month.ok && school.ok && checkoutBotUsername(env) &&
     String(env.TELEGRAM_BOT_TOKEN || '') && telegramWebhookSecretValid(env) &&
     checkoutCapabilitySecretValid(env) &&
-    urls.successUrl2 && urls.failUrl2 &&
     (!promoCode || promoPrice)
   );
 }
@@ -774,12 +753,7 @@ export async function createCheckoutPayment(env, body) {
     email: frozen.email,
     isTest: frozen.environment === 'test',
     receipt: frozen.receipt_json || '',
-    expiresAt: Number(frozen.expires_at) - 60_000,
-    shp: {
-      Shp_environment: frozen.environment,
-      Shp_order_id: String(frozen.order_id)
-    },
-    ...checkoutReturnUrls(env)
+    expiresAt: Number(frozen.expires_at) - 60_000
   });
   return {
     ok: true,
@@ -904,10 +878,19 @@ export async function loadRobokassaOrder(env, paymentId) {
 export function validateRobokassaCallbackOrder(env, order, normalized, fields) {
   if (!order) return { ok: false, reason: 'unknown_order' };
   const environment = paymentEnvironment(env);
-  if (!environment || order.environment !== environment || fields.Shp_environment !== environment) {
+  if (!environment || order.environment !== environment) {
     return { ok: false, reason: 'environment_mismatch', retry: true };
   }
-  if (String(fields.Shp_order_id || '') !== String(order.order_id) ||
+  const shpEnvironment = String(fields.Shp_environment || '');
+  const shpOrderId = String(fields.Shp_order_id || '');
+  // New hosted checkouts use Robokassa's minimal receipt signature and bind
+  // the signed InvId/OutSum directly to the authoritative D1 order. Continue
+  // accepting the complete legacy Shp pair so callbacks from forms created
+  // before this rollout remain verifiable, but reject partial or conflicting
+  // pairs instead of silently weakening their historical binding.
+  if ((!!shpEnvironment !== !!shpOrderId) ||
+      (shpEnvironment && shpEnvironment !== environment) ||
+      (shpOrderId && shpOrderId !== String(order.order_id)) ||
       String(order.order_id) !== String(normalized.payment_id)) {
     return { ok: false, reason: 'order_binding_mismatch', retry: true };
   }

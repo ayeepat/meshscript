@@ -199,13 +199,7 @@ function sortedShpPairs(fields) {
 function expectedPaymentSignature(fields) {
   const parts = [fields.MerchantLogin, fields.OutSum, fields.InvId];
   for (const value of [
-    fields.Receipt,
-    fields.StepByStep,
-    fields.SuccessUrl2 == null ? '' : encodeURIComponent(String(fields.SuccessUrl2)),
-    fields.SuccessUrl2Method,
-    fields.FailUrl2 == null ? '' : encodeURIComponent(String(fields.FailUrl2)),
-    fields.FailUrl2Method,
-    fields.Token
+    fields.Receipt, fields.StepByStep, fields.ResultUrl2, fields.Token
   ]) {
     if (value !== '' && value != null) parts.push(String(value));
   }
@@ -509,34 +503,25 @@ try {
     assert.equal(fields.Email, 'buyer@example.com');
     assert.equal(fields.ResultUrl2, undefined,
       'the classic checkout must use the cabinet ResultURL, not the JWS ResultUrl2 flow');
-    assert.equal(fields.SuccessUrl2, SUCCESS_URL2);
-    assert.equal(fields.SuccessUrl2Method, 'GET');
-    assert.equal(fields.FailUrl2, FAIL_URL2);
-    assert.equal(fields.FailUrl2Method, 'GET');
+    assert.equal(fields.SuccessUrl2, undefined,
+      'browser return routes must come from the Robokassa cabinet');
+    assert.equal(fields.SuccessUrl2Method, undefined);
+    assert.equal(fields.FailUrl2, undefined,
+      'browser return routes must come from the Robokassa cabinet');
+    assert.equal(fields.FailUrl2Method, undefined);
     assert.match(fields.Receipt || '', /^%7B/);
     const serializedForm = new URLSearchParams(fields).toString();
-    assert.ok(serializedForm.includes(
-      `SuccessUrl2=${encodeURIComponent(SUCCESS_URL2)}`
-    ), 'ordinary form serialization must encode the raw SuccessUrl2 exactly once');
-    assert.ok(serializedForm.includes(
-      `FailUrl2=${encodeURIComponent(FAIL_URL2)}`
-    ), 'ordinary form serialization must encode the raw FailUrl2 exactly once');
+    assert.equal(serializedForm.includes('SuccessUrl2='), false);
+    assert.equal(serializedForm.includes('FailUrl2='), false);
     assert.ok(serializedForm.includes(
       `Receipt=${encodeURIComponent(fields.Receipt)}`
     ), 'the already provider-encoded Receipt receives the separate form-transport encoding');
     assert.equal(serializedForm.includes('ResultUrl2='), false);
-    assert.equal(fields.Shp_environment, 'production');
-    assert.equal(fields.Shp_order_id, fields.InvId);
+    assert.equal(fields.Shp_environment, undefined);
+    assert.equal(fields.Shp_order_id, undefined);
     assert.equal(fields.SignatureValue, expectedPaymentSignature(fields),
-      'the encoded browser return URLs and frozen receipt/order fields must be covered by Password #1');
+      'the provider-encoded receipt must be covered by the minimal Password #1 signature');
     assert.match(fields.SignatureValue, /^[0-9a-f]{64}$/);
-    for (const name of ['SuccessUrl2', 'FailUrl2']) {
-      assert.notEqual(
-        expectedPaymentSignature({ ...fields, [name]: `${fields[name]}tampered` }),
-        fields.SignatureValue,
-        `${name} must be integrity-bound by SignatureValue`
-      );
-    }
     assert.equal(JSON.stringify(fields).includes(CLIENT_SUPPLIED_TELEGRAM_ID), false,
       'a browser Telegram id must not leak into provider parameters');
 
@@ -604,7 +589,7 @@ try {
 
     // Simulate the browser reaching SuccessUrl2. A redirect and arbitrary
     // status-poll JSON are browser claims, never settlement authority.
-    const redirect = new URL(fields.SuccessUrl2);
+    const redirect = new URL(SUCCESS_URL2);
     redirect.searchParams.set('InvId', fields.InvId);
     redirect.searchParams.set('OutSum', fields.OutSum);
     redirect.searchParams.set('SignatureValue', fields.SignatureValue);

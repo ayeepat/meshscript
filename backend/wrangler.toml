@@ -87,10 +87,9 @@ ROBOKASSA_MERCHANT_LOGIN = "smeshai"
 PAYMENT_ENVIRONMENT = "production"
 ROBOKASSA_OUT_CURRENCY_LABEL = "RUB"
 ROBOKASSA_REFUND_HASH_ALGO = "HS256"
-# Every hosted checkout carries its browser return routes in the Password #1
-# signature. The authoritative standard ResultURL is configured in the
-# Robokassa cabinet; ResultUrl2 uses a different JWS callback format and is not
-# sent to the classic ResultURL handler.
+# Cabinet-owned browser return routes. Hosted checkout deliberately omits the
+# optional URL2 signature modifiers and uses Robokassa's minimal documented
+# receipt signature; these values mirror the required cabinet configuration.
 ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
 ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/"
 # The cabinet confirms Robocheki SMZ for this NPD shop. Send itemized receipt
