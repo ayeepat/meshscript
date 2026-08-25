@@ -10,16 +10,51 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
-      - name: Use Node.js 20
+      - name: Use Node.js 24 LTS
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
-          node-version: 20
+          node-version: 24
           cache: npm
-      - name: Install locked dependencies
-        run: npm ci
-      - name: Run regression suite
-        run: npm test
+          cache-dependency-path: |
+            package-lock.json
+            backend/package-lock.json
+            motion/package-lock.json
+      - name: Use Python 3.13
+        uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+        with:
+          python-version: '3.13'
+          cache: pip
+          cache-dependency-path: motion/requirements.txt
+      - name: Install locked JavaScript dependencies
+        run: |
+          npm ci
+          npm --prefix backend ci
+          npm --prefix motion ci
+      - name: Install locked motion-audio dependencies
+        run: python -m pip install --disable-pip-version-check --require-hashes -r motion/requirements.txt
+      - name: Check source and run regression suite
+        run: npm run verify
+      - name: Validate VPS readiness, durable quota, and installer configuration
+        run: npm --prefix backend-vps test
+      - name: Validate the motion toolchain and compile the ad
+        run: npm --prefix motion run check
+      - name: Dry-run the Cloudflare Worker build
+        env:
+          WRANGLER_LOG_PATH: ${{ runner.temp }}/wrangler.log
+        run: npm --prefix backend run deploy -- --dry-run --outdir "$RUNNER_TEMP/worker-dry-run"
+      - name: Build and verify the extension release archive
+        run: |
+          npm run package:extension
+          npm run verify:package
+      - name: Upload the verified extension archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: smesh-ai-yandex-extension
+          path: smesh-ai-yandex-v*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

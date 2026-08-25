@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { DatabaseSync } from 'node:sqlite';
 import { timingSafeEqualCalls } from './helpers/worker-runtime-shim.mjs';
 
 const { default: worker } = await import('../backend/src/worker.js');
@@ -13,17 +15,38 @@ globalThis.fetch = async (url, init = {}) => {
 };
 
 const kv = new Map();
+const sqlite = new DatabaseSync(':memory:');
+sqlite.exec(await readFile(new URL('../backend/schema.sql', import.meta.url), 'utf8'));
+const d1 = {
+  prepare(sql) {
+    const statement = (args = []) => ({
+      bind: (...bound) => statement(bound),
+      async first(column) {
+        const row = sqlite.prepare(sql).get(...args) || null;
+        return column ? row?.[column] ?? null : row;
+      },
+      async all() { return { results: sqlite.prepare(sql).all(...args) }; },
+      async run() {
+        const result = sqlite.prepare(sql).run(...args);
+        return { meta: { changes: Number(result.changes) || 0 } };
+      }
+    });
+    return statement();
+  }
+};
 const baseEnv = {
   TELEGRAM_BOT_TOKEN: 'test-token',
   SUPPORT_CHAT_ID: '777',
   LICENSES: {
     async get(key) { return kv.get(key) || null; },
     async put(key, value) { kv.set(key, value); }
-  }
+  },
+  DB: d1
 };
 const ctx = { waitUntil() {} };
 
 const forgedOwnerReply = {
+  update_id: 7654321,
   message: {
     message_id: 9,
     chat: { id: 777 },
@@ -75,7 +98,7 @@ assert.ok(timingSafeEqualCalls.count >= 2,
 // a separate administrator header, and side-effecting helpers are POST-only.
 const operatorEnv = {
   ...configuredEnv,
-  ADMIN_SECRET: 'admin-secret'
+  ADMIN_SECRET: 'admin-secret'.repeat(3)
 };
 
 telegramCalls.length = 0;

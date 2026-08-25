@@ -18,6 +18,13 @@ const CACHE_KEY = 'runtimeConfig';
 const FETCH_TIMEOUT_MS = 8000;
 const FETCH_MAX_BYTES = 64 * 1024;
 const SIGNATURE_BYTES = 64; // WebCrypto ECDSA P-256 uses IEEE-P1363 r || s.
+const CONFIG_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const MAX_SIGNED_VALIDITY_MS = 7 * 24 * 60 * 60 * 1000;
+const NOTICE_ORIGINS = new Set([
+  'https://smeshai.xyz',
+  'https://www.smeshai.xyz',
+  'https://chromewebstore.google.com'
+]);
 
 // Finite policy, deliberately duplicated in the classic content script as a
 // second trust-boundary check. Remote config may select a pre-reviewed DOM path;
@@ -31,6 +38,8 @@ export const APPROVED_HOMEWORK_SELECTORS = Object.freeze([
 function emptyConfig() {
   return {
     configVersion: 0,
+    issuedAt: 0,
+    expiresAt: 0,
     subjectVocabulary: null,
     homeworkAnchorSelector: null,
     minExtensionVersion: null,
@@ -63,7 +72,10 @@ function cleanNotice(n) {
   if (!text) return null;
   let url = null;
   if (typeof n.url === 'string') {
-    try { const u = new URL(n.url.trim()); if (u.protocol === 'https:') url = u.href; }
+    try {
+      const u = new URL(n.url.trim());
+      if (u.protocol === 'https:' && NOTICE_ORIGINS.has(u.origin)) url = u.href;
+    }
     catch { /* invalid URL — omit it */ }
   }
   return url ? { text, url } : { text };
@@ -75,6 +87,8 @@ export function sanitizeRuntimeConfig(raw, fetchedAt = Date.now()) {
     if (Number.isSafeInteger(raw.configVersion) && raw.configVersion >= 0) {
       cfg.configVersion = raw.configVersion;
     }
+    if (Number.isSafeInteger(raw.issuedAt)) cfg.issuedAt = raw.issuedAt;
+    if (Number.isSafeInteger(raw.expiresAt)) cfg.expiresAt = raw.expiresAt;
     cfg.subjectVocabulary = cleanVocabulary(raw.subjectVocabulary);
     cfg.homeworkAnchorSelector = cleanSelector(raw.homeworkAnchorSelector);
     cfg.minExtensionVersion = cleanVersion(raw.minExtensionVersion);
@@ -113,7 +127,8 @@ function verificationKey(publicJwk) {
 
 export async function verifySignedConfigEnvelope(envelope, {
   publicJwk = RUNTIME_CONFIG_PUBLIC_KEY_JWK,
-  fetchedAt = Date.now()
+  fetchedAt = Date.now(),
+  now = Date.now()
 } = {}) {
   if (!envelope || typeof envelope !== 'object' || Array.isArray(envelope)) return null;
   const payloadBytes = decodeBase64Url(envelope.payload, FETCH_MAX_BYTES);
@@ -126,6 +141,12 @@ export async function verifySignedConfigEnvelope(envelope, {
     );
     if (!valid) return null;
     const raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes));
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
+        !Number.isSafeInteger(raw.configVersion) || raw.configVersion < 1 ||
+        !Number.isSafeInteger(raw.issuedAt) || !Number.isSafeInteger(raw.expiresAt) ||
+        raw.issuedAt < 0 || raw.issuedAt > now + CONFIG_CLOCK_SKEW_MS ||
+        raw.expiresAt <= now || raw.expiresAt <= raw.issuedAt ||
+        raw.expiresAt - raw.issuedAt > MAX_SIGNED_VALIDITY_MS) return null;
     return sanitizeRuntimeConfig(raw, fetchedAt);
   } catch { return null; }
 }
@@ -134,7 +155,7 @@ async function validateCached(cached) {
   if (!cached || typeof cached !== 'object') return null;
   const fetchedAt = Number(cached.fetchedAt);
   if (!Number.isFinite(fetchedAt) || fetchedAt <= 0 || fetchedAt > Date.now()) return null;
-  const config = await verifySignedConfigEnvelope(cached.envelope, { fetchedAt });
+  const config = await verifySignedConfigEnvelope(cached.envelope, { fetchedAt, now: Date.now() });
   return config ? { config, envelope: cached.envelope, fetchedAt } : null;
 }
 
@@ -155,6 +176,58 @@ async function fetchFresh() {
   } catch { return null; }
 }
 
+/**
+ * One refresh at a time, per context.
+ *
+ * Concurrent callers each fetched and then each stored UNCONDITIONALLY, and the
+ * only rollback guard compared against the cache snapshot read BEFORE that
+ * caller's fetch — a window as long as the fetch itself. A slow v2 racing a
+ * fast v3 therefore left the verified cache back on v2, silently downgrading
+ * every consumer to older signed config.
+ */
+let refreshInFlight = null;
+
+function refreshRemoteConfig() {
+  if (!refreshInFlight) {
+    refreshInFlight = commitFreshConfig().finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
+
+async function commitFreshConfig() {
+  const fresh = await fetchFresh();
+  if (!fresh) return null;
+
+  // Re-read and re-verify the cache immediately before committing. The
+  // pre-fetch snapshot is stale by exactly the fetch duration; this narrows the
+  // regression window to two adjacent storage operations and also covers a
+  // writer in another extension context, which single-flight alone cannot.
+  let currentRaw = null;
+  try { ({ [CACHE_KEY]: currentRaw = null } = await chrome.storage.local.get(CACHE_KEY)); }
+  catch { return fresh.config; }
+  const current = await validateCached(currentRaw);
+
+  if (current && fresh.config.configVersion < current.config.configVersion) {
+    return current.config;
+  }
+  if (current && fresh.config.configVersion === current.config.configVersion) {
+    // The sequence number identifies one immutable payload. Accept an exact
+    // re-sign/republication, but reject same-version equivocation so a CDN or
+    // config-host compromise cannot swap policy without advancing the audit
+    // trail.
+    if (fresh.envelope.payload !== current.envelope.payload) return current.config;
+    const refreshed = { envelope: fresh.envelope, fetchedAt: fresh.fetchedAt };
+    try { await chrome.storage.local.set({ [CACHE_KEY]: refreshed }); } catch { /* cache is optional */ }
+    return fresh.config;
+  }
+  try {
+    await chrome.storage.local.set({
+      [CACHE_KEY]: { envelope: fresh.envelope, fetchedAt: fresh.fetchedAt }
+    });
+  } catch { /* verified in-memory config remains safe for this call */ }
+  return fresh.config;
+}
+
 /** Return a verified config, refreshing at most once per TTL. Never throws. */
 export async function getRuntimeConfig({ force = false } = {}) {
   let cachedRaw = null;
@@ -169,21 +242,8 @@ export async function getRuntimeConfig({ force = false } = {}) {
     return cached.config;
   }
 
-  const fresh = await fetchFresh();
-  if (fresh) {
-    if (cached && fresh.config.configVersion < cached.config.configVersion) {
-      const refreshed = { envelope: cached.envelope, fetchedAt: Date.now() };
-      try { await chrome.storage.local.set({ [CACHE_KEY]: refreshed }); } catch { /* signed cache remains usable */ }
-      return { ...cached.config, fetchedAt: refreshed.fetchedAt };
-    }
-    try {
-      await chrome.storage.local.set({
-        [CACHE_KEY]: { envelope: fresh.envelope, fetchedAt: fresh.fetchedAt }
-      });
-    } catch { /* verified in-memory config remains safe for this call */ }
-    return fresh.config;
-  }
-  return cached?.config || emptyConfig();
+  const refreshed = await refreshRemoteConfig();
+  return refreshed || cached?.config || emptyConfig();
 }
 
 export function isVersionBelow(version, min) {

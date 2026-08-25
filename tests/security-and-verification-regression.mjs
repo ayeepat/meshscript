@@ -31,26 +31,35 @@ assert.equal(productionPromptSources.includes('frameEditablePrompt'), false,
   'prompt framing must not substitute for an enforcement boundary');
 assert.doesNotMatch(source('../src/settings/settings.html'), /data-(?:tab|panel)="prompts"/);
 
-// Opening a saved history card navigates to the real dashboard in local replay
-// mode. Neither the Settings click nor that dashboard loader may issue a solve.
+// Opening a saved history card must be a local read, never another solve/API
+// request. Keep the assertion scoped to the History UI so unrelated settings
+// actions are free to use their own message types.
 const settingsJs = source('../src/settings/settings.js');
 const historyUi = settingsJs.slice(
   settingsJs.indexOf('/* ---------- History ---------- */'),
   settingsJs.indexOf('/* ---------- Textbooks (GDZ) ---------- */')
 );
-assert.match(historyUi, /dashboard\.html\?history=/,
-  'history cards must open the dashboard replay mode');
+assert.match(historyUi, /type:\s*'LIST_MESSAGES'/,
+  'history cards must load their saved messages');
 assert.doesNotMatch(historyUi, /type:\s*'SOLVE'/,
   'opening history must never issue another AI solve request');
-const dashboardJs = source('../src/dashboard/dashboard.js');
-const historyDashboard = dashboardJs.slice(
-  dashboardJs.indexOf('/* ---------- Read-only replay of locally saved chats ---------- */'),
-  dashboardJs.indexOf('/* ---------- Init: load week from the last popup scan ---------- */')
-);
-assert.match(historyDashboard, /type:\s*'GET_HISTORY_SNAPSHOT'/,
-  'history dashboard must load one local history snapshot');
-assert.doesNotMatch(historyDashboard, /type:\s*'SOLVE'|sendToChat\s*\(/,
-  'history dashboard loader must never start or continue an AI chat');
+assert.doesNotMatch(settingsJs, /innerHTML\s*=\s*`[^`]*\$\{resp\?\.error/,
+  'runtime/storage errors must be rendered as text, never interpolated markup');
+
+const workerJs = source('../src/background/service-worker.js');
+assert.match(workerJs, /isMeshContentUrl\(sender\.tab\.url\)\s*&&\s*isMeshContentUrl\(sender\.url\)/,
+  'content authority must validate the actual sending frame as well as the top-level tab');
+const manifest = JSON.parse(source('../manifest.json'));
+// storage.local.setAccessLevel gained local/sync support in Chromium a8f1f33
+// (main position #1482413, July 2025). Chrome 139 branched earlier at
+// #1477651; Chrome 140 branched later at #1496484 and is the first release
+// guaranteed to contain the change. Accepting an earlier release let the
+// extension install on
+// builds where the trusted-only secret store silently does nothing, leaving
+// API/licence/referral secrets readable from this extension's content-script
+// contexts — a failed isolation invariant, not merely a missing nicety.
+assert.ok(Number(manifest.minimum_chrome_version) >= 140,
+  'Chrome must actually enforce trusted-only storage.local before the extension can run');
 
 // Execute the actual verification helpers from the classic content script in a
 // small VM context, without duplicating their implementation in the test.
@@ -81,6 +90,15 @@ assert.equal(sandbox.valueTook({ value: 'другой ответ' }, 'прави
 assert.equal(sandbox.valueTook({ value: '' }, 'правильный ответ'), false);
 assert.equal(sandbox.answerValueMatches('да, нет', 'да. нет'), false,
   'decimal-separator equivalence must not alter punctuation in text answers');
+
+const choiceSource = [
+  scraper.slice(scraper.indexOf('function normalize(text)'), scraper.indexOf('// Apply remote runtime-config overrides')),
+  scraper.slice(scraper.indexOf("const OPTION_LETTERS = '"), scraper.indexOf('// Similarity in [0,1]'))
+].join('\n');
+const choiceSandbox = {};
+vm.runInNewContext(`${choiceSource}\nthis.parseChoiceIndices = parseChoiceIndices;`, choiceSandbox);
+assert.deepEqual(Array.from(choiceSandbox.parseChoiceIndices('а и в', 3)), [0, 2],
+  'whitespace-delimited Cyrillic «и» must split multi-choice answers');
 
 const review = source('../docs/STORE-REVIEW.md');
 assert.match(review, /updateSessionRules\(\)/);

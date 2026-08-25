@@ -7,24 +7,30 @@
 #        npx wrangler kv namespace create LICENSES
 #     Wrangler prints an `id = "…"` — paste it below.
 #  3. Set the secrets (NOT in this file — see backend/README.md):
-#        npx wrangler secret put ROBOKASSA_PASSWORD2         # ResultURL signature password from Robokassa
+#        npx wrangler secret put ROBOKASSA_PASSWORD1_PRODUCTION # payment-init signature password
+#        npx wrangler secret put ROBOKASSA_PASSWORD2_PRODUCTION # ResultURL/OpState signature password
+#        npx wrangler secret put ROBOKASSA_PASSWORD3_PRODUCTION # refund JWT password
 #        npx wrangler secret put ADMIN_SECRET
+#        npx wrangler secret put STATS_SECRET              # read-only dashboard token, distinct from ADMIN_SECRET
 #        npx wrangler secret put RESEND_API_KEY              # optional
 #        npx wrangler secret put TELEGRAM_BOT_TOKEN          # optional
 #        npx wrangler secret put OWNER_LICENSE_KEY           # optional dev-bypass key
 #        npx wrangler secret put SUPPORT_CHAT_ID             # your numeric Telegram id (support bot)
 #        npx wrangler secret put TELEGRAM_WEBHOOK_SECRET     # random string (support bot webhook auth)
-#        npx wrangler secret put AI_PROXY_API_KEY            # 302.AI key (AI proxy, ai-proxy.js)
-#        npx wrangler secret put INGEST_KEY                  # shared with the VPS: opted-in usage -> POST /t/ai
-#        npx wrangler secret put ANALYTICS_SALT              # license-key pseudonymization (analytics.js)
+#        npx wrangler secret put AI_PROXY_API_KEY            # only if the legacy Worker proxy is explicitly enabled
+#        npx wrangler secret put INGEST_KEY                  # >=32 random bytes: /verify telemetry HMAC + VPS /t/ai
 #  4. Apply every schema migration BEFORE deploying payment code:
-#        npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
-#  5. `npx wrangler deploy`
+#        npx wrangler d1 migrations apply smesh-analytics --remote
+#  5. First deploy: `npx wrangler deploy --keep-vars --var RUNTIME_WRITE_EPOCH:1`
 #  6. Confirm smeshapi.site is bound to this worker (Cloudflare → Workers → Triggers).
 
 name = "smesh-licenses"
 main = "src/worker.js"
 compatibility_date = "2025-01-15"
+# Production intentionally permits dashboard-only non-secret overrides (see
+# [vars] below). Preserve variables not represented in this file on every
+# ordinary deploy; tracked keys still update from this configuration.
+keep_vars = true
 
 # Custom domain (dedicated apex, registered for the RU-block workaround: the
 # shared *.workers.dev suffix is DPI-blocked in Russia). Cloudflare creates the
@@ -34,6 +40,12 @@ routes = [
   { pattern = "smeshapi.site", custom_domain = true }
 ]
 
+# Cron: re-drives failed license deliveries (delivery_outbox) and stranded
+# referral credits until they land — the durable retry channel behind the
+# payment webhook's ack. Each run is bounded (LIMIT) and idempotent.
+[triggers]
+crons = ["*/5 * * * *"]
+
 # License rows. Keyed by license key string. Value is the JSON in licenses.js.
 [[kv_namespaces]]
 binding = "LICENSES"
@@ -41,25 +53,53 @@ id = "cc972aa483a741ff96bce115f84ab4c1"
 
 # Analytics: devices / events / purchases + atomic telemetry abuse budgets
 # (see schema.sql + src/analytics.js).
-# Created with `npx wrangler d1 create smesh-analytics`. Apply the schema with:
-#   npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
+# Created with `npx wrangler d1 create smesh-analytics`. Apply tracked changes with:
+#   npx wrangler d1 migrations apply smesh-analytics --remote
 [[d1_databases]]
 binding = "DB"
 database_name = "smesh-analytics"
 database_id = "ccacb16f-f77e-4017-91f6-1c642d7a9b9a"
+# Deployed schema changes go through `wrangler d1 migrations apply` (numbered
+# files in migrations/; schema.sql stays the fresh-install snapshot — see its
+# header for the change flow).
+migrations_dir = "migrations"
 
 # Non-secret config. Override in the Cloudflare dashboard for production.
 [vars]
+# Normal deployments are writable. The backup runbook overrides this exact
+# value to "true" in a 100% maintenance deployment, then explicitly restores
+# false after both KV and D1 artifacts validate.
+BACKUP_MAINTENANCE = "false"
+# RUNTIME_WRITE_EPOCH is deliberately NOT pinned in this file. It is a
+# dashboard/CLI-managed non-secret variable which must equal the durable D1
+# row; the backup protocol increments it. keep_vars=true preserves it across
+# ordinary deploys, while readiness and every mutation fail closed if missing
+# or mismatched.
 # Must match the hash algorithm selected in Robokassa technical settings.
-ROBOKASSA_HASH_ALGO = "MD5"
+ROBOKASSA_HASH_ALGO = "SHA256"
+# This production Worker accepts only production orders and production
+# credentials. Test mode belongs in a separate Worker + D1 database; never
+# swap test Password#2 into this deployment.
+PAYMENT_ENVIRONMENT = "production"
+ROBOKASSA_OUT_CURRENCY_LABEL = "RUB"
+ROBOKASSA_REFUND_HASH_ALGO = "HS256"
+# REQUIRED before launch: choose `provider` or `external`. Provider mode also
+# requires ROBOKASSA_RECEIPT_TAX, ROBOKASSA_RECEIPT_PAYMENT_METHOD and
+# ROBOKASSA_RECEIPT_PAYMENT_OBJECT (plus optional ROBOKASSA_RECEIPT_SNO).
+# Do not copy a tax treatment from a sample; have the merchant's accountant set
+# the actual values. Leaving the choice absent intentionally keeps health red.
+# ROBOKASSA_FISCALIZATION_MODE = "provider"
+# ROBOKASSA_RECEIPT_TAX = "none"
+# ROBOKASSA_RECEIPT_PAYMENT_METHOD = "full_payment"
+# ROBOKASSA_RECEIPT_PAYMENT_OBJECT = "service"
 # Optional hard IP filter for ResultURL. Signature verification remains required.
-ROBOKASSA_ENFORCE_IP_ALLOWLIST = "false"
+ROBOKASSA_ENFORCE_IP_ALLOWLIST = "true"
 # Email "from" address. Must be a verified sender in your Resend account.
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 # Product type when no pricing threshold below matches (or none is set).
 DEFAULT_LICENSE_TYPE = "lifetime"
 # Anti-abuse: hard cap on how many devices a single license can activate.
-DEVICE_LIMIT = "3"
+DEVICE_LIMIT = "1"
 
 # ── Pricing → plan (planFromAmount in worker.js) ──────────────────────────────
 # All amounts in RUB, all OPTIONAL. Leave unset to keep everything lifetime.
@@ -68,12 +108,16 @@ DEVICE_LIMIT = "3"
 # Monthly 199₽, lifetime 990₽:
 SUBSCRIPTION_MIN_RUB = "199"
 LIFETIME_MIN_RUB = "990"
+# Exact server-owned catalog prices frozen into payment_orders at checkout.
+# The *_MIN_RUB values above remain only for historical compatibility.
+SUBSCRIPTION_PRICE_RUB = "199"
+LIFETIME_PRICE_RUB = "990"
 # Subscription length in days (default 30 when unset).
 SUBSCRIPTION_DAYS = "30"
 
 # ── Referral program (referrals.js; all OPTIONAL, defaults shown) ────────────
 # Friend enters your code at checkout and PAYS → you earn this many free days.
-# Uncapped: every payout corresponds to a real purchase.
+# Rewards are capped server-side at 30 total days per referral code.
 REFERRAL_PAID_DAYS = "7"
 # The paying friend's OWN new subscription is extended by this percent
 # (30-day plan → 33 days). Subscriptions only; lifetime can't be extended.
@@ -81,7 +125,15 @@ REFERRAL_BUYER_BONUS_PCT = "10"
 # Daily per-IP budget for the invite-code endpoint (/referral/code). "0" off.
 REFERRAL_IP_DAILY_LIMIT = "30"
 
+# Pseudonymous analytics event/inactive-device retention. Runtime clamps this
+# privacy boundary to 30..365 days; user-triggered /t/delete remains immediate.
+ANALYTICS_RETENTION_DAYS = "90"
+
 # ── AI proxy (ai-proxy.js): Qwen/DeepSeek for licensed users, no user keys ───
+# The production extension uses the VPS proxy, which is the sole quota
+# authority. Keep the legacy Worker route retired unless an operator is
+# deliberately running a separately reviewed emergency migration.
+AI_PROXY_LEGACY_ENABLED = "false"
 # Requires the AI_PROXY_API_KEY secret (see above) + the proxy_quota table
 # (schema.sql). Daily request caps, all env-tunable without a redeploy:
 # OpenAI-compatible base URL. 302.AI resells Qwen + DeepSeek with no KYC —

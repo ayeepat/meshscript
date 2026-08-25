@@ -1,20 +1,41 @@
--- СМЭШ AI analytics schema (D1 / SQLite).
--- Apply:  npx wrangler d1 execute smesh-analytics --remote --file=schema.sql
--- Local:  npx wrangler d1 execute smesh-analytics --local  --file=schema.sql
+-- СМЭШ AI analytics schema (D1 / SQLite) — the FULL-SCHEMA SNAPSHOT.
+--
+-- This file describes the complete current shape for FRESH databases and for
+-- reading. It is NOT a migration system: every statement is CREATE TABLE IF
+-- NOT EXISTS, so reapplying it against an older database silently keeps the
+-- old column shape and the worker then fails at runtime on missing columns.
+--
+-- Deployed databases evolve ONLY through migrations/ (wrangler d1 migrations;
+-- tracked in the d1_migrations table):
+--   change flow: edit this snapshot AND add migrations/000N_<name>.sql with
+--                the ALTER/CREATE delta, in the same commit — the
+--                schema-migration-parity regression fails if they diverge.
+--   apply:       npx wrangler d1 migrations apply smesh-analytics --remote
+--   fresh/local: npx wrangler d1 execute smesh-analytics --local --file=schema.sql
 --
 -- `day` columns are calendar days in MOSCOW time (UTC+3) — the audience is
 -- Russian school students, so "a day" must mean their day, not UTC's.
 
+-- Durable write authority for cross-store backups. BACKUP_MAINTENANCE blocks
+-- new route/cron admission, while this primary-D1 row is checked immediately
+-- before every D1/KV mutation. Rotating write_epoch revokes invocations from
+-- every older deployment even after writes are enabled again.
+CREATE TABLE IF NOT EXISTS runtime_write_fence (
+  singleton      INTEGER PRIMARY KEY CHECK (singleton = 1),
+  write_epoch    INTEGER NOT NULL CHECK (write_epoch >= 1),
+  writes_enabled INTEGER NOT NULL DEFAULT 1 CHECK (writes_enabled IN (0, 1)),
+  updated_at     INTEGER NOT NULL
+);
+INSERT OR IGNORE INTO runtime_write_fence
+  (singleton, write_epoch, writes_enabled, updated_at)
+VALUES (1, 1, 1, unixepoch('subsec') * 1000);
+
 -- One row per extension install. device_id is the same anonymous UUID the
 -- extension already sends to /verify and /referral/*.
 --
--- Data minimization (2026-07): `ua` and `license_key` are DEAD columns — the
--- ingest writes NULL to ua and never binds a raw key anymore. New installs get
--- `license_ref` instead: HMAC-SHA256(license_key, ANALYTICS_SALT secret),
--- computed server-side ONLY when a legacy client still posts the raw key.
--- Migration on an existing DB:
---   ALTER TABLE devices ADD COLUMN license_ref TEXT;
---   UPDATE devices SET ua = NULL, license_key = NULL;  -- purge collected raws
+-- Data minimization (2026-07): `ua`, `license_key`, and `license_ref` are DEAD
+-- compatibility columns. Ingest ignores raw UA/license fields from legacy
+-- clients; applying this schema also purges any values collected previously.
 CREATE TABLE IF NOT EXISTS devices (
   device_id    TEXT PRIMARY KEY,
   first_seen   INTEGER NOT NULL,          -- ms epoch
@@ -23,10 +44,13 @@ CREATE TABLE IF NOT EXISTS devices (
   ua           TEXT,                      -- LEGACY, always NULL now (raw UA is not stored)
   version      TEXT,                      -- extension version
   provider     TEXT,                      -- last selected AI provider
-  license_key  TEXT,                      -- LEGACY, never written (see license_ref)
-  license_ref  TEXT,                      -- HMAC pseudonym of the license key (may be null)
+  license_key  TEXT,                      -- LEGACY, always NULL now
+  license_ref  TEXT,                      -- LEGACY pseudonym, no longer written
   license_type TEXT                       -- lifetime | subscription | none
 );
+UPDATE devices
+SET ua = NULL, license_key = NULL, license_ref = NULL
+WHERE ua IS NOT NULL OR license_key IS NOT NULL OR license_ref IS NOT NULL;
 
 -- One row per usage event. Content-free by design: no task text, no answers —
 -- only what/when/how-much. meta is a small JSON blob for per-type extras.
@@ -44,7 +68,7 @@ CREATE TABLE IF NOT EXISTS events (
   cost_usd   REAL    NOT NULL DEFAULT 0,  -- exact provider cost when reported, else estimate
   files_pdf  INTEGER NOT NULL DEFAULT 0,  -- PDF attachments on this solve
   files_img  INTEGER NOT NULL DEFAULT 0,  -- image attachments (photos/screenshots)
-  meta       TEXT                         -- small JSON: {mode, gdz_auto, refused, msg, ...}
+  meta       TEXT                         -- fixed-vocabulary, typed metrics only (see analytics.js)
 );
 CREATE INDEX IF NOT EXISTS idx_events_day    ON events(day);
 CREATE INDEX IF NOT EXISTS idx_events_device ON events(device_id, day);
@@ -66,14 +90,16 @@ CREATE TABLE IF NOT EXISTS purchases (
   expires_at       INTEGER,               -- ms epoch, null = lifetime
   is_preorder      INTEGER DEFAULT 0,
   note             TEXT,
-  device_ids       TEXT                   -- JSON array of activated device ids
+  device_ids       TEXT,                  -- JSON array of activated device ids
+  amount_kopecks   INTEGER                -- authoritative minor units for money
 );
 CREATE INDEX IF NOT EXISTS idx_purchases_issued ON purchases(issued_at);
 
 -- Authoritative payment idempotency registry. KV cannot atomically perform
 -- "create if absent", so simultaneous gateway deliveries could mint two keys.
--- license_json makes a committed claim recoverable when an invocation dies
--- before it materializes the corresponding KV license row.
+-- license_json makes a committed claim recoverable ONLY when an invocation
+-- dies before materializing the KV license row; it never refreshes or replaces
+-- an existing live row.
 CREATE TABLE IF NOT EXISTS payment_issuance (
   gateway      TEXT    NOT NULL,
   payment_id   TEXT    NOT NULL,
@@ -83,6 +109,93 @@ CREATE TABLE IF NOT EXISTS payment_issuance (
   PRIMARY KEY (gateway, payment_id)
 );
 
+-- Server-created order authority. ResultURL proves Robokassa accepted money;
+-- only a matching row here authorizes product, amount, currency, environment,
+-- contact and referral fulfillment.
+CREATE TABLE IF NOT EXISTS payment_orders (
+  order_id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  gateway           TEXT    NOT NULL CHECK (gateway = 'robokassa'),
+  environment       TEXT    NOT NULL CHECK (environment IN ('production', 'test')),
+  status            TEXT    NOT NULL CHECK (status IN (
+    'pending', 'paid', 'fulfilled', 'review', 'refund_pending', 'refunded', 'expired'
+  )),
+  amount_kopecks    INTEGER NOT NULL CHECK (amount_kopecks > 0),
+  currency          TEXT    NOT NULL CHECK (currency = 'RUB'),
+  plan_type         TEXT    NOT NULL CHECK (plan_type IN ('lifetime', 'subscription')),
+  subscription_days INTEGER CHECK (subscription_days IS NULL OR subscription_days BETWEEN 1 AND 3650),
+  email             TEXT,
+  telegram_user_id  TEXT,
+  referral_code     TEXT,
+  device_id         TEXT,
+  is_preorder       INTEGER NOT NULL DEFAULT 0 CHECK (is_preorder IN (0, 1)),
+  fiscalization_mode TEXT   NOT NULL CHECK (fiscalization_mode IN ('provider', 'external')),
+  receipt_json      TEXT,
+  created_at        INTEGER NOT NULL,
+  expires_at        INTEGER NOT NULL,
+  paid_at           INTEGER,
+  fulfilled_at      INTEGER,
+  provider_op_key   TEXT,
+  reconciled_at     INTEGER,
+  refund_request_id TEXT,
+  refund_status     TEXT,
+  refund_kopecks    INTEGER CHECK (refund_kopecks IS NULL OR refund_kopecks > 0),
+  refunded_at       INTEGER,
+  CHECK (
+    (fiscalization_mode = 'provider' AND receipt_json IS NOT NULL) OR
+    (fiscalization_mode = 'external' AND receipt_json IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_payment_orders_status
+  ON payment_orders(environment, status, created_at);
+
+-- Append-only transition/evidence log. Sensitive callback signatures and
+-- license bearer keys are stripped or one-way referenced before storage.
+CREATE TABLE IF NOT EXISTS payment_events (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  gateway         TEXT    NOT NULL,
+  payment_id      TEXT    NOT NULL,
+  order_id        INTEGER,
+  environment     TEXT,
+  event_type      TEXT    NOT NULL,
+  amount_kopecks  INTEGER,
+  currency        TEXT,
+  details_json    TEXT,
+  created_at      INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payment_events_payment
+  ON payment_events(gateway, payment_id, created_at);
+
+-- Per-order refund polling state. The cron sweep used to select a fixed
+-- ORDER BY order_id batch and query the provider sequentially under one outer
+-- catch, so the FIRST row whose provider call threw ended the whole sweep and
+-- was then re-selected every run — twenty stuck rows could permanently starve
+-- every later refund, leaving provider-finished refunds with live licenses.
+-- Backing off a failing row here moves it out of the eligible set, so
+-- selection stays fair and one bad row can no longer block the queue.
+-- next_poll_at is a ms epoch; 0 means "due now".
+CREATE TABLE IF NOT EXISTS payment_refund_poll (
+  order_id      INTEGER PRIMARY KEY,
+  attempts      INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_poll_at  INTEGER NOT NULL DEFAULT 0,
+  last_error    TEXT,
+  last_error_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_payment_refund_poll_due
+  ON payment_refund_poll(next_poll_at);
+
+-- Atomic referral capability→code claim. KV cannot create-if-absent, so the
+-- unique auth_hash chooses one stable code under simultaneous first requests;
+-- the KV record and pointers are recoverable materializations of this claim.
+CREATE TABLE IF NOT EXISTS referral_auth_claims (
+  auth_hash TEXT    PRIMARY KEY,
+  code      TEXT    NOT NULL,
+  created_at INTEGER NOT NULL
+);
+-- A code is itself a bearer lookup capability and must map to exactly one
+-- referral owner. Random generation retries on this unique conflict.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_referral_auth_claims_code
+  ON referral_auth_claims(code);
+
 -- One atomic referral payout claim per purchased license. The reward remains
 -- mirrored in KV, but concurrent webhook deliveries cannot both credit it.
 CREATE TABLE IF NOT EXISTS referral_credits (
@@ -90,6 +203,75 @@ CREATE TABLE IF NOT EXISTS referral_credits (
   ref_code    TEXT    NOT NULL,
   claimed_at  INTEGER NOT NULL
 );
+
+-- Retryable referral payout journal. target_* persists the resolved INTENT so
+-- retries replay one absolute expiry write instead of incrementing twice after
+-- a crash. materialized_at is set ONLY after ref:<code> was rewritten from D1;
+-- NULL on an applied row means user-visible KV may be stale and must recover.
+-- PRE-LAUNCH NOTE: if today's brief interim version of this table was applied,
+-- DROP the empty referral_credit_state table and re-apply this schema.
+CREATE TABLE IF NOT EXISTS referral_credit_state (
+  license_key TEXT    PRIMARY KEY,
+  ref_code    TEXT    NOT NULL,
+  days        INTEGER NOT NULL,
+  status      TEXT    NOT NULL,           -- pending | applied
+  created_at  INTEGER NOT NULL,
+  applied_at  INTEGER,
+  materialized_at INTEGER,                -- set after D1-derived ref:* KV rewrite
+  target_kind TEXT,                       -- owner | reward
+  target_key  TEXT,
+  target_expiry TEXT,                      -- fixed ISO expiry for replay
+  target_generation INTEGER NOT NULL DEFAULT 0,
+  retry_attempts INTEGER NOT NULL DEFAULT 0,
+  retry_after INTEGER NOT NULL DEFAULT 0,  -- ms epoch; failed codes back off
+  last_error_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_referral_credit_retry
+  ON referral_credit_state(status, materialized_at, retry_after, created_at);
+
+-- Per-code leases serialize KV read-modify-write payouts. KV has no CAS, so
+-- without this lock concurrent purchases can overwrite counters and expiry.
+CREATE TABLE IF NOT EXISTS referral_apply_locks (
+  ref_code    TEXT    PRIMARY KEY,
+  lease_until INTEGER NOT NULL
+);
+
+-- Write-once KV materialization registry + generic per-row leases. KV has no
+-- compare-and-set, so "create the KV row if missing" is a stale-read race: a
+-- webhook replay can read null (KV is eventually consistent), pause, and then
+-- overwrite a row that was revoked / device-bound / credited in between. A
+-- name recorded here means the row was DEFINITELY written once; recovery
+-- paths must never write its issue-time snapshot again. kv_apply_locks
+-- serializes the materializers themselves (same lease shape as
+-- referral_apply_locks). Names: 'license:<key>', 'ref:<CODE>'.
+CREATE TABLE IF NOT EXISTS kv_materializations (
+  name            TEXT    PRIMARY KEY,
+  materialized_at INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kv_apply_locks (
+  name        TEXT    PRIMARY KEY,
+  lease_until INTEGER NOT NULL
+);
+
+-- Durable license-delivery outbox. The payment webhook acks the gateway only
+-- AFTER the retry job is persisted here; the worker's cron trigger re-drives
+-- rows with backoff until one channel confirms (delivered_at) or attempts run
+-- out. Exhausted rows stay for operator inspection — they are the "buyer paid
+-- but never got the key" worklist.
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+  license_key      TEXT    PRIMARY KEY,
+  email            TEXT,
+  telegram_user_id INTEGER,
+  is_preorder      INTEGER NOT NULL DEFAULT 0,
+  created_at       INTEGER NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at  INTEGER NOT NULL,
+  claim_token      TEXT,
+  lease_until      INTEGER,
+  delivered_at     INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_due
+  ON delivery_outbox(delivered_at, next_attempt_at, lease_until);
 
 -- AI-proxy daily quota counters (see src/ai-proxy.js). One row per Moscow
 -- day × license × provider, bumped atomically per request. The special row
@@ -116,13 +298,147 @@ CREATE TABLE IF NOT EXISTS license_devices (
   added_at    INTEGER NOT NULL,           -- ms epoch
   PRIMARY KEY (license_key, device_id)
 );
+CREATE INDEX IF NOT EXISTS idx_license_devices_device ON license_devices(device_id);
 
--- Atomic abuse budgets for the anonymous telemetry endpoint. KV read-modify-
--- write counters lose increments under concurrency; this table makes every
--- admission decision against one authoritative row. Old days can be pruned.
+-- One authenticated ACTIVE installation per license. `license_devices` above
+-- remains an append-only compatibility/audit index; it is not authorization.
+-- The first installation receives a random bearer capability whose SHA-256
+-- digest is stored here. A different installation cannot replace the active
+-- row merely by choosing another client-side UUID: the current installation
+-- must explicitly deactivate with that capability first.
+CREATE TABLE IF NOT EXISTS license_activations (
+  license_key    TEXT    PRIMARY KEY,
+  status         TEXT    NOT NULL CHECK (status IN ('active', 'inactive')),
+  device_id      TEXT,
+  token_hash     TEXT,
+  generation     INTEGER NOT NULL DEFAULT 1 CHECK (generation >= 1),
+  activated_at   INTEGER,
+  last_seen_at   INTEGER,
+  deactivated_at INTEGER,
+  CHECK (
+    (status = 'active' AND device_id IS NOT NULL AND token_hash IS NOT NULL
+                       AND activated_at IS NOT NULL AND last_seen_at IS NOT NULL)
+    OR
+    (status = 'inactive' AND device_id IS NULL AND token_hash IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_license_activations_device
+  ON license_activations(device_id) WHERE status = 'active';
+
+-- Authoritative revocation registry. The KV license row is rewritten wholesale
+-- by concurrent mutators (the /verify device mirror, referral expiry
+-- extensions) and KV reads can be stale for up to a minute, so a revocation
+-- recorded only as KV status can be resurrected to "active" by an in-flight
+-- read-modify-write. A row here is permanent and strongly consistent:
+-- /verify (and therefore /ai/chat) rejects the key even when the KV mirror
+-- says active, and heals the mirror back to revoked.
+CREATE TABLE IF NOT EXISTS license_revocations (
+  license_key TEXT    PRIMARY KEY,
+  revoked_at  INTEGER NOT NULL,          -- ms epoch
+  reason      TEXT
+);
+
+-- Paid-but-unissued review journal. A signed Robokassa callback is money that
+-- already moved; when the webhook acks WITHOUT issuing (missing delivery
+-- contact, unconfigured or unmatched pricing), the ack stops gateway retries
+-- forever and console logs are the only other trace. The callback is
+-- journaled here BEFORE that ack so the operator can recover (manual issue or
+-- refund); if this write fails the webhook answers non-OK and the gateway's
+-- redelivery loop stays the durable channel. fields_json has SignatureValue
+-- stripped — a stored signature is an offline brute-force target for
+-- Password#2. resolved_at is operator bookkeeping.
+CREATE TABLE IF NOT EXISTS payment_review (
+  gateway     TEXT    NOT NULL,
+  payment_id  TEXT    NOT NULL,
+  invoice_id  TEXT,
+  amount_rub  REAL,
+  reason      TEXT    NOT NULL,          -- invalid_plan_config | no_floor_configured | below_floor | no_contact | no_plan_matched
+  fields_json TEXT,
+  created_at  INTEGER NOT NULL,          -- ms epoch
+  resolved_at INTEGER,
+  environment TEXT,
+  amount_kopecks INTEGER,
+  resolution TEXT,
+  resolution_note TEXT,
+  PRIMARY KEY (gateway, payment_id)
+);
+
+-- Atomic named counters. Currently only the support-bot ticket sequence:
+-- the historical KV read-increment-write let two concurrent submissions both
+-- become «#1001», with one ticket:<no> record silently overwriting the other.
+-- Seeded once from the legacy KV `seq:ticket` value so numbering continues.
+CREATE TABLE IF NOT EXISTS counters (
+  name  TEXT    PRIMARY KEY,
+  value INTEGER NOT NULL
+);
+
+-- Durable owner-forwarding outbox for the Telegram support bot. Ticket bodies
+-- and sender profile data stay only in expiring KV records. D1 retains the
+-- ticket number plus the temporary Telegram source route needed to copy an
+-- attachment; those identifiers are nulled as soon as forwarding settles.
+CREATE TABLE IF NOT EXISTS support_forward_outbox (
+  ticket_no               TEXT    PRIMARY KEY,
+  source_chat_id          TEXT,
+  source_message_id       INTEGER,
+  has_attachment          INTEGER NOT NULL DEFAULT 0
+                                  CHECK (has_attachment IN (0, 1)),
+  created_at              INTEGER NOT NULL,
+  attempts                INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at         INTEGER NOT NULL,
+  claim_token             TEXT,
+  lease_until             INTEGER,
+  text_forwarded_at       INTEGER,
+  attachment_forwarded_at INTEGER,
+  forwarded_at            INTEGER,
+  CHECK (
+    has_attachment = 0 OR
+    forwarded_at IS NOT NULL OR
+    (source_chat_id IS NOT NULL AND source_message_id IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_support_forward_outbox_due
+  ON support_forward_outbox(forwarded_at, next_attempt_at, lease_until);
+
+-- Telegram webhook idempotency. Telegram defines update_id precisely so a
+-- receiver can ignore repeats, and it RETRIES any delivery that is not
+-- acknowledged with a 2xx. The handler used to persist nothing and always
+-- answer 200: replaying one update minted a second ticket, forwarded it to the
+-- owner again and sent the user a second confirmation, while a genuine
+-- internal failure was acknowledged as success and never retried.
+--
+-- The lease makes this recoverable rather than a claim-and-ACK: a delivery that
+-- dies mid-processing leaves an incomplete row whose lease expires, so Telegram's
+-- own retry can pick it up instead of the update being lost.
+CREATE TABLE IF NOT EXISTS telegram_updates (
+  update_id    INTEGER PRIMARY KEY,
+  claimed_at   INTEGER NOT NULL,
+  lease_until  INTEGER NOT NULL,
+  completed_at INTEGER,
+  result_kind  TEXT,
+  ticket_no    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_updates_claimed
+  ON telegram_updates(claimed_at);
+
+-- Deletion tombstones for /t/delete. Without one, an in-flight ingest request
+-- admitted before the deletion can recreate the device and its events right
+-- after the delete returns success. Deletion writes the tombstone and the
+-- DELETEs in one atomic batch; both ingest paths gate their inserts on "no
+-- tombstone fresher than the TTL" inside the insert statement itself, so the
+-- check cannot race the delete. After the TTL a still-opted-in install may
+-- report again — the user erased history, not future participation.
+CREATE TABLE IF NOT EXISTS device_tombstones (
+  device_id  TEXT    PRIMARY KEY,
+  deleted_at INTEGER NOT NULL             -- ms epoch
+);
+
+-- Atomic abuse budgets shared by telemetry, admin-auth failures, and failed
+-- license lookups. KV read-modify-write counters lose increments under
+-- concurrency; this table keeps each budget authoritative. Rows from old days
+-- can be pruned.
 CREATE TABLE IF NOT EXISTS telemetry_budget (
   day        TEXT    NOT NULL,
-  scope      TEXT    NOT NULL,          -- ip | device
+  scope      TEXT    NOT NULL,          -- ip | device | admin_fail | verify_fail
   budget_key TEXT    NOT NULL,
   count      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, scope, budget_key)

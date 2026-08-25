@@ -24,8 +24,11 @@ const SKIP_UNDER_B64_CHARS = 300_000; // ~220 KB raw: already cheap to ship, not
 // up RAM at DECODE time (w*h*4 bytes), long before any canvas work. Read the
 // dimensions straight from the container headers first — cheap, no decode —
 // and skip the whole recompression when they're implausible for homework.
-const MAX_DECODE_PIXELS = 50_000_000; // ~50 MP ≈ 200 MB RGBA
-const MAX_DECODE_SIDE = 20_000;
+// Keep one decoded RGBA surface near 64 MiB before decoder/canvas overhead.
+// Sequential processing prevents batch multiplication, but a 50 MP *single*
+// image was still roughly a 200 MiB allocation and could kill an MV3 worker.
+export const MAX_DECODE_PIXELS = 16_000_000;
+export const MAX_DECODE_SIDE = 8_192;
 
 // Header-level dimensions for the formats we deliberately decode. Returning
 // null is a security decision: unknown or malformed formats are never handed to
@@ -151,5 +154,11 @@ export async function compressImageFile(f) {
 
 /** Recompress every image in a files array; non-images pass through as-is. */
 export async function compressImageFiles(files = []) {
-  return Promise.all(files.map(compressImageFile));
+  // STRICTLY SEQUENTIAL. The per-image bomb guard bounds ONE decode to
+  // MAX_DECODE_PIXELS (~64 MiB raw RGBA), and one-at-a-time processing keeps
+  // that peak from multiplying across a batch. The bitmap is closed before
+  // the next file begins.
+  const out = [];
+  for (const f of files) out.push(await compressImageFile(f));
+  return out;
 }

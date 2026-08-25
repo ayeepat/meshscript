@@ -24,7 +24,7 @@ function decodeBase64Url(value) {
   } catch { return null; }
 }
 
-async function mutateLaunches(mutator) {
+async function mutateLaunches(mutator, { commitAfterTrustedWrite = false } = {}) {
   const run = launchQueue.then(async () => {
     const [{ [SESSION_KEY]: storedLaunches = {} }, { [LOCAL_KEY]: storedKeys = {} }] = await Promise.all([
       chrome.storage.session.get(SESSION_KEY),
@@ -47,8 +47,16 @@ async function mutateLaunches(mutator) {
     // unusable orphan, never plaintext or a decryptable untrusted-session blob.
     if (Object.keys(keys).length) await chrome.storage.local.set({ [LOCAL_KEY]: keys });
     else await chrome.storage.local.remove(LOCAL_KEY);
-    if (Object.keys(launches).length) await chrome.storage.session.set({ [SESSION_KEY]: launches });
-    else await chrome.storage.session.remove(SESSION_KEY);
+    try {
+      if (Object.keys(launches).length) await chrome.storage.session.set({ [SESSION_KEY]: launches });
+      else await chrome.storage.session.remove(SESSION_KEY);
+    } catch (error) {
+      // During consume, removing the trusted key is the irreversible commit:
+      // the old session ciphertext can no longer be decrypted or consumed
+      // again. Deliver the already-decrypted payload and let the next sweep
+      // remove that harmless orphan. Stores/cleanup still fail loudly.
+      if (!commitAfterTrustedWrite) throw error;
+    }
     return result;
   });
   launchQueue = run.catch(() => {});
@@ -64,8 +72,22 @@ export function storeDashboardLaunch(payload) {
       day: payload?.day || '',
       homeworkId: payload?.homeworkId || '',
       homeworkItemId: payload?.homeworkItemId || '',
-      rowToken: payload?.rowToken || ''
+      rowToken: payload?.rowToken || '',
+      scanId: payload?.scanId || '',
+      principal: payload?.principal || null,
+      principalError: payload?.principalError || null
     };
+    // Attachment bodies are already base64 and can approach the storage.session
+    // quota after another base64 encryption layer. Keep them beside the AES key
+    // in trusted-only storage.local, keyed by this launch id. The dashboard only
+    // receives them when it consumes the matching one-time capability.
+    const files = Array.isArray(payload?.files)
+      ? payload.files.map((file) => ({
+        mimeType: file?.mimeType || '',
+        dataBase64: file?.dataBase64 || '',
+        name: file?.name || ''
+      }))
+      : [];
     const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
     const rawKey = new Uint8Array(await crypto.subtle.exportKey('raw', key));
     const iv = crypto.getRandomValues(new Uint8Array(12));
@@ -77,7 +99,7 @@ export function storeDashboardLaunch(payload) {
       iv: encodeBase64Url(iv),
       expiresAt
     };
-    keys[id] = { key: encodeBase64Url(rawKey), expiresAt };
+    keys[id] = { key: encodeBase64Url(rawKey), expiresAt, files };
     return id;
   });
 }
@@ -97,11 +119,21 @@ export function consumeDashboardLaunch(id) {
       const key = await crypto.subtle.importKey('raw', rawKey, 'AES-GCM', false, ['decrypt']);
       const plaintext = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ciphertext);
       const payload = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(plaintext));
-      return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
+      return payload && typeof payload === 'object' && !Array.isArray(payload)
+        ? { ...payload, files: Array.isArray(keyEntry.files) ? keyEntry.files : [] }
+        : null;
     } catch { return null; }
-  });
+  }, { commitAfterTrustedWrite: true });
 }
 
 export function cleanupDashboardLaunches() {
   return mutateLaunches(() => undefined);
+}
+
+/** Wipe every pending dashboard launch and its trusted key/attachment half. */
+export function wipeDashboardLaunches() {
+  return mutateLaunches((launches, keys) => {
+    for (const id of Object.keys(launches)) delete launches[id];
+    for (const id of Object.keys(keys)) delete keys[id];
+  });
 }

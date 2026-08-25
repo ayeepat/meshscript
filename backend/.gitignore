@@ -1,6 +1,7 @@
 node_modules/
 .wrangler/
-.dev.vars
-.env
-.env.local
+# Secret-bearing env files in EVERY variant (.env.production, .dev.vars.staging, …)
+.dev.vars*
+.env*
 *.log
+backups/

@@ -14,6 +14,12 @@
   const STORAGE_KEY = 'smeshAnswerPanel';
   const DEFAULT_W = 400;
   const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
+  // The worker's fill runs three passes across every frame — native inputs, the
+  // MathQuill main-world pass, then the ASYNC interactive pass that opens each
+  // custom dropdown (~0.7s per dropdown). A matching question with several
+  // dropdowns can push a single fill well past 8s, so an 8s cap here would time
+  // out and paint a false «Ошибка» / wrong ⚠ over a page the worker did fill.
+  const FILL_TIMEOUT_MS = 45000;
 
   // Brand fonts, served from the extension bundle (web_accessible_resources).
   // Injected into the Shadow DOM so the panel matches every other surface:
@@ -49,6 +55,14 @@
   let hostEl = null;
   let shadow = null;
   let lastPayload = null;
+  let panelGeneration = 0;
+  let activePanelNonce = '';
+  let captureCheckTimer = null;
+  // A drag owns capture listeners on `window`, so replacing/removing the Shadow
+  // DOM alone is not a teardown. Keep the one active cleanup reachable from
+  // show(), hide() and pagehide; a cancelled old gesture must never persist its
+  // detached coordinates over the replacement panel's state.
+  let activeDragCleanup = null;
   let state = { x: null, y: null, minimized: false };
 
   // Theme follows the user's extension preference ('system' | 'light' | 'dark'),
@@ -139,9 +153,23 @@
       `</li>`;
   }
 
-  function buildPanel(payload) {
+  function isPanelCurrent(generation, panelNonce, panel = null) {
+    return generation === panelGeneration && panelNonce === activePanelNonce &&
+      (!panel || panel.isConnected);
+  }
+
+  function buildPanel(payload, generation, panelNonce) {
+    cancelActiveDrag();
     const questions = Array.isArray(payload?.questions) ? payload.questions : [];
-    lastPayload = { questions };
+    // Keep the exact page identity beside the answers. Per-question re-solves
+    // cross an AI/network await, so their reply must be checked against this
+    // capture again before it can replace any visible answer text.
+    lastPayload = {
+      questions,
+      capture: payload?.capture || null,
+      panelNonce,
+      generation,
+    };
 
     shadow.innerHTML = `
       <style>
@@ -370,7 +398,7 @@
     const panel = shadow.querySelector('.panel');
     positionPanel(panel);
     wireDrag(panel);
-    wireButtons(panel, questions);
+    wireButtons(panel, questions, generation, panelNonce);
   }
 
   function positionPanel(panel) {
@@ -388,6 +416,7 @@
   function wireDrag(panel) {
     const bar = panel.querySelector('[data-drag]');
     let startX = 0, startY = 0, panelX = 0, panelY = 0;
+    let dragging = false;
 
     // The global mousemove/mouseup listeners exist ONLY for the duration of an
     // active drag, then remove themselves. Earlier they were attached to window
@@ -395,23 +424,39 @@
     // test solve, every page of a multi-page run) leaked another pair, piling up
     // dozens of dead listeners that pinned detached panel DOM in memory.
     const onMove = (e) => {
+      if (!dragging || !panel.isConnected) {
+        cleanup(false);
+        return;
+      }
       const w = panel.offsetWidth;
       const x = clamp(panelX + (e.clientX - startX), 0, Math.max(0, innerWidth - w));
       const y = clamp(panelY + (e.clientY - startY), 0, Math.max(0, innerHeight - 40));
       panel.style.left = x + 'px';
       panel.style.top = y + 'px';
     };
-    const onUp = () => {
+    const cleanup = (persist = false) => {
+      if (!dragging) return;
+      dragging = false;
       window.removeEventListener('mousemove', onMove, true);
       window.removeEventListener('mouseup', onUp, true);
+      window.removeEventListener('blur', onBlur, true);
       bar.classList.remove('dragging');
-      state.x = parseFloat(panel.style.left) || 0;
-      state.y = parseFloat(panel.style.top) || 0;
-      saveState();
+      if (activeDragCleanup === cleanup) activeDragCleanup = null;
+      if (persist && panel.isConnected) {
+        state.x = parseFloat(panel.style.left) || 0;
+        state.y = parseFloat(panel.style.top) || 0;
+        saveState();
+      }
     };
+    const onUp = () => cleanup(true);
+    // Mouseup may be lost when the pointer leaves the browser. Window blur ends
+    // the gesture and safely preserves only a still-connected current panel.
+    const onBlur = () => cleanup(true);
 
     bar.addEventListener('mousedown', (e) => {
+      if (e.button !== 0) return;
       if (e.target.closest('button')) return;
+      if (activeDragCleanup) activeDragCleanup(false);
       const rect = panel.getBoundingClientRect();
       panel.style.left = rect.left + 'px';
       panel.style.top = rect.top + 'px';
@@ -421,16 +466,23 @@
       panelY = rect.top;
       startX = e.clientX;
       startY = e.clientY;
+      dragging = true;
       bar.classList.add('dragging');
+      activeDragCleanup = cleanup;
       window.addEventListener('mousemove', onMove, true);
       window.addEventListener('mouseup', onUp, true);
+      window.addEventListener('blur', onBlur, true);
       e.preventDefault();
     });
   }
 
+  function cancelActiveDrag() {
+    if (activeDragCleanup) activeDragCleanup(false);
+  }
+
   // Paint the ✓ / ⚠ markers from a fill summary onto the matching lines.
-  function markFillResults(summary) {
-    if (!shadow) return;
+  function markFillResults(summary, generation, panelNonce) {
+    if (!shadow || !isPanelCurrent(generation, panelNonce)) return;
     const filled = new Set((summary?.filled || []).map(String));
     const skipped = new Set((summary?.skipped || []).map(String));
     shadow.querySelectorAll('li[data-qid]').forEach((li) => {
@@ -449,8 +501,8 @@
 
   // Set the ✓ / ⚠ marker on ONE line only (after a single-question re-fill),
   // without touching the other lines' markers the way markFillResults would.
-  function markOneLine(qid, kind) {
-    if (!shadow) return;
+  function markOneLine(qid, kind, generation, panelNonce) {
+    if (!shadow || !isPanelCurrent(generation, panelNonce)) return;
     const li = [...shadow.querySelectorAll('li[data-qid]')]
       .find((el) => el.getAttribute('data-qid') === String(qid));
     if (!li) return;
@@ -464,36 +516,30 @@
     else if (kind === 'warn') { mark.className = 'mark warn'; mark.textContent = '⚠ '; }
   }
 
-  // Fill just THIS frame's form via scraper.js (same isolated world). Used as a
-  // fallback when the service worker can't be reached.
-  function localFill(qs) {
-    try {
-      return (typeof window.__smeshFill === 'function') ? window.__smeshFill(qs) : null;
-    } catch { return null; }
-  }
-
   // Fill the test form. The form often lives inside an iframe (Mesh embeds some
   // test players), which the panel's own frame can't reach — so ask the service
-  // worker to run the fill in EVERY frame of the tab and merge the result. If
-  // the worker is unreachable, fall back to filling this frame directly.
-  async function requestFill(qs) {
-    const resp = await sendMsg('FILL_ANSWERS_ALL', { questions: qs }, 8000);
-    if (!resp || !resp.ok || !resp.summary) {
-      // Worker error / no receiver → fill this frame only.
-      return localFill(qs) || (resp && resp.summary) || null;
-    }
-    return resp.summary;
+  // worker to run the fill in EVERY frame of the tab and merge the result. Do
+  // not fall back to a local fill: only the worker can revalidate that these
+  // answers still belong to the captured URL/document/question signature.
+  async function requestFill(qs, panelNonce) {
+    const resp = await sendMsg(
+      'FILL_ANSWERS_ALL',
+      { questions: qs, panelNonce },
+      FILL_TIMEOUT_MS,
+      panelNonce,
+    );
+    return (resp?.ok && resp.summary) ? resp.summary : null;
   }
 
   // The trusted click is checked at the handler. The worker separately requires
   // a short-lived, single-use capability tied to this tab and exact action.
-  function requestActionToken(action) {
+  function requestActionToken(action, panelNonce) {
     return new Promise((resolve) => {
       let done = false;
       const finish = (r) => { if (!done) { done = true; resolve(r); } };
       const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), 5000);
       try {
-        chrome.runtime.sendMessage({ type: 'GET_ACTION_TOKEN', action }, (r) => {
+        chrome.runtime.sendMessage({ type: 'GET_ACTION_TOKEN', action, panelNonce }, (r) => {
           clearTimeout(t);
           if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
           else finish(r || { ok: false, error: 'no response' });
@@ -504,8 +550,8 @@
 
   // Promise-wrapped privileged sendMessage with a hard timeout so a recycled
   // service worker (dropped reply) never leaves a line spinning forever.
-  async function sendMsg(type, payload, timeoutMs) {
-    const grant = await requestActionToken(type);
+  async function sendMsg(type, payload, timeoutMs, panelNonce) {
+    const grant = await requestActionToken(type, panelNonce);
     if (!grant?.ok || !grant.token) return grant || { ok: false, error: 'no action token' };
     return new Promise((resolve) => {
       let done = false;
@@ -524,15 +570,21 @@
   // «Перерешать этот вопрос»: re-ask one question, drop the fresh answer into
   // the line, then push just that answer into the form and re-mark the line.
   // The page is the source of truth, so the worker re-captures it server-side.
-  async function resolveOne(btn) {
-    if (btn.disabled) return;
+  async function resolveOne(btn, generation, panelNonce) {
+    if (btn.disabled || !isPanelCurrent(generation, panelNonce)) return;
     const li = btn.closest('li');
     const aEl = li && li.querySelector('.a');
     const qid = li && li.getAttribute('data-qid');
     const i = Number(btn.dataset.qi);
-    const qs = (lastPayload && lastPayload.questions) || [];
+    const qs = (lastPayload && lastPayload.generation === generation &&
+      lastPayload.panelNonce === panelNonce && lastPayload.questions) || [];
     const q = qs[i];
     if (!q || !aEl) return;
+    const expectedCapture = lastPayload?.capture || null;
+    if (!captureStillMatches(expectedCapture)) {
+      hide(panelNonce, generation);
+      return;
+    }
 
     const prev = q.answer ?? '';
     btn.disabled = true;
@@ -545,38 +597,75 @@
     const r = await sendMsg('RESOLVE_QUESTION', {
       index: q.index != null ? q.index : i + 1,
       prevAnswer: prev,
-      questionText: q.text || ''
-    }, 130000);
+      questionText: q.text || '',
+      panelNonce,
+    }, 130000, panelNonce);
 
-    btn.classList.remove('spinning');
-    btn.disabled = false;
-    aEl.classList.remove('resolving');
-
-    if (!r || !r.ok || !r.answer) {
-      aEl.textContent = prevText; // restore the prior answer
-      btn.classList.add('failed');
-      setTimeout(() => btn.classList.remove('failed'), 1500);
+    // The worker validates after AI completion, but the same-document player
+    // can switch question/account between that read and message delivery. Do
+    // not even restore/update the stale line: remove the obsolete panel and let
+    // the user solve the newly captured page explicitly.
+    if (!isPanelCurrent(generation, panelNonce, btn) ||
+        !captureStillMatches(expectedCapture)) {
+      hide(panelNonce, generation);
       return;
     }
 
-    q.answer = r.answer;
+    if (!r || !r.ok || !r.answer) {
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+      aEl.classList.remove('resolving');
+      aEl.textContent = prevText; // restore the prior answer
+      btn.classList.add('failed');
+      setTimeout(() => {
+        if (isPanelCurrent(generation, panelNonce, btn)) btn.classList.remove('failed');
+      }, 1500);
+      return;
+    }
+
     // Carry fresh per-field values for a multi-box question (x & y, x₁ & x₂) so
     // the re-fill below spreads them across every box, not just the first. The
-    // worker omits `parts` for single-box questions — clear stale ones then.
-    if ('parts' in r) q.parts = r.parts || undefined;
-    aEl.textContent = r.answer;
+    // worker returns null `parts` for single-box questions — clear stale ones then.
+    const nextQuestion = { ...q, answer: r.answer };
+    if ('parts' in r) nextQuestion.parts = r.parts || undefined;
     // Best-effort: push only this answer into the form and re-mark the line.
     // Pin `index` to the line's qid so scraper.js targets this exact question
     // by number/position — identical to the full-page fill — even when the
     // model returned no number of its own (qid then falls back to i+1).
+    let summary = null;
     try {
-      const summary = await requestFill([{ ...q, index: qid }]);
-      const filled = new Set((summary?.filled || []).map(String));
-      markOneLine(qid, filled.has(String(qid)) ? 'ok' : 'warn');
-    } catch { /* answer is updated; user can still hit «Заполнить» */ }
+      summary = await requestFill([{ ...nextQuestion, index: qid }], panelNonce);
+    } catch { /* the capture check below still owns the post-await boundary */ }
+    if (!isPanelCurrent(generation, panelNonce, btn)) return;
+    // The worker validates immediately around the form mutation, but the
+    // same-document player can switch again while its reply crosses back to
+    // this content script. Revalidate even when requestFill rejects: otherwise
+    // a transport failure could skip this guard and leave the old answer
+    // readable on the replacement page.
+    if (!captureStillMatches(expectedCapture)) {
+      hide(panelNonce, generation);
+      return;
+    }
+    // Publish the fresh answer only after the refill await and final capture
+    // check. Until here the line remains «…», so an account/question switch
+    // during a slow fill never gets a window in which it can display old-page
+    // answer text before teardown.
+    q.answer = nextQuestion.answer;
+    if ('parts' in r) q.parts = nextQuestion.parts;
+    aEl.textContent = nextQuestion.answer;
+    aEl.classList.remove('resolving');
+    btn.classList.remove('spinning');
+    btn.disabled = false;
+    const filled = new Set((summary?.filled || []).map(String));
+    markOneLine(
+      qid,
+      filled.has(String(qid)) ? 'ok' : 'warn',
+      generation,
+      panelNonce,
+    );
   }
 
-  function wireButtons(panel, questions) {
+  function wireButtons(panel, questions, generation, panelNonce) {
     const closeBtn = panel.querySelector('.btn-close');
     const toggleBtn = panel.querySelector('.btn-toggle');
     const copyBtn = panel.querySelector('.btn-copy');
@@ -585,36 +674,53 @@
     panel.querySelectorAll('.btn-resolve').forEach((b) => {
       b.addEventListener('click', (event) => {
         if (!event.isTrusted) return;
-        resolveOne(b);
+        resolveOne(b, generation, panelNonce);
       });
     });
 
-    closeBtn.addEventListener('click', hide);
+    closeBtn.addEventListener('click', () => hide(panelNonce, generation));
 
     fillBtn.addEventListener('click', async (event) => {
-      if (!event.isTrusted) return;
-      const qs = (lastPayload && lastPayload.questions) || questions || [];
+      if (!event.isTrusted || !isPanelCurrent(generation, panelNonce, panel)) return;
+      const payload = lastPayload && lastPayload.generation === generation &&
+        lastPayload.panelNonce === panelNonce ? lastPayload : null;
+      const qs = payload?.questions || questions || [];
+      const expectedCapture = payload?.capture || null;
       const orig = fillBtn.textContent;
       fillBtn.disabled = true;
       let summary = null;
       try {
-        summary = await requestFill(qs);
+        summary = await requestFill(qs, panelNonce);
       } catch { summary = null; }
+      if (!isPanelCurrent(generation, panelNonce, panel)) return;
+      if (!captureStillMatches(expectedCapture)) {
+        hide(panelNonce, generation);
+        return;
+      }
       fillBtn.disabled = false;
       if (!summary) {
         fillBtn.textContent = 'Ошибка';
         fillBtn.classList.add('failed');
-        setTimeout(() => { fillBtn.textContent = orig; fillBtn.classList.remove('failed'); }, 1600);
+        setTimeout(() => {
+          if (!isPanelCurrent(generation, panelNonce, panel)) return;
+          fillBtn.textContent = orig;
+          fillBtn.classList.remove('failed');
+        }, 1600);
         return;
       }
-      markFillResults(summary);
+      markFillResults(summary, generation, panelNonce);
       const n = (summary.filled || []).length;
       fillBtn.textContent = `✓ ${n}`;
       fillBtn.classList.add('copied');
-      setTimeout(() => { fillBtn.textContent = orig; fillBtn.classList.remove('copied'); }, 1600);
+      setTimeout(() => {
+        if (!isPanelCurrent(generation, panelNonce, panel)) return;
+        fillBtn.textContent = orig;
+        fillBtn.classList.remove('copied');
+      }, 1600);
     });
 
     toggleBtn.addEventListener('click', () => {
+      if (!isPanelCurrent(generation, panelNonce, panel)) return;
       state.minimized = !state.minimized;
       panel.classList.toggle('minimized', state.minimized);
       toggleBtn.textContent = state.minimized ? '▢' : '–';
@@ -622,6 +728,14 @@
     });
 
     copyBtn.addEventListener('click', async () => {
+      if (!isPanelCurrent(generation, panelNonce, panel)) return;
+      const payload = lastPayload && lastPayload.generation === generation &&
+        lastPayload.panelNonce === panelNonce ? lastPayload : null;
+      const expectedCapture = payload?.capture || null;
+      if (!captureStillMatches(expectedCapture)) {
+        hide(panelNonce, generation);
+        return;
+      }
       const txt = questions.map((q, i) => {
         const n = q.index != null ? q.index : i + 1;
         const t = (q.text || '').trim();
@@ -629,22 +743,90 @@
       }).join('\n');
       try {
         await navigator.clipboard.writeText(txt);
+        if (!isPanelCurrent(generation, panelNonce, panel)) return;
+        if (!captureStillMatches(expectedCapture)) {
+          hide(panelNonce, generation);
+          return;
+        }
         const orig = copyBtn.textContent;
         copyBtn.textContent = '✓';
         copyBtn.classList.add('copied');
-        setTimeout(() => { copyBtn.textContent = orig; copyBtn.classList.remove('copied'); }, 1200);
+        setTimeout(() => {
+          if (!isPanelCurrent(generation, panelNonce, panel)) return;
+          copyBtn.textContent = orig;
+          copyBtn.classList.remove('copied');
+        }, 1200);
       } catch { /* clipboard blocked; nothing graceful to do here */ }
     });
   }
 
-  async function show(payload) {
-    await Promise.all([loadState(), loadTheme()]);
-    ensureHost();
-    buildPanel(payload);
+  function captureStillMatches(expected) {
+    if (!expected || typeof expected !== 'object') return false;
+    const currentUrl = typeof window.location?.href === 'string' ? window.location.href : '';
+    const pageId = window.__smeshCaptureDocumentId;
+    const signature = typeof window.__smeshPageSig === 'function' ? window.__smeshPageSig() : '';
+    const principal = typeof window.__smeshCurrentPrincipal === 'function'
+      ? window.__smeshCurrentPrincipal() : '';
+    return currentUrl === expected.url && pageId === expected.pageId &&
+      signature === expected.signature && principal === expected.principal;
   }
 
-  function hide() {
+  function validateActivePanelCapture() {
+    const payload = lastPayload;
+    if (!hostEl || !payload?.capture) return;
+    const generation = payload.generation;
+    const panelNonce = payload.panelNonce;
+    if (!isPanelCurrent(generation, panelNonce) || captureStillMatches(payload.capture)) return;
+    hide(panelNonce, generation);
+  }
+
+  function scheduleActivePanelCaptureCheck() {
+    if (!hostEl || !lastPayload || captureCheckTimer != null) return;
+    // Throttle noisy framework mutation bursts while still checking throughout
+    // continuous SPA rendering instead of postponing forever on every change.
+    captureCheckTimer = setTimeout(() => {
+      captureCheckTimer = null;
+      validateActivePanelCapture();
+    }, 100);
+  }
+
+  async function show(payload) {
+    const panelNonce = payload?.panelNonce;
+    if (typeof panelNonce !== 'string' ||
+        !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(panelNonce)) {
+      throw new Error('invalid answer-panel capability');
+    }
+    // Invalidate every handler and continuation belonging to the previous
+    // panel before the first asynchronous storage read. Remove its presentation
+    // at the same boundary: action capabilities alone do not stop old answer
+    // text being readable while loadState()/loadTheme() is stalled.
+    cancelActiveDrag();
+    const generation = ++panelGeneration;
+    activePanelNonce = panelNonce;
+    lastPayload = null;
     if (hostEl) { hostEl.remove(); hostEl = null; shadow = null; }
+    const expected = payload?.capture;
+    if (!captureStillMatches(expected)) throw new Error('captured test page changed');
+    await Promise.all([loadState(), loadTheme()]);
+    if (!isPanelCurrent(generation, panelNonce) || !captureStillMatches(expected)) {
+      throw new Error('captured test page changed');
+    }
+    ensureHost();
+    if (!isPanelCurrent(generation, panelNonce)) throw new Error('answer panel replaced');
+    buildPanel(payload, generation, panelNonce);
+  }
+
+  function hide(expectedNonce = null, expectedGeneration = null) {
+    if (expectedNonce != null && expectedNonce !== activePanelNonce) return false;
+    if (expectedGeneration != null && expectedGeneration !== panelGeneration) return false;
+    cancelActiveDrag();
+    if (captureCheckTimer != null) clearTimeout(captureCheckTimer);
+    captureCheckTimer = null;
+    panelGeneration += 1;
+    activePanelNonce = '';
+    lastPayload = null;
+    if (hostEl) { hostEl.remove(); hostEl = null; shadow = null; }
+    return true;
   }
 
   window.__smeshPanel = { show, hide };
@@ -671,6 +853,51 @@
   // When the preference is 'system', follow the OS scheme as it flips.
   darkMedia.addEventListener('change', () => { if (themePref === 'system') applyTheme(); });
 
-  // Tear down on full navigation (SPA route changes won't fire — user closes manually).
-  window.addEventListener('pagehide', hide);
+  // Same-document Mesh navigation does not fire pagehide. Observe question and
+  // account DOM changes, route events, and a low-frequency fallback for
+  // identity changes sourced only from storage/cookies. All paths validate the
+  // exact generation/capture before removing anything.
+  let captureObserver = null;
+  let capturePoll = null;
+  let captureWatchersArmed = false;
+
+  function armActivePanelCaptureWatchers() {
+    if (captureWatchersArmed) return;
+    captureWatchersArmed = true;
+    try {
+      if (!captureObserver) captureObserver = new MutationObserver(scheduleActivePanelCaptureCheck);
+      captureObserver.observe(document.documentElement, {
+        subtree: true,
+        childList: true,
+        attributes: true,
+        characterData: true,
+      });
+    } catch {
+      // A failed observer must be constructible again on a later pageshow. The
+      // interval remains an independent fallback in environments without one.
+      captureObserver = null;
+    }
+    if (capturePoll == null) capturePoll = setInterval(scheduleActivePanelCaptureCheck, 1000);
+  }
+
+  function disarmActivePanelCaptureWatchers() {
+    if (!captureWatchersArmed && capturePoll == null) return;
+    captureWatchersArmed = false;
+    try { captureObserver?.disconnect(); } catch { /* already detached */ }
+    if (capturePoll != null) clearInterval(capturePoll);
+    capturePoll = null;
+  }
+
+  armActivePanelCaptureWatchers();
+  window.addEventListener('popstate', scheduleActivePanelCaptureCheck);
+  window.addEventListener('hashchange', scheduleActivePanelCaptureCheck);
+
+  window.addEventListener('pagehide', () => {
+    disarmActivePanelCaptureWatchers();
+    hide();
+  });
+  // A page restored from the back-forward cache reuses this exact isolated
+  // world. Re-arm once; repeated pageshow events must not duplicate observers
+  // or polling intervals.
+  window.addEventListener('pageshow', armActivePanelCaptureWatchers);
 })();

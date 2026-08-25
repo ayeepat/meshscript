@@ -281,3 +281,14 @@ svg[fill="none"] { stroke-width: 1.75; }
   padding: 3px 5px;
   pointer-events: none; user-select: none; white-space: nowrap;
 }
+
+/* Respect the OS accessibility preference across popup, dashboard and
+   Settings. JS-driven reveals separately take the same fast path. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

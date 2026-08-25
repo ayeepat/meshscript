@@ -13,7 +13,7 @@ The fix is a **polling pseudo-stream**: every RU-facing request is short.
 
 ```
 Extension ──POST /ai/start───▶  ai.smeshapi.site (this box, DNS-only / grey-cloud)
-          ◀─{ job_id }───────       │  GET /verify ──▶ smeshapi.site (CF worker, licenses)
+          ◀─{ job_id }───────       │ POST /verify ──▶ smeshapi.site (CF worker, licenses)
 Extension ──GET /ai/poll──┐         └─ POST (SSE) ──▶ api.302.ai (Qwen / DeepSeek,
           ◀─{chunk,done}──┘ ~0.6s        buffered in memory per job — this leg
    … repeat until done …                 never touches Russia)
@@ -23,6 +23,12 @@ Extension ──POST /ai/blob──▶    (short chunks, bound to that ticket)
 
 Extension ──everything else──▶ smeshapi.site (CF worker, unchanged)
 ```
+
+Every paid upload/start/chat request is bound to three values: license key,
+device UUID and the random `activation_token` issued by the first successful
+Worker `/verify`. The key plus UUID alone cannot use or transfer a license.
+Only the authenticated Settings “Deactivate license / sign out” action releases
+device number 1; a competing installation is told to sign out there first.
 
 The client feeds each poll's chunk into the same SSE parser it uses for
 direct streams (`createSseSink` in `src/lib/http.js`), so the UI still
@@ -40,16 +46,26 @@ replayed history), the client slices the whole `messages` JSON into **8 KB**
  the extension obtains a short-lived `/ai/upload-ticket` after server-side
  license verification; every chunk and the final `/ai/start` are bound to that
  ticket's generated blob id, license, and device. The server reassembles the
- string (bounded + 90s inactivity TTL, swept by GC) and `/ai/start` arrives
+ string (bounded and swept by GC) and `/ai/start` arrives
  tiny with `{ messages_blob: <id> }`, which `prepareChat` parses back into
  `messages`. See `uploadBlob` in `src/lib/smesh-proxy.js`.
 
+Upload tickets reserve their declared size before any chunks are accepted.
+Reservations are capped at 40 MiB process-wide, 10 MiB/device, 12 MiB/license
+and 18 MiB/IP, with at most two live tickets per device/license and four per
+IP. A ticket must receive its first chunk within 12 seconds; only genuinely new
+bytes extend the 20-second progress deadline. The absolute upload lifetime is
+ten minutes, so duplicates and slow drips cannot pin memory indefinitely.
+
 ## Files
-- `server.js` — the proxy (Node 18+, **zero npm deps**). License verified via
-  the CF worker `/verify` per request; per-license + global daily quotas
-  enforced locally (`/var/lib/smesh-proxy/quota.json`); poll jobs buffered in
-  memory (bounded: max 100 active, abandoned jobs aborted after 90s, done
-  jobs GC'd after 5 min). PDFs: a `{type:'file'}` data-URI part re-routes the
+- `server.js` — the proxy (Node 24 LTS, **zero npm deps**). License verified via
+  the CF worker `/verify` per request with its activation bearer; per-license + global daily quotas
+  are atomically persisted before a job is accepted
+  (`/var/lib/smesh-proxy/quota.json`); poll jobs buffered in
+  memory (bounded: max 24 active and 64 total retained, abandoned jobs aborted
+  after 90s, done jobs GC'd after 5 min). Long polls are admitted at most two
+  per job/token, six per client IP, and 32 process-wide, leaving listener
+  capacity for health checks and unrelated users. PDFs: a `{type:'file'}` data-URI part re-routes the
   job to the Gemini chain (`PROXY_PDF_MODEL`, default `gemini-2.5-flash` —
   verified reading PDFs on 302.AI), since neither Qwen nor DeepSeek can.
 - `setup.sh` — one-shot installer for Ubuntu 22.04/24.04. Installs Node +
@@ -67,31 +83,116 @@ forever). The Caddyfile therefore pins `protocols h1` + `header Connection
 close`, forcing a fresh sub-5s connection per request. Re-enabling h2/h3
 resurrects the mid-answer hang for RU users.
 
-## Deploy (summary — box live at 34.141.121.103, GCP europe-west3, migrated off AWS 2026-07-09)
-GCP project `project-2bc53756-d2a7-40e9-be4` (account ermd219@gmail.com), instance
-`smesh-ai-proxy`, zone `europe-west3-a`.
+## Deploy (GCP example)
+
+Keep the real project id, billing-account email, instance name, and static IP
+in a private password manager or ops notebook—not in the repository. The
+examples below assume `GCP_PROJECT`, `GCP_INSTANCE`, and `GCP_ZONE` are set in
+the operator's shell.
+
 1. Create an `e2-small` Ubuntu 24.04 VM near RU (`europe-west3`), firewall tag
    `smesh-proxy` (rule `smesh-allow-web` opens 80+443; default VPC rule opens 22).
 2. Reserve a static external IP (`smesh-ai-proxy-ip`) and attach it.
 3. Cloudflare DNS: point `ai.smeshapi.site` → static IP, **DNS only (grey cloud)**.
-4. `gcloud compute scp setup.sh smesh-ai-proxy:/tmp/ --zone=europe-west3-a`, then
-   `gcloud compute ssh smesh-ai-proxy --zone=europe-west3-a --command="bash /tmp/setup.sh"`.
-5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key AND `INGEST_KEY` (same value as the worker secret `npx wrangler secret put INGEST_KEY`; enables server-truth usage reporting to POST /t/ai for the owner dashboard) → `sudo systemctl restart smesh-proxy`.
-6. Verify: `curl -s https://ai.smeshapi.site/health` → `{"ok":true}`.
-7. Update deploy: `gcloud compute scp server.js smesh-ai-proxy:/tmp/ --zone=europe-west3-a`, then
-   `sudo install -m 644 /tmp/server.js /opt/smesh-proxy/server.js && sudo systemctl restart smesh-proxy`.
-8. Zero-downtime host move: tar `/var/lib/caddy` on the old box and restore it on
-   the new one (chown `caddy:caddy`) so the Let's Encrypt cert is valid before the
-   DNS flip; copy `/var/lib/smesh-proxy/quota.json` too so daily quotas survive.
+4. `gcloud --project "$GCP_PROJECT" compute scp setup.sh "$GCP_INSTANCE:/tmp/" --zone="$GCP_ZONE"`, then
+   `gcloud --project "$GCP_PROJECT" compute ssh "$GCP_INSTANCE" --zone="$GCP_ZONE" --command="bash /tmp/setup.sh"`.
+5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key AND `INGEST_KEY` (same value as the worker secret `npx wrangler secret put INGEST_KEY`; enables opt-in server-observed usage reporting to POST /t/ai for the owner dashboard). Set `PROXY_QWEN_DAILY` and `PROXY_DEEPSEEK_DAILY` within `1..5000`, and `PROXY_GLOBAL_DAILY` within `1..100000` and no lower than either provider cap. Then run `sudo systemctl restart smesh-proxy`.
+6. Verify readiness: `curl -fsS https://ai.smeshapi.site/ready` must return
+   `{"ok":true,"checks":{"upstream_key":true,"quota_config":true,"quota_store":true}}`.
+   Invalid or out-of-range quota configuration fails readiness and AI admission
+   closed rather than silently increasing spend.
+   `/health` is intentionally liveness-only and can remain 200 while required
+   configuration or quota storage is unavailable.
+7. Update deploy: **re-run the installer**, exactly like step 4 —
+   `gcloud compute scp setup.sh …` then `bash /tmp/setup.sh`. `setup.sh` is
+   idempotent and is the only path that applies EVERY dependent change, not
+   just the app code: it upgrades an existing Node 20 host to the declared
+   Node 24 (the systemd unit runs `/usr/bin/node`), and it rewrites the systemd
+   unit and the Caddy site config. It also embeds the current `server.js`
+   verbatim — `npm run sync:vps` keeps that payload byte-identical, and
+   `npm run test:vps-parity` gates it.
+
+   Copying `server.js` alone — which this step used to prescribe — leaves an
+   existing host on stale, untested runtime and service configuration: new
+   server code can then run under an old Node major or an old unit/Caddy
+   config that was never tested together. Only use the file-only path as a
+   deliberate hotfix when you have confirmed the runtime and service
+   configuration are already current:
+   `sudo install -o root -g smeshai -m 640 /tmp/server.js
+   /opt/smesh-proxy/server.js && sudo systemctl restart smesh-proxy`.
+   Either way, finish with the `/ready` check in step 6.
+8. Host move: this service's quota authority is a local file, so two accepting
+   hosts are **not** a zero-downtime cluster. Before the final quota copy, stop
+   admissions on the old host and wait for its in-flight jobs to settle; then
+   stop `smesh-proxy`, copy `/var/lib/smesh-proxy/quota.json` once, start the new
+   host and require `/ready`. Flip DNS only after that check, and keep the old
+   service stopped throughout DNS propagation. Otherwise both snapshots can
+   spend the same per-license/global allowance and one host's increments will
+   be lost. A genuinely overlap-safe cutover requires one shared atomic quota
+   store. The Caddy certificate may be copied earlier (`/var/lib/caddy`, then
+   `chown caddy:caddy`) because it is not quota authority.
 
 ## Extension side
 - `src/lib/smesh-proxy.js` — start → poll → cancel client (the only caller).
 - `src/lib/config.js` — `AI_BACKEND_URL = 'https://ai.smeshapi.site'`.
 - `manifest.json` — `https://ai.smeshapi.site/*` in `host_permissions`.
 
+## Incident 2026-07-14: every solve failed with «ИИ-сервис временно недоступен»
+
+**Symptom.** For ~20 minutes every real request from every user died with the
+UNAVAILABLE toast (both providers — users saw «Qwen: ИИ-сервис временно
+недоступен…» and assumed a Qwen outage). `journalctl -u smesh-proxy` showed
+only `verify http error 404`, repeating. Meanwhile `/health` was fine, 302.AI
+answered normally, and **synthetic `/verify` probes from the same VM — curl
+and a fresh `node -e` process, 22 requests — all returned 200.**
+
+**Root cause (inferred, high confidence).** The license check to the CF
+worker (`smeshapi.site/verify`) used global `fetch()`, whose shared undici
+pool keeps TLS connections to Cloudflare alive across requests. One pooled
+connection went bad — pinned to an edge state that answered **404 for the
+worker route** — and because the pool kept reusing it, every *real* verify
+rode the poisoned socket while every *fresh* connection reached a healthy
+edge. `systemctl restart smesh-proxy` (new process → new pool) cured it
+instantly, which strongly supports—but does not uniquely prove—the
+connection-state theory: nothing else changed (no deploy on either side that
+day).
+
+**Why users saw "unavailable" instead of a license error.** Correct behavior:
+a non-200 from `/verify` is infrastructure trouble, not a verdict on the key,
+so the proxy answered 503 UNAVAILABLE rather than "key not found". The gap
+was resilience, not semantics.
+
+**Fixes now in `server.js` — do not undo any of these:**
+1. `postJsonFresh()` — verify runs over `node:https` with `agent: false`
+   (fresh connection per request, `Connection: close`). No pool → no poisoned
+   socket to reuse. Verify is low-volume (ok-verdicts cached 60 s), so the
+   extra ~50 ms handshake is irrelevant. **Never "optimize" this back to
+   `fetch()`/keep-alive.**
+2. One retry (400 ms apart) on a non-200 / thrown verify — each attempt on
+   its own fresh connection.
+3. A last-known-good **grace store** (`verifyGrace`, 10 min TTL): if
+   `/verify` is unreachable but this license+device verified ok within the
+   window, the solve proceeds (loudly logged). Explicit negative verdicts
+   evict the grace entry, so a revoked key can't hide behind an outage for
+   longer than the TTL.
+4. The verify error log now includes status, `cf-ray`, `server` header, and a
+   body snippet — a bare `verify http error 404` proved undiagnosable live.
+
+**If UNAVAILABLE toasts ever spike again:** check
+`journalctl -u smesh-proxy --since '30 min ago' | grep verify` — if you see
+`verify http error` with a `cf-ray` id, it's the CF edge again; the immediate
+remedy is `sudo systemctl restart smesh-proxy` (drops all pooled state), and
+the ray id lets Cloudflare support trace the edge. If there's no ray id /
+`server=cloudflare`, something between GCP and CF is intercepting.
+
 ## Ops
 - Logs: `journalctl -u smesh-proxy -f` (app), `journalctl -u caddy -f` (TLS).
 - Restart after env change: `sudo systemctl restart smesh-proxy`.
+- Monitor `GET /ready`, not `/health`; readiness fails closed when the upstream
+  key is absent or quota accounting cannot be read and durably rewritten.
+- The production listener is fixed by systemd to `127.0.0.1:8080`, matching
+  Caddy. Do not add `PORT` or `HOST` to `/etc/smesh-proxy.env`; legacy values
+  are deliberately removed from the service environment on installer upgrades.
 - The 302.AI key lives **only** in `/etc/smesh-proxy.env` (chmod 600) — never in
   the repo or the client.
 - `/ai/streamtest` (here and the temp copy in `backend/src/worker.js`) is the

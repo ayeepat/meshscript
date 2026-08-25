@@ -20,10 +20,15 @@
  * two hosts, so the match list there covers both (top frame only):
  *   • https://uchebnik.mos.ru/exam/challenge/…   (the test IS the top frame)
  *   • https://school.mos.ru/<course>/cwork?…     (test runs in a uchebnik iframe)
- * Both carry an xAPI launch signature (activityId + lrs endpoint + registration).
+ *   • https://school.mos.ru/dt/<block>/<subj>/go?subcategory_id=…  («Цифровой
+ *     учитель» / Фундаментальные науки — the task renders INLINE, no xAPI iframe,
+ *     so only the route identifies it)
+ * The first two carry an xAPI launch signature (activityId + lrs endpoint +
+ * registration); the /dt tasks are detected by route alone.
  * The user picked "show only on detected tests", so looksLikeTest() below gates
- * whether the pill actually appears. Edit BOTH the manifest match list and
- * looksLikeTest() when МЭШ ships a new test URL shape.
+ * whether the pill actually appears. The manifest match list already covers
+ * school.mos.ru/* (minus /diary), so a new test URL shape usually needs only a
+ * looksLikeTest() edit — touch the manifest too if it lands on a new host.
  */
 (() => {
   if (window.__smeshPill) return;
@@ -42,8 +47,9 @@
   //   • STRONG (any one is enough): the documented xAPI launch signature
   //     (activityId / cwork_id / registration / scorm_id / endpoint=...lrs),
   //     a known МЭШ test route family (/exam, /challenge, /cwork,
-  //     /control-work, /01math/maths/test), or an iframe whose src itself
-  //     carries a test-player marker (activityId, /lrs, /exam, /launch, cwork).
+  //     /control-work, /01math/maths/test, or a «Цифровой учитель» /dt/…/go
+  //     task view), or an iframe whose src itself carries a test-player marker
+  //     (activityId, /lrs, /exam, /launch, cwork).
   //   • WEAK (need TWO distinct weak hits if no strong one fired): lesson_id,
   //     generic words like /test or /training in the path, or a bare
   //     uchebnik.mos.ru iframe with no stronger marker in its src.
@@ -65,15 +71,22 @@
     } catch { /* no iframe access / malformed DOM — treat as absent */ }
     return '';
   }
-  function hasTestIframe() {
-    return !!iframeSignal();
-  }
   function looksLikeTest() {
     const { pathname, search } = location;
     const iframe = iframeSignal();
     const strongQuery = /[?&](activityId|cwork_id|registration|scorm_id)=/i.test(search) || /[?&]endpoint=[^&]*lrs/i.test(search);
+    // «Цифровой учитель» task views render the task INLINE (no xAPI iframe), so
+    // only the route identifies them. Two shapes seen in the wild:
+    //   /01math/maths/test?subcategory_id=…            (older)
+    //   /dt/<block>/<subject>/go?subcategory_id=…      (Фундаментальные науки, 2026)
+    // Require a /go task segment OR a subcategory_id so the /dt catalog/landing
+    // pages (which carry neither) stay quiet — same false-positive discipline as
+    // the weak tier below.
+    const dtTaskRoute = /^\/dt(?:\/|$)/i.test(pathname) &&
+      (/\/go(?:\/|$)/i.test(pathname) || /[?&]subcategory_id=/i.test(search));
     const strongPath = /\/(exam|challenge|cwork|control[-_]?work)(\/|$|\?)/i.test(pathname) ||
-      /^\/01math\/maths\/test(?:\/|$)/i.test(pathname);
+      /^\/01math\/maths\/test(?:\/|$)/i.test(pathname) ||
+      dtTaskRoute;
     if (strongQuery || strongPath || iframe === 'strong') {
       log('test detect strong', { pathname, search, iframe });
       return true;
@@ -96,7 +109,9 @@
   let shadow = null;
   let state = { x: null, y: null };
   let busy = false;
+  let runGen = 0;
   let thinker = null;
+  let activeDragCleanup = null;
 
   let themePref = 'system';
   // Active AI provider, shown as a tiny GRQ/OPR/QWN/DSK tag on the pill so the
@@ -104,6 +119,12 @@
   // common/provider-badge.js (can't import an ES module into a content script).
   let providerId = 'openrouter';
   let providerAbbr = 'OPR';
+  // Initial storage reads race live storage.onChanged delivery (and a completed
+  // drag can race a route-triggered rebuild). Each revision makes the newest
+  // local/event state authoritative over an older callback snapshot.
+  let stateRevision = 0;
+  let themeRevision = 0;
+  let providerRevision = 0;
   const PROV_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
   function setProvider(p) {
     providerId = PROV_ABBR[p] ? p : 'openrouter';
@@ -216,26 +237,35 @@
   }
 
   /* ---------- State / theme persistence (chrome.storage) ---------- */
-  function loadState() {
+  function loadState(expectedRunGen = runGen) {
+    const expectedRevision = stateRevision;
     return new Promise((resolve) => {
       try {
         chrome.storage.session.get(STORAGE_KEY, (v) => {
-          if (!chrome.runtime.lastError && v?.[STORAGE_KEY]) state = { ...state, ...v[STORAGE_KEY] };
+          if (expectedRunGen === runGen && expectedRevision === stateRevision &&
+              !chrome.runtime.lastError && v?.[STORAGE_KEY]) {
+            state = { ...state, ...v[STORAGE_KEY] };
+          }
           resolve();
         });
       } catch { resolve(); }
     });
   }
   function saveState() {
+    stateRevision++;
     try { chrome.storage.session.set({ [STORAGE_KEY]: state }); } catch { /* session blocked */ }
   }
-  function loadTheme() {
+  function loadTheme(expectedRunGen = runGen) {
+    const expectedRevision = themeRevision;
     // storage.session, not local: local is trusted-contexts-only (it holds the
     // API keys), so the worker mirrors just `theme`/`aiProvider` into session.
     return new Promise((resolve) => {
       try {
         chrome.storage.session.get('theme', (v) => {
-          if (!chrome.runtime.lastError && v?.theme) themePref = v.theme;
+          if (expectedRunGen === runGen && expectedRevision === themeRevision &&
+              !chrome.runtime.lastError) {
+            themePref = v?.theme || 'system';
+          }
           resolve();
         });
       } catch { resolve(); }
@@ -245,11 +275,15 @@
     const pill = shadow && shadow.querySelector('.pill');
     if (pill) pill.dataset.theme = resolveTheme();
   }
-  function loadProvider() {
+  function loadProvider(expectedRunGen = runGen) {
+    const expectedRevision = providerRevision;
     return new Promise((resolve) => {
       try {
         chrome.storage.session.get('aiProvider', (v) => {
-          if (!chrome.runtime.lastError) setProvider(v?.aiProvider);
+          if (expectedRunGen === runGen && expectedRevision === providerRevision &&
+              !chrome.runtime.lastError) {
+            setProvider(v?.aiProvider);
+          }
           resolve();
         });
       } catch { resolve(); }
@@ -275,13 +309,19 @@
       <style>
         ${fontFaceCss()}
         :host {
-          all: initial;
-          position: fixed;
-          inset: 0 auto auto 0;
-          width: 0;
-          height: 0;
-          z-index: 2147483647;
-          pointer-events: none;
+          all: initial !important;
+          position: fixed !important;
+          inset: 0 auto auto 0 !important;
+          width: 0 !important;
+          height: 0 !important;
+          z-index: 2147483647 !important;
+          pointer-events: none !important;
+          opacity: 1 !important;
+          visibility: visible !important;
+          transform: none !important;
+          filter: none !important;
+          clip: auto !important;
+          clip-path: none !important;
         }
         :host, * { box-sizing: border-box; }
 
@@ -526,10 +566,18 @@
       pill.style.left = x + 'px';
       pill.style.top = y + 'px';
     };
-    const onUp = () => {
+    const cleanup = () => {
       window.removeEventListener('mousemove', onMove, true);
       window.removeEventListener('mouseup', onUp, true);
       pill.classList.remove('dragging');
+      if (activeDragCleanup === cleanup) activeDragCleanup = null;
+    };
+    const onUp = () => {
+      cleanup();
+      // A route/detection teardown can remove the pill during an active drag.
+      // That cancelled gesture must not write detached coordinates back over a
+      // newer build's storage snapshot.
+      if (!pill.isConnected) return;
       if (moved) {
         state.x = parseFloat(pill.style.left) || 0;
         state.y = parseFloat(pill.style.top) || 0;
@@ -546,7 +594,9 @@
       pill.style.bottom = 'auto';
       pillX = rect.left; pillY = rect.top;
       startX = e.clientX; startY = e.clientY; moved = false;
+      if (activeDragCleanup) activeDragCleanup();
       pill.classList.add('dragging');
+      activeDragCleanup = cleanup;
       window.addEventListener('mousemove', onMove, true);
       window.addEventListener('mouseup', onUp, true);
       e.preventDefault();
@@ -557,6 +607,8 @@
   // All guard on `shadow`: a panic-hide (Esc) mid-solve nulls it, but the
   // in-flight worker reply still resolves and calls back in here.
   function showThinking(prefix) {
+    // A prior run's auto-idle callback must not re-enable this run's controls.
+    clearTimeout(showResult._t);
     if (!shadow) return;
     const pill = shadow.querySelector('.pill');
     const stext = shadow.querySelector('.stext');
@@ -597,8 +649,11 @@
     const pages = `Решено страниц: ${solved}.`;
     switch (outcome) {
       case 'finish': return `${pages} Дошёл до конца — отправку не нажимаю, проверь и отправь сам.`;
+      case 'blocked': return `${pages} «Дальше» есть, но сам её не нажимаю — можно случайно отправить тест. Перейди дальше вручную и нажми «Решить».`;
       case 'none': return `${pages} Не нашёл «Дальше» — похоже, последняя страница. Проверь и отправь сам.`;
       case 'stuck': return `${pages} Страница не сменилась — остановился. Проверь оставшиеся вопросы.`;
+      case 'partial': return `${pages} Текущая страница заполнена не полностью — остановился до «Дальше». Проверь её вручную.`;
+      case 'unrecognized': return `${pages} Вопросы на текущей странице не распознаны — остановился до «Дальше». Проверь её вручную.`;
       case 'max': return `${pages} Достигнут предел в 30 страниц — остановился. Проверь и отправь сам.`;
       default: return `Готово. ${pages}`;
     }
@@ -623,27 +678,72 @@
     });
   }
 
+  // The operation currently running in the worker, or ''. Removing local UI is
+  // NOT cancellation: the worker keeps solving, filling, navigating and
+  // spending for up to 30 pages, and the hidden answer panel can reappear. Every
+  // teardown path must name this run and tell the worker to abort it.
+  let activeOpId = '';
+
+  function cancelActiveOperation() {
+    const opId = activeOpId;
+    if (!opId) return;
+    activeOpId = '';
+    try {
+      chrome.runtime.sendMessage(
+        { type: 'PILL_CANCEL', payload: { opId } },
+        () => void chrome.runtime.lastError // the worker may already be gone
+      );
+    } catch { /* extension context torn down */ }
+  }
+
   // One long-lived privileged message to the worker. A generous guard so a
   // recycled service worker (dropped reply) never leaves the pill spinning.
   async function send(type, timeoutMs) {
+    // Allocate and PUBLISH the operation id before the first await. The token
+    // request is a round trip to the worker, and a ×/Esc/route change/pagehide
+    // during it used to find activeOpId still empty: no cancel was sent, and
+    // once the token resolved the operation started anyway — invisible and
+    // uncancellable.
+    const opId = `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    activeOpId = opId;
     const grant = await requestActionToken(type);
-    if (!grant?.ok || !grant.token) return grant || { ok: false, error: 'нет токена действия' };
+    // Ownership can have been revoked while we waited. Re-check after EVERY
+    // await, not just at entry.
+    if (activeOpId !== opId) return { ok: false, cancelled: true, error: 'отменено' };
+    if (!grant?.ok || !grant.token) {
+      activeOpId = '';
+      return grant || { ok: false, error: 'нет токена действия' };
+    }
     return new Promise((resolve) => {
       let done = false;
-      const finish = (r) => { if (!done) { done = true; resolve(r); } };
-      const t = setTimeout(() => finish({ ok: false, error: 'timeout' }), timeoutMs);
+      const finish = (r) => {
+        if (done) return;
+        done = true;
+        if (activeOpId === opId) activeOpId = '';
+        resolve(r);
+      };
+      // A local timeout is not cancellation either — the worker is still
+      // running. Stop it explicitly before giving up on the reply.
+      const t = setTimeout(() => {
+        cancelActiveOperation();
+        finish({ ok: false, error: 'timeout' });
+      }, timeoutMs);
       try {
-        chrome.runtime.sendMessage({ type, token: grant.token, payload: { provider: providerId } }, (r) => {
-          clearTimeout(t);
-          if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
-          else finish(r || { ok: false, error: 'нет ответа' });
-        });
+        chrome.runtime.sendMessage(
+          { type, token: grant.token, payload: { provider: providerId, opId } },
+          (r) => {
+            clearTimeout(t);
+            if (chrome.runtime.lastError) finish({ ok: false, error: chrome.runtime.lastError.message });
+            else finish(r || { ok: false, error: 'нет ответа' });
+          }
+        );
       } catch (e) { clearTimeout(t); finish({ ok: false, error: String(e) }); }
     });
   }
 
   async function solvePage() {
     if (busy) return;
+    const gen = ++runGen;
     busy = true;
     setButtonsDisabled(true);
     showThinking('');
@@ -651,6 +751,7 @@
     // solve + fill. The worker keeps the SW alive via the streaming call, so this
     // only bounds a genuinely stuck run, not a slow-but-progressing one.
     const r = await send('PILL_SOLVE_PAGE', 240000);
+    if (gen !== runGen || !shadow) return;
     busy = false;
     if (!r.ok) { showResult(errText(r.error), true); return; }
     if (!r.count) { showResult('Вопросы не распознаны. Проверьте, что тест на экране.', true); return; }
@@ -660,11 +761,13 @@
 
   async function solveAll() {
     if (busy) return;
+    const gen = ++runGen;
     busy = true;
     setButtonsDisabled(true);
     showThinking('Страница 1');
     // 30 pages × (solve + advance) — give it room, but always settle eventually.
     const r = await send('PILL_SOLVE_ALL', 30 * 60000);
+    if (gen !== runGen || !shadow) return;
     busy = false;
     if (!r.ok) { showResult(errText(r.error), true); return; }
     showResult(paginationSummary(r.outcome, r.solved));
@@ -701,9 +804,14 @@
   async function build() {
     if (built) return;
     built = true;
+    const gen = runGen;
     wireGlobalsOnce();
     loadBrandFonts(); // document-scope, so Unbounded actually renders in the shadow DOM
-    await Promise.all([loadState(), loadTheme(), loadProvider()]);
+    await Promise.all([loadState(gen), loadTheme(gen), loadProvider(gen)]);
+    // A boolean alone is insufficient here: the SPA can leave and re-enter a
+    // test while this build is awaiting storage, making `built` true again for
+    // a NEW build. Only this exact lifecycle generation may mount/render.
+    if (gen !== runGen || !built || dismissed || !looksLikeTest()) return;
     ensureHost();
     render();
   }
@@ -732,11 +840,22 @@
     try {
       chrome.storage.onChanged.addListener((changes, area) => {
         if (area !== 'session') return;
+        if (changes[STORAGE_KEY]) {
+          stateRevision++;
+          const next = changes[STORAGE_KEY].newValue;
+          state = next && typeof next === 'object'
+            ? { ...state, ...next }
+            : { x: null, y: null };
+          const pill = shadow && shadow.querySelector('.pill');
+          if (pill) positionPill(pill);
+        }
         if (changes.theme) {
+          themeRevision++;
           themePref = changes.theme.newValue || 'system';
           applyTheme();
         }
         if (changes.aiProvider) {
+          providerRevision++;
           setProvider(changes.aiProvider.newValue);
           applyProvider();
         }
@@ -756,20 +875,40 @@
       if (e.key === 'Escape' && hostEl) panicHide();
     }, true);
 
-    window.addEventListener('pagehide', () => {
-      if (thinker) { thinker.stop(); thinker = null; }
-    });
+    window.addEventListener('pagehide', () => invalidatePillLifecycle({ hidePanel: true }));
+  }
+
+  /**
+   * Tear down one exact pill lifecycle. Incrementing runGen invalidates BOTH a
+   * pending build and a pending solve continuation. This is shared by explicit
+   * panic-hide, SPA route/detection loss and full page teardown so none of those
+   * paths leaves a busy overlay or detached drag listeners behind.
+   */
+  function invalidatePillLifecycle({ dismiss = false, hidePanel = false } = {}) {
+    runGen++;
+    // Local teardown alone left the worker solving and spending against a page
+    // the student had closed the pill on. Stop the run in the worker too.
+    cancelActiveOperation();
+    busy = false;
+    clearTimeout(showResult._t);
+    showResult._t = null;
+    if (thinker) { thinker.stop(); thinker = null; }
+    if (activeDragCleanup) activeDragCleanup();
+    if (dismiss) dismissed = true;
+    if (hostEl) hostEl.remove();
+    hostEl = null;
+    shadow = null;
+    built = false;
+    if (hidePanel) {
+      try { window.__smeshPanel?.hide(); } catch { /* panel not present */ }
+    }
   }
 
   // Panic / quick-hide: instantly remove the pill AND the answer panel, and stay
   // hidden on THIS page (the poll must not rebuild it a second later). A reload
   // or a navigation to another test URL clears the dismissal and brings it back.
   function panicHide() {
-    if (thinker) { thinker.stop(); thinker = null; }
-    busy = false; // a stale in-flight solve must not block a rebuilt pill
-    dismissed = true;
-    if (hostEl) { hostEl.remove(); hostEl = null; shadow = null; built = false; }
-    try { window.__smeshPanel?.hide(); } catch { /* panel not present */ }
+    invalidatePillLifecycle({ dismiss: true, hidePanel: true });
   }
 
   window.__smeshPill = { build, hide: panicHide, looksLikeTest, evaluate };
@@ -782,9 +921,21 @@
   // after navigation. The poll is gentle and only runs on МЭШ hosts.
   let lastHref = location.href;
   function evaluate() {
-    if (location.href !== lastHref) { lastHref = location.href; dismissed = false; } // new route → pill allowed again
+    if (location.href !== lastHref) {
+      lastHref = location.href;
+      dismissed = false; // a new route may show the pill again
+      invalidatePillLifecycle({ hidePanel: true });
+    }
     if (dismissed) return;
-    if (!looksLikeTest()) return;
+    if (!looksLikeTest()) {
+      // Detection can disappear while storage is loading or a solve is pending.
+      // Both states belong to the old page and must be invalidated immediately;
+      // waiting for `busy` to clear kept the pill alive on unrelated SPA pages.
+      if (built || hostEl || busy || thinker) {
+        invalidatePillLifecycle({ hidePanel: true });
+      }
+      return;
+    }
     if (!built) { log('test detected → showing pill', location.href); build(); return; }
     // Already built: if a heavy SPA re-render detached our host, re-attach it.
     if (hostEl && !document.documentElement.contains(hostEl)) {

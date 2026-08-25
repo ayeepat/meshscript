@@ -2,13 +2,14 @@
  * Full-window dashboard: week-of-homework sidebar + chat solve view.
  * Each sidebar lesson keeps its own chat in this tab. The AI is only called
  * when a lesson is opened for the first time (or you send a follow-up).
- * Settings can also reopen the 7-day local history here in read-only mode.
+ * Chat history (7-day TTL) lives in Settings, not here.
  */
 import { initTheme, toggleTheme } from '../common/theme.js';
-import { extractMath, restoreMath } from '../common/tex.js';
+import { mdToHtml } from '../common/markdown.js';
+import { filesLabel } from '../common/plural.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
-import { mountProviderBadge } from '../common/provider-badge.js';
+import { PROVIDER_ABBR, PROVIDER_NAME } from '../common/provider-badge.js';
 import { isPdfFile } from '../lib/file-kinds.js';
 import { isGdzApiUrl, isGdzHumanUrl } from '../lib/gdz-hosts.js';
 import {
@@ -17,9 +18,21 @@ import {
   MAX_AUDIO_UPLOAD_BYTES,
   validateRequestFileBudget
 } from '../lib/upload-limits.js';
+import { awaitStablePendingRead } from '../lib/pending-read.js';
+import { principalBindingMatches } from '../lib/principal-binding.js';
 
-// Tiny "which AI service is active" tag next to the theme switch in the header.
-mountProviderBadge('provBadge');
+// Tiny "which AI model will answer" tag next to the theme switch. In the
+// dashboard the Авто/Думать toggle — not the Settings provider — decides the
+// model (see the SOLVE payload's `engine`), so the badge is painted from the
+// engine instead of mountProviderBadge's aiProvider setting.
+const ENGINE_PROVIDER = { auto: 'deepseek', think: 'qwen' };
+function paintEngineBadge(engine) {
+  const el = document.getElementById('provBadge');
+  const p = ENGINE_PROVIDER[engine];
+  el.textContent = PROVIDER_ABBR[p];
+  el.title = `Сейчас отвечает: ${PROVIDER_NAME[p]}`;
+  el.hidden = false;
+}
 
 // Keep the theme button icon in sync with the resolved theme.
 document.addEventListener('themechange', (e) => {
@@ -28,8 +41,6 @@ document.addEventListener('themechange', (e) => {
 initTheme();
 
 const params = new URLSearchParams(location.search);
-const historySessionId = params.get('history') || '';
-const historyMode = params.has('history');
 const launchPayload = await (async () => {
   const launch = params.get('launch');
   if (!launch) return {};
@@ -47,17 +58,25 @@ const initialDay = launchPayload.day || '';
 const initialHomeworkId = launchPayload.homeworkId || '';
 const initialHomeworkItemId = launchPayload.homeworkItemId || '';
 const initialRowToken = launchPayload.rowToken || '';
+const initialScanId = launchPayload.scanId || '';
+let initialFiles = Array.isArray(launchPayload.files) ? launchPayload.files : [];
 
 const chatEl = document.getElementById('chat');
 const titleEl = document.getElementById('title');
 const weekEl = document.getElementById('week');
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
-// key -> { key, day, subject, task, homeworkId, homeworkItemId, rowToken, sessionId, history, started, pending }
+// key -> { key, day, subject, task, homeworkId, homeworkItemId, rowToken,
+//          sessionId, history, started, pending, pendingOwner, thinkingOwner }
 const chats = new Map();
 let activeKey = null;
 let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
+let solveEngine = 'auto'; // 'auto' (DeepSeek, fast) | 'think' (Qwen, reasons longer)
 let weekDataError = '';
+// Must match service-worker.js MAX_HISTORY_MESSAGES. The dashboard retains the
+// full conversation for local rendering, but only this completed tail is ever
+// budgeted or serialized to the privileged SOLVE boundary.
+const MAX_REPLAY_MESSAGES = 8;
 
 function taskPrefix(task, len = 40) {
   return (task || '').replace(/\s+/g, ' ').trim().slice(0, len);
@@ -71,53 +90,18 @@ const keyFor = (day, subject, task, homeworkId = '', homeworkItemId = '', rowTok
 };
 const activeChat = () => chats.get(activeKey);
 
+function replayableHistory(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .filter((message) => !message?.needsUpload && message?.error !== true)
+    .slice(-MAX_REPLAY_MESSAGES);
+}
+
 function sameMeshRow(upload, chat) {
-  // pendingUpload may contain another lesson/child's file. A scan-generated row
-  // token is the only identity accepted; subject/task similarity is display
-  // data, not ownership evidence.
-  return !!upload?.rowToken && !!chat.rowToken && upload.rowToken === chat.rowToken;
-}
-
-/* ---------- Minimal safe markdown renderer (no external libs) ---------- */
-
-function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function inlineMd(s) {
-  return s
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>');
-}
-
-function mdToHtml(md) {
-  // Pull LaTeX out first so markdown processing can't mangle *, _ inside it.
-  const { text, chunks } = extractMath(md);
-  const lines = escapeHtml(text).split(/\r?\n/);
-  let html = '';
-  let list = null; // 'ul' | 'ol'
-  const closeList = () => { if (list) { html += `</${list}>`; list = null; } };
-  for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) { closeList(); continue; }
-    const h = line.match(/^#{1,6}\s+(.*)$/);
-    if (h) { closeList(); html += `<h4>${inlineMd(h[1])}</h4>`; continue; }
-    const ul = line.match(/^[*\-•]\s+(.*)$/);
-    if (ul) {
-      if (list !== 'ul') { closeList(); html += '<ul>'; list = 'ul'; }
-      html += `<li>${inlineMd(ul[1])}</li>`; continue;
-    }
-    const ol = line.match(/^\d+[.)]\s+(.*)$/);
-    if (ol) {
-      if (list !== 'ol') { closeList(); html += '<ol>'; list = 'ol'; }
-      html += `<li>${inlineMd(ol[1])}</li>`; continue;
-    }
-    closeList();
-    html += `<p>${inlineMd(line)}</p>`;
-  }
-  closeList();
-  return restoreMath(html, chunks);
+  // A launch payload must never lend its files to another lesson/child. A
+  // scan capability plus its row token are the accepted identity; subject/task
+  // similarity is display data, not ownership evidence.
+  return !!upload?.scanId && upload.scanId === chat.scanId &&
+    !!upload.rowToken && !!chat.rowToken && upload.rowToken === chat.rowToken;
 }
 
 /* ---------- Typewriter: starts slow, accelerates, finishes fast ---------- */
@@ -127,7 +111,8 @@ function mdToHtml(md) {
 const TYPEWRITER_MAX = 1500;
 
 function typewriter(el, fullText) {
-  if (fullText.length > TYPEWRITER_MAX) { el.innerHTML = mdToHtml(fullText); return; }
+  const reduceMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+  if (reduceMotion || fullText.length > TYPEWRITER_MAX) { el.innerHTML = mdToHtml(fullText); return; }
   let i = 0;
   let chunk = 1; // chars per frame; grows each frame -> accelerating reveal
   function step() {
@@ -143,6 +128,25 @@ function typewriter(el, fullText) {
 }
 
 /* ---------- Chat UI ---------- */
+
+/**
+ * Blinking caret after the last character of a streaming answer. Inserted
+ * after the last non-empty TEXT node rather than styled onto the last block
+ * (a ::after on :last-child drops to its own line under lists), so it hugs
+ * the tail wherever mdToHtml put it. The next innerHTML replacement discards
+ * it, so every render re-appends; the final render simply doesn't.
+ */
+function appendStreamCaret(root) {
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  let last = null;
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    if (n.textContent.trim()) last = n;
+  }
+  const caret = document.createElement('span');
+  caret.className = 'type-caret';
+  if (last?.parentNode) last.parentNode.insertBefore(caret, last.nextSibling);
+  else root.appendChild(caret);
+}
 
 function retryButton(onClick) {
   const b = document.createElement('button');
@@ -185,7 +189,7 @@ function attachChip(files) {
   const icon = (files.length === 1 && (files[0].mimeType || '').startsWith('image/')) ? 'image' : 'file';
   const label = files.length === 1
     ? (files[0].name || 'файл')
-    : `${files.length} файла`;
+    : filesLabel(files.length);
   chip.innerHTML =
     `<span class="ac-check">${iconSvg('check', 13)}</span>` +
     `<span class="ac-ico">${iconSvg(icon, 13)}</span>` +
@@ -276,15 +280,40 @@ function showToast(text) {
 
 // Stop a chat's thinking ticker and remove its bubble. Always pair the two so a
 // removed bubble never leaks its interval.
-function stopThinking(chat) {
-  if (!chat.thinkingEl) return;
-  chat.thinkingEl.__ticker?.stop();
-  chat.thinkingEl.remove();
-  chat.thinkingEl = null;
+function stopThinking(chat, owner = null) {
+  if (owner != null && chat.thinkingOwner !== owner) return;
+  if (chat.thinkingEl) {
+    chat.thinkingEl.__ticker?.stop();
+    chat.thinkingEl.remove();
+    chat.thinkingEl = null;
+  }
+  chat.thinkingOwner = null;
+}
+
+function beginChatOperation(chat, owner) {
+  if (!chat || !owner || (chat.pendingOwner && chat.pendingOwner !== owner)) return false;
+  chat.pendingOwner = owner;
+  chat.pending = true;
+  return true;
+}
+
+function ownsChatOperation(chat, owner) {
+  return !!chat && !!owner && chat.pendingOwner === owner;
+}
+
+function releaseChatOperation(chat, owner) {
+  if (!ownsChatOperation(chat, owner)) return false;
+  chat.pendingOwner = null;
+  chat.pending = false;
+  return true;
 }
 
 /** Re-render the whole chat from a lesson's stored history (no animation). */
 function renderChat(chat) {
+  // A pending chat can have an older ticker whose element was detached by a
+  // lesson switch. Stop it before rebuilding so assigning the replacement does
+  // not orphan an interval behind an unreachable element.
+  if (chat?.thinkingEl) stopThinking(chat);
   chatEl.innerHTML = '';
   if (!chat) {
     chatEl.innerHTML = '<p class="hintmsg">Выберите урок слева, чтобы получить решение.</p>';
@@ -292,10 +321,6 @@ function renderChat(chat) {
   }
   const card = gdzCardEl(chat); // GDZ answers sit above the chat
   if (card) chatEl.appendChild(card);
-  if (historyMode && !chat.history.length) {
-    chatEl.innerHTML = '<p class="hintmsg">В этом чате нет сохранённых сообщений.</p>';
-    return;
-  }
   chat.history.forEach((m, i) => {
     // Retry is only offered on the trailing error — the one that actually
     // failed and can be resent. `m.error` is set by finish() at the point of
@@ -309,7 +334,10 @@ function renderChat(chat) {
       onRetry: isLastError ? () => retryLastTurn(chat) : null
     });
   });
-  if (chat.pending) chat.thinkingEl = thinkingBubble();
+  if (chat.pending) {
+    chat.thinkingEl = thinkingBubble();
+    chat.thinkingOwner = chat.pendingOwner || null;
+  }
 }
 
 /* ---------- Image lightbox (click a GDZ answer to enlarge) ---------- */
@@ -495,15 +523,21 @@ function fileToInline(file) {
 
 /**
  * Run one solve attempt over a streaming port: `task`/`files` are what to
- * solve, `history` is the prior turns to replay (already filtered of gate
- * refusals). Tokens are revealed live; the answer is appended to the lesson's
+ * solve, `history` is the prior-turn candidate set; this function filters and
+ * caps it before any file budgeting or serialization. Tokens are revealed
+ * live; the answer is appended to the lesson's
  * history even if the user switched lessons meanwhile — the DOM is only
  * touched when the lesson is the active one. Shared by the first send
  * (sendToChat) and a retry of a failed turn (retryLastTurn) — retry passes
  * the SAME task/files/history so the model sees an identical request, it just
  * runs again over a fresh port.
  */
-function runSolveAttempt(chat, task, files, history) {
+function runSolveAttempt(chat, task, files, history, owner = Symbol('solve')) {
+  // The first-open GDZ lookup may hand its existing ownership into the actual
+  // solve. Any unrelated operation is rejected before it can mutate history or
+  // share the chat's pending/session state.
+  if (!beginChatOperation(chat, owner)) return Promise.resolve(false);
+  history = replayableHistory(history);
   const deduped = deduplicateRequestFiles(files, history);
   files = deduped.files;
   history = deduped.history;
@@ -511,11 +545,18 @@ function runSolveAttempt(chat, task, files, history) {
   if (!budget.ok) {
     chat.history.push({ role: 'assistant', content: budget.error, error: false });
     if (activeKey === chat.key) bubble('assistant', budget.error);
+    releaseChatOperation(chat, owner);
+    stopThinking(chat, owner);
     renderSidebar();
-    return Promise.resolve();
+    return Promise.resolve(false);
   }
-  chat.pending = true;
-  if (activeKey === chat.key) chat.thinkingEl = thinkingBubble();
+  if (activeKey === chat.key) {
+    // Reuse of the startup owner intentionally replaces «Ищу готовые ответы»
+    // with the normal solve ticker; it cannot touch another operation's ticker.
+    stopThinking(chat, owner);
+    chat.thinkingEl = thinkingBubble();
+    chat.thinkingOwner = owner;
+  }
   // PDFs are the slowest attachments to solve — a quick, kind heads-up so the
   // wait doesn't read as a stuck/broken UI.
   const replayHasPdf = history.some((m) => m?.files?.some(isPdfFile));
@@ -524,8 +565,22 @@ function runSolveAttempt(chat, task, files, history) {
   }
   renderSidebar();
 
+  let port;
+  try {
+    port = chrome.runtime.connect({ name: 'solve' });
+  } catch (error) {
+    const message = `Ошибка: ${error?.message || 'не удалось открыть соединение'}`;
+    releaseChatOperation(chat, owner);
+    stopThinking(chat, owner);
+    chat.history.push({ role: 'assistant', content: message, error: true });
+    if (activeKey === chat.key) bubble('assistant', message, {
+      onRetry: () => retryLastTurn(chat),
+    });
+    renderSidebar();
+    return Promise.resolve(false);
+  }
+
   return new Promise((resolve) => {
-    const port = chrome.runtime.connect({ name: 'solve' });
     let acc = '';        // accumulated streamed text
     let shell = null;    // live assistant bubble, created on first delta
     let settled = false;
@@ -536,61 +591,122 @@ function runSolveAttempt(chat, task, files, history) {
     const ensureShell = () => {
       if (activeKey !== chat.key) return;
       if (shell && shell.wrap.isConnected) return;
-      stopThinking(chat);
+      stopThinking(chat, owner);
       shell = assistantShell();
       shell.body.innerHTML = mdToHtml(acc);
     };
 
-    // Re-parsing the full markdown on every token is O(n²) and janks on long
-    // answers. Coalesce AND throttle: deltas just append to `acc`; the DOM
-    // re-parses at most once per RENDER_THROTTLE_MS (not once per frame), which
-    // keeps the work bounded as the answer grows. `finish()` does the final
-    // clean render, so throttling never affects the result the user ends on.
-    const RENDER_THROTTLE_MS = 90;
-    let renderPending = false;
+    // The polling transport hands us text in ~0.6 s bursts, so rendering `acc`
+    // as it arrives makes the answer blurt out a paragraph at a time. Instead,
+    // reveal it at a smooth character rate: `shown` chases `acc.length` from a
+    // rAF loop, at a speed proportional to the backlog (drains in ~1 s, so it
+    // never falls behind the stream) with a floor that keeps short answers
+    // lively. Re-parsing the full markdown per frame is O(n²) and janks on
+    // long answers, so the DOM re-parses at most once per RENDER_THROTTLE_MS —
+    // smoothness comes from small per-render increments, not per-frame parses.
+    // `finish()` does the final clean render, so none of this affects the
+    // result the user ends on.
+    const reduceMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)').matches === true;
+    const RENDER_THROTTLE_MS = 50;
+    const REVEAL_MIN_RATE = 90;    // chars/sec floor
+    const REVEAL_CATCHUP_SEC = 1.1; // drain any backlog in about this long
+    let shown = 0;                 // chars of `acc` currently revealed
+    let revealRaf = 0;
+    let lastStep = 0;
     let lastRender = 0;
-    const doFlush = () => {
-      renderPending = false;
+    let finishPaint = null;        // set by finish(): reveal glides to the end, then this paints the clean final render
+    const renderSlice = () => {
       lastRender = performance.now();
-      if (settled || activeKey !== chat.key) return;
       ensureShell();
-      shell.body.innerHTML = mdToHtml(acc);
+      if (!shell) return;
+      shell.body.innerHTML = mdToHtml(acc.slice(0, shown));
+      appendStreamCaret(shell.body);
       chatEl.scrollTop = chatEl.scrollHeight;
     };
-    const scheduleRender = () => {
-      if (renderPending || activeKey !== chat.key) return;
-      renderPending = true;
-      const wait = Math.max(0, RENDER_THROTTLE_MS - (performance.now() - lastRender));
-      setTimeout(() => requestAnimationFrame(doFlush), wait);
+    const revealStep = (now) => {
+      revealRaf = 0;
+      if (settled && !finishPaint) return;
+      if (activeKey !== chat.key) {
+        // Not visible: skip ahead. Mid-stream, ensureShell repaints on return;
+        // post-finish, renderChat paints the answer from history — drop the
+        // pending final paint so it can't append a duplicate bubble.
+        shown = acc.length;
+        lastStep = 0;
+        finishPaint = null;
+        return;
+      }
+      if (!lastStep) lastStep = now;
+      const dt = Math.min((now - lastStep) / 1000, 0.1);
+      lastStep = now;
+      const backlog = acc.length - shown;
+      const rate = Math.max(REVEAL_MIN_RATE, backlog / REVEAL_CATCHUP_SEC);
+      shown = Math.min(acc.length, shown + Math.max(1, Math.round(rate * dt)));
+      if (now - lastRender >= RENDER_THROTTLE_MS) renderSlice();
+      if (shown < acc.length) revealRaf = requestAnimationFrame(revealStep);
+      else {
+        lastStep = 0;
+        if (finishPaint) { const paint = finishPaint; finishPaint = null; paint(); }
+        else renderSlice(); // caught up — paint the tail now, resume on next delta
+      }
+    };
+    const scheduleReveal = () => {
+      if (settled && !finishPaint) return;
+      if (reduceMotion) { shown = acc.length; if (activeKey === chat.key) renderSlice(); return; }
+      if (!revealRaf) revealRaf = requestAnimationFrame(revealStep);
     };
 
     const finish = (answer, { animate = false, needsUpload = false, isError = false } = {}) => {
       if (settled) return;
       settled = true;
-      chat.pending = false;
+      const ownedAtFinish = releaseChatOperation(chat, owner);
+      // An operation that no longer owns this chat is obsolete. Its answer may
+      // belong to an earlier startup/send and must not enter replay history or
+      // repaint over the current operation.
+      if (!ownedAtFinish) {
+        stopThinking(chat, owner);
+        try { port.disconnect(); } catch { /* already gone */ }
+        resolve(false);
+        return;
+      }
       const onRetry = isError ? () => retryLastTurn(chat) : null;
       chat.history.push({ role: 'assistant', content: answer, needsUpload, error: isError });
+      stopThinking(chat, owner);
       if (activeKey === chat.key) {
-        stopThinking(chat);
-        if (shell && shell.wrap.isConnected) {
-          shell.body.innerHTML = mdToHtml(answer); // clean final render
-          shell.wrap.appendChild(copyButton(() => answer));
-          if (onRetry) { shell.wrap.classList.add('errored'); shell.wrap.appendChild(retryButton(onRetry)); }
+        const paintFinal = () => {
+          if (shell && shell.wrap.isConnected) {
+            shell.body.innerHTML = mdToHtml(answer); // clean final render (drops the caret)
+            shell.wrap.appendChild(copyButton(() => answer));
+            if (onRetry) { shell.wrap.classList.add('errored'); shell.wrap.appendChild(retryButton(onRetry)); }
+          } else {
+            bubble('assistant', answer, { animate, needsUpload, onRetry });
+          }
+        };
+        // Don't snap the unrevealed tail in at once — that's the same blurt
+        // the reveal exists to avoid. When the authoritative answer extends
+        // what's on screen, glide the reveal to its end first; revealStep
+        // calls paintFinal when it catches up.
+        if (!isError && !reduceMotion && shell && shell.wrap.isConnected &&
+            shown < answer.length && answer.startsWith(acc.slice(0, shown))) {
+          acc = answer;
+          finishPaint = paintFinal;
+          scheduleReveal();
         } else {
-          bubble('assistant', answer, { animate, needsUpload, onRetry });
+          paintFinal();
         }
       }
       renderSidebar();
       try { port.disconnect(); } catch { /* already gone */ }
-      resolve();
+      resolve(true);
     };
 
     port.onMessage.addListener((m) => {
       if (m?.type === 'delta') {
         acc += m.text;
-        scheduleRender();
+        scheduleReveal();
       } else if (m?.type === 'done') {
-        chat.sessionId = m.result?.sessionId || chat.sessionId;
+        if (ownsChatOperation(chat, owner)) {
+          chat.sessionId = m.result?.sessionId || chat.sessionId;
+        }
         // Prefer the authoritative full text; fall back to what we streamed.
         // animate only when nothing streamed (e.g. the photo-request guard).
         finish(m.result?.answer ?? acc, { animate: !acc, needsUpload: !!m.result?.needsUpload });
@@ -599,18 +715,25 @@ function runSolveAttempt(chat, task, files, history) {
       }
     });
 
-    // The service worker can be torn down; surface that instead of hanging. A
-    // disconnect after tokens already streamed keeps the partial answer (not an
-    // error); a disconnect with nothing streamed is a real failure — flag it so
-    // the retry button appears.
-    port.onDisconnect.addListener(() => acc
-      ? finish(acc)
-      : finish('Ошибка: соединение прервано.', { isError: true }));
+    // The service worker can be torn down; every disconnect before a done/error
+    // message is abnormal. Preserve any streamed text for the student, but mark
+    // the turn errored so retry is offered and the truncated answer is never
+    // replayed as trustworthy follow-up context. finish() disconnects normally
+    // only after setting `settled`, so that expected callback is a guarded no-op.
+    port.onDisconnect.addListener(() => finish(
+      acc
+        ? acc + '\n\n_Ответ оборван — соединение прервано. Нажмите «Повторить», чтобы решить заново._'
+        : 'Ошибка: соединение прервано.',
+      { isError: true }));
 
-    port.postMessage({
-      type: 'SOLVE',
-      payload: { subject: chat.subject, task, files, sessionId: chat.sessionId, history, mode: answerMode }
-    });
+    try {
+      port.postMessage({
+        type: 'SOLVE',
+        payload: { subject: chat.subject, task, files, sessionId: chat.sessionId, history, mode: answerMode, engine: solveEngine }
+      });
+    } catch (error) {
+      finish(`Ошибка: ${error?.message || 'не удалось отправить запрос'}`, { isError: true });
+    }
   });
 }
 
@@ -618,19 +741,22 @@ function runSolveAttempt(chat, task, files, history) {
  * Send a new message within a lesson's chat: records the user turn, shows its
  * bubble, then runs the attempt. See runSolveAttempt for the streaming part.
  */
-function sendToChat(chat, text, files) {
+function sendToChat(chat, text, files, owner = Symbol('solve')) {
+  // Reserve the chat before recording the user turn. That makes startup and
+  // composer sends mutually exclusive even when the GDZ lookup is awaiting.
+  if (!beginChatOperation(chat, owner)) return Promise.resolve(false);
   // Context BEFORE this message. Drop gate refusals (the "пришлите фото / нужен
   // файл" prompts): they're UI nudges, not real conversation, and replaying
   // them as assistant turns biases the next answer's tone.
-  const prior = chat.history.filter((m) => !m.needsUpload);
+  const prior = replayableHistory(chat.history);
   // Keep the FULL files (incl. base64) on the user turn. The chip only reads
   // name/mime, but the service worker replays history attachments to the model
   // so a follow-up question still "sees" the photo/PDF from an earlier turn.
-  // Bounded by MAX_HISTORY_MESSAGES in the service worker.
+  // replayableHistory bounds that context before the worker boundary as well.
   const turnFiles = files || [];
   chat.history.push({ role: 'user', content: text, files: turnFiles });
   if (activeKey === chat.key) bubble('user', text, { files: turnFiles });
-  return runSolveAttempt(chat, text, turnFiles, prior);
+  return runSolveAttempt(chat, text, turnFiles, prior, owner);
 }
 
 /**
@@ -649,7 +775,7 @@ function retryLastTurn(chat) {
   const prevUser = h[h.length - 2];
   if (!prevUser || prevUser.role !== 'user') return;
   h.pop(); // drop the failed assistant turn; prevUser is now the tail
-  const priorHistory = h.slice(0, h.length - 1).filter((m) => !m.needsUpload);
+  const priorHistory = replayableHistory(h.slice(0, h.length - 1));
   if (activeKey === chat.key) renderChat(chat);
   runSolveAttempt(chat, prevUser.content, prevUser.files || [], priorHistory);
 }
@@ -662,24 +788,15 @@ function retryLastTurn(chat) {
  */
 async function startLesson(chat) {
   chat.started = true;
-  let files = [];
-  try {
-    const { pendingUpload } = await chrome.storage.local.get('pendingUpload');
-    // One-use handoff: consume it on FIRST read no matter what — an unmatched
-    // or expired payload must not linger (base64 file bodies) waiting for a
-    // future lesson to mis-claim it. The retention alarm is only the backstop.
-    if (pendingUpload) await chrome.storage.local.remove('pendingUpload');
-    // Files come from the popup: manually attached OR auto-fetched from Mesh.
-    // The scan-generated row token is the ownership boundary; stale subject/day
-    // text must never make another row's file look like a match.
-    const fresh = Number.isFinite(pendingUpload?.ts)
-      ? Date.now() - pendingUpload.ts <= 60 * 60 * 1000
-      : true; // legacy handoff without ts — honour it once, it's gone now anyway
-    const pending = pendingUpload?.files || (pendingUpload?.file ? [pendingUpload.file] : []);
-    if (fresh && pending.length && sameMeshRow(pendingUpload, chat)) {
-      files = pending; // the attachment chip (added by bubble) shows the file
-    }
-  } catch (_e) { /* upload is best-effort */ }
+  const owner = Symbol('startup');
+  if (!beginChatOperation(chat, owner)) {
+    chat.started = false;
+    return false;
+  }
+  // The files were consumed together with this dashboard's one-time launch.
+  // Keep the row-token check as a defense-in-depth ownership boundary.
+  const files = sameMeshRow(launchPayload, chat) ? initialFiles : [];
+  if (files.length) initialFiles = [];
 
   // Ready GDZ answers are free (no API), shown as a card above the chat. The
   // lookup hits gdz-ru.com and can take a few seconds, so show a transient
@@ -687,22 +804,47 @@ async function startLesson(chat) {
   // user didn't attach a file to solve, that's the whole answer: show ONLY the
   // card — no auto AI turn, so no task echo and no "Нужен файл" nudge. The user
   // can still ask follow-ups in the composer.
-  if (activeKey === chat.key) chat.thinkingEl = thinkingBubble({ words: ['Ищу готовые ответы'] });
-  const hasGdz = await maybeShowGdz(chat);
-  stopThinking(chat);
-  if (hasGdz && !files.length) return;
+  if (activeKey === chat.key) {
+    stopThinking(chat);
+    chat.thinkingEl = thinkingBubble({ words: ['Ищу готовые ответы'] });
+    chat.thinkingOwner = owner;
+  }
+  renderSidebar();
+  try {
+    const hasGdz = await maybeShowGdz(chat);
+    if (!ownsChatOperation(chat, owner)) return false;
+    stopThinking(chat, owner);
+    if (hasGdz && !files.length) {
+      // Ready GDZ answers replaced the AI turn, so no solve runs to repaint the
+      // sidebar — mark this lesson done now (chat.started is already true) instead
+      // of leaving it blank until the user opens another lesson.
+      releaseChatOperation(chat, owner);
+      renderSidebar();
+      return true;
+    }
 
-  await sendToChat(chat, chat.task, files);
+    return await sendToChat(chat, chat.task, files, owner);
+  } finally {
+    // Normally the solve or GDZ-only branch released this owner. This is the
+    // failure path for a rejected lookup/transport; identity checking prevents
+    // an old finally block from clearing a newer operation.
+    if (releaseChatOperation(chat, owner)) {
+      stopThinking(chat, owner);
+      renderSidebar();
+    }
+  }
 }
 
 async function activateLesson(key) {
   const chat = chats.get(key);
   if (!chat || key === activeKey) return;
+  const previous = activeChat();
+  if (previous?.thinkingEl) stopThinking(previous);
   activeKey = key;
   titleEl.textContent = `${chat.subject} — решение`;
   renderChat(chat);
   renderSidebar();
-  if (!historyMode && !chat.started) await startLesson(chat); // the only place the API gets triggered automatically
+  if (!chat.started) await startLesson(chat); // the only place the API gets triggered automatically
 }
 
 /* ---------- Sidebar: whole week, grouped by day, scrollable ---------- */
@@ -733,6 +875,9 @@ function renderSidebar() {
     for (const chat of dayChats) {
       const el = document.createElement('div');
       el.className = 'lesson' + (chat.key === activeKey ? ' active' : '');
+      el.tabIndex = 0;
+      el.setAttribute('role', 'button');
+      el.setAttribute('aria-current', chat.key === activeKey ? 'true' : 'false');
       el.innerHTML = '<div class="subj"></div><div class="t"></div>';
       const subj = el.querySelector('.subj');
       if (chat.pending) {
@@ -748,6 +893,11 @@ function renderSidebar() {
       subj.append(chat.subject);
       el.querySelector('.t').textContent = (chat.task || '').slice(0, 80);
       el.onclick = () => activateLesson(chat.key);
+      el.onkeydown = (e) => {
+        if (e.key !== 'Enter' && e.key !== ' ') return;
+        if (e.key === ' ') e.preventDefault();
+        activateLesson(chat.key);
+      };
       weekEl.appendChild(el);
     }
   }
@@ -763,52 +913,99 @@ const fileNameEl = document.getElementById('filename');
 // Held as an already-inlined file so a pasted screenshot and a picked file
 // share one path (an <input type=file> can't be set programmatically).
 let pendingFile = null;
+let fileReadGen = 0;
+let pendingFileRead = null;
+// Only the short file-read/handoff phase needs a composer mutex. Once
+// sendToChat synchronously owns `chat.pending`, another lesson must remain free
+// to send even if this model stream is slow or never settles.
+const composerPreparingChats = new WeakSet();
 
 function showAttachment(name) {
   fileNameEl.textContent = name;
   fileChip.hidden = false;
 }
-function clearAttachment() {
-  // If a recording is live, the chip's × means "stop and throw it away".
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    discardRec = true;
-    try { mediaRecorder.stop(); } catch { /* already stopping */ }
-    return;
-  }
+function clearAttachmentPresentation() {
   pendingFile = null;
   fileInput.value = '';
+  fileNameEl.textContent = '';
   fileChip.hidden = true;
   fileChip.classList.remove('recording');
+}
+function clearAttachment() {
+  // The chip's × invalidates every file read and microphone phase — permission
+  // prompt, recording, stop/final conversion, or a transient error notice. A
+  // late callback from either path is then unable to resurrect the attachment.
+  fileReadGen++;
+  pendingFileRead = null;
+  if (micSession) cancelMicSession(micSession);
+  clearAttachmentPresentation();
 }
 
 document.getElementById('attach').onclick = () => fileInput.click();
 fileInput.onchange = async () => {
   const f = fileInput.files[0];
   if (!f) return;
+  const gen = ++fileReadGen;
+  // A picked file is a newer attachment intent than every microphone phase,
+  // including an async final conversion. Revoke that session before clearing
+  // shared presentation so its late result cannot replace the selected file.
+  if (micSession) cancelMicSession(micSession, { restoreAttachment: false });
+  // The old chip and old payload are one state. Clear both before attempting a
+  // replacement so a failed read cannot advertise a file that will not send.
+  // The generation already made an older read ineligible; also detach its
+  // promise now so a synchronously rejected replacement cannot leave composer
+  // sends waiting on an obsolete FileReader forever.
+  pendingFileRead = null;
+  clearAttachmentPresentation();
+  let read = null;
   try {
-    pendingFile = await fileToInline(f);
+    read = fileToInline(f);
+    pendingFileRead = read;
+    const inline = await read;
+    if (gen !== fileReadGen) return;
+    pendingFile = inline;
     showAttachment(f.name);
   } catch (e) {
-    fileInput.value = '';
+    if (gen !== fileReadGen) return;
+    // A send click may already be awaiting this exact read. Invalidate that
+    // click as well as the attachment UI so it cannot silently continue as a
+    // text-only request after the selected file failed to decode.
+    fileReadGen++;
+    clearAttachmentPresentation();
     showToast(e?.message || 'Не удалось прочитать файл.');
+  } finally {
+    if (pendingFileRead === read) pendingFileRead = null;
   }
 };
 document.getElementById('clearfile').onclick = clearAttachment;
 
 // Paste a screenshot / snipped image straight into the chat (Ctrl/⌘+V).
 document.addEventListener('paste', async (e) => {
-  if (historyMode) return;
   const item = [...(e.clipboardData?.items || [])].find((it) => it.type.startsWith('image/'));
   if (!item) return;
   const blob = item.getAsFile();
   if (!blob) return;
   e.preventDefault();
   const name = blob.name || `screenshot-${Date.now()}.png`;
+  const gen = ++fileReadGen;
+  if (micSession) cancelMicSession(micSession, { restoreAttachment: false });
+  pendingFileRead = null;
+  clearAttachmentPresentation();
+  let read = null;
   try {
-    pendingFile = await fileToInline(new File([blob], name, { type: blob.type || 'image/png' }));
+    read = fileToInline(new File([blob], name, { type: blob.type || 'image/png' }));
+    pendingFileRead = read;
+    const inline = await read;
+    if (gen !== fileReadGen) return;
+    pendingFile = inline;
     showAttachment(name);
   } catch (e) {
+    if (gen !== fileReadGen) return;
+    fileReadGen++;
+    clearAttachmentPresentation();
     showToast(e?.message || 'Не удалось прочитать изображение.');
+  } finally {
+    if (pendingFileRead === read) pendingFileRead = null;
   }
 });
 
@@ -820,14 +1017,95 @@ document.addEventListener('paste', async (e) => {
 const micBtn = document.getElementById('mic');
 const MAX_REC_MS = 10 * 60 * 1000;
 const MAX_REC_BYTES = Math.floor(MAX_AUDIO_UPLOAD_BYTES * 0.95);
-let mediaRecorder = null;
-let recChunks = [];
-let recBytes = 0;
-let recStream = null;
-let recTimer = null;
-let recStart = 0;
-let discardRec = false;
-let recLimitMessage = '';
+const MIC_IDLE_TITLE = 'Записать аудио с микрофона и расшифровать (для аудирования)';
+let micSession = null;
+let micStartPromise = null;
+let micStartSession = null;
+let micPageUnloading = false;
+
+function createMicSession() {
+  return {
+    phase: 'starting',
+    cancelled: false,
+    stream: null,
+    recorder: null,
+    chunks: [],
+    bytes: 0,
+    timer: null,
+    noticeTimer: null,
+    startedAt: 0,
+    limitMessage: ''
+  };
+}
+
+function isCurrentMicSession(session) {
+  return micSession === session && !session.cancelled;
+}
+
+function clearMicTimer(session) {
+  if (session.timer) clearInterval(session.timer);
+  session.timer = null;
+}
+
+function stopMicTracks(session) {
+  const stream = session.stream;
+  session.stream = null;
+  if (!stream) return;
+  try {
+    for (const track of stream.getTracks?.() || []) {
+      try { track.stop(); } catch { /* another cleanup path already stopped it */ }
+    }
+  } catch { /* malformed/closing stream: nothing else can release here */ }
+}
+
+function resetMicButton() {
+  micBtn.classList.remove('recording');
+  micBtn.title = MIC_IDLE_TITLE;
+}
+
+function restoreAttachmentAfterMic() {
+  fileChip.classList.remove('recording');
+  if (pendingFile) showAttachment(pendingFile.name || 'файл');
+  else fileChip.hidden = true;
+}
+
+function detachAndStopRecorder(session) {
+  const recorder = session.recorder;
+  session.recorder = null;
+  if (!recorder) return;
+  recorder.ondataavailable = null;
+  recorder.onstop = null;
+  recorder.onerror = null;
+  if (recorder.state === 'recording' || recorder.state === 'paused') {
+    try { recorder.stop(); } catch { /* stream cleanup below is authoritative */ }
+  }
+}
+
+function cancelMicSession(session, { restoreAttachment = true } = {}) {
+  if (!session) return;
+  const wasCurrent = micSession === session;
+  session.cancelled = true;
+  session.phase = 'cancelled';
+  clearMicTimer(session);
+  if (session.noticeTimer) clearTimeout(session.noticeTimer);
+  session.noticeTimer = null;
+  detachAndStopRecorder(session);
+  stopMicTracks(session);
+  session.chunks.length = 0;
+  session.bytes = 0;
+  if (micStartSession === session) {
+    // getUserMedia permission promises are browser-owned and may never settle.
+    // Release only this session's single-flight slot so a cancelled/page-restored
+    // composer can start a fresh request. The old continuation still owns and
+    // stops any stream that eventually arrives.
+    micStartSession = null;
+    micStartPromise = null;
+  }
+  if (!wasCurrent) return;
+  micSession = null;
+  resetMicButton();
+  if (restoreAttachment) restoreAttachmentAfterMic();
+}
 
 // Prefer a codec Groq Whisper accepts; fall back to the browser default.
 function pickRecMime() {
@@ -842,10 +1120,11 @@ function fmtTime(ms) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-function tickRecording() {
-  const elapsed = Date.now() - recStart;
+function tickRecording(session) {
+  if (!isCurrentMicSession(session) || session.phase !== 'recording') return;
+  const elapsed = Date.now() - session.startedAt;
   if (elapsed >= MAX_REC_MS) {
-    stopRecordingForLimit('Запись остановлена: достигнут лимит 10 минут.');
+    stopRecordingForLimit(session, 'Запись остановлена: достигнут лимит 10 минут.');
     return;
   }
   fileChip.classList.add('recording');
@@ -853,143 +1132,268 @@ function tickRecording() {
   fileNameEl.textContent = `● Запись… ${fmtTime(elapsed)} / ${fmtTime(MAX_REC_MS)}`;
 }
 
-function stopRecordingForLimit(message) {
-  if (!mediaRecorder || mediaRecorder.state !== 'recording') return;
-  recLimitMessage = message;
-  try { mediaRecorder.stop(); }
-  catch { resetMicUi(); }
+function requestRecordingStop(session, limitMessage = '') {
+  if (!isCurrentMicSession(session) || session.phase !== 'recording') return;
+  if (limitMessage) session.limitMessage = limitMessage;
+  session.phase = 'stopping';
+  clearMicTimer(session);
+  resetMicButton();
+  try {
+    session.recorder.stop();
+  } catch {
+    failMicSession(session, 'Не удалось завершить запись. Попробуйте ещё раз.');
+    return;
+  }
+  // recorder.stop() queues the final data/stop events; the input track itself
+  // is no longer needed and must not stay live if those events are delayed.
+  stopMicTracks(session);
 }
 
-function resetMicUi() {
-  if (recTimer) { clearInterval(recTimer); recTimer = null; }
-  if (recStream) { recStream.getTracks().forEach((t) => t.stop()); recStream = null; }
-  micBtn.classList.remove('recording');
-  micBtn.title = 'Записать аудио с микрофона и расшифровать (для аудирования)';
+function stopRecordingForLimit(session, message) {
+  requestRecordingStop(session, message);
 }
 
 // Briefly show an error in the chip, then clear it if nothing got attached.
-function flashChipError(text) {
+function flashChipError(session, text) {
+  if (!isCurrentMicSession(session)) return;
+  session.phase = 'failed';
   fileChip.classList.remove('recording');
   showAttachment(text);
-  setTimeout(() => { if (!pendingFile) { fileChip.hidden = true; } }, 2800);
+  session.noticeTimer = setTimeout(() => {
+    session.noticeTimer = null;
+    if (!isCurrentMicSession(session)) return;
+    micSession = null;
+    restoreAttachmentAfterMic();
+  }, 2800);
 }
 
-async function onRecordingStop() {
-  const baseMime = ((mediaRecorder && mediaRecorder.mimeType) || 'audio/webm').split(';')[0];
-  const limitMessage = recLimitMessage;
-  recLimitMessage = '';
-  resetMicUi();
-  const chunks = recChunks;
-  recChunks = [];
-  recBytes = 0;
-  if (limitMessage && !discardRec) showToast(limitMessage);
-  if (discardRec || !chunks.length) {
-    discardRec = false;
+function failMicSession(session, message) {
+  clearMicTimer(session);
+  detachAndStopRecorder(session);
+  stopMicTracks(session);
+  session.chunks.length = 0;
+  session.bytes = 0;
+  if (!isCurrentMicSession(session)) {
+    session.cancelled = true;
+    session.phase = 'cancelled';
+    return;
+  }
+  if (micPageUnloading) {
+    cancelMicSession(session, { restoreAttachment: false });
+    return;
+  }
+  resetMicButton();
+  flashChipError(session, message);
+}
+
+async function onRecordingStop(session, recorder) {
+  clearMicTimer(session);
+  stopMicTracks(session);
+  recorder.ondataavailable = null;
+  recorder.onstop = null;
+  recorder.onerror = null;
+  if (session.recorder === recorder) session.recorder = null;
+
+  // A queued stop callback can still arrive after clear, unload, or a newer
+  // start. It may clean only its own session-owned resources, never shared UI.
+  if (!isCurrentMicSession(session) ||
+      (session.phase !== 'recording' && session.phase !== 'stopping')) return;
+  session.phase = 'processing';
+  resetMicButton();
+  fileChip.classList.remove('recording');
+
+  const baseMime = (recorder.mimeType || 'audio/webm').split(';')[0];
+  const limitMessage = session.limitMessage;
+  session.limitMessage = '';
+  const chunks = session.chunks;
+  session.chunks = [];
+  session.bytes = 0;
+  if (limitMessage) showToast(limitMessage);
+  if (!chunks.length) {
+    micSession = null;
     pendingFile = null;
     fileInput.value = '';
     fileChip.hidden = true;
-    fileChip.classList.remove('recording');
     return;
   }
   const blob = new Blob(chunks, { type: baseMime });
   const name = `Запись с микрофона.${REC_EXT[baseMime] || 'webm'}`;
   try {
-    pendingFile = await fileToInline(new File([blob], name, { type: baseMime }));
-    fileChip.classList.remove('recording');
+    const inline = await fileToInline(new File([blob], name, { type: baseMime }));
+    if (!isCurrentMicSession(session) || session.phase !== 'processing') return;
+    pendingFile = inline;
+    fileReadGen++; // a stale picker/paste read must not overwrite the fresh recording
+    micSession = null;
     showAttachment(name);
   } catch (e) {
+    if (!isCurrentMicSession(session) || session.phase !== 'processing') return;
+    micSession = null;
     pendingFile = null;
     fileChip.hidden = true;
-    fileChip.classList.remove('recording');
     showToast(e?.message || 'Запись слишком большая.');
   }
 }
 
-async function startRecording() {
+async function startMicSession(session) {
   if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
-    flashChipError('Запись с микрофона не поддерживается в этом браузере.');
+    failMicSession(session, 'Запись с микрофона не поддерживается в этом браузере.');
     return;
   }
+  let stream;
   try {
     // CRITICAL: turn OFF echo cancellation / noise suppression / auto-gain.
     // With the browser defaults (all ON), the mic stream actively REMOVES sound
     // coming from the device's own speakers — it treats it as echo — so audio
     // you play out loud to record (a listening track) comes back near-silent and
     // Whisper hallucinates filler ("Hush!", "Thank you."). We want the raw signal.
-    recStream = await navigator.mediaDevices.getUserMedia({
+    stream = await navigator.mediaDevices.getUserMedia({
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
     });
   } catch (e) {
+    if (!isCurrentMicSession(session) || micPageUnloading) {
+      cancelMicSession(session, { restoreAttachment: false });
+      return;
+    }
     const denied = e?.name === 'NotAllowedError' || e?.name === 'SecurityError';
-    flashChipError(denied
+    failMicSession(session, denied
       ? 'Нет доступа к микрофону — разрешите его для расширения.'
       : 'Микрофон недоступен.');
     return;
   }
-  const mimeType = pickRecMime();
-  recChunks = [];
-  recBytes = 0;
-  discardRec = false;
-  recLimitMessage = '';
-  try {
-    mediaRecorder = mimeType ? new MediaRecorder(recStream, { mimeType }) : new MediaRecorder(recStream);
-  } catch {
-    mediaRecorder = new MediaRecorder(recStream);
+  session.stream = stream;
+  if (!isCurrentMicSession(session) || micPageUnloading) {
+    cancelMicSession(session, { restoreAttachment: false });
+    return;
   }
-  mediaRecorder.ondataavailable = (ev) => {
-    if (!ev.data?.size || recLimitMessage) return;
-    const nextBytes = recBytes + ev.data.size;
-    if (nextBytes <= MAX_AUDIO_UPLOAD_BYTES) {
-      recChunks.push(ev.data);
-      recBytes = nextBytes;
+
+  try {
+    const mimeType = pickRecMime();
+    let recorder;
+    try {
+      recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
+    } catch {
+      recorder = new MediaRecorder(stream);
     }
-    if (nextBytes >= MAX_REC_BYTES) {
-      stopRecordingForLimit('Запись остановлена: достигнут лимит размера.');
+    session.recorder = recorder;
+    recorder.ondataavailable = (ev) => {
+      if (!isCurrentMicSession(session) || !ev.data?.size || session.limitMessage) return;
+      const nextBytes = session.bytes + ev.data.size;
+      if (nextBytes <= MAX_AUDIO_UPLOAD_BYTES) {
+        session.chunks.push(ev.data);
+        session.bytes = nextBytes;
+      }
+      if (nextBytes >= MAX_REC_BYTES) {
+        stopRecordingForLimit(session, 'Запись остановлена: достигнут лимит размера.');
+      }
+    };
+    recorder.onstop = () => {
+      onRecordingStop(session, recorder).catch(() => {
+        failMicSession(session, 'Не удалось обработать запись. Попробуйте ещё раз.');
+      });
+    };
+    recorder.onerror = () => {
+      failMicSession(session, 'Не удалось записать звук. Попробуйте ещё раз.');
+    };
+    recorder.start(1000);
+    session.phase = 'recording';
+    session.startedAt = Date.now();
+    micBtn.classList.add('recording');
+    micBtn.title = 'Остановить запись';
+    tickRecording(session);
+    session.timer = setInterval(() => tickRecording(session), 1000);
+  } catch {
+    failMicSession(session, 'Микрофон недоступен.');
+  }
+}
+
+function startRecording() {
+  if (micStartPromise && micStartSession && isCurrentMicSession(micStartSession)) {
+    return micStartPromise;
+  }
+  micStartPromise = null;
+  micStartSession = null;
+  if (micPageUnloading) return Promise.resolve();
+  // A microphone start is a newer composer/attachment intent. Revoke any
+  // picker/paste read (and any Send click waiting on its generation) before
+  // asynchronous permission acquisition begins.
+  fileReadGen++;
+  pendingFileRead = null;
+  if (micSession) cancelMicSession(micSession);
+  const session = createMicSession();
+  micSession = session;
+  const startup = startMicSession(session);
+  micStartPromise = startup;
+  micStartSession = session;
+  void startup.then(
+    () => {
+      if (micStartPromise === startup && micStartSession === session) {
+        micStartPromise = null;
+        micStartSession = null;
+      }
+    },
+    () => {
+      if (micStartPromise === startup && micStartSession === session) {
+        micStartPromise = null;
+        micStartSession = null;
+      }
     }
-  };
-  mediaRecorder.onstop = onRecordingStop;
-  mediaRecorder.start(1000);
-  recStart = Date.now();
-  micBtn.classList.add('recording');
-  micBtn.title = 'Остановить запись';
-  tickRecording();
-  recTimer = setInterval(tickRecording, 1000);
+  );
+  return startup;
 }
 
 micBtn.onclick = () => {
-  if (mediaRecorder && mediaRecorder.state === 'recording') {
-    mediaRecorder.stop(); // onRecordingStop builds + attaches the clip
-  } else {
-    startRecording();
-  }
+  const session = micSession;
+  if (session?.phase === 'starting') return cancelMicSession(session);
+  if (session?.phase === 'recording') return requestRecordingStop(session);
+  startRecording(); // failed/stopping/processing sessions are superseded safely
 };
 
 window.addEventListener('pagehide', () => {
-  if (mediaRecorder?.state === 'recording') {
-    discardRec = true;
-    try { mediaRecorder.stop(); } catch { /* already stopping */ }
-  }
-  resetMicUi();
+  micPageUnloading = true;
+  if (micSession) cancelMicSession(micSession, { restoreAttachment: false });
+});
+window.addEventListener('pageshow', () => {
+  micPageUnloading = false;
+  resetMicButton();
+  restoreAttachmentAfterMic();
 });
 
 async function sendFromComposer() {
-  if (historyMode) return;
   const chat = activeChat();
-  if (!chat || chat.pending) return; // ignore until the current answer lands
-  if (mediaRecorder && mediaRecorder.state === 'recording') return; // stop the recording first
-  let text = inputEl.value.trim();
-  const files = pendingFile ? [pendingFile] : [];
-  if (!text && !files.length) return;
-  // A recording sent with no note: tell the model explicitly to SOLVE the
-  // listening task from the transcript, not just echo it back.
-  if (!text && files.some((f) => (f.mimeType || '').startsWith('audio/'))) {
-    text = 'Это аудиозапись к заданию по аудированию. Расшифруй её и выполни задание ' +
-      '(ответь на вопросы / заполни пропуски по записи).';
+  if (!chat || chat.pending || composerPreparingChats.has(chat)) return;
+  if (micSession && ['starting', 'recording', 'stopping', 'processing'].includes(micSession.phase)) return;
+  const draftAtClick = inputEl.value;
+  const fileGenAtClick = fileReadGen;
+  composerPreparingChats.add(chat);
+  let solvePromise = null;
+  try {
+    await awaitStablePendingRead(() => pendingFileRead);
+    // A file picker, paste, draft edit, or lesson switch while FileReader was
+    // pending changes the meaning of this click. Preserve the new state and let
+    // the user send it deliberately instead of crossing chats/attachments.
+    if ((micSession && ['starting', 'recording', 'stopping', 'processing'].includes(micSession.phase)) ||
+        activeChat() !== chat || chat.pending || fileReadGen !== fileGenAtClick ||
+        inputEl.value !== draftAtClick) return;
+    let text = draftAtClick.trim();
+    const files = pendingFile ? [pendingFile] : [];
+    if (!text && !files.length) return;
+    // A recording sent with no note: tell the model explicitly to SOLVE the
+    // listening task from the transcript, not just echo it back.
+    if (!text && files.some((f) => (f.mimeType || '').startsWith('audio/'))) {
+      text = 'Это аудиозапись к заданию по аудированию. Расшифруй её и выполни задание ' +
+        '(ответь на вопросы / заполни пропуски по записи).';
+    }
+    inputEl.value = '';
+    clearAttachment();
+    // Text may be empty when only a file is sent — the chip shows the attachment.
+    // sendToChat reserves chat.pending synchronously before returning its model
+    // promise. Hand off ownership, then release this short preparation mutex;
+    // awaiting the model here would globally strand other lesson composers.
+    solvePromise = sendToChat(chat, text, files);
+  } finally {
+    composerPreparingChats.delete(chat);
   }
-  inputEl.value = '';
-  clearAttachment();
-  // Text may be empty when only a file is sent — the chip shows the attachment.
-  await sendToChat(chat, text, files);
+  return solvePromise;
 }
 
 document.getElementById('send').onclick = sendFromComposer;
@@ -1005,6 +1409,21 @@ document.getElementById('themeBtn').onclick = toggleTheme;
 
 /* ---------- Answer-mode toggle (Кратко / Объяснить) ---------- */
 
+/**
+ * Storage snapshots resolve asynchronously. A click that lands first must win:
+ * repainting stale state would also revert the mode/engine sent in the next
+ * SOLVE payload.
+ */
+let modeTouched = false;
+let engineTouched = false;
+let dashboardPreferenceWriteQueue = Promise.resolve();
+function persistDashboardPreference(key, value) {
+  const write = dashboardPreferenceWriteQueue.then(() =>
+    chrome.storage.local.set({ [key]: value })
+  );
+  dashboardPreferenceWriteQueue = write.catch(() => {});
+  return write;
+}
 const modeSeg = document.getElementById('modeSeg');
 function markMode(mode) {
   answerMode = mode;
@@ -1015,94 +1434,77 @@ function markMode(mode) {
 modeSeg.addEventListener('click', (e) => {
   const b = e.target.closest('button');
   if (!b) return;
+  modeTouched = true;
   markMode(b.dataset.mode);
-  chrome.storage.local.set({ answerMode: b.dataset.mode });
+  void persistDashboardPreference('answerMode', b.dataset.mode);
 });
 chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
-  if (saved === 'brief' || saved === 'explain') markMode(saved);
+  if (!modeTouched && (saved === 'brief' || saved === 'explain')) markMode(saved);
 });
 
-/* ---------- Read-only replay of locally saved chats ---------- */
+/* ---------- Engine toggle (Авто / Думать) ---------- */
 
-function savedDay(createdAt) {
-  const date = new Date(createdAt);
-  if (Number.isNaN(date.getTime())) return 'Сохранённые';
-  return date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long' });
+// Which model solves: «Авто» answers fast (DeepSeek, low reasoning effort),
+// «Думать» reasons at length (Qwen thinks by default). Applies to the NEXT
+// send — an in-flight solve keeps the engine it started with.
+const engineSeg = document.getElementById('engineSeg');
+function markEngine(engine) {
+  solveEngine = engine;
+  for (const b of engineSeg.querySelectorAll('button')) {
+    b.classList.toggle('active', b.dataset.engine === engine);
+  }
+  paintEngineBadge(engine);
 }
-
-function configureHistoryMode() {
-  document.body.classList.add('history-mode');
-  document.querySelector('.sidebar h2').textContent = 'История чатов';
-  document.querySelector('.brandsub').textContent = 'Сохранённые решения';
-  inputEl.placeholder = 'История сохранена локально · только просмотр';
-  for (const control of document.querySelectorAll('.composer button, .composer input, .composer textarea, #modeSeg button')) {
-    control.disabled = true;
-  }
-}
-
-async function loadHistoryDashboard() {
-  configureHistoryMode();
-  let response;
-  try {
-    response = await chrome.runtime.sendMessage({ type: 'GET_HISTORY_SNAPSHOT' });
-  } catch {
-    response = null;
-  }
-  const snapshot = response?.ok ? response.snapshot : null;
-  if (!snapshot?.sessions?.length) {
-    weekDataError = response?.error || 'Сохранённых чатов пока нет.';
-    renderSidebar();
-    titleEl.textContent = 'История решений';
-    chatEl.innerHTML = '<p class="hintmsg">Сохранённых чатов пока нет.</p>';
-    return;
-  }
-
-  for (const session of snapshot.sessions) {
-    const key = `history:${session.id}`;
-    const messages = Array.isArray(snapshot.messages?.[session.id])
-      ? snapshot.messages[session.id]
-        .filter((message) => message?.role === 'user' || message?.role === 'assistant')
-        .map((message) => ({
-          role: message.role,
-          content: typeof message.content === 'string' ? message.content : ''
-        }))
-      : [];
-    chats.set(key, {
-      key,
-      day: savedDay(session.created_at),
-      subject: session.subject || 'Задание',
-      task: session.task_text || '(без описания)',
-      homeworkId: '',
-      homeworkItemId: '',
-      rowToken: '',
-      sessionId: session.id,
-      history: messages,
-      started: true,
-      pending: false,
-      historyOnly: true
-    });
-  }
-
-  renderSidebar();
-  const requestedKey = `history:${historySessionId}`;
-  const startKey = chats.has(requestedKey) ? requestedKey : chats.keys().next().value;
-  await activateLesson(startKey);
-}
+engineSeg.addEventListener('click', (e) => {
+  const b = e.target.closest('button');
+  if (!b) return;
+  engineTouched = true;
+  markEngine(b.dataset.engine);
+  void persistDashboardPreference('solveEngine', b.dataset.engine);
+});
+paintEngineBadge(solveEngine);
+chrome.storage.local.get('solveEngine').then(({ solveEngine: saved }) => {
+  if (!engineTouched && (saved === 'auto' || saved === 'think')) markEngine(saved);
+});
 
 /* ---------- Init: load week from the last popup scan ---------- */
 
 const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
 
 (async function init() {
-  if (historyMode) {
-    await loadHistoryDashboard();
-    return;
-  }
   const { weekHomework } = await chrome.storage.local.get('weekHomework');
   const scannedAt = weekHomework?.scannedAt;
   const scanAge = Date.now() - scannedAt;
-  const freshWeek = Number.isFinite(scannedAt) && scanAge >= 0 && scanAge <= WEEK_SCAN_MAX_AGE_MS;
-  if (!freshWeek && weekHomework) {
+  let freshWeek = Number.isFinite(scannedAt) && scanAge >= 0 && scanAge <= WEEK_SCAN_MAX_AGE_MS;
+  const cacheScanId = weekHomework?.scanId || null;
+  const launchScanId = initialScanId || null;
+  const cachePrincipal = weekHomework?.principal || null;
+  const launchPrincipal = launchPayload.principal || null;
+  const cachePrincipalError = weekHomework?.principalError || null;
+  const launchPrincipalError = launchPayload.principalError || null;
+  // The week cache is identity-sensitive even when this page was opened
+  // directly. Its exact scan capability must arrive through the encrypted,
+  // consume-once launch; freshness alone never authorizes browsing it.
+  if (freshWeek && !principalBindingMatches({
+    cacheScanId,
+    launchScanId,
+    cachePrincipal,
+    launchPrincipal,
+    cacheError: cachePrincipalError,
+    launchError: launchPrincipalError,
+  })) {
+    freshWeek = false;
+    if (!launchScanId) {
+      weekDataError = 'Чтобы безопасно открыть сохранённую неделю, откройте попап СМЭШ AI в нужном дневнике и нажмите «Решить» у задания.';
+    } else if (cachePrincipalError || launchPrincipalError) {
+      weekDataError = 'Не удалось однозначно определить профиль ученика. Выберите нужный профиль в дневнике, обновите страницу и просканируйте задания заново.';
+    } else if (cacheScanId !== launchScanId) {
+      weekDataError = 'Скан недели изменился после открытия задания. Вернитесь в дневник, просканируйте задания заново и снова нажмите «Решить».';
+    } else {
+      weekDataError = 'Скан недели сделан для другого или неподтверждённого профиля. Откройте попап на нужном дневнике и просканируйте задания заново.';
+    }
+  }
+  if (!freshWeek && weekHomework && !weekDataError) {
     weekDataError = 'Скан недели устарел. Откройте попап на текущей странице дневника и просканируйте задания заново.';
   }
   for (const group of freshWeek ? (weekHomework?.days || []) : []) {
@@ -1117,7 +1519,9 @@ const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
           homeworkId: item.homeworkId || '',
           homeworkItemId: item.homeworkItemId || '',
           rowToken: item.rowToken || '',
-          sessionId: null, history: [], started: false, pending: false
+          scanId: cacheScanId || '',
+          sessionId: null, history: [], started: false, pending: false,
+          pendingOwner: null, thinkingOwner: null
         });
       }
     }
@@ -1136,7 +1540,7 @@ const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
     if (match) {
       startKey = match.key;
     } else if (!freshWeek) {
-      openError = 'Скан домашних заданий устарел. Вернитесь в дневник, откройте попап СМЭШ AI и запустите свежий скан.';
+      openError = weekDataError || 'Скан домашних заданий устарел. Вернитесь в дневник, откройте попап СМЭШ AI и запустите свежий скан.';
     } else if (!initialRowToken) {
       openError = 'Не найден идентификатор строки задания. Откройте его заново из свежего списка в попапе СМЭШ AI.';
     } else {
@@ -1152,6 +1556,13 @@ const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
     const hint = document.createElement('p');
     hint.className = 'hintmsg';
     hint.textContent = openError;
+    chatEl.appendChild(hint);
+  } else if (weekDataError) {
+    titleEl.textContent = 'Неделя недоступна';
+    chatEl.innerHTML = '';
+    const hint = document.createElement('p');
+    hint.className = 'hintmsg';
+    hint.textContent = weekDataError;
     chatEl.appendChild(hint);
   } else renderChat(null);
 })();

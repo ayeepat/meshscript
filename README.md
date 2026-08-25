@@ -1,121 +1,130 @@
 # СМЭШ AI
 
-Manifest V3 Chrome extension: a personal homework assistant for the Mesh
-(`school.mos.ru`) platform. Scans the homeworks page, detects subjects with
-robust DOM traversal (no hardcoded MUI class names), and solves tasks using
-subject-aware prompts. Four AI providers: **OpenRouter** (BYO paid key, Gemini
-2.5 Flash — the main solver, answers stream token-by-token), **Groq** (BYO free
-key — also transcribes listening-task audio via Whisper), and **Qwen** /
-**DeepSeek**, which need no user key — they run through the СМЭШ license proxy
-(`ai.smeshapi.site`). Solve history is stored locally in the browser
-(`chrome.storage.local`, locked to trusted contexts) with a 7-day TTL. Optional,
-**off-by-default** anonymous usage statistics can be enabled in Settings
-(content-free: event types/token counts only, deletable server-side). No login
-automation — it works inside your already logged-in browser session, which also
-lets it **fetch homework attachments** straight from Mesh when you press
-«Решить» on a task.
+Расширение для Chromium-браузеров: читает домашнее задание прямо на странице
+МЭШ и пишет ответ. Условие никуда не надо копировать — открыли дневник,
+нажали «Решить», ответ развернулся в соседней вкладке.
 
-## File structure
+Установка, тарифы и короткие разборы — на [smeshai.xyz](https://smeshai.xyz/).
 
-```
-manifest.json
-src/
-  content/scraper.js          # DOM scraping, pattern/vocabulary based
-  popup/                      # week of homework (collapsible days) + Solve + file upload
-  dashboard/                  # full-window solve view; sidebar = week's lessons
-  settings/                   # keys, provider settings, history viewer
-  background/service-worker.js# AI provider orchestration (+ streaming port)
-  lib/                        # ai.js, openrouter.js, groq.js, http.js, history.js, prompts.js,
-                              #   subject-router.js, gdz-api.js, gdz-match.js
-  lib/gdz-ua-rule.js          # session DNR rule: scoped GDZ User-Agent rewrite
-assets/icons/                 # icon16/48/128.png
-assets/fonts/                 # Manrope (woff2)
-```
+## Быстрый старт
 
-## Verification
+1. **Поставьте расширение.** Готовый листинг сейчас один —
+   [Microsoft Edge Add-ons](https://microsoftedge.microsoft.com/addons/detail/jockjfcmofofpjjpoljclneoabhcioao).
+   Для Chrome и Яндекс Браузера страница магазина ещё готовится, пока
+   ставится [вручную](#установка-вручную). Нужен браузер на Chromium 140
+   или новее.
+2. **Активируйте ключ.** Иконка расширения → ⚙️ → раздел «Лицензия» → поле
+   «Ключ доступа».
+3. **Откройте дневник:** `school.mos.ru/diary/homeworks/homeworks`.
+   Расширение просканирует всю видимую неделю, каждый день — сворачивающийся
+   блок.
+4. **Нажмите «Решить»** у нужного задания. Откроется отдельная вкладка, слева
+   в ней — уроки недели: можно кликать по очереди, у каждого свой чат. К ИИ
+   расширение обращается, только когда вы открываете урок, не раньше.
 
-Run every local regression, including the VPS embedded-server parity check:
+При первом запуске появится экран согласия. Пока вы его не приняли, ни одно
+задание никуда не отправляется.
+
+## Лицензия
+
+Ключ продаётся на сайте, [тарифы здесь](https://smeshai.xyz/pricing/) —
+подписка или разовая оплата. С лицензией свой ключ провайдера не нужен:
+запросы идут через наш прокси к передовым ИИ-моделям.
+
+**Один ключ — одно устройство.** Ключ привязывается к той установке, где вы
+его активировали. Переезжаете на другой компьютер — сначала «Деактивировать
+ключ на этом устройстве» в настройках, потом активация на новом. Второй
+установке расширение прямо скажет, где именно надо выйти.
+
+**Пригласи друга.** В настройках лежит ваш личный код. Друг вводит его при
+оплате подписки: ему +10% дней (30 → 33), вам +7 дней за каждого купившего.
+Код бесплатный и бессрочный.
+
+## Что умеет
+
+- **Тесты МЭШ.** Вкладка «Тест» в попапе: расширение снимает видимый экран,
+  вытаскивает текст страницы и отвечает номерами и ответами, без разборов.
+  Пролистнули к следующему вопросу — нажали ещё раз. Ответы на тесты нигде не
+  сохраняются. «Решить все страницы» делает то же самое подряд по страницам.
+- **Файлы подтягиваются сами.** Задание вида «сделать из прикреплённого
+  файла»: нажатие «Решить» на этой строке заберёт файл из вашей же открытой
+  сессии МЭШ. Скачивать и загружать обратно не нужно. Не нашлось — попросит
+  загрузить руками.
+- **Ответ печатается на глазах**, а не появляется через полминуты тишины.
+  Переключатель «Кратко» / «Объяснить» в шапке решает, получите вы короткий
+  ход решения или полный разбор, как от репетитора.
+- **Фото страницы учебника.** Ctrl/⌘+V прямо в поле ввода — скриншот или
+  вырезанный кусок страницы уходит в чат вместе с вопросом.
+- **Каталог ГДЗ.** В настройках выбираете класс и добавляете свои учебники и
+  тетради — после этого «упр. 25» или «Р.т. с. 74» подтягивают готовый ответ
+  картинкой, без фотографирования и без трат на ИИ.
+- **История решений.** Прошлые чаты лежат в настройках и разворачиваются
+  целиком — можно вернуться к тому, что решали в понедельник.
+
+## Чего расширение не делает
+
+- **Не входит в аккаунт.** Оно работает внутри уже открытой вами сессии
+  МЭШ — ни логина, ни пароля у него нет.
+- **Не отправляет тест.** Автолистание перелистывает страницу только тогда,
+  когда «Далее» — обычная ссылка. Кнопку, за которой может оказаться сдача
+  работы, расширение не нажимает и честно пишет, что дальше вручную.
+- **Не забирает историю к себе.** Она хранится в браузере
+  (`chrome.storage.local`) и стирается через 7 дней. Ни аккаунта, ни общего
+  хранилища: снесли расширение — история исчезла вместе с ним.
+
+Анонимная статистика по умолчанию выключена, включается и удаляется там же, в
+настройках. Полный разбор разрешений и потоков данных —
+в [docs/STORE-REVIEW.md](docs/STORE-REVIEW.md).
+
+## Свой ключ вместо лицензии
+
+Если ключ провайдера у вас уже есть, лицензия не нужна — вставьте его в
+настройках и выберите провайдера.
+
+- **OpenRouter** — https://openrouter.ai/keys, ключ вида `sk-or-v1-…`.
+  Платный, деньги списываются за каждое решение.
+- **Groq** — https://console.groq.com/keys, ключ вида `gsk_…`. Бесплатный, и
+  он же расшифровывает аудирование. Без него аудиозапись придётся
+  расписывать текстом самостоятельно.
+
+## Установка вручную
+
+1. Скачайте репозиторий (`Code` → `Download ZIP`) и распакуйте.
+2. Откройте `chrome://extensions`.
+3. Включите **Режим разработчика** — переключатель справа сверху.
+4. **Загрузить распакованное расширение** → выберите распакованную папку.
+
+## Поддержка
+
+Телеграм-бот [@smeshaibot](https://t.me/smeshaibot?start=support). Кнопки
+«Поддержка» в попапе и настройках ведут туда же.
+
+## Разработчикам
+
+Те же гейты, что CI гоняет на каждый push и pull request:
 
 ```sh
 npm ci
-npm test
+npm --prefix backend ci
+npm --prefix motion ci
+python3 -m pip install --disable-pip-version-check --require-hashes -r motion/requirements.txt
+npm run verify
+npm --prefix backend-vps test
+npm --prefix motion run check
+WRANGLER_LOG_PATH=/tmp/smesh-wrangler.log npm --prefix backend run deploy -- --dry-run --outdir /tmp/smesh-worker-dry-run
+npm run package:extension
+npm run verify:package
 ```
 
-The same locked commands run automatically on every push and pull request.
-After editing `backend-vps/server.js`, use `npm run sync:vps`; CI fails if the
-generated copy inside `backend-vps/setup.sh` was not committed with it.
+Они покрывают разбор исходников, все регрессии, инварианты готовности, квот и
+установщика VPS, детерминированные ассеты и сцены ролика, сборку воркера
+Cloudflare и ровно тот архив расширения, который уходит в релиз.
 
-## Setup — exactly what YOU must do
+После правок в `backend-vps/server.js` запускайте `npm run sync:vps`: CI
+упадёт, если сгенерированную копию внутри `backend-vps/setup.sh` не
+закоммитили рядом.
 
-### 1. Get the AI provider keys
-- **OpenRouter** (main solver): https://openrouter.ai/keys → create a key
-  (`sk-or-v1-…`). This is the paid provider — keep usage to actual solves.
-- **Groq** (free, no card): https://console.groq.com/keys → create a key
-  (`gsk_…`). Used for cheap/menial tasks (task classification). Optional but
-  recommended; without it those tasks fall back to local heuristics.
-
-### 2. Load the extension in Chrome
-1. Open `chrome://extensions`.
-2. Toggle **Developer mode** (top right).
-3. Click **Load unpacked** and select this project folder.
-
-### 3. Configure keys
-1. Click the extension icon → the **⚙️ gear** (opens Settings), or right-click
-   the icon → **Options**.
-2. Paste **OpenRouter API Key** and **Groq API Key**, and pick the provider.
-3. (Optional) Edit the base prompt for any subject category.
-4. Click **Сохранить** (Save).
-
-### 4. Use it
-1. Log into Mesh and open `school.mos.ru/diary/homeworks/homeworks`.
-2. Click the extension icon. It scans the whole visible week of homework;
-   each day is a collapsible section (the nearest day starts expanded).
-   For in-app Mesh tests, open the test page, switch the popup to the
-   **Тест** tab and press the button: the extension screenshots the visible
-   screen + extracts the page text and replies with question numbers and
-   answers only (no explanations). Scroll to the next question and press
-   again. Test answers are not persisted.
-3. Press **Solve** on a subject to open the full-window dashboard. The
-   sidebar lists every lesson of the week — click one to solve it (the AI
-   is only called when you open a lesson, and each lesson keeps its own
-   chat while the tab is open). Solve history (7-day TTL) is opened from
-   Settings in the same dashboard, with all saved chats in a read-only sidebar.
-
-## Notes & trade-offs
-- **Local-only history.** Solve history lives in `chrome.storage.local` with a
-  7-day TTL, scoped to this browser profile. No backend, no shared keys, no
-  account — clearing extension data or reinstalling wipes it.
-- **Attachment fetch on demand.** For tasks that reference a file ("сделать из
-  прикреплённого файла"), pressing «Решить» on that row pulls the file straight
-  from your logged-in Mesh session and attaches it — no manual download, and
-  nothing is fetched for rows you never open. It falls back to manual upload if
-  nothing is found; ambiguous page-scraped links require an explicit pick. The
-  discovery call hits the verified `lesson_schedule_items/<id>` family-API
-  endpoint (with the Bearer token + `X-mes-*` headers) in
-  `src/content/scraper.js`; the files live on `school.mos.ru/ej/attachments/...`
-  and are downloaded by the service worker through a strict
-  school.mos.ru/uchebnik.mos.ru allowlist with size ceilings.
-- **Streaming answers.** The dashboard solve streams tokens live over a
-  `chrome.runtime` port (OpenRouter/Groq SSE). The popup test solver stays a
-  single round-trip.
-- **Answer mode.** A Кратко/Объяснить toggle in the dashboard header switches
-  between a concise worked answer (still shows steps) and a full tutor-style
-  explanation.
-- **Paste images.** In the dashboard composer, Ctrl/⌘+V pastes a screenshot or
-  snipped photo of a textbook page directly into the chat.
-- **Friendly errors.** Bad key / no credit / rate-limit failures surface as a
-  short Russian message instead of a raw provider dump (see `src/lib/http.js`).
-- **GDZ catalog (ready-made answers).** In Settings → **Каталог ГДЗ** you pick a
-  grade and add the textbooks / workbooks for your subjects. After that, tasks
-  like «упр. 25» or «Р.т. с. 74» get the matching GDZ answer images pulled in
-  automatically instead of prompting for a photo. It talks to the gdz.ru
-  mobile-app backend (not the JS-challenged public site): a session
-  `declarativeNetRequest` rule built in `src/lib/gdz-ua-rule.js` rewrites the
-  User-Agent to the `okhttp` UA that
-  DDoS-Guard allowlists, since MV3 `fetch()` can't set it. The catalog is cached
-  (7-day TTL) and resolved tasks are cached per book + number, so it's zero AI
-  cost after the first catalog fetch (`src/lib/gdz-api.js`, `src/lib/gdz-match.js`).
-- **Popup file uploads** attached next to a task are handed to the dashboard
-  and included with the lesson's first AI message.
-- **Russian language guard:** a bare “Упр. 25” with no uploaded page photo makes
-  the assistant ask for a photo instead of inventing the exercise text.
+Остальные части системы описаны у себя:
+[backend/](backend/README.md) — воркер лицензий и платежей,
+[backend-vps/](backend-vps/README.md) — AI-прокси на опросах,
+[motion/](motion/README.md) — рендер рекламного ролика.

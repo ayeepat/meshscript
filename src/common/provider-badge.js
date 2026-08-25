@@ -10,7 +10,7 @@
  */
 
 export const PROVIDER_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
-const PROVIDER_NAME = { groq: 'Groq', openrouter: 'OpenRouter', qwen: 'Qwen', deepseek: 'DeepSeek' };
+export const PROVIDER_NAME = { groq: 'Groq', openrouter: 'OpenRouter', qwen: 'Qwen', deepseek: 'DeepSeek' };
 
 function pick(provider) {
   const p = PROVIDER_ABBR[provider] ? provider : 'openrouter';
@@ -31,10 +31,18 @@ export async function mountProviderBadge(elOrId) {
     el.title = `Сейчас отвечает: ${name}`;
     el.hidden = false;
   };
-  const { aiProvider = 'openrouter' } = await chrome.storage.local.get('aiProvider');
-  paint(pick(aiProvider));
-  // Live-update if the provider is switched in Settings while this page is open.
+  // Subscribe before the initial asynchronous read. Otherwise a Settings
+  // change between get() starting and its stale snapshot resolving is missed,
+  // and the old snapshot paints over the user's newer provider for the rest of
+  // this page lifetime.
+  let generation = 0;
   chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.aiProvider) paint(pick(changes.aiProvider.newValue || 'openrouter'));
+    if (area === 'local' && changes.aiProvider) {
+      generation++;
+      paint(pick(changes.aiProvider.newValue || 'openrouter'));
+    }
   });
+  const readGeneration = generation;
+  const { aiProvider = 'openrouter' } = await chrome.storage.local.get('aiProvider');
+  if (generation === readGeneration) paint(pick(aiProvider));
 }

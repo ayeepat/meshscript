@@ -10,8 +10,9 @@
  * If RESEND_API_KEY is unset the function quietly skips. Lets the operator
  * launch with Telegram-only delivery and add email later.
  */
+import { fetchDelivery } from './http.js';
 
-export async function sendLicenseEmail(env, { to, key, isPreorder }) {
+export async function sendLicenseEmail(env, { to, key, isPreorder, dedupe = true }) {
   if (!env.RESEND_API_KEY || !to) return { skipped: true };
 
   const launchNote = isPreorder
@@ -27,27 +28,39 @@ export async function sendLicenseEmail(env, { to, key, isPreorder }) {
       </div>
       <p style="font-size:14px;line-height:1.55;margin:0 0 12px;">${escapeHtml(launchNote)}</p>
       <p style="font-size:12px;color:#5d5d66;line-height:1.5;margin:24px 0 0;">
-        Ключ привязывается к трём устройствам. Если возникли вопросы — просто ответьте на это письмо.
+        Ключ активируется на одном устройстве. Чтобы перенести его на другой компьютер, нажмите «Деактивировать ключ на этом устройстве» в настройках расширения и активируйте ключ там. Если возникли вопросы — просто ответьте на это письмо.
       </p>
     </div>
   `;
 
-  const res = await fetch('https://api.resend.com/emails', {
-    method: 'POST',
-    headers: {
+  let res;
+  try {
+    res = await fetchDelivery('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
       Authorization: `Bearer ${env.RESEND_API_KEY}`,
-      'Content-Type': 'application/json'
+      'Content-Type': 'application/json',
+      // Resend retains API idempotency keys for 24 hours. This covers the
+      // ambiguous "provider accepted, isolate died before settlement" seam;
+      // deliberate admin force-resends opt out via dedupe=false.
+      ...(dedupe ? { 'Idempotency-Key': `license-delivery:${key}` } : {})
     },
     body: JSON.stringify({
       from: env.EMAIL_FROM || 'СМЭШ AI <onboarding@resend.dev>',
       to: [to],
       subject: 'Ваш ключ доступа к СМЭШ AI',
       html
-    })
-  });
-  if (!res.ok) {
-    return { skipped: false, ok: false, status: res.status, error: await res.text() };
+    }),
+      redirect: 'manual'
+    });
+  } catch {
+    return { skipped: false, ok: false, status: 0, error: 'network_error' };
   }
+  if (!res.ok) {
+    try { await res.body?.cancel(); } catch { /* already closed */ }
+    return { skipped: false, ok: false, status: res.status, error: 'api_error' };
+  }
+  try { await res.body?.cancel(); } catch { /* already closed */ }
   return { skipped: false, ok: true };
 }
 

@@ -15,6 +15,7 @@
  */
 
 import { isOfficeFile } from './file-kinds.js';
+import { clipText } from './clip-text.js';
 
 /* ---------- base64 <-> bytes/utf-8 ---------- */
 
@@ -260,12 +261,14 @@ function parseSharedStrings(xml) {
 // <is><t>…</t></is> for inline strings). Numbers are stored INLINE in <v> and
 // are NOT in sharedStrings, so reading sharedStrings alone drops every numeric
 // cell — the bug this fixes. Resolve `t="s"` refs against the shared strings and
-// take the literal <v> for everything else (numbers, booleans). Rows are newline-
-// separated, cells tab-separated, so the layout survives into the model prompt.
+// take the literal <v> for everything else (numbers, booleans). Rows are
+// newline-separated and cells tab-separated with padding for skipped columns,
+// so the original table alignment survives into the model prompt.
 function sheetToText(xml, shared) {
   const rows = [];
   xml.replace(/<row\b[^>]*>([\s\S]*?)<\/row>/g, (_, row) => {
     const cells = [];
+    let lastIndex = -1;
     row.replace(/<c\b([^>]*)>([\s\S]*?)<\/c>/g, (__, attrs, body) => {
       const type = (attrs.match(/\bt="([^"]+)"/) || [])[1];
       let val = '';
@@ -279,7 +282,23 @@ function sheetToText(xml, shared) {
         const v = (body.match(/<v\b[^>]*>([\s\S]*?)<\/v>/) || [])[1];
         if (v != null) val = xmlEntities(v);
       }
-      if (val !== '') cells.push(val);
+      if (val !== '') {
+        const columnLetters = (attrs.match(/\br="([A-Z]+)\d+"/) || [])[1];
+        let columnIndex = -1;
+        if (columnLetters) {
+          columnIndex = 0;
+          for (const letter of columnLetters) columnIndex = columnIndex * 26 + letter.charCodeAt(0) - 64;
+          columnIndex -= 1;
+        }
+        if (columnIndex < 0 || columnIndex > lastIndex + 64) {
+          // A real homework sheet does not jump across >64 empty columns. Clamp
+          // hostile coordinates such as XFD1 instead of allocating a 16K row.
+          columnIndex = lastIndex + 1;
+        }
+        while (cells.length <= columnIndex) cells.push('');
+        cells[columnIndex] = val;
+        lastIndex = Math.max(lastIndex, columnIndex);
+      }
       return '';
     });
     if (cells.length) rows.push(cells.join('\t'));
@@ -341,7 +360,7 @@ export async function extractOfficeText(file) {
     if (!text && shared.length) text = tidy(shared.join('\n'));
   }
 
-  text = (text || '').slice(0, 100000).trim();
+  text = clipText(text || '', 100000).trim();
   return text || null;
 }
 

@@ -7,8 +7,14 @@
  * fabricates an answer to material it never received.
  */
 
-export const isImageFile = (f) =>
-  (f?.mimeType || '').startsWith('image/') || /\.(png|jpe?g|gif|webp|bmp)$/i.test(f?.name || '');
+const SAFE_RASTER_MIME = /^image\/(?:png|jpe?g|gif|webp)$/i;
+const GENERIC_MIME = /^(?:application\/(?:octet-stream|download)|binary\/octet-stream)?$/i;
+
+export const isImageFile = (f) => {
+  const mime = String(f?.mimeType || '').trim();
+  return SAFE_RASTER_MIME.test(mime) ||
+    (GENERIC_MIME.test(mime) && /\.(png|jpe?g|gif|webp)$/i.test(f?.name || ''));
+};
 
 export const isPdfFile = (f) =>
   (f?.mimeType || '') === 'application/pdf' || /\.pdf$/i.test(f?.name || '');

@@ -10,6 +10,9 @@
     "tail": "wrangler tail"
   },
   "devDependencies": {
-    "wrangler": "^4.107.1"
+    "wrangler": "4.114.0"
+  },
+  "overrides": {
+    "undici": "7.29.0"
   }
 }

@@ -11,9 +11,22 @@ class FakeD1 {
         if (sql.includes('INSERT INTO telemetry_budget')) {
           return {
             first: async () => {
-              const [day, scope, key, amount] = args;
+              // Device admission is now a tombstone-gated INSERT..SELECT with
+              // a literal scope; its fourth bind is the tombstone cutoff, not
+              // the increment. Model both SQL shapes faithfully.
+              const [day, scope, key, amount] = sql.includes("SELECT ?1, 'device'")
+                ? [args[0], 'device', args[1], args[2]]
+                : args;
               const id = `${day}|${scope}|${key}`;
-              const count = (this.budgets.get(id) || 0) + amount;
+              const current = this.budgets.get(id) || 0;
+              const cap = args[4];
+              const limit = args[5];
+              // Production SQL saturates at limit+1 and then its WHERE clause
+              // performs no further UPDATE/RETURNING work.
+              if (Number.isFinite(limit) && current > limit) return null;
+              const count = Number.isFinite(cap)
+                ? Math.min(current + amount, cap)
+                : current + amount;
               this.budgets.set(id, count);
               return count;
             }
@@ -63,18 +76,23 @@ assert.equal(db.eventBatches, 0);
 // Atomic IP admission permits exactly the first 500; rotating device IDs does
 // not create a new shared allowance.
 const burst = await Promise.all(Array.from({ length: 21 }, (_, i) =>
-  handleIngest(ingestRequest(`${String(i).padStart(8, '0')}-0000-4000-8000-000000000000`), env)
+  handleIngest(
+    ingestRequest(`${String(i).padStart(8, '0')}-0000-4000-8000-000000000000`),
+    env,
+    `${String(i).padStart(8, '0')}-0000-4000-8000-000000000000`
+  )
 ));
 assert.equal(burst.filter((result) => result.ok).length, 20);
 assert.equal(burst.filter((result) => result.status === 429).length, 1);
 const ipBudget = [...db.budgets.entries()].find(([key]) => key.includes('|ip|203.0.113.10'));
-assert.equal(ipBudget?.[1], 525, 'atomic counter must retain every concurrent increment');
+assert.equal(ipBudget?.[1], 501,
+  'the shared counter must saturate just over the limit instead of writing forever');
 
 // One device is independently capped even when its IP still has room.
 const db2 = new FakeD1();
 const device = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const sameDevice = await Promise.all(Array.from({ length: 13 }, () =>
-  handleIngest(ingestRequest(device, { ip: '198.51.100.20' }), { DB: db2 })
+  handleIngest(ingestRequest(device, { ip: '198.51.100.20' }), { DB: db2 }, device)
 ));
 assert.equal(sameDevice.filter((result) => result.ok).length, 12);
 assert.equal(sameDevice.at(-1).status, 429);

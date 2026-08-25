@@ -15,6 +15,14 @@ import { getLicenseStatus, setLicenseKey, reasonMessage } from '../lib/license.j
 import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
 import { assertUploadAllowed } from '../lib/upload-limits.js';
+import { filesLabel, pluralRu } from '../common/plural.js';
+import { awaitStablePendingRead } from '../lib/pending-read.js';
+import {
+  isTestCaptureContext,
+  testCaptureChangedError,
+  withMatchingTestCapture,
+} from '../lib/test-capture-context.js';
+import { classifyAutopilotFill } from '../lib/test-autopilot.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
@@ -64,7 +72,7 @@ function setDropAttached(drop, files) {
   drop.classList.add('has');
   drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
   drop.querySelector('.droplabel').textContent =
-    files.length === 1 ? files[0].name : `${files.length} файла из МЭШ`;
+    files.length === 1 ? files[0].name : `${filesLabel(files.length)} из МЭШ`;
 }
 
 // Scanning the week is a passive act: no homework text leaves the device and
@@ -138,6 +146,16 @@ function sendToBackground(msg) {
  * On success the drop shows the file as already attached, so the user never
  * leaves the page to download it.
  */
+function attachmentBindingPayload(card) {
+  return {
+    tabId: card.tabId,
+    scanId: card.scanId,
+    principal: card.principal,
+    principalError: card.principalError,
+    rowToken: card.rowToken,
+  };
+}
+
 async function tryAutoFetch(card, { quiet = false } = {}) {
   const { homeworkId, homeworkItemId, upKey, drop } = card;
   if (uploads[upKey]?.length) return true;
@@ -146,35 +164,65 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
+  if (!card.principal || card.principalError || !card.scanId || !card.rowToken) {
+    autoFetchFailures.set(upKey, 'профиль или скан МЭШ не подтверждён');
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
   if (autoFetched.has(upKey)) {
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
   autoFetched.add(upKey);
-  const tab = await getActiveTab();
-  if (!tab?.id) {
+  const tabId = card.tabId;
+  if (!tabId) {
     autoFetchFailures.set(upKey, 'нет вкладки МЭШ');
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
   if (!quiet) setDropLoading(drop, 'Ищу файл в МЭШ…');
 
-  const found = await sendToContent(tab.id, {
+  const found = await sendToContent(tabId, {
     type: 'MESH_LIST_MATERIALS',
     homeworkId,
     homeworkItemId,
     rowToken: card.rowToken,
-    task: card.task
+    task: card.task,
+    principal: card.principal,
+    principalError: card.principalError,
   });
+  const bindingCheck = await sendToContent(tabId, {
+    type: 'MESH_VERIFY_HOMEWORK_CONTEXT',
+    principal: card.principal,
+    principalError: card.principalError,
+    rowToken: card.rowToken,
+  });
+  if (!bindingCheck?.ok || bindingCheck.matches !== true) {
+    card.candidates = [];
+    card.candidateAuth = null;
+    autoFetchFailures.set(upKey, 'профиль или список МЭШ изменился');
+    if (!quiet) showStoredAutoFetchFailure(card);
+    return false;
+  }
   card.candidates = Array.isArray(found?.candidates) ? found.candidates : [];
-  card.candidateAuth = { headers: found?.headers || null, token: found?.token || null };
+  card.candidateAuth = found && found.stage !== 'binding_changed' &&
+      (found.headers || found.token) ? {
+    headers: found?.headers || null,
+    token: found?.token || null,
+    binding: attachmentBindingPayload(card),
+  } : null;
   // Same-origin attachments are already downloaded by the content script; any
   // cross-origin URLs come back for the service worker to fetch.
   let files = found?.files || [];
   if (found?.urls?.length) {
     const dl = await sendToBackground({
       type: 'DOWNLOAD_FILES',
-      payload: { urls: found.urls, headers: found.headers, token: found.token }
+      payload: {
+        urls: found.urls,
+        headers: found.headers,
+        token: found.token,
+        ...attachmentBindingPayload(card),
+      }
     });
     if (dl?.ok && dl.files?.length) files = files.concat(dl.files);
   }
@@ -204,6 +252,7 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     no_urls: 'файла нет в задании',
     auth_redirect: 'нужна авторизация',
     download_failed: 'не скачалось',
+    binding_changed: 'профиль или список МЭШ изменился',
     exception: 'ошибка запроса'
   }[found?.stage] || 'не найдено';
   autoFetchFailures.set(upKey, why);
@@ -236,7 +285,8 @@ async function chooseCandidateForCard(card) {
     payload: {
       urls: [card.candidates[index].url],
       headers: card.candidateAuth?.headers,
-      token: card.candidateAuth?.token
+      token: card.candidateAuth?.token,
+      ...(card.candidateAuth?.binding || attachmentBindingPayload(card)),
     }
   });
   if (dl?.ok && dl.files?.length) {
@@ -345,7 +395,7 @@ function sendScan(tabId) {
   });
 }
 
-function buildCard(day, item) {
+function buildCard(day, item, scanContext) {
   const card = document.createElement('div');
   card.className = 'card';
   card.innerHTML = `
@@ -380,47 +430,57 @@ function buildCard(day, item) {
   solveBtn.className = 'solve';
   solveBtn.textContent = 'Решить';
   solveBtn.onclick = async () => {
-    // The explicit per-row action is what authorizes pulling this row's files
-    // from Mesh — nothing was pre-downloaded during the passive week scan.
-    if (!cardObj.fetchPromise && item.homeworkId && !uploads[upKey]?.length) {
-      setDropLoading(drop, 'Ищу файл в МЭШ…');
-      cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
-    }
-    // Wait for the in-flight fetch so a quick click doesn't open the solve
-    // with no file attached (the other half of the intermittency).
-    if (cardObj.fetchPromise) { try { await cardObj.fetchPromise; } catch { /* manual fallback */ } }
-    await chooseCandidateForCard(cardObj);
-    await weekSavePromise;
-    // Hand any attached files (manual or auto-fetched) to the dashboard. Include
-    // the task so the dashboard matches THIS homework, not another same-subject
-    // one. `ts` feeds the retention sweep: an unconsumed handoff dies in 1 h.
-    if (uploads[upKey]?.length) {
-      await chrome.storage.local.set({
-        pendingUpload: {
-          ts: Date.now(),
-          day,
+    if (cardObj.launching || cardObj.launched) return;
+    cardObj.launching = true;
+    solveBtn.disabled = true;
+    input.disabled = true;
+    drop.setAttribute('aria-disabled', 'true');
+    solveBtn.textContent = 'Открываю…';
+    try {
+      // The explicit per-row action is what authorizes pulling this row's files
+      // from Mesh — nothing was pre-downloaded during the passive week scan.
+      if (!cardObj.fetchPromise && item.homeworkId && !uploads[upKey]?.length) {
+        setDropLoading(drop, 'Ищу файл в МЭШ…');
+        cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
+      }
+      // Wait for the in-flight fetch so a quick click doesn't open the solve
+      // with no file attached (the other half of the intermittency).
+      if (cardObj.fetchPromise) { try { await cardObj.fetchPromise; } catch { /* manual fallback */ } }
+      await awaitStablePendingRead(() => cardObj.readPromise);
+      await chooseCandidateForCard(cardObj);
+      await weekSavePromise;
+      // Metadata and files share one consume-once launch id in the service worker,
+      // so quick launches for different rows cannot overwrite each other.
+      const response = await sendToBackground({
+        type: 'OPEN_DASHBOARD',
+        payload: {
           subject: item.subject,
           task: item.task,
+          day,
           homeworkId: item.homeworkId,
           homeworkItemId: item.homeworkItemId,
           rowToken: item.rowToken,
-          files: uploads[upKey]
+          tabId: scanContext.tabId,
+          scanId: scanContext.scanId,
+          principal: scanContext.principal,
+          principalError: scanContext.principalError,
+          files: uploads[upKey] || []
         }
       });
-    } else {
-      await chrome.storage.local.remove('pendingUpload'); // drop stale leftovers
-    }
-    chrome.runtime.sendMessage({
-      type: 'OPEN_DASHBOARD',
-      payload: {
-        subject: item.subject,
-        task: item.task,
-        day,
-        homeworkId: item.homeworkId,
-        homeworkItemId: item.homeworkItemId,
-        rowToken: item.rowToken
+      if (!response?.ok) throw new Error(response?.error || 'Не удалось открыть решение.');
+      cardObj.launched = true;
+      solveBtn.textContent = 'Открыто';
+    } catch (error) {
+      solveBtn.textContent = 'Повторить';
+      solveBtn.title = error?.message || 'Не удалось открыть решение.';
+    } finally {
+      cardObj.launching = false;
+      if (!cardObj.launched) {
+        solveBtn.disabled = false;
+        input.disabled = false;
+        drop.removeAttribute('aria-disabled');
       }
-    });
+    }
   };
   row.appendChild(solveBtn);
 
@@ -429,6 +489,8 @@ function buildCard(day, item) {
   // regex gives an instant label, the batched Groq call refines it.
   const drop = document.createElement('label');
   drop.className = 'drop';
+  drop.tabIndex = 0;
+  drop.setAttribute('role', 'button');
   drop.innerHTML = '<span class="dropicon"></span><span class="droplabel"></span>';
   const firstKind = classifyTask(item.task).kind;
   setDropKind(drop, firstKind);
@@ -439,10 +501,18 @@ function buildCard(day, item) {
     homeworkId: item.homeworkId,
     homeworkItemId: item.homeworkItemId,
     rowToken: item.rowToken,
+    scanId: scanContext.scanId,
+    principal: scanContext.principal,
+    principalError: scanContext.principalError,
+    tabId: scanContext.tabId,
     upKey,
     fetchPromise: null,
+    fileGen: 0,
+    readPromise: null,
     candidates: [],
-    candidateAuth: null
+    candidateAuth: null,
+    launching: false,
+    launched: false
   };
   cardDrops.push(cardObj);
   // No auto-fetch here: pulling files from Mesh for every scanned row would
@@ -454,18 +524,34 @@ function buildCard(day, item) {
   input.accept = '.pdf,.doc,.docx,.ppt,.pptx,.xls,.xlsx,.txt,.csv,.rtf,.md,image/*,audio/*,.mp3,.m4a,.wav,.ogg,.opus,.flac,.aac';
   input.style.display = 'none';
   const setFile = async (file) => {
+    if (cardObj.launching || cardObj.launched) return;
+    const gen = ++cardObj.fileGen;
+    delete uploads[upKey];
+    let read = null;
     try {
-      uploads[upKey] = [await fileToInline(file)];
+      read = fileToInline(file);
+      cardObj.readPromise = read;
+      const inline = await read;
+      if (gen !== cardObj.fileGen) return;
+      uploads[upKey] = [inline];
       drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
       drop.querySelector('.droplabel').textContent = file.name;
       drop.classList.remove('need');
       drop.classList.add('has');
     } catch (e) {
+      if (gen !== cardObj.fileGen) return;
       delete uploads[upKey];
       setDropAttachFallback(drop, e?.message || 'не удалось прочитать файл');
+    } finally {
+      if (cardObj.readPromise === read) cardObj.readPromise = null;
     }
   };
   input.onchange = () => { if (input.files[0]) setFile(input.files[0]); };
+  drop.onkeydown = (e) => {
+    if (e.key !== 'Enter' && e.key !== ' ') return;
+    if (e.key === ' ') e.preventDefault();
+    input.click();
+  };
   drop.appendChild(input);
   drop.ondragover = (e) => { e.preventDefault(); };
   drop.ondrop = (e) => {
@@ -476,12 +562,31 @@ function buildCard(day, item) {
   return card;
 }
 
-function render(data) {
+function render(data, scanId, tabId) {
   const dayEl = document.getElementById('day');
   const listEl = document.getElementById('list');
+  const scanContext = Object.freeze({
+    scanId,
+    tabId,
+    principal: data.principal || null,
+    principalError: typeof data.principalError === 'string' ? data.principalError.slice(0, 1024) : null,
+  });
   const days = (data.days || []).filter((d) => d.subjects?.length);
   listEl.innerHTML = '';
   cardDrops = [];
+
+  // Every successful scan replaces the cache, including an empty result. This
+  // prevents a previous child's/week's rows from remaining launchable after a
+  // later scan found nothing. Cards capture this exact immutable scan context.
+  weekSavePromise = chrome.storage.local.set({
+    weekHomework: {
+      days,
+      scannedAt: Date.now(),
+      scanId: scanContext.scanId,
+      principal: scanContext.principal,
+      principalError: scanContext.principalError,
+    }
+  });
 
   if (!days.length) {
     dayEl.textContent = 'Ближайший день не найден';
@@ -490,8 +595,6 @@ function render(data) {
   }
 
   dayEl.textContent = 'Домашние задания на неделю';
-  // Save the week scan so the dashboard sidebar can show it.
-  weekSavePromise = chrome.storage.local.set({ weekHomework: { days, scannedAt: Date.now() } });
 
   days.forEach((group, idx) => {
     const details = document.createElement('details');
@@ -507,7 +610,7 @@ function render(data) {
     summary.append(dname, count);
     details.appendChild(summary);
     for (const item of group.subjects) {
-      details.appendChild(buildCard(group.day, item));
+      details.appendChild(buildCard(group.day, item, scanContext));
     }
     listEl.appendChild(details);
   });
@@ -520,8 +623,12 @@ function setStatus(el, text) {
   el.append(text);
 }
 
+// Quotes are escaped too: this is used inside an href attribute in
+// renderNotice(), and the popup is an extension page with full chrome.* access.
 function escapeHtml(s) {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
 }
 
 function aiNoticeHtml() {
@@ -604,13 +711,26 @@ function reasoningFromPartial(raw) {
  * JSON ({reasoning, answers:[{n,a}]}), so the happy path is a clean parse. The
  * later tiers salvage partial/truncated replies so a cut-off response never
  * surfaces as raw JSON to the user.
+ *
+ * The model occasionally answers with a bare number, boolean, or a structured
+ * value ({"text":…}/[…] for multi-select) instead of a string. Template-
+ * interpolating those prints "[object Object]"; render them readably instead.
  */
+function answerToText(a) {
+  if (typeof a === 'string') return a;
+  if (a != null && typeof a === 'object') {
+    try { return JSON.stringify(a) || String(a); } catch { return String(a); }
+  }
+  return String(a);
+}
+
 function formatTestAnswers(raw) {
   const fromObj = (obj) => {
     if (!obj || !Array.isArray(obj.answers)) return null;
     const lines = obj.answers
-      .filter((x) => x && (x.a != null))
-      .map((x) => `№${x.n}: ${x.a}`);
+      .filter((x) => x && x.a != null &&
+        (typeof x.n === 'number' || (typeof x.n === 'string' && x.n.trim() !== '')))
+      .map((x) => `№${x.n}: ${answerToText(x.a)}`);
     return lines.length ? lines.join('\n') : null;
   };
   // (1) Whole JSON — the happy path when the reply came back intact.
@@ -632,11 +752,11 @@ function formatTestAnswers(raw) {
  *  final-answers text so the caller can offer a one-tap copy. */
 function renderAnswer(el, raw) {
   const plain = formatTestAnswers(raw);
-  const { text, chunks } = extractMath(plain);
-  const html = escapeHtml(text)
+  const math = extractMath(plain);
+  const html = escapeHtml(math.text)
     .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
     .replace(/\n/g, '<br>');
-  el.innerHTML = restoreMath(html, chunks) + aiNoticeHtml();
+  el.innerHTML = restoreMath(html, math) + aiNoticeHtml();
   return plain;
 }
 
@@ -654,6 +774,11 @@ function withTimeout(promise, ms, message) {
   const guard = new Promise((_, reject) => {
     timer = setTimeout(() => reject(new Error(message)), ms);
   });
+  // When the guard wins, the original promise is still running and may reject
+  // later (a tab switch aborts the capture). Attach a handler so that late
+  // rejection is not reported as unhandled; Promise.race still sees the first
+  // settlement either way.
+  promise.catch(() => {});
   return Promise.race([promise, guard]).finally(() => clearTimeout(timer));
 }
 
@@ -687,13 +812,16 @@ async function captureVisibleTarget(target) {
  * @returns {Promise<{pageText:string, screenshot:object}>}
  */
 async function capturePage(tab) {
+  const currentTab = await chrome.tabs.get(tab.id);
+  requireMeshTestTab(currentTab);
+  const captured = await currentTestCapture(currentTab.id);
   const [pageText, dataUrl] = await withTimeout(
     Promise.all([
       chrome.scripting
-        .executeScript({ target: { tabId: tab.id }, func: () => document.body.innerText.slice(0, 15000) })
+        .executeScript({ target: { tabId: currentTab.id }, func: () => document.body.innerText.slice(0, 15000) })
         .then(([inj]) => inj?.result || '')
         .catch(() => ''),
-      captureVisibleTarget(tab)
+      captureVisibleTarget(currentTab)
     ]),
     20000,
     'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
@@ -702,7 +830,16 @@ async function capturePage(tab) {
   // of throwing on dataUrl.split (which read as a cryptic error).
   const b64 = (dataUrl || '').split(',')[1];
   if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
-  return { pageText, screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' } };
+  const capture = await withMatchingTestCapture(
+    captured,
+    currentTestCapture,
+    async (current) => current,
+  );
+  return {
+    pageText,
+    screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' },
+    capture,
+  };
 }
 
 /**
@@ -721,12 +858,15 @@ function timeoutMessage(provider) {
   return `Не удалось получить ответ за 2 минуты. Проверьте интернет и настройки ${name}, затем попробуйте ещё раз.`;
 }
 
-async function requestSolve(tabId, screenshot, pageText) {
+async function requestSolve(tabId, screenshot, pageText, capture) {
   const { aiProvider } = await chrome.storage.local.get('aiProvider');
   const provider = PROVIDER_ABBR[aiProvider] ? aiProvider : undefined;
   return withTimeout(
     new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: 'SOLVE_TEST', payload: { text: pageText, screenshot, tabId, provider } }, (r) => {
+      chrome.runtime.sendMessage({
+        type: 'SOLVE_TEST',
+        payload: { text: pageText, screenshot, tabId, provider, capture },
+      }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
         else resolve(r || { ok: false, error: 'нет ответа' });
       });
@@ -751,15 +891,16 @@ async function solveTestOnScreen() {
     const tab = await getActiveTab();
     requireMeshTestTab(tab);
 
-    const { pageText, screenshot } = await capturePage(tab);
+    const { pageText, screenshot, capture } = await capturePage(tab);
 
     // Live status: a shifting verb + elapsed seconds so a long reasoning pass
     // never looks frozen. Stopped the moment the answer lands or an error fires.
     ticker = startThinking(box);
-    const resp = await requestSolve(tab.id, screenshot, pageText);
+    const resp = await requestSolve(tab.id, screenshot, pageText, capture);
     ticker.stop();
     ticker = null;
     if (!resp.ok) throw new Error(resp.error || 'нет ответа');
+    await withMatchingTestCapture(capture, currentTestCapture, async () => undefined);
     const plain = renderAnswer(box, resp.answer);
     const copyLabel = document.getElementById('copyTestLabel');
     copyBtn.hidden = false;
@@ -790,6 +931,12 @@ async function pageSignature(tabId) {
   return r?.sig || '';
 }
 
+async function currentTestCapture(tabId) {
+  const r = await sendToBackground({ type: 'TEST_PAGE_SIG', payload: { tabId } });
+  if (!r?.ok || !isTestCaptureContext(r.capture)) throw testCaptureChangedError();
+  return r.capture;
+}
+
 // Poll the page signature until it differs from `beforeSig` (page changed) or
 // the budget runs out. A short initial settle gives the new page time to render.
 async function waitForChange(tabId, beforeSig, timeout) {
@@ -806,16 +953,23 @@ async function waitForChange(tabId, beforeSig, timeout) {
 /**
  * Try to advance to the next page. Clicks «Далее», then waits for the content to
  * actually change. One short retry if the first click doesn't take. Returns:
- *   'ok'     — advanced to a new page
- *   'finish' — only a submit/finish control remains (NOT clicked — user's call)
- *   'none'   — no forward control found at all
- *   'stuck'  — clicked but the page never changed
+ *   'ok'      — advanced to a new page
+ *   'finish'  — only a submit/finish control remains (NOT clicked — user's call)
+ *   'blocked' — a real «Далее» exists but has no provably safe activation
+ *   'none'    — no forward control found at all
+ *   'stuck'   — clicked but the page never changed
  */
-async function advancePage(tabId, beforeSig) {
+async function advancePage(capture) {
+  const tabId = capture.tabId;
+  const beforeSig = capture.signature;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const r = await sendToBackground({ type: 'TEST_NEXT_PAGE', payload: { tabId } });
+    const r = await sendToBackground({
+      type: 'TEST_NEXT_PAGE',
+      payload: { tabId, capture }
+    });
     const status = r?.status || 'none';
     if (status === 'finish') return 'finish';
+    if (status === 'blocked') return 'blocked';
     if (status === 'ambiguous') return 'ambiguous';
     if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
     // status === 'clicked': wait for the new page. Be generous on the first try
@@ -825,12 +979,16 @@ async function advancePage(tabId, beforeSig) {
   return 'stuck';
 }
 
-function renderPaginationSummary(box, outcome, solved) {
+function renderPaginationSummary(box, outcome, solved, partial, unrecognized) {
   const pages = `Решено страниц: ${solved}.`;
   let msg;
   switch (outcome) {
     case 'finish':
       msg = `${pages} Дошёл до конца теста — отправку не нажимаю, проверь и отправь сам.`;
+      break;
+    case 'blocked':
+      msg = `${pages} Кнопка «Дальше» на странице есть, но сама я её не нажимаю — она может отправить тест. ` +
+        'Перейди на следующую страницу вручную и нажми «Решить тест» ещё раз.';
       break;
     case 'none':
       msg = `${pages} Не нашёл кнопку «Дальше» — похоже, это последняя страница. Проверь и отправь сам.`;
@@ -841,11 +999,25 @@ function renderPaginationSummary(box, outcome, solved) {
     case 'ambiguous':
       msg = `${pages} Нашёл несколько неоднозначных кнопок «Дальше» — ничего не нажал. Продолжите вручную.`;
       break;
+    case 'partial':
+      msg = `${pages} Текущая страница заполнена не полностью — остановился до нажатия «Дальше». Проверь её вручную.`;
+      break;
+    case 'unrecognized':
+      msg = `${pages} Не распознал вопросы на текущей странице — остановился до нажатия «Дальше». Проверь её вручную.`;
+      break;
     case 'max':
       msg = `${pages} Достигнут предел в 30 страниц — остановился. Проверь и отправь сам.`;
       break;
     default:
       msg = `Готово. ${pages}`;
+  }
+  if (partial) {
+    msg += ` Внимание: ответы на ${partial} ${pluralRu(partial, 'странице', 'страницах', 'страницах')} ` +
+      'заполнены не полностью — проверь их вручную.';
+  }
+  if (unrecognized) {
+    msg += ` На ${unrecognized} ${pluralRu(unrecognized, 'странице', 'страницах', 'страницах')} ` +
+      'вопросы не распознаны — проверь их вручную.';
   }
   box.textContent = msg;
 }
@@ -870,6 +1042,8 @@ async function solveAllPages() {
   setStatus(box, 'Запускаю…');
   let ticker = null;
   let solved = 0;
+  let partial = 0;
+  let unrecognized = 0;
   let outcome = 'done';
   try {
     const tab = await getActiveTab();
@@ -878,32 +1052,60 @@ async function solveAllPages() {
     for (let page = 1; page <= MAX_PAGES; page++) {
       // Solve the visible page. Progress reads «Страница N · Решаю… 12s».
       ticker = startThinking(box, { prefix: `Страница ${page}` });
-      const { pageText, screenshot } = await capturePage(tab);
-      const resp = await requestSolve(tab.id, screenshot, pageText);
+      const { pageText, screenshot, capture } = await capturePage(tab);
+      const resp = await requestSolve(tab.id, screenshot, pageText, capture);
       if (!resp.ok) throw new Error(resp.error || 'нет ответа');
       ticker.stop();
       ticker = null;
 
       // Fill this page's answers into the form (across all frames).
       const questions = resp.questions || [];
+      let fill = null;
       if (questions.length) {
-        await sendToBackground({ type: 'FILL_ANSWERS_TAB', payload: { tabId: tab.id, questions } });
-        solved++;
+        fill = await sendToBackground({
+          type: 'FILL_ANSWERS_TAB',
+          payload: { tabId: tab.id, questions, capture },
+        });
+        if (!fill?.ok) throw new Error(fill?.error || 'Не удалось заполнить ответы.');
       }
+      const fillState = classifyAutopilotFill(questions, fill?.summary);
+      if (fillState === 'unrecognized') {
+        unrecognized++;
+        outcome = 'unrecognized';
+        break;
+      }
+      if (fillState === 'partial') {
+        partial++;
+        outcome = 'partial';
+        break;
+      }
+      solved++;
       // Let the fill's React re-render settle so the page signature captures the
       // current (filled) state — otherwise a late repaint could look like a
       // navigation and fool the change detector below.
       await sleep(700);
+      const navigationCapture = await currentTestCapture(tab.id);
+
+      // Never leave the user on page MAX_PAGES + 1 without solving it. A
+      // read-only discovery still lets an exactly-30-page test report normal
+      // completion when page 30 has only a finish/submit control.
+      if (page === MAX_PAGES) {
+        const finalState = await sendToBackground({
+          type: 'TEST_NEXT_PAGE',
+          payload: { tabId: tab.id, capture: navigationCapture, inspectOnly: true }
+        });
+        outcome = finalState?.status === 'finish' ? 'finish' : 'max';
+        break;
+      }
 
       // Advance to the next page.
       setStatus(box, `Страница ${page} готова. Открываю следующую…`);
-      const beforeSig = await pageSignature(tab.id);
-      const nav = await advancePage(tab.id, beforeSig);
+      const nav = await advancePage(navigationCapture);
       if (nav === 'finish') { outcome = 'finish'; break; }
+      if (nav === 'blocked') { outcome = 'blocked'; break; }
       if (nav === 'none') { outcome = 'none'; break; }
       if (nav === 'ambiguous') { outcome = 'ambiguous'; break; }
       if (nav === 'stuck') { outcome = 'stuck'; break; }
-      if (page === MAX_PAGES) { outcome = 'max'; break; }
       await sleep(500); // small settle before solving the new page
     }
   } catch (e) {
@@ -915,7 +1117,7 @@ async function solveAllPages() {
   } finally {
     if (ticker) ticker.stop();
   }
-  renderPaginationSummary(box, outcome, solved);
+  renderPaginationSummary(box, outcome, solved, partial, unrecognized);
   btn.disabled = false;
   allBtn.disabled = false;
 }
@@ -947,7 +1149,7 @@ async function scanHomework() {
     showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + escapeHtml(resp.error || '') + '</small></p>');
     return;
   }
-  render(resp.data);
+  render(resp.data, crypto.randomUUID(), tab.id);
 }
 
 /* ---------- First-run onboarding (consent + a working AI key) ---------- */
@@ -1000,29 +1202,66 @@ async function finishOnboarding() {
   const consent = document.getElementById('obConsent').checked;
   const typed = document.getElementById('obKey').value.trim();
   if (!consent) { showObError('Поставьте галочку согласия, чтобы продолжить.'); return; }
-  const field = PROVIDER_KEY_FIELD[obProvider];
-  if (field) {
-    // Re-pasting isn't required if a key for the chosen provider is already stored
-    // (e.g. set earlier in Settings) — consent alone is enough to proceed then.
-    const { [field]: existing } = await chrome.storage.local.get(field);
-    if (!typed && !existing) { showObError('Вставьте API-ключ выбранного сервиса.'); return; }
-  } else {
-    // Qwen/DeepSeek: the typed value is the СМЭШ license key. Verify it right
-    // here so the very first «Решить» can't fail on a bad license. An already
-    // active license (entered earlier in Settings) passes without retyping.
-    if (typed) {
-      const r = await setLicenseKey(typed);
-      if (!r.ok) { showObError(reasonMessage(r.reason)); return; }
+  // Freeze the provider for the WHOLE validation. obProvider is mutable UI
+  // state: a switch during the awaits below must not let one provider be
+  // validated and a different one persisted (e.g. Groq checked, Qwen saved
+  // without a license). The controls are also locked so the typed value can't
+  // change meaning (API key ↔ license key) mid-flight.
+  const provider = obProvider;
+  const field = PROVIDER_KEY_FIELD[provider];
+  const startBtn = document.getElementById('obStart');
+  const providerBtns = document.querySelectorAll('#obProvider button');
+  startBtn.disabled = true;
+  for (const b of providerBtns) b.disabled = true;
+  try {
+    if (field) {
+      // Re-pasting isn't required if a key for the chosen provider is already stored
+      // (e.g. set earlier in Settings) — consent alone is enough to proceed then.
+      const { [field]: existing } = await chrome.storage.local.get(field);
+      if (!typed && !existing) { showObError('Вставьте API-ключ выбранного сервиса.'); return; }
+      // Verify the effective key RIGHT HERE so the very first «Решить» can't
+      // dead-end on a rejected credential — the same guarantee the license
+      // branch below already gives. Only a definitive provider rejection
+      // (401/403) blocks onboarding; a network failure is ambiguous (the key
+      // may be fine, the probe just didn't reach the provider) and must not.
+      const verdict = await sendToBackground({
+        type: 'VERIFY_PROVIDER_KEY',
+        payload: { provider, apiKey: typed || existing }
+      });
+      if (verdict?.ok !== true && verdict?.reason !== 'unreachable') {
+        showObError(verdict?.reason === 'bad_key'
+          ? 'Сервис отклонил этот API-ключ. Проверьте его или получите новый по ссылке выше.'
+          : 'Не удалось проверить API-ключ. Попробуйте ещё раз.');
+        return;
+      }
     } else {
-      const status = await getLicenseStatus();
-      if (!status?.ok) { showObError('Введите ключ лицензии СМЭШ (SMESH-…) или купите её на сайте.'); return; }
+      // Qwen/DeepSeek: the typed value is the СМЭШ license key. Verify it right
+      // here so the very first «Решить» can't fail on a bad license. An already
+      // active license (entered earlier in Settings) passes without retyping.
+      if (typed) {
+        const r = await setLicenseKey(typed);
+        if (!r.ok) { showObError(reasonMessage(r.reason)); return; }
+      } else {
+        const status = await getLicenseStatus();
+        if (!status?.ok) { showObError('Введите ключ лицензии СМЭШ (SMESH-…) или купите её на сайте.'); return; }
+      }
     }
+    showObError('');
+    const data = { aiProvider: provider };
+    if (field && typed) data[field] = typed;
+    await chrome.storage.local.set(data);
+    await setConsent(true);
+  } catch {
+    // Storage/runtime promises can still reject even though the normal
+    // background-message wrapper converts transport failures to a null reply.
+    // Keep onboarding fail-closed and give the student a recoverable UI instead
+    // of leaking an unhandled rejection from the button handler.
+    showObError('Не удалось проверить или сохранить ключ. Попробуйте ещё раз.');
+    return;
+  } finally {
+    startBtn.disabled = false;
+    for (const b of providerBtns) b.disabled = false;
   }
-  showObError('');
-  const data = { aiProvider: obProvider };
-  if (field && typed) data[field] = typed;
-  await chrome.storage.local.set(data);
-  await setConsent(true);
   showOnboarding(false);
   scanHomework();
 }
@@ -1050,7 +1289,7 @@ async function isReadyToSolve() {
     // Hidden BYO Model Studio key bypasses the license entirely.
     if (stored.qwenApiKey) return true;
     // Otherwise the license must be USABLE, not merely entered: a confirmed-bad
-    // verdict (expired / revoked / not_found / device_limit) has no working
+    // verdict (expired / revoked / not_found / device_in_use) has no working
     // credential, so send the user to onboarding — where the error and a fix
     // field are shown — instead of letting every «Решить» dead-end on the proxy.
     // A network-only failure is ambiguous (the key may be fine, the verify just

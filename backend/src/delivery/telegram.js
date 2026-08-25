@@ -11,6 +11,7 @@
  * If TELEGRAM_BOT_TOKEN is unset or the buyer never gave us a user_id,
  * the function quietly skips. Email then becomes the fallback.
  */
+import { fetchDelivery } from './http.js';
 
 export async function sendLicenseTelegram(env, { user_id, key, isPreorder }) {
   if (!env.TELEGRAM_BOT_TOKEN || !user_id) return { skipped: true };
@@ -24,21 +25,29 @@ export async function sendLicenseTelegram(env, { user_id, key, isPreorder }) {
     'Ваш ключ доступа к *СМЭШ AI*:\n\n' +
     `\`${escapeMdCode(key)}\`\n\n` +
     `${escapeMd(launchNote)}\n\n` +
-    '_Ключ работает на трёх устройствах\\. Если что — напишите прямо в этот чат\\._';
+    '_Ключ активируется на одном устройстве\\. Чтобы перенести его на другой компьютер, нажмите «Деактивировать ключ на этом устройстве» в настройках расширения и активируйте ключ там\\. Если что — напишите прямо в этот чат\\._';
 
-  const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      chat_id: user_id,
-      text,
-      parse_mode: 'MarkdownV2',
-      disable_web_page_preview: true
-    })
-  });
-  if (!res.ok) {
-    return { skipped: false, ok: false, status: res.status, error: await res.text() };
+  let res;
+  try {
+    res = await fetchDelivery(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: user_id,
+        text,
+        parse_mode: 'MarkdownV2',
+        disable_web_page_preview: true
+      }),
+      redirect: 'manual'
+    });
+  } catch {
+    return { skipped: false, ok: false, status: 0, error: 'network_error' };
   }
+  if (!res.ok) {
+    try { await res.body?.cancel(); } catch { /* already closed */ }
+    return { skipped: false, ok: false, status: res.status, error: 'api_error' };
+  }
+  try { await res.body?.cancel(); } catch { /* already closed */ }
   return { skipped: false, ok: true };
 }
 

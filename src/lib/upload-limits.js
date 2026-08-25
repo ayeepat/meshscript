@@ -10,9 +10,10 @@
 import { isAudioFile } from './file-kinds.js';
 
 // The licensed proxy stores the complete messages JSON under a 9 MiB ceiling.
-// At most 6 raw MiB becomes at most 8 MiB of base64, reserving the remaining
-// MiB for data-URI/JSON structure, prompts and replayed text. This is one shared
-// budget across current and historical files, not a per-file allowance.
+// At most 6 raw MiB of NON-AUDIO becomes at most 8 MiB of base64, reserving the
+// remaining MiB for data-URI/JSON structure, prompts and replayed text. It is
+// one shared standard-file budget across current and historical turns; audio
+// is transcribed before provider messages and has the separate Whisper limit.
 export const MAX_STANDARD_UPLOAD_BYTES = 6 * 1024 * 1024;
 export const MAX_AUDIO_UPLOAD_BYTES = 25 * 1024 * 1024;
 export const MAX_REQUEST_FILE_BYTES = 6 * 1024 * 1024;
@@ -58,21 +59,32 @@ function decodedBase64Bytes(dataBase64) {
 
 function fileReplayKey(file) {
   const data = typeof file?.dataBase64 === 'string' ? file.dataBase64 : '';
-  return `${String(file?.name || '')}\u0000${data.length}\u0000${data.slice(0, 256)}`;
+  const mid = data.length >> 1;
+  return `${String(file?.name || '')}\u0000${data.length}\u0000${data.slice(0, 256)}\u0000` +
+    `${data.slice(mid, mid + 256)}\u0000${data.slice(-256)}`;
 }
 
 /**
- * Remove a file repeated by the current turn/history replay. The intentionally
- * cheap fingerprint is the contract for this path: Mesh files are already
- * base64 in memory, so hashing every multi-megabyte body again would add a large
- * latency/allocation tax merely to suppress an identical replay.
+ * Remove a file repeated by the current turn/history replay. A cheap sampled
+ * fingerprint selects a small candidate bucket; exact full-string equality is
+ * the deduplication contract. Mesh files are already base64 in memory, so this
+ * avoids hashing every multi-megabyte body and allocates no second body copy.
  */
 export function deduplicateRequestFiles(files = [], history = []) {
-  const seen = new Set();
+  // The sampled key is only a cheap bucket selector. It must never be treated as
+  // proof that two attachments are identical: same-name/same-length files can
+  // differ outside all three samples. Keep references to the full strings in
+  // each (normally one-entry) bucket and use exact string equality before
+  // suppressing a replay. This adds no second base64 allocation and only scans a
+  // multi-megabyte body in the rare case where its cheap fingerprint collides.
+  const seen = new Map();
   const keep = (list) => (Array.isArray(list) ? list : []).filter((file) => {
     const key = fileReplayKey(file);
-    if (seen.has(key)) return false;
-    seen.add(key);
+    const data = typeof file?.dataBase64 === 'string' ? file.dataBase64 : '';
+    const bucket = seen.get(key);
+    if (bucket?.some((prior) => prior === data)) return false;
+    if (bucket) bucket.push(data);
+    else seen.set(key, [data]);
     return true;
   });
 
@@ -90,9 +102,12 @@ export function deduplicateRequestFiles(files = [], history = []) {
 }
 
 /**
- * Enforce one decoded attachment budget over the exact set sent to a provider,
- * including replayed history. Returns a user-ready result instead of throwing
- * so both UI and service-worker boundaries can surface the same Russian error.
+ * Enforce separate decoded budgets over the exact set entering a solve,
+ * including replayed history. Non-audio stays under 6 MiB because it can reach
+ * the proxy as base64. Audio is transcribed to text by Groq Whisper first and
+ * never reaches provider messages as base64 (failure adds only a short note),
+ * so its aggregate follows Groq's own 25 MiB file limit instead. Returns a
+ * user-ready result so UI and service-worker boundaries surface one message.
  */
 export function validateRequestFileBudget(fullFileList) {
   const files = Array.isArray(fullFileList) ? fullFileList : [];
@@ -103,12 +118,27 @@ export function validateRequestFileBudget(fullFileList) {
         `Максимум — ${MAX_REQUEST_FILE_COUNT} файлов, включая файлы из истории.`
     };
   }
-  const totalBytes = files.reduce((sum, file) => sum + decodedBase64Bytes(file?.dataBase64), 0);
-  if (totalBytes > MAX_REQUEST_FILE_BYTES) {
+  let totalBytes = 0;
+  let audioBytes = 0;
+  let nonAudioBytes = 0;
+  for (const file of files) {
+    const bytes = decodedBase64Bytes(file?.dataBase64);
+    totalBytes += bytes;
+    if (isAudioFile(file)) audioBytes += bytes;
+    else nonAudioBytes += bytes;
+  }
+  if (nonAudioBytes > MAX_REQUEST_FILE_BYTES) {
     return {
       ok: false,
-      error: `Общий размер вложений — ${formatMegabytes(totalBytes)} МБ. ` +
+      error: `Общий размер вложений — ${formatMegabytes(nonAudioBytes)} МБ. ` +
         `Максимум — ${formatMegabytes(MAX_REQUEST_FILE_BYTES)} МБ, включая файлы из истории.`
+    };
+  }
+  if (audioBytes > MAX_AUDIO_UPLOAD_BYTES) {
+    return {
+      ok: false,
+      error: `Общий размер аудиофайлов — ${formatMegabytes(audioBytes)} МБ. ` +
+        `Максимум — ${formatMegabytes(MAX_AUDIO_UPLOAD_BYTES)} МБ, включая файлы из истории.`
     };
   }
   return { ok: true, fileCount: files.length, totalBytes };

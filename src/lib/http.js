@@ -10,6 +10,13 @@
  */
 
 const DEFAULT_TIMEOUT_MS = 60000;
+const MAX_STREAM_CHARS = 2 * 1024 * 1024;
+const MAX_RESPONSE_TEXT_BYTES = 64 * 1024;
+
+// Sentinel returned when a stream completes with no content deltas at all.
+// Callers detect it to surface a retryable error instead of saving/showing it
+// as if it were a real answer.
+export const EMPTY_ANSWER = '(пустой ответ)';
 
 /** Pull a human-readable message out of a provider error payload. */
 function extractError(text) {
@@ -49,6 +56,50 @@ export function httpError(label, status, bodyText) {
   return new Error(friendlyMessage(label, status, extractError(bodyText)));
 }
 
+/** Read at most `maxBytes` from an upstream response, then cancel the rest. */
+export async function readResponseTextBounded(response, maxBytes = MAX_RESPONSE_TEXT_BYTES) {
+  if (!response?.body?.getReader || !Number.isFinite(maxBytes) || maxBytes < 0) return '';
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value?.byteLength) continue;
+      const take = Math.min(value.byteLength, maxBytes - total);
+      if (take) chunks.push(value.subarray(0, take));
+      total += take;
+      if (take < value.byteLength || total >= maxBytes) {
+        try { await reader.cancel('response body limit reached'); } catch { /* already closed */ }
+        break;
+      }
+    }
+  } catch { return ''; }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+  return new TextDecoder().decode(bytes);
+}
+
+/**
+ * The timeout must cover the body read, not only response headers: stalled
+ * connections routinely deliver headers and then hang the body. This is the
+ * same transport constraint that requires smesh-proxy.js to own its fetchText.
+ */
+export async function fetchTextBounded(url, init = {}, { timeoutMs = 15000, maxBytes } = {}) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, { ...init, signal: ctrl.signal });
+    const text = await readResponseTextBounded(res, maxBytes);
+    if (ctrl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
+    return { ok: res.ok, status: res.status, text };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Incremental OpenAI-style SSE parser, decoupled from any transport. Feed it
  * text with push() (as many times as you like, chunk boundaries anywhere —
@@ -60,11 +111,18 @@ export function httpError(label, status, bodyText) {
  * parser, so frame handling can never drift between the two paths.
  *
  * push() THROWS on provider error frames (same semantics postStream had
- * inline); finish() fires onUsage once and returns the full text.
+ * inline); finish() fires onUsage once and returns the full text — or THROWS
+ * when the stream never delivered its terminal `data: [DONE]` frame, because
+ * a cleanly closed socket without it is an incomplete answer, not a result.
  */
 export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, rawErrors = false }) {
   let buffer = '';
   let full = '';
+  // OpenAI-style streams terminate every COMPLETED answer with `data: [DONE]`.
+  // A body that merely ends (proxy idle cut, upstream dying with a clean FIN)
+  // has exactly the shape of a truncated answer, so finish() refuses to treat
+  // it as success — graceful EOF is not a completion signal.
+  let sawDone = false;
   // Token/cost accounting rides the SAME stream. The final frame carries a
   // `usage` object (OpenRouter with usage.include; Groq/OpenAI-compat with
   // stream_options.include_usage — Groq nests it under x_groq.usage), and the
@@ -77,7 +135,7 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
     line = line.trim();
     if (!line.startsWith('data:')) return;
     const data = line.slice(5).trim();
-    if (data === '[DONE]') return;
+    if (data === '[DONE]') { sawDone = true; return; }
     let json;
     try { json = JSON.parse(data); }
     catch { return; } // incomplete / non-JSON frame — ignore, never fatal
@@ -107,6 +165,9 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
 
   return {
     push(text) {
+      if (buffer.length + full.length + String(text).length > MAX_STREAM_CHARS) {
+        throw new Error(`${label}: ответ превысил безопасный лимит. Задайте более короткий вопрос.`);
+      }
       buffer += text;
       // SSE frames are separated by blank lines; process complete lines.
       let nl;
@@ -122,10 +183,13 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
         buffer = '';
         processLine(line);
       }
+      if (!sawDone) {
+        throw new Error(`${label}: ответ получен не полностью. Попробуйте ещё раз.`);
+      }
       if (onUsage && (usage || model)) {
         try { onUsage({ ...(usage || {}), model }); } catch { /* telemetry never breaks the answer */ }
       }
-      return full || '(пустой ответ)';
+      return full || EMPTY_ANSWER;
     }
   };
 }
@@ -160,8 +224,19 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const ctrl = new AbortController();
   // Reset the idle timer on every chunk so long answers don't trip it.
-  let timer = setTimeout(() => ctrl.abort(), timeoutMs);
-  const bump = () => { clearTimeout(timer); timer = setTimeout(() => ctrl.abort(), timeoutMs); };
+  let timedOut = false;
+  const armTimeout = () => setTimeout(() => {
+    timedOut = true;
+    ctrl.abort();
+  }, timeoutMs);
+  let timer = armTimeout();
+  const bump = () => {
+    clearTimeout(timer);
+    // Once an idle timer has fired the controller is permanently aborted.
+    // Do not let a queued final chunk reset `timedOut` and turn the following
+    // read failure back into a raw AbortError.
+    if (!ctrl.signal.aborted) timer = armTimeout();
+  };
   // Link the caller's signal to our internal controller so a port disconnect
   // tears down the SSE read loop immediately — otherwise the upstream provider
   // keeps streaming (and charging) until idle timeout.
@@ -174,22 +249,30 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
       method: 'POST',
       headers: { 'Content-Type': 'application/json', ...headers },
       body: JSON.stringify({ ...body, stream: true }),
+      redirect: 'error',
       signal: ctrl.signal
     });
   } catch (e) {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onExternalAbort);
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (e.name === 'AbortError') {
+    if (timedOut && e.name === 'AbortError') {
       throw new Error(`${label}: превышено время ожидания. Попробуйте ещё раз.`);
     }
     throw e;
   }
 
   if (!res.ok) {
-    const text = await res.text().catch(() => '');
+    const text = await readResponseTextBounded(res);
     clearTimeout(timer);
     signal?.removeEventListener('abort', onExternalAbort);
+    // readResponseTextBounded deliberately swallows reader failures. Restore
+    // the caller/timeout semantics here so an abort during a stalled error
+    // body is not misreported as an HTTP/provider failure.
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (timedOut && ctrl.signal.aborted) {
+      throw new Error(`${label}: превышено время ожидания. Попробуйте ещё раз.`);
+    }
     if (rawErrors) {
       throw new Error(extractError(text) || `${label}: ошибка сервера (${res.status}). Попробуйте ещё раз.`);
     }
@@ -201,6 +284,7 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
   if (!res.body) {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onExternalAbort);
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
     throw new Error(`${label}: пустой ответ сервера (нет потока данных).`);
   }
 
@@ -217,7 +301,11 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
     }
     sink.push(decoder.decode());
   } catch (e) {
+    ctrl.abort(); // stop a malicious/oversized/erroring upstream immediately
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (timedOut && (e?.name === 'AbortError' || ctrl.signal.aborted)) {
+      throw new Error(`${label}: превышено время ожидания. Попробуйте ещё раз.`);
+    }
     throw e;
   } finally {
     clearTimeout(timer);

@@ -1,6 +1,6 @@
 /**
- * Anonymous usage telemetry → the license backend's /t endpoint (analytics.js
- * on the worker; the admin dashboard reads the aggregates).
+ * Opt-in, pseudonymous usage telemetry → the license backend's /t endpoint
+ * (analytics.js on the worker; the admin dashboard reads aggregates).
  *
  * OPT-IN: nothing is ever sent unless the user has BOTH accepted the data-
  * processing consent AND enabled the separate «Анонимная статистика» toggle in
@@ -9,11 +9,12 @@
  * takes effect on the very next batch.
  *
  * CONTENT-FREE by design: never sends task text, answers, files or anything a
- * student typed — only event types, subject names, token counts, provider
- * costs and coarse device facts (browser family, extension version, the same
- * anonymous device_id that /verify and /referral/* already use). The license
- * KEY is never transmitted — only its type (lifetime/subscription/none) — and
- * errors travel as fixed codes, never as raw message text.
+ * student typed — only event types, canonical subject names, provider/model,
+ * fixed metrics and coarse device facts (browser family, extension version,
+ * the same pseudonymous device_id that /verify and /referral/* already use).
+ * Client-reported token/cost values are not sent or counted as financial
+ * truth; the VPS separately reports provider-observed usage. The license KEY
+ * is never transmitted — only its type — and errors travel as fixed codes.
  *
  * Fire-and-forget everywhere: telemetry must never slow down or break a
  * solve, so every path swallows its own failures and drops events on error.
@@ -69,10 +70,7 @@ export function costFromUsage(provider, usage) {
 export function usageFields(provider, usage) {
   return {
     provider: provider || null,
-    model: usage?.model || null,
-    tokens_in: Number(usage?.prompt_tokens) || 0,
-    tokens_out: Number(usage?.completion_tokens) || 0,
-    cost_usd: costFromUsage(provider, usage)
+    model: usage?.model || null
   };
 }
 
@@ -120,23 +118,44 @@ async function flush() {
     // statistics toggle (Settings → «Анонимная статистика», default OFF).
     const { telemetryEnabled, aiProvider = 'openrouter', licenseStatus } =
       await chrome.storage.local.get(['telemetryEnabled', 'aiProvider', 'licenseStatus']);
-    if (!telemetryEnabled || !(await hasConsent())) return;
+    const telemetryToken = typeof licenseStatus?.telemetry_token === 'string'
+      ? licenseStatus.telemetry_token
+      : '';
+    const telemetryExpiresAt = Number(licenseStatus?.telemetry_token_expires_at) || 0;
+    if (
+      !telemetryEnabled ||
+      !(await hasConsent()) ||
+      !licenseStatus?.ok ||
+      !telemetryToken ||
+      telemetryExpiresAt <= Date.now()
+    ) return;
     const body = {
       device_id: await getDeviceId(),
       browser: detectBrowser(),
       version: chrome.runtime.getManifest().version,
       provider: aiProvider,
       // Type only — the raw key never rides a telemetry request (the backend
-      // hashes any legacy-client key it still receives; see analytics.js).
+      // discards any legacy-client key it still receives; see analytics.js).
       license_type: licenseStatus?.ok ? (licenseStatus.type || null) : 'none',
       events
     };
+    // The gate above was read BEFORE the device lookup awaited, so a toggle
+    // during that gap still sent this batch. Re-read both consents at the last
+    // possible moment: withdrawing consent must stop the very next request,
+    // not the one after it.
+    const { telemetryEnabled: stillEnabled } =
+      await chrome.storage.local.get('telemetryEnabled');
+    if (!stillEnabled || !(await hasConsent())) return;
     // keepalive lets the batch survive the service worker being torn down
     // right after the response that triggered it.
     await fetch(new URL('/t', BACKEND_URL).toString(), {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Telemetry-Token': telemetryToken
+      },
       body: JSON.stringify(body),
+      redirect: 'error',
       keepalive: true
     });
   } catch { /* offline / backend down — drop, never retry-loop */ }

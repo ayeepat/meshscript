@@ -1,10 +1,12 @@
 /**
  * Usage analytics: ingest + admin aggregation queries (D1).
  *
- * Ingest (`POST /t`) is open like /verify — the extension fires small,
- * CONTENT-FREE batches (no task text, no answers; only event types, subjects,
- * token counts, costs). Everything else here is admin-only aggregation for
- * the dashboard (ayeepat.github.io/smeshaidashboard), guarded in worker.js.
+ * Ingest (`POST /t`) accepts only a short-lived capability issued by a
+ * successful `/verify` for the same device. The extension fires small,
+ * CONTENT-FREE batches (no task text or answers). Token/cost accounting is
+ * accepted only from the authenticated server-to-server `/t/ai` path.
+ * Everything else here is admin-only aggregation for the dashboard
+ * (ayeepat.github.io/smeshaidashboard), guarded in worker.js.
  *
  * Days are MOSCOW calendar days (UTC+3): the audience is Russian students,
  * so "today" must be their today. All aggregates key on events.day, which is
@@ -14,8 +16,8 @@
  * mirror (see mirrorLicense + backfillLicenses).
  */
 
-import { getLicense } from './licenses.js';
-import { cleanDeviceId } from './referrals.js';
+import { getLicense, markMaterialized } from './licenses.js';
+import { cleanDeviceId, cleanPublicDeviceId } from './referrals.js';
 
 const MSK_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -48,12 +50,181 @@ const EVENT_TYPES = new Set([
   'solve', 'test_solve', 'test_requestion', 'gdz_pull', 'error'
 ]);
 const BROWSERS = new Set(['chrome', 'yandex', 'opera', 'edge', 'firefox', 'other']);
+const PROVIDERS = new Set(['openrouter', 'groq', 'qwen', 'deepseek']);
+const LICENSE_TYPES = new Set(['lifetime', 'subscription', 'none']);
+const MODELS = new Set([
+  'google/gemini-2.5-flash',
+  'gemini-2.5-flash',
+  'gemini-2.5-flash-lite',
+  'llama-3.3-70b-versatile',
+  'meta-llama/llama-4-scout-17b-16e-instruct',
+  'qwen3.7-plus',
+  'qwen-vl-plus',
+  'qwen-plus',
+  'deepseek-v4-flash'
+]);
 // "Real usage" = a student actually used a feature (heartbeats/installs/errors
 // mark activity but are not usage).
 const USE_TYPES = "('solve','test_solve','test_requestion','gdz_pull')";
 
-const clampStr = (v, max) => (typeof v === 'string' ? v.slice(0, max) : null);
 const clampInt = (v, max) => Math.max(0, Math.min(max, Math.round(num(v))));
+
+// "Content-free" is enforced at this boundary, not assumed of clients: a
+// buggy or malicious sender must not be able to persist task text, answers,
+// filenames, or credential-like strings through `meta` or `subject`.
+//
+// String meta values are limited to the exact short vocabulary the extension
+// and the VPS proxy actually emit (see service-worker.js track() call sites
+// and backend-vps jobTimings). Numeric/boolean metrics also require an exact
+// key and per-key type/range, so content cannot be encoded in arbitrary keys.
+const META_STRING_VALUES = {
+  mode: new Set(['brief', 'explain']),
+  engine: new Set(['auto', 'think']),
+  category: new Set([
+    'worked_solution', 'direct_answer', 'paragraph_summary',
+    'russian_full', 'literature', 'test_answer'
+  ]),
+  effort: new Set(['low', 'medium', 'high']),
+  effort_reason: new Set(['engine_auto', 'easy', 'chatty', 'followup']),
+  source: new Set(['manual', 'lesson']),
+  src: new Set(['vps']),
+  code: new Set([
+    'consent_required', 'license_invalid', 'key_missing', 'capture_failed',
+    'rate_limited', 'provider_timeout', 'provider_http', 'network', 'other'
+  ]),
+  op: new Set([
+    'GET_ACTION_TOKEN', 'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST',
+    'FILL_ANSWERS_ALL', 'FILL_ANSWERS_TAB', 'TEST_PAGE_SIG',
+    'TEST_NEXT_PAGE', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL',
+    'RESOLVE_QUESTION', 'GET_RUNTIME_CONFIG', 'CONSUME_DASH_LAUNCH',
+    'CLASSIFY_TASKS', 'OPENROUTER_CREDITS', 'DOWNLOAD_FILES',
+    'LIST_SESSIONS', 'LIST_MESSAGES', 'GDZ_CATALOG', 'GDZ_SEARCH',
+    'GDZ_RESOLVE', 'GDZ_FOR_TASK', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
+    'GDZ_SELFTEST', 'solve_stream'
+  ])
+};
+const META_BOOLEAN_KEYS = new Set(['ok', 'est_rates']);
+const META_NUMBER_FIELDS = {
+  followup: { min: 0, max: 1, integer: true },
+  gdz_auto: { min: 0, max: 100, integer: true },
+  images: { min: 0, max: 100, integer: true },
+  books: { min: 0, max: 100, integer: true },
+  connect_ms: { min: 0, max: 3_600_000, integer: true },
+  resp_ms: { min: 0, max: 3_600_000, integer: true },
+  ttft_ms: { min: 0, max: 3_600_000, integer: true },
+  stream_ms: { min: 0, max: 3_600_000, integer: true },
+  total_ms: { min: 0, max: 3_600_000, integer: true },
+  tok_per_s: { min: 0, max: 10_000, integer: false }
+};
+const META_MAX_ENTRIES = 12;
+
+function sanitizeVersion(value) {
+  if (!/^\d{1,5}(?:\.\d{1,5}){0,3}$/.test(value)) return null;
+  return value.split('.').every((part) => Number(part) <= 65535) ? value : null;
+}
+
+// Every meta lookup below resolves OWN properties only. A bare
+// META_STRING_VALUES[key] also returns Object.prototype members, so a caller
+// key of "constructor" produced `Object` — truthy, so `?.` did not guard — and
+// `Object.has(...)` is not a function, which turned one ingest field into an
+// uncaught TypeError and a 500 that dropped the whole event batch.
+const metaStringVocabulary = (key) =>
+  (typeof key === 'string' && Object.hasOwn(META_STRING_VALUES, key)) ? META_STRING_VALUES[key] : null;
+const metaNumberField = (key) =>
+  (typeof key === 'string' && Object.hasOwn(META_NUMBER_FIELDS, key)) ? META_NUMBER_FIELDS[key] : null;
+
+function sanitizeMetaString(key, value) {
+  if (typeof value !== 'string') return null;
+  if (key === 'from') return sanitizeVersion(value);
+  return metaStringVocabulary(key)?.has(value) ? value : null;
+}
+
+function sanitizeMeta(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const out = Object.create(null);
+  let entries = 0;
+  for (const [key, value] of Object.entries(raw)) {
+    if (entries >= META_MAX_ENTRIES) break;
+    if (META_BOOLEAN_KEYS.has(key) && typeof value === 'boolean') {
+      out[key] = value;
+      entries++;
+      continue;
+    }
+    const numberField = metaNumberField(key);
+    if (numberField && typeof value === 'number' && Number.isFinite(value)) {
+      const bounded = Math.max(numberField.min, Math.min(numberField.max, value));
+      out[key] = numberField.integer ? Math.round(bounded) : bounded;
+      entries++;
+      continue;
+    }
+    if (key === 'from' || metaStringVocabulary(key)) {
+      const safe = sanitizeMetaString(key, value);
+      if (safe != null) { out[key] = safe; entries++; }
+    }
+  }
+  if (!entries) return null;
+  try { return JSON.stringify({ ...out }).slice(0, 400); } catch { return null; }
+}
+
+const SUBJECT_VOCABULARY = [
+  [/русск[^\n]*язык/, 'Русский язык'],
+  [/родн[^\n]*литератур/, 'Родная литература'],
+  [/родн[^\n]*язык/, 'Родной язык'],
+  [/литератур/, 'Литература'],
+  [/англ/, 'Английский язык'],
+  [/немец/, 'Немецкий язык'],
+  [/француз/, 'Французский язык'],
+  [/испан/, 'Испанский язык'],
+  [/китай/, 'Китайский язык'],
+  [/иностран/, 'Иностранный язык'],
+  [/вероятн|статистик/, 'Вероятность и статистика'],
+  [/алгебр/, 'Алгебра'],
+  [/геометр/, 'Геометрия'],
+  [/математ/, 'Математика'],
+  [/физическ[^\n]*культур|физкультур/, 'Физическая культура'],
+  [/физик/, 'Физика'],
+  [/хими/, 'Химия'],
+  [/информат/, 'Информатика'],
+  [/астроном/, 'Астрономия'],
+  [/истори/, 'История'],
+  [/обществ/, 'Обществознание'],
+  [/географ/, 'География'],
+  [/биолог/, 'Биология'],
+  [/обж|безопасност/, 'ОБЖ'],
+  [/технолог/, 'Технология'],
+  [/музык/, 'Музыка'],
+  [/изобраз|\bизо\b/, 'ИЗО'],
+  [/мхк|искусств/, 'Искусство'],
+  [/экономик/, 'Экономика'],
+  [/право/, 'Право'],
+  [/окружающ[^\n]*мир/, 'Окружающий мир'],
+  [/естествознан/, 'Естествознание']
+];
+
+// Subject is an aggregate dimension, not a free-text field. Recognize known
+// school-course stems and store only the fixed canonical label; unknown input
+// becomes NULL, so task text/answers/credentials cannot ride through it.
+function sanitizeSubject(raw) {
+  if (typeof raw !== 'string') return null;
+  const normalized = raw.slice(0, 160).toLowerCase().replace(/ё/g, 'е');
+  for (const [pattern, canonical] of SUBJECT_VOCABULARY) {
+    if (pattern.test(normalized)) return canonical;
+  }
+  return null;
+}
+
+const sanitizeProvider = (raw) => typeof raw === 'string' && PROVIDERS.has(raw) ? raw : null;
+const sanitizeModel = (raw) => typeof raw === 'string' && MODELS.has(raw) ? raw : null;
+const sanitizeLicenseType = (raw) =>
+  typeof raw === 'string' && LICENSE_TYPES.has(raw) ? raw : null;
+
+// /t/delete tombstones: an ingest admitted before a deletion must not be able
+// to recreate the erased device afterwards. Both ingest paths embed this
+// freshness check INSIDE their insert statements (D1 serializes writers, so
+// the check cannot race the delete batch). After the TTL a still-opted-in
+// install may legitimately report again.
+const TOMBSTONE_TTL_MS = 15 * 60 * 1000;
+const tombstoneCutoff = () => Date.now() - TOMBSTONE_TTL_MS;
 
 async function readJsonBounded(request, maxBytes) {
   const declared = Number(request.headers.get('content-length') || 0);
@@ -89,40 +260,146 @@ async function readJsonBounded(request, maxBytes) {
   }
 }
 
+/* ---------------- shared atomic daily budgets (D1) ---------------- */
 // Admission counters live in D1, not KV. The UPSERT is one authoritative,
 // atomic increment, so synchronized requests cannot all observe the same old
-// value and overwrite one another. IP limits bound device-id rotation; device
-// limits keep one install from consuming the whole shared IP allowance.
-async function chargeIngestBudget(env, ip, device, n) {
-  const day = mskDay();
-  const bump = (scope, key) => env.DB.prepare(
-    `INSERT INTO telemetry_budget (day, scope, budget_key, count) VALUES (?, ?, ?, ?)
-     ON CONFLICT(day, scope, budget_key) DO UPDATE SET count = count + excluded.count
-     RETURNING count`
-  ).bind(day, scope, key, n).first('count');
+// value and overwrite one another.
+//
+// The limiter must also protect the resource it meters: without the
+// per-isolate cache below, every request REJECTED for being over budget would
+// still cost a D1 write, so sustained abuse keeps consuming the database
+// forever. Once this isolate has seen D1 declare a key over its limit for the
+// current window, later hits short-circuit in memory. The cache only replays
+// verdicts D1 already made — admissions always go through the shared counter.
+const blockedBudgets = new Map(); // `${scope}|${key}` -> window (day) seen over-limit
+let blockedBudgetWindow = null;
 
-  const ipUsed = await bump('ip', ip || 'unknown');
-  if (ipUsed > INGEST_IP_DAILY_LIMIT) return false;
-  const deviceUsed = await bump('device', device);
-  return deviceUsed <= INGEST_DEVICE_DAILY_LIMIT;
+function enterBudgetWindow(day) {
+  // Do not retain yesterday's raw IP/device keys in a long-lived isolate. The
+  // cache is only an optimization for one daily window; clearing it cannot
+  // admit anything incorrectly because D1 remains the authoritative counter.
+  if (blockedBudgetWindow !== day) {
+    blockedBudgets.clear();
+    blockedBudgetWindow = day;
+  }
 }
 
-/**
- * Pseudonymize a license key: HMAC-SHA256 keyed by the ANALYTICS_SALT worker
- * secret (`wrangler secret put ANALYTICS_SALT`). Current clients send only
- * license_type; if a LEGACY client still posts the raw key, this is the only
- * form that may touch D1 — same key ⇒ same ref, so joins still work, but the
- * stored value can't be redeemed or matched back to a purchase without the
- * salt. No salt configured ⇒ store nothing.
- */
-async function licenseRef(env, rawKey) {
-  if (!rawKey || typeof rawKey !== 'string' || !env.ANALYTICS_SALT) return null;
-  const enc = new TextEncoder();
-  const hmacKey = await crypto.subtle.importKey(
-    'raw', enc.encode(env.ANALYTICS_SALT), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const sig = await crypto.subtle.sign('HMAC', hmacKey, enc.encode(rawKey.slice(0, 64)));
-  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+export function budgetBlockedToday(day, scope, key) {
+  enterBudgetWindow(day);
+  return blockedBudgets.get(`${scope}|${key}`) === day;
+}
+
+export function markBudgetBlocked(day, scope, key) {
+  enterBudgetWindow(day);
+  // Crude size bound; a cleared cache simply repopulates from D1 verdicts.
+  if (blockedBudgets.size > 10_000) blockedBudgets.clear();
+  blockedBudgets.set(`${scope}|${key}`, day);
+}
+
+export async function bumpDailyBudget(env, day, scope, key, amount, limit) {
+  if (limit > 0 && budgetBlockedToday(day, scope, key)) return limit + amount;
+  const boundedAmount = Math.max(1, Math.trunc(Number(amount) || 1));
+  let rawCount;
+  if (limit > 0) {
+    // Saturate at limit+1 and then stop mutating the row. This is shared D1
+    // state, so it protects the database even when abuse fans out across
+    // isolates whose in-memory blocked caches do not overlap.
+    rawCount = await env.DB.prepare(
+      `INSERT INTO telemetry_budget (day, scope, budget_key, count)
+       VALUES (?1, ?2, ?3, MIN(?4, ?5))
+       ON CONFLICT(day, scope, budget_key) DO UPDATE SET
+         count = MIN(telemetry_budget.count + excluded.count, ?5)
+       WHERE telemetry_budget.count <= ?6
+       RETURNING count`
+    ).bind(day, scope, key, boundedAmount, limit + 1, limit).first('count');
+  } else {
+    rawCount = await env.DB.prepare(
+      `INSERT INTO telemetry_budget (day, scope, budget_key, count) VALUES (?1, ?2, ?3, ?4)
+       ON CONFLICT(day, scope, budget_key) DO UPDATE SET count = count + excluded.count
+       RETURNING count`
+    ).bind(day, scope, key, boundedAmount).first('count');
+  }
+  // A saturated row deliberately performs no UPDATE and therefore returns no
+  // row. Treat it as blocked without reopening a write path.
+  const count = rawCount == null ? limit + boundedAmount : Number(rawCount) || 0;
+  if (limit > 0 && count > limit) markBudgetBlocked(day, scope, key);
+  return count;
+}
+
+// Reserve one unit before an expensive operation whose final verdict decides
+// whether the unit should remain charged. Unlike bumpDailyBudget(), this does
+// not use the day-long blocked cache: a later successful operation can refund
+// a reservation, so a permanent per-isolate negative cache would incorrectly
+// keep rejecting after the authoritative D1 count fell below the limit.
+export async function reserveDailyBudget(env, day, scope, key, amount, limit) {
+  const boundedAmount = Math.max(1, Math.trunc(Number(amount) || 1));
+  const rawCount = await env.DB.prepare(
+    `INSERT INTO telemetry_budget (day, scope, budget_key, count)
+     SELECT ?1, ?2, ?3, ?4
+     WHERE ?4 <= ?5
+     ON CONFLICT(day, scope, budget_key) DO UPDATE SET
+       count = telemetry_budget.count + excluded.count
+     WHERE telemetry_budget.count + excluded.count <= ?5
+     RETURNING count`
+  ).bind(day, scope, key, boundedAmount, limit).first('count');
+  // A reservation that would cross the limit deliberately performs no INSERT
+  // or UPDATE and therefore returns no row. Report an over-limit sentinel to
+  // the caller without persisting it: only admitted work may later be
+  // refunded, so a rejected concurrent reservation must never leave a +1
+  // balance that falsely keeps the shared source blocked.
+  return rawCount == null ? limit + boundedAmount : Number(rawCount) || 0;
+}
+
+// Refund a reservation after the expensive operation proved non-anonymous
+// (valid, expired, revoked, unavailable, etc.). The atomic decrement composes
+// with concurrent reservations; a missing/pruned row is already equivalent to
+// zero. Rows remain at zero so no delete-vs-insert race can lose an increment.
+export async function releaseDailyBudget(env, day, scope, key, amount = 1) {
+  const boundedAmount = Math.max(1, Math.trunc(Number(amount) || 1));
+  const rawCount = await env.DB.prepare(
+    `UPDATE telemetry_budget
+     SET count = MAX(0, count - ?4)
+     WHERE day = ?1 AND scope = ?2 AND budget_key = ?3
+     RETURNING count`
+  ).bind(day, scope, key, boundedAmount).first('count');
+  return rawCount == null ? 0 : Number(rawCount) || 0;
+}
+
+// IP limits bound device-id rotation; device limits keep one install from
+// consuming the whole shared IP allowance.
+async function chargeIngestBudget(env, ip, device, n) {
+  const day = mskDay();
+  const ipUsed = await bumpDailyBudget(env, day, 'ip', ip || 'unknown', n, INGEST_IP_DAILY_LIMIT);
+  if (ipUsed > INGEST_IP_DAILY_LIMIT) return 'rate_limited';
+  if (budgetBlockedToday(day, 'device', device)) return 'rate_limited';
+  // The conditional insert and tombstone test are one SQLite statement. If a
+  // deletion linearized first, an in-flight ingest may still consume its IP
+  // abuse budget but cannot recreate the erased device-scoped identifier row.
+  const rawDeviceUsed = await env.DB.prepare(
+    `INSERT INTO telemetry_budget (day, scope, budget_key, count)
+     SELECT ?1, 'device', ?2, MIN(?3, ?5)
+     WHERE NOT EXISTS (
+       SELECT 1 FROM device_tombstones WHERE device_id = ?2 AND deleted_at > ?4
+     )
+     ON CONFLICT(day, scope, budget_key) DO UPDATE SET
+       count = MIN(telemetry_budget.count + excluded.count, ?5)
+     WHERE telemetry_budget.count <= ?6
+     RETURNING count`
+  ).bind(
+    day, device, n, tombstoneCutoff(),
+    INGEST_DEVICE_DAILY_LIMIT + 1, INGEST_DEVICE_DAILY_LIMIT
+  ).first('count');
+  // No returned row means either a fresh deletion tombstone suppressed the
+  // insert or a saturated shared row suppressed another rejected write. Both
+  // cases stop before persistence. A locally known saturation keeps the
+  // explicit 429; the indistinguishable cross-isolate/tombstone case is a
+  // successful no-op so an erasure does not create a retry loop.
+  if (rawDeviceUsed == null) {
+    return budgetBlockedToday(day, 'device', device) ? 'rate_limited' : 'suppressed';
+  }
+  const deviceUsed = Number(rawDeviceUsed) || 0;
+  if (deviceUsed > INGEST_DEVICE_DAILY_LIMIT) markBudgetBlocked(day, 'device', device);
+  return deviceUsed <= INGEST_DEVICE_DAILY_LIMIT ? 'allowed' : 'rate_limited';
 }
 
 /**
@@ -130,12 +407,11 @@ async function licenseRef(env, rawKey) {
  * { device_id, browser, version, provider, license_type,
  *   events: [{ ts, type, subject, provider, model, tokens_in, tokens_out,
  *              cost_usd, files_pdf, files_img, meta }] }
- * (legacy clients may still send license_key/ua — the key is stored only as
- * its HMAC pseudonym, the UA is discarded)
+ * (legacy clients may still send license_key/ua — both are discarded)
  * Returns {ok:true, accepted:N}. Never throws on bad fields — they're clamped
  * or dropped, because a telemetry write must never break the extension.
  */
-export async function handleIngest(request, env) {
+export async function handleIngest(request, env, attestedDeviceId) {
   const parsed = await readJsonBounded(request, MAX_INGEST_BODY_BYTES);
   if (!parsed.ok) return parsed;
   const body = parsed.value;
@@ -143,8 +419,11 @@ export async function handleIngest(request, env) {
     return { ok: false, reason: 'bad_json', status: 400 };
   }
 
-  const device = cleanDeviceId(body.device_id);
+  const device = cleanPublicDeviceId(body.device_id);
   if (!device) return { ok: false, reason: 'bad_device', status: 400 };
+  if (!attestedDeviceId || device !== cleanPublicDeviceId(attestedDeviceId)) {
+    return { ok: false, reason: 'device_mismatch', status: 403 };
+  }
 
   const rawEvents = Array.isArray(body.events) ? body.events.slice(0, 25) : [];
   const now = Date.now();
@@ -155,63 +434,74 @@ export async function handleIngest(request, env) {
     // from the future.
     let ts = num(e.ts) || now;
     if (ts > now + 5 * 60 * 1000 || ts < now - 7 * DAY_MS) ts = now;
-    let meta = null;
-    if (e.meta != null) {
-      try { meta = JSON.stringify(e.meta).slice(0, 400); } catch { meta = null; }
-    }
     events.push({
       ts,
       day: mskDay(ts),
       type: e.type,
-      subject: clampStr(e.subject, 80),
-      provider: clampStr(e.provider, 24),
-      model: clampStr(e.model, 80),
-      tokens_in: clampInt(e.tokens_in, 5_000_000),
-      tokens_out: clampInt(e.tokens_out, 5_000_000),
-      cost_usd: Math.max(0, Math.min(50, num(e.cost_usd))),
+      subject: sanitizeSubject(e.subject),
+      provider: sanitizeProvider(e.provider),
+      model: sanitizeModel(e.model),
+      // Browser telemetry is attested to a paid device but remains
+      // self-reported. Never turn those caller-chosen numbers into
+      // financial-looking dashboard totals. Provider-observed token/cost
+      // truth arrives separately through the INGEST_KEY-gated /t/ai path.
+      tokens_in: 0,
+      tokens_out: 0,
+      cost_usd: 0,
       files_pdf: clampInt(e.files_pdf, 20),
       files_img: clampInt(e.files_img, 40),
-      meta
+      meta: sanitizeMeta(e.meta)
     });
   }
 
   const ip = request.headers.get('cf-connecting-ip') || '';
-  if (!(await chargeIngestBudget(env, ip, device, Math.max(1, events.length)))) {
+  const admission = await chargeIngestBudget(env, ip, device, Math.max(1, events.length));
+  if (admission === 'rate_limited') {
     return { ok: false, reason: 'rate_limited', status: 429 };
   }
+  if (admission === 'suppressed') return { ok: true, accepted: 0 };
 
   const browser = BROWSERS.has(body.browser) ? body.browser : 'other';
-  // Data minimization (2026-07): the raw UA is never stored (browser family is
-  // enough), and a raw license key — legacy clients only — is reduced to its
-  // HMAC pseudonym before it can reach a bind. license_key stays NULL for all
-  // new rows; the column survives only for pre-migration data.
-  const ref = await licenseRef(env, body.license_key);
+  const cutoff = tombstoneCutoff();
+  // Data minimization: raw UA/license credentials from legacy clients are
+  // ignored completely. Browser family + declared license type are sufficient
+  // for product analytics and cannot be redeemed as bearer credentials.
+  // Every insert is gated on the tombstone freshness check INSIDE the
+  // statement so an ingest admitted before a /t/delete cannot recreate the
+  // erased device afterwards.
   const stmts = [
     env.DB.prepare(
-      `INSERT INTO devices (device_id, first_seen, last_seen, browser, ua, version, provider, license_ref, license_type)
-       VALUES (?1, ?2, ?2, ?3, NULL, ?4, ?5, ?6, ?7)
+      `INSERT INTO devices (device_id, first_seen, last_seen, browser, ua, version, provider, license_key, license_type)
+       SELECT ?1, ?2, ?2, ?3, NULL, ?4, ?5, NULL, ?6
+       WHERE NOT EXISTS (
+         SELECT 1 FROM device_tombstones WHERE device_id = ?1 AND deleted_at > ?7
+       )
        ON CONFLICT(device_id) DO UPDATE SET
          last_seen   = excluded.last_seen,
          browser     = excluded.browser,
          ua          = NULL,
+         license_key = NULL,
          version     = excluded.version,
          provider    = COALESCE(excluded.provider, devices.provider),
-         license_ref = COALESCE(excluded.license_ref, devices.license_ref),
          license_type= COALESCE(excluded.license_type, devices.license_type)`
     ).bind(
       device, now, browser,
-      clampStr(body.version, 24), clampStr(body.provider, 24),
-      ref, clampStr(body.license_type, 16)
+      typeof body.version === 'string' ? sanitizeVersion(body.version) : null,
+      sanitizeProvider(body.provider), sanitizeLicenseType(body.license_type), cutoff
     )
   ];
   for (const e of events) {
     stmts.push(env.DB.prepare(
       `INSERT INTO events (ts, day, device_id, type, subject, provider, model,
                            tokens_in, tokens_out, cost_usd, files_pdf, files_img, meta)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13
+       WHERE NOT EXISTS (
+         SELECT 1 FROM device_tombstones WHERE device_id = ?3 AND deleted_at > ?14
+       )`
     ).bind(
       e.ts, e.day, device, e.type, e.subject, e.provider, e.model,
-      e.tokens_in, e.tokens_out, e.cost_usd, e.files_pdf, e.files_img, e.meta
+      e.tokens_in, e.tokens_out, e.cost_usd, e.files_pdf, e.files_img, e.meta,
+      cutoff
     ));
   }
   await env.DB.batch(stmts);
@@ -219,25 +509,114 @@ export async function handleIngest(request, env) {
 }
 
 /**
- * POST /t/delete — { device_id }: erase every analytics row for one device
- * (events + the device row itself). User-initiated from Settings; the device
- * id is the caller's own unguessable UUID, so no further auth is needed —
- * a forged request can only erase its own pseudonymous data. Idempotent.
+ * POST /t/delete — erase every analytics row for the device authenticated by
+ * the Worker's deletion-only erasure capability. The request body is parsed
+ * only for a bounded JSON contract; any caller-supplied device id is ignored.
  */
-export async function handleDeleteDevice(request, env) {
+export async function handleDeleteDevice(request, env, attestedDeviceId = '') {
   const parsed = await readJsonBounded(request, MAX_DELETE_BODY_BYTES);
   if (!parsed.ok) return parsed;
   const body = parsed.value;
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return { ok: false, reason: 'bad_json', status: 400 };
   }
-  const device = cleanDeviceId(body.device_id);
+  const device = cleanPublicDeviceId(attestedDeviceId);
   if (!device) return { ok: false, reason: 'bad_device', status: 400 };
+  const known = await env.DB.prepare(
+    `SELECT (
+       EXISTS(SELECT 1 FROM devices WHERE device_id = ?1) OR
+       EXISTS(SELECT 1 FROM events WHERE device_id = ?1) OR
+       EXISTS(SELECT 1 FROM telemetry_budget WHERE scope = 'device' AND budget_key = ?1)
+     ) AS known`
+  ).bind(device).first('known');
+  // Do not let authenticated-but-empty devices churn tombstones. The delete is
+  // still idempotently successful from the user's perspective.
+  if (Number(known) !== 1) return { ok: true, deleted: false };
+  // Tombstone FIRST, in the same atomic batch as the deletes: any ingest
+  // write lands either entirely before this batch (its rows are deleted
+  // below) or entirely after (its inserts see the tombstone and no-op), so
+  // "deleted" can no longer be silently undone by an in-flight request.
+  // Admission budgets keyed by this device id are personal identifiers too
+  // and must not survive the user's erasure.
   await env.DB.batch([
+    env.DB.prepare(
+      `INSERT INTO device_tombstones (device_id, deleted_at) VALUES (?1, ?2)
+       ON CONFLICT(device_id) DO UPDATE SET deleted_at = excluded.deleted_at`
+    ).bind(device, Date.now()),
     env.DB.prepare('DELETE FROM events  WHERE device_id = ?').bind(device),
-    env.DB.prepare('DELETE FROM devices WHERE device_id = ?').bind(device)
+    env.DB.prepare('DELETE FROM devices WHERE device_id = ?').bind(device),
+    env.DB.prepare(
+      "DELETE FROM telemetry_budget WHERE scope = 'device' AND budget_key = ?"
+    ).bind(device)
   ]);
-  return { ok: true };
+  blockedBudgets.delete(`device|${device}`);
+  return { ok: true, deleted: true };
+}
+
+/* ----------------------- retention enforcement ------------------------ */
+
+const BUDGET_RETENTION_DAYS = 7;
+const TOMBSTONE_RETENTION_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_ANALYTICS_RETENTION_DAYS = 90;
+const MIN_ANALYTICS_RETENTION_DAYS = 30;
+const MAX_ANALYTICS_RETENTION_DAYS = 365;
+
+function analyticsRetentionDays(env) {
+  const configured = Number(env?.ANALYTICS_RETENTION_DAYS);
+  if (!Number.isFinite(configured) || configured <= 0) {
+    return DEFAULT_ANALYTICS_RETENTION_DAYS;
+  }
+  return Math.max(
+    MIN_ANALYTICS_RETENTION_DAYS,
+    Math.min(MAX_ANALYTICS_RETENTION_DAYS, Math.trunc(configured))
+  );
+}
+
+/**
+ * Cron-driven lifecycle enforcement for the identifier-bearing bookkeeping
+ * tables. Budget rows carry raw IPs, device ids, and Telegram uids for abuse
+ * control; they are operationally dead after a few days and must not
+ * accumulate into a permanent identifier log. proxy_quota rows for past days
+ * are dead weight by contract (schema.sql), and tombstones only need to
+ * outlive their 15-minute TTL. Pseudonymous product events and inactive
+ * device rows also have a finite lifecycle (90 days by default, configurable
+ * from 30–365 days) in addition to immediate per-device erasure via /t/delete.
+ * Deletes are cheap no-ops when nothing is due (day is the PK prefix).
+ */
+export async function pruneExpiredAnalytics(env) {
+  if (!env.DB) return { pruned: false };
+  const now = Date.now();
+  // Keep exactly seven Moscow calendar buckets: today plus the previous six.
+  // Subtracting seven days and deleting `< cutoff` retained an eighth bucket
+  // (the day exactly seven days ago).
+  const dayCutoff = mskDay(now - (BUDGET_RETENTION_DAYS - 1) * DAY_MS);
+  const analyticsDays = analyticsRetentionDays(env);
+  const analyticsCutoffMs = now - analyticsDays * DAY_MS;
+  const analyticsDayCutoff = mskDay(analyticsCutoffMs);
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM telemetry_budget WHERE day < ?1').bind(dayCutoff),
+    env.DB.prepare('DELETE FROM proxy_quota WHERE day < ?1').bind(dayCutoff),
+    env.DB.prepare('DELETE FROM device_tombstones WHERE deleted_at < ?1')
+      .bind(now - TOMBSTONE_RETENTION_MS),
+    env.DB.prepare('DELETE FROM events WHERE ts < ?1').bind(analyticsCutoffMs),
+    // Keep a device if any retained event contradicts a stale last_seen value.
+    // This is defensive against historic/imported rows whose mirror timestamp
+    // was incomplete; the event is more useful than the denormalized field.
+    env.DB.prepare(
+      `DELETE FROM devices
+       WHERE last_seen < ?1
+         AND NOT EXISTS (
+           SELECT 1 FROM events
+           WHERE events.device_id = devices.device_id AND events.ts >= ?1
+         )`
+    ).bind(analyticsCutoffMs)
+  ]);
+  return {
+    pruned: true,
+    budget_before_day: dayCutoff,
+    analytics_before_day: analyticsDayCutoff,
+    analytics_retention_days: analyticsDays
+  };
 }
 
 /* --------------------------- server ingest ---------------------------- */
@@ -269,34 +648,39 @@ export async function handleServerIngest(request, env) {
   const stmts = [];
   let accepted = 0;
   for (const e of rawEvents) {
-    const device = cleanDeviceId(e?.device_id);
+    const device = cleanPublicDeviceId(e?.device_id);
     if (!device) continue;
     let ts = num(e.ts) || now;
     if (ts > now + 5 * 60 * 1000 || ts < now - 7 * DAY_MS) ts = now;
-    let meta = null;
-    if (e.meta != null) {
-      try { meta = JSON.stringify(e.meta).slice(0, 400); } catch { meta = null; }
-    }
     // The device row may not exist yet — server events arrive even for
     // installs that never opted into client telemetry. Create a minimal row
     // so per-user drilldowns and the users table can join; never move
-    // first_seen forward or clobber client-reported fields.
+    // first_seen forward or clobber client-reported fields. Same tombstone
+    // gate and meta minimization as the open /t path: the VPS is trusted,
+    // but the stored shape stays uniformly content-free.
+    const cutoff = tombstoneCutoff();
     stmts.push(env.DB.prepare(
       `INSERT INTO devices (device_id, first_seen, last_seen)
-       VALUES (?1, ?2, ?2)
+       SELECT ?1, ?2, ?2
+       WHERE NOT EXISTS (
+         SELECT 1 FROM device_tombstones WHERE device_id = ?1 AND deleted_at > ?3
+       )
        ON CONFLICT(device_id) DO UPDATE SET
          last_seen = MAX(devices.last_seen, excluded.last_seen)`
-    ).bind(device, ts));
+    ).bind(device, ts, cutoff));
     stmts.push(env.DB.prepare(
       `INSERT INTO events (ts, day, device_id, type, subject, provider, model,
                            tokens_in, tokens_out, cost_usd, files_pdf, files_img, meta)
-       VALUES (?, ?, ?, 'ai_call', NULL, ?, ?, ?, ?, ?, 0, 0, ?)`
+       SELECT ?1, ?2, ?3, 'ai_call', NULL, ?4, ?5, ?6, ?7, ?8, 0, 0, ?9
+       WHERE NOT EXISTS (
+         SELECT 1 FROM device_tombstones WHERE device_id = ?3 AND deleted_at > ?10
+       )`
     ).bind(
       ts, mskDay(ts), device,
-      clampStr(e.provider, 24), clampStr(e.model, 80),
+      sanitizeProvider(e.provider), sanitizeModel(e.model),
       clampInt(e.tokens_in, 5_000_000), clampInt(e.tokens_out, 5_000_000),
       Math.max(0, Math.min(50, num(e.cost_usd))),
-      meta
+      sanitizeMeta(e.meta), cutoff
     ));
     accepted++;
   }
@@ -313,18 +697,27 @@ export async function handleServerIngest(request, env) {
  */
 export async function mirrorLicense(env, license) {
   if (!env.DB || !license?.key) return;
+  let amountKopecks = license.amount_kopecks;
+  if (amountKopecks == null && license.amount_rub != null) {
+    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(license.amount_rub));
+    amountKopecks = match
+      ? Number(match[1]) * 100 + Number((match[2] || '').padEnd(2, '0'))
+      : null;
+  }
+  if (!Number.isSafeInteger(amountKopecks) || amountKopecks <= 0) amountKopecks = null;
   await env.DB.prepare(
     `INSERT OR REPLACE INTO purchases
-       (license_key, gateway, payment_id, type, status, amount_rub, email,
-        telegram_user_id, issued_at, expires_at, is_preorder, note, device_ids)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       (license_key, gateway, payment_id, type, status, amount_rub, amount_kopecks,
+        email, telegram_user_id, issued_at, expires_at, is_preorder, note, device_ids)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     license.key,
     license.gateway || null,
     license.payment_id || null,
     license.type || null,
     license.status || null,
-    license.amount_rub == null ? null : num(license.amount_rub),
+    amountKopecks == null ? null : amountKopecks / 100,
+    amountKopecks,
     license.email || null,
     license.telegram_user_id == null ? null : String(license.telegram_user_id),
     license.issued_at ? Date.parse(license.issued_at) || null : null,
@@ -347,11 +740,45 @@ export async function backfillLicenses(env) {
       try { license = JSON.parse(raw); } catch { continue; }
       if (!license?.key) continue;
       await mirrorLicense(env, license);
+      // Seed the write-once materialization flag for rows created before the
+      // kv_materializations table existed: a listed row provably exists, so a
+      // payment-webhook replay must never rewrite its issue-time snapshot.
+      await markMaterialized(env, `license:${license.key}`);
       imported++;
     }
     cursor = page.list_complete ? null : page.cursor;
   } while (cursor);
-  return { imported };
+  // Same protection for referral records that predate the flag table: their
+  // counters/reward pointers must never be reset by a claim recovery either.
+  let refCursor, refsFlagged = 0;
+  do {
+    const page = await env.LICENSES.list({ prefix: 'ref:', cursor: refCursor, limit: 1000 });
+    for (const k of page.keys) {
+      await markMaterialized(env, k.name);
+      refsFlagged++;
+    }
+    refCursor = page.list_complete ? null : page.cursor;
+  } while (refCursor);
+  return { imported, refs_flagged: refsFlagged };
+}
+
+/** Purge legacy identifiers across both pre- and post-license_ref schemas. */
+export async function purgeLegacyIdentifiers(env) {
+  try {
+    const result = await env.DB.prepare(
+      `UPDATE devices SET ua = NULL, license_key = NULL, license_ref = NULL
+       WHERE ua IS NOT NULL OR license_key IS NOT NULL OR license_ref IS NOT NULL`
+    ).run();
+    return { rows: Number(result?.meta?.changes) || 0, pseudonym_column: true };
+  } catch {
+    // Older databases never received license_ref; the raw columns still exist
+    // and must be purged without making that optional migration a dependency.
+    const result = await env.DB.prepare(
+      `UPDATE devices SET ua = NULL, license_key = NULL
+       WHERE ua IS NOT NULL OR license_key IS NOT NULL`
+    ).run();
+    return { rows: Number(result?.meta?.changes) || 0, pseudonym_column: false };
+  }
 }
 
 /* ----------------------------- aggregates ---------------------------- */
@@ -405,9 +832,9 @@ async function revenueRollup(env, fromTs, toTs = null) {
   const row = await env.DB.prepare(
     `SELECT
        COUNT(*)                                            AS licenses,
-       SUM(CASE WHEN amount_rub > 0 THEN 1 ELSE 0 END)     AS paid,
-       SUM(COALESCE(amount_rub, 0))                        AS revenue_rub,
-       AVG(CASE WHEN amount_rub > 0 THEN amount_rub END)   AS avg_check_rub,
+       SUM(CASE WHEN amount_kopecks > 0 THEN 1 ELSE 0 END) AS paid,
+       SUM(COALESCE(amount_kopecks, 0))                    AS revenue_kopecks,
+       AVG(CASE WHEN amount_kopecks > 0 THEN amount_kopecks END) AS avg_check_kopecks,
        SUM(type = 'subscription')                          AS subscriptions,
        SUM(type = 'lifetime')                              AS lifetimes,
        SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END) AS revoked,
@@ -417,6 +844,8 @@ async function revenueRollup(env, fromTs, toTs = null) {
   ).bind(...binds).first();
   const out = {};
   for (const k of Object.keys(row || {})) out[k] = num(row[k]);
+  out.revenue_rub = out.revenue_kopecks / 100;
+  out.avg_check_rub = out.avg_check_kopecks / 100;
   return out;
 }
 
@@ -521,7 +950,7 @@ export async function statsTimeseries(env, days) {
     env.DB.prepare(
       `SELECT date(issued_at / 1000 + 10800, 'unixepoch') AS day,
               COUNT(*) AS purchases,
-              SUM(COALESCE(amount_rub, 0)) AS revenue_rub
+              SUM(COALESCE(amount_kopecks, 0)) AS revenue_kopecks
        FROM purchases WHERE issued_at >= ? GROUP BY 1`
     ).bind(fromTs).all()
   ]);
@@ -548,7 +977,7 @@ export async function statsTimeseries(env, days) {
   for (const r of pur?.results || []) {
     if (!byDay[r.day]) continue;
     byDay[r.day].purchases = num(r.purchases);
-    byDay[r.day].revenue_rub = num(r.revenue_rub);
+    byDay[r.day].revenue_rub = num(r.revenue_kopecks) / 100;
   }
   return { ok: true, days: n, rows: Object.values(byDay) };
 }
@@ -569,9 +998,14 @@ const USER_SORTS = {
 export async function statsUsers(env, p) {
   const days = num(p.days);
   const from = days > 0 ? daysBack(days - 1) : '0000-00-00';
-  const sort = USER_SORTS[p.sort] || USER_SORTS.cost;
-  const limit = Math.max(1, Math.min(200, num(p.limit) || 50));
-  const offset = Math.max(0, num(p.offset));
+  // `sort`, `limit` and `offset` are the only fragments spliced into the SQL
+  // text below, so each must be reduced to a value this module chose. Own-
+  // property lookup keeps `?sort=constructor` from interpolating a function
+  // into ORDER BY, and truncation keeps a fractional `?limit=5.5` from
+  // reaching SQLite, which rejects a non-integer LIMIT outright.
+  const sort = (Object.hasOwn(USER_SORTS, p.sort) ? USER_SORTS[p.sort] : null) || USER_SORTS.cost;
+  const limit = Math.max(1, Math.min(200, Math.trunc(num(p.limit)) || 50));
+  const offset = Math.max(0, Math.trunc(num(p.offset)));
 
   // Filters bind ONLY to the outer WHERE (they exist in both the page query and
   // the count query). The window `from` binds only to the JOIN subquery, which
@@ -584,8 +1018,11 @@ export async function statsUsers(env, p) {
   if (p.license === 'paid') filters.push(`d.license_type IN ('subscription','lifetime')`);
   if (p.license === 'none') filters.push(`(d.license_type IS NULL OR d.license_type = 'none')`);
   if (p.q) {
-    const like = `%${String(p.q).slice(0, 40)}%`;
-    filters.push('(d.device_id LIKE ? OR d.license_key LIKE ?)');
+    // The search term is bound, but LIKE still reads `%` and `_` in the VALUE
+    // as wildcards — an unescaped `%` matches every device instead of the
+    // literal the operator typed. Escape them and declare the escape char.
+    const like = `%${String(p.q).slice(0, 40).replace(/[\\%_]/g, '\\$&')}%`;
+    filters.push(`(d.device_id LIKE ? ESCAPE '\\' OR d.license_key LIKE ? ESCAPE '\\')`);
     filterBinds.push(like, like);
   }
   const where = filters.length ? 'WHERE ' + filters.join(' AND ') : '';
@@ -647,7 +1084,7 @@ export async function statsUserDetail(env, deviceId) {
     env.DB.prepare(
       `SELECT day,
               SUM(type IN ${USE_TYPES}) AS uses,
-              SUM(cost_usd)             AS cost_usd
+              SUM(CASE WHEN type != 'ai_call' THEN cost_usd ELSE 0 END) AS cost_usd
        FROM events WHERE device_id = ?1 AND day >= ?2 GROUP BY day ORDER BY day`
     ).bind(device, daysBack(59)).all(),
     env.DB.prepare(
@@ -712,24 +1149,114 @@ export async function statsSubjects(env, days) {
   return { ok: true, subjects: rows?.results || [] };
 }
 
-/** GET /admin/stats/purchases?days=N — list + slices for the money tab. */
-export async function statsPurchases(env, days) {
+/** GET /admin/stats/purchases?days=N&limit=N&cursor=... — money-tab pages. */
+const PURCHASE_LIST_LIMIT = 500;
+const PURCHASE_LIST_DEFAULT = 100;
+const PURCHASE_OFFSET_MAX = 1_000_000;
+const PURCHASE_CURSOR_MAX_CHARS = 512;
+
+function purchaseCursor(row) {
+  const payload = JSON.stringify([Number(row?.issued_at) || 0, String(row?.license_key || '')]);
+  const bytes = new TextEncoder().encode(payload);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function parsePurchaseCursor(raw) {
+  if (raw == null || raw === '') return { ok: true, value: null };
+  const value = typeof raw === 'string' ? raw.trim() : '';
+  if (!value || value.length > PURCHASE_CURSOR_MAX_CHARS || !/^[A-Za-z0-9_-]+$/.test(value)) {
+    return { ok: false };
+  }
+  try {
+    const padded = value.replace(/-/g, '+').replace(/_/g, '/') +
+      '='.repeat((4 - value.length % 4) % 4);
+    const decoded = atob(padded);
+    if (btoa(decoded).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '') !== value) {
+      return { ok: false };
+    }
+    const bytes = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    const issuedAt = Number(parsed?.[0]);
+    const licenseKey = parsed?.[1];
+    if (!Array.isArray(parsed) || parsed.length !== 2 ||
+        !Number.isSafeInteger(issuedAt) || issuedAt < 0 ||
+        typeof licenseKey !== 'string' || !licenseKey || licenseKey.length > 128) {
+      return { ok: false };
+    }
+    return { ok: true, value: { issued_at: issuedAt, license_key: licenseKey } };
+  } catch {
+    return { ok: false };
+  }
+}
+
+function purchaseListOptions(raw) {
+  const options = raw && typeof raw === 'object' ? raw : { days: raw };
+  const days = Math.max(0, Math.min(3650, Math.trunc(Number(options.days) || 0)));
+  const requestedLimit = Math.trunc(Number(options.limit) || PURCHASE_LIST_DEFAULT);
+  const limit = Math.max(1, Math.min(PURCHASE_LIST_LIMIT, requestedLimit));
+  const requestedOffset = Math.trunc(Number(options.offset) || 0);
+  if (requestedOffset < 0 || requestedOffset > PURCHASE_OFFSET_MAX) {
+    return { ok: false, reason: 'bad_offset', status: 400 };
+  }
+  const cursor = parsePurchaseCursor(options.cursor);
+  if (!cursor.ok) return { ok: false, reason: 'bad_cursor', status: 400 };
+  return { ok: true, days, limit, offset: requestedOffset, cursor: cursor.value };
+}
+
+export async function statsPurchases(env, rawOptions) {
+  const options = purchaseListOptions(rawOptions);
+  if (!options.ok) return options;
+  const { days, limit, offset, cursor } = options;
   const fromTs = days > 0 ? Date.now() - days * DAY_MS : 0;
+  const listStatement = cursor
+    ? env.DB.prepare(
+      `SELECT * FROM purchases
+       WHERE COALESCE(issued_at, 0) >= ?
+         AND (COALESCE(issued_at, 0) < ?
+           OR (COALESCE(issued_at, 0) = ? AND license_key < ?))
+       ORDER BY COALESCE(issued_at, 0) DESC, license_key DESC
+       LIMIT ?`
+    ).bind(fromTs, cursor.issued_at, cursor.issued_at, cursor.license_key, limit + 1)
+    : env.DB.prepare(
+      `SELECT * FROM purchases
+       WHERE COALESCE(issued_at, 0) >= ?
+       ORDER BY COALESCE(issued_at, 0) DESC, license_key DESC
+       LIMIT ? OFFSET ?`
+    ).bind(fromTs, limit + 1, offset);
   const [rows, gateways, summary] = await Promise.all([
-    env.DB.prepare(
-      `SELECT * FROM purchases WHERE issued_at >= ? ORDER BY issued_at DESC LIMIT 500`
-    ).bind(fromTs).all(),
+    // Fetch one extra row so clients receive an explicit continuation signal.
+    // license_key is the stable tie-breaker when payments share issued_at.
+    listStatement.all(),
     env.DB.prepare(
       `SELECT COALESCE(gateway,'?') AS gateway, COUNT(*) AS n,
-              SUM(COALESCE(amount_rub,0)) AS revenue_rub
-       FROM purchases WHERE issued_at >= ? GROUP BY 1 ORDER BY revenue_rub DESC`
+              SUM(COALESCE(amount_kopecks,0)) AS revenue_kopecks
+       FROM purchases WHERE issued_at >= ? GROUP BY 1 ORDER BY revenue_kopecks DESC`
     ).bind(fromTs).all(),
     revenueRollup(env, fromTs || null)
   ]);
+  const list = rows?.results || [];
+  const hasMore = list.length > limit;
+  const page = list.slice(0, limit);
   return {
     ok: true,
-    purchases: rows?.results || [],
-    gateways: gateways?.results || [],
+    limit,
+    offset: cursor ? null : offset,
+    truncated: hasMore,
+    has_more: hasMore,
+    // Offset remains for older dashboard builds, but an opaque keyset cursor is
+    // the unbounded continuation mechanism. Never clamp an oversized offset
+    // backward and repeat a page forever.
+    next_offset: hasMore && !cursor && offset + limit <= PURCHASE_OFFSET_MAX
+      ? offset + limit
+      : null,
+    next_cursor: hasMore && page.length ? purchaseCursor(page[page.length - 1]) : null,
+    purchases: page,
+    gateways: (gateways?.results || []).map((row) => ({
+      ...row,
+      revenue_rub: num(row.revenue_kopecks) / 100
+    })),
     summary
   };
 }
@@ -737,6 +1264,7 @@ export async function statsPurchases(env, days) {
 /**
  * GET /admin/stats/retention — classic D1/D7/D30 (exact-day, among devices old
  * enough to qualify) + 8 weekly cohorts × 8 weeks of "came back that week".
+ * `truncated` makes the hard D1 scan bound explicit to API consumers.
  */
 export async function statsRetention(env) {
   const [devices, activity] = await Promise.all([
@@ -745,11 +1273,12 @@ export async function statsRetention(env) {
       `SELECT device_id, day FROM events WHERE day >= ? GROUP BY device_id, day LIMIT 100000`
     ).bind(daysBack(90)).all()
   ]);
+  const activityRows = activity?.results || [];
 
   const firstDay = {};
   for (const d of devices?.results || []) firstDay[d.device_id] = mskDay(num(d.first_seen));
   const activeDays = {};
-  for (const r of activity?.results || []) (activeDays[r.device_id] ||= new Set()).add(r.day);
+  for (const r of activityRows) (activeDays[r.device_id] ||= new Set()).add(r.day);
 
   const today = mskDay();
   const dayNum = (d) => Math.floor(Date.parse(d + 'T00:00:00Z') / DAY_MS);
@@ -792,6 +1321,7 @@ export async function statsRetention(env) {
 
   return {
     ok: true,
+    truncated: activityRows.length >= 100000,
     classic: Object.fromEntries(Object.entries(classic).map(([k, v]) => [
       k, { eligible: v.n, returned: v.back, rate: v.n ? v.back / v.n : null }
     ])),
@@ -799,7 +1329,10 @@ export async function statsRetention(env) {
   };
 }
 
-/** GET /admin/stats/referrals — rollup of the KV referral records. */
+/**
+ * GET /admin/stats/referrals — rollup of the KV referral records. `truncated`
+ * is true when another KV cursor remained after the 5000-record safety bound.
+ */
 export async function statsReferrals(env) {
   let cursor;
   const codes = [];
@@ -825,6 +1358,7 @@ export async function statsReferrals(env) {
   codes.sort((a, b) => b.purchases - a.purchases || b.days_earned - a.days_earned);
   return {
     ok: true,
+    truncated: !!cursor,
     total_codes: codes.length,
     total_referred_purchases: codes.reduce((s, c) => s + c.purchases, 0),
     total_days_earned: codes.reduce((s, c) => s + c.days_earned, 0),
@@ -855,8 +1389,12 @@ export async function statsRate(env, force = false) {
   if (fresh && !force) return { ok: true, ...cached, stale: false, source: 'cbr' };
 
   try {
-    const res = await fetch(FX_URL, { headers: { accept: 'application/json' } });
-    const data = await res.json().catch(() => null);
+    const res = await fetch(FX_URL, {
+      headers: { accept: 'application/json' },
+      redirect: 'manual'
+    });
+    const parsed = await readJsonBounded(res, 64 * 1024);
+    const data = parsed.ok ? parsed.value : null;
     const rate = Number(data?.Valute?.USD?.Value);
     if (!res.ok || !Number.isFinite(rate) || rate <= 0) {
       if (cached) return { ok: true, ...cached, stale: true, source: 'cache' };

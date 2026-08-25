@@ -16,11 +16,20 @@
  */
 
 export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, qwen: 80, deepseek: 150 };
+// Single source of truth for the ceiling advertised in Settings; also clamps hand-edited storage values.
+export const MAX_DAILY_LIMIT = 10000;
 
 // Human-readable provider names for the over-limit error message.
 const PROVIDER_NAMES = { openrouter: 'OpenRouter', groq: 'Groq', qwen: 'Qwen', deepseek: 'DeepSeek' };
 const HISTORY_DAYS = 14;
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
+
+/**
+ * Storage reservations expire so an orphan cannot block the budget forever,
+ * but a live long stream can outlast that TTL. Worker-local state lets its
+ * commit still charge usage; if the worker dies, its awaiting stream dies too.
+ */
+const localReservations = new Map();
 
 // chrome.storage.local has no compare-and-swap. Serialising every reservation
 // transition inside this service worker prevents simultaneous solves from
@@ -64,7 +73,7 @@ async function load() {
 
 function limitFor(rateLimits, provider) {
   const v = Number(rateLimits[provider]);
-  return Number.isFinite(v) && v > 0 ? Math.floor(v) : DEFAULT_LIMITS[provider] ?? 100;
+  return Number.isFinite(v) && v > 0 ? Math.min(MAX_DAILY_LIMIT, Math.floor(v)) : DEFAULT_LIMITS[provider] ?? 100;
 }
 
 function currentCount(slot, day) {
@@ -80,17 +89,28 @@ function currentCount(slot, day) {
  * orphan can only block a slot until its short expiry.
  */
 async function reserveOneInner(provider) {
+  const day = todayKey();
+  for (const [id, reservation] of localReservations) {
+    if (reservation.day !== day) localReservations.delete(id);
+  }
   const { rateLimits, rateUsage, rateAttempts, rateReservations } = await load();
   const limit = limitFor(rateLimits, provider);
-  const day = todayKey();
   const used = currentCount(rateUsage[provider], day);
   const now = Date.now();
   const reservations = {};
+  const countedIds = new Set();
   let pending = 0;
   for (const [id, reservation] of Object.entries(rateReservations || {})) {
     if (!reservation || !Number.isFinite(reservation.expiresAt) || reservation.expiresAt <= now) continue;
     reservations[id] = reservation;
+    countedIds.add(id);
     if (reservation.provider === provider && reservation.day === day) pending++;
+  }
+  // Storage reservations expire for crash recovery, but a live request in this
+  // worker remains chargeable after that TTL. Count those worker-local slots as
+  // well or a long stream can reserve past the cap and commit over budget.
+  for (const [id, reservation] of localReservations) {
+    if (!countedIds.has(id) && reservation.provider === provider && reservation.day === day) pending++;
   }
   if (used + pending >= limit) {
     const name = PROVIDER_NAMES[provider] || provider;
@@ -110,6 +130,7 @@ async function reserveOneInner(provider) {
   const id = crypto.randomUUID();
   reservations[id] = { provider, day, expiresAt: now + RESERVATION_TTL_MS };
   await chrome.storage.local.set({ rateAttempts: nextAttempts, rateReservations: reservations });
+  localReservations.set(id, { provider, day });
   return id;
 }
 
@@ -123,8 +144,13 @@ export function reserveOne(provider) {
 
 async function commitOneInner(id) {
   const { rateUsage, rateHistory, rateReservations } = await load();
-  const reservation = rateReservations?.[id];
-  if (!reservation) throw new Error('Rate-limit reservation expired before commit.');
+  const reservation = rateReservations?.[id] || localReservations.get(id);
+  /**
+   * The answer has already been delivered. These counters are client-side UX;
+   * server caps remain authoritative, so an unknown reservation is a silent
+   * undercount rather than a false solve failure.
+   */
+  if (!reservation) return;
 
   const reservations = { ...rateReservations };
   delete reservations[id];
@@ -139,15 +165,25 @@ async function commitOneInner(id) {
   const row = hist[day] || {};
   hist[day] = { ...row, [provider]: (Number(row[provider]) || 0) + 1 };
   await chrome.storage.local.set({ rateUsage: usage, rateHistory: hist, rateReservations: reservations });
+  localReservations.delete(id);
 }
 
 export function commitOne(id) {
-  const run = chargeQueue.then(() => commitOneInner(id));
-  chargeQueue = run.catch(() => {});
+  // The provider has already returned a successful (and potentially paid)
+  // answer before this bookkeeping runs. A local-storage outage must never
+  // turn that answer into a retryable provider error: doing so both discards
+  // useful work and invites a second paid request. Drop the worker-local hold
+  // on failure; any persisted reservation remains non-chargeable and expires
+  // through the normal crash-recovery TTL.
+  const run = chargeQueue
+    .then(() => commitOneInner(id))
+    .catch(() => { localReservations.delete(id); });
+  chargeQueue = run;
   return run;
 }
 
 async function cancelOneInner(id) {
+  localReservations.delete(id);
   const { rateReservations } = await load();
   if (!rateReservations || !Object.hasOwn(rateReservations, id)) return;
   const reservations = { ...rateReservations };

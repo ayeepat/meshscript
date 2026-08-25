@@ -3,8 +3,8 @@
  * setting in chrome.storage.local. Defaults to OpenRouter (Gemini 2.5 Flash).
  *
  * Four providers: OpenRouter (BYO key, main solver, reads PDFs natively),
- * Groq (BYO free key, vision + text, also the fallback for classification/
- * audio — see classify-ai.js/groq.js's transcribeAudio), Qwen (qwen3.7-plus —
+ * Groq (BYO free key, vision + text, also transcribes listening audio — see
+ * groq.js's transcribeAudio), Qwen (qwen3.7-plus —
  * vision + text) and DeepSeek (deepseek-v4-flash — cheapest, TEXT ONLY, no
  * vision). Qwen and DeepSeek need NO user key: they run through the СМЭШ
  * license proxy (smesh-proxy.js), with a hidden BYO Alibaba-key path for
@@ -17,6 +17,7 @@ import { askQwen } from './qwen.js';
 import { askDeepseek } from './deepseek.js';
 import { isImageFile, isPdfFile } from './file-kinds.js';
 import { SECURITY_GUARD } from './security-prompt.js';
+import { consentNetworkSignal } from './consent.js';
 
 export const AI_PROVIDERS = ['openrouter', 'groq', 'qwen', 'deepseek'];
 
@@ -52,9 +53,13 @@ export async function askAI(systemPrompt, userText, files = [], history = [], op
   }
   // Tag the usage frame with the provider we actually routed to, so callers
   // (telemetry) don't have to re-derive it. Pure pass-through when no onUsage.
+  // This is the centralized last gate immediately before any provider
+  // dispatcher can call fetch(). It re-reads consent after all slow capture /
+  // attachment preparation and aborts an in-flight request on withdrawal.
+  const networkSignal = await consentNetworkSignal(opts.signal || null);
   const routed = opts.onUsage
-    ? { ...opts, onUsage: (usage) => opts.onUsage(usage, chosen) }
-    : opts;
+    ? { ...opts, signal: networkSignal, onUsage: (usage) => opts.onUsage(usage, chosen) }
+    : { ...opts, signal: networkSignal };
   if (chosen === 'groq') return askGroq(hardenedSystemPrompt, userText, files, history, routed);
   if (chosen === 'qwen') return askQwen(hardenedSystemPrompt, userText, files, history, routed);
   if (chosen === 'deepseek') return askDeepseek(hardenedSystemPrompt, userText, files, history, routed);

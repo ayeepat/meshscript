@@ -6,6 +6,8 @@ import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
+const ACTIVATION_TOKEN = 'A'.repeat(43);
+
 async function listen(server) {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
@@ -73,7 +75,8 @@ try {
   const started = await post(`${base}/ai/start`, {
     provider: 'qwen',
     license_key: 'SMESH-TEST-TEST-TEST',
-    device_id: 'device-aaaaaaaa',
+    device_id: '00000000-0000-4000-8000-000000000063',
+    activation_token: ACTIVATION_TOKEN,
     messages: [{ role: 'user', content: 'hi' }]
   });
   assert.equal(started.status, 200);

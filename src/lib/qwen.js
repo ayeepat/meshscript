@@ -37,6 +37,7 @@ import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
 import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 import { getLicenseStatus } from './license.js';
+import { clipText } from './clip-text.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
 // PROXY_QWEN_MODEL, now served via 302.AI) — this constant talks to
@@ -72,13 +73,13 @@ function fileToContentPart(f, allowPdf) {
     };
   }
   if (isTextFile(f)) {
-    // Plain text and locally-extracted Office docs (see extract.js) — inline
-    // the contents so the model actually reads them instead of refusing.
+    // Plain text and locally-extracted Office docs (see extract.js) — inline a
+    // marked prefix so the model reads them and knows if the source is clipped.
     const text = base64ToUtf8(f.dataBase64);
     return {
       type: 'text',
       text: text
-        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
+        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${clipText(text, 50000)}`
         : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
     };
   }

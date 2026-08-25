@@ -60,6 +60,35 @@ assert.equal(
   'detecting the reported route must start mounting the pill'
 );
 
+// «Цифровой учитель» / Фундаментальные науки — the 2026 inline task route. The
+// task renders directly in the page (no xAPI iframe), so route detection is the
+// only signal; the pill must still appear.
+const dtTaskRoute = detectorFor('https://school.mos.ru/dt/fundamental/maths/go?subcategory_id=2172');
+assert.equal(
+  dtTaskRoute.looksLikeTest(),
+  true,
+  'the Digital Teacher /dt task route must show the solve pill'
+);
+assert.equal(
+  dtTaskRoute.buildStarted(),
+  true,
+  'detecting the /dt task route must start mounting the pill'
+);
+
+// A /dt task view identified by subcategory_id alone (no /go segment) still counts.
+assert.equal(
+  detectorFor('https://school.mos.ru/dt/fundamental/physics/task?subcategory_id=88').looksLikeTest(),
+  true,
+  'a /dt task view carrying subcategory_id is detected even without a /go segment'
+);
+
+// …but a bare /dt catalog/landing page (no /go, no subcategory_id) stays quiet.
+assert.equal(
+  detectorFor('https://school.mos.ru/dt/fundamental/maths').looksLikeTest(),
+  false,
+  'the /dt topic catalog (no task markers) must not trip the pill'
+);
+
 assert.equal(
   detectorFor('https://school.mos.ru/library/test').looksLikeTest(),
   false,

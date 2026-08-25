@@ -4,11 +4,20 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "check": "node scripts/check-source.mjs",
+    "package:extension": "node scripts/package-extension.mjs",
+    "verify:package": "node scripts/package-extension.mjs --verify",
     "test": "node scripts/run-regressions.mjs",
     "test:vps-parity": "node tests/vps-setup-parity.mjs",
-    "sync:vps": "node scripts/sync-vps-server.mjs"
+    "sync:vps": "node scripts/sync-vps-server.mjs",
+    "verify": "npm run check && npm test"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "parse5": "8.0.1",
+    "postcss": "8.5.26",
+    "yaml": "2.9.0"
   }
 }

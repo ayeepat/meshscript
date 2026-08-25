@@ -5,25 +5,33 @@
  */
 import { askAI, normalizeAIProvider } from '../lib/ai.js';
 import { getByoKey } from '../lib/qwen.js';
-import { fetchOpenRouterCredits, getSpendHistory } from '../lib/openrouter.js';
+import { fetchOpenRouterCredits, getSpendHistory, verifyOpenRouterKey } from '../lib/openrouter.js';
+import { verifyGroqKey } from '../lib/groq.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import {
-  createSession,
-  addMessage,
+  appendSolveTurn,
   listSessions,
   listMessages,
-  getHistorySnapshot,
-  cleanupLocalData
+  cleanupLocalData,
+  deleteAllLocalData,
+  getDeviceId,
 } from '../lib/history.js';
-import { ensureLicensed } from '../lib/license.js';
+import { ensureLicensed, setLicenseKey, deactivateCurrentLicense } from '../lib/license.js';
+import { getMyReferralCode } from '../lib/referral.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
-import { isBareTextbookRef, classifyTask, needsAudio } from '../lib/task-classifier.js';
-import { classifyTasksAI } from '../lib/classify-ai.js';
+import { isBareTextbookRef, classifyTask, needsAudio, isEasyTask, isChatty, isLightFollowup, testPageEffort } from '../lib/task-classifier.js';
 import { isReadableFile, hasPdf, isAudioFile, isPdfFile, isImageFile } from '../lib/file-kinds.js';
 import { track, heartbeat, usageFields, errorCode } from '../lib/telemetry.js';
-import { getCatalog, searchBooks, resolveTask, resolveForTask, fetchTaskImage } from '../lib/gdz-api.js';
+import { EMPTY_ANSWER } from '../lib/http.js';
+import {
+  getCatalog,
+  searchBooks,
+  resolveForTask,
+  fetchTaskImage,
+  normalizeGdzApiUrl,
+} from '../lib/gdz-api.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 import { transcribeAudioFiles } from '../lib/transcribe.js';
@@ -33,6 +41,17 @@ import {
   consumeDashboardLaunch,
   cleanupDashboardLaunches
 } from '../lib/dashboard-launch.js';
+import { addGdzBook, removeGdzBook } from '../lib/gdz-books.js';
+import { capturePillDomText } from '../lib/pill-dom-capture.js';
+import {
+  executeScriptInCapturedDocuments,
+  isTestCaptureContext,
+  TEST_CAPTURE_CHANGED,
+  testCaptureChangedError,
+  withMatchingTestCapture,
+} from '../lib/test-capture-context.js';
+import { classifyAutopilotFill, resolvePaginationTarget } from '../lib/test-autopilot.js';
+import { isHomeworkScanId, principalBindingMatches } from '../lib/principal-binding.js';
 import {
   MAX_STANDARD_UPLOAD_BYTES,
   MAX_AUDIO_UPLOAD_BYTES,
@@ -46,6 +65,169 @@ import {
 const DEBUG = false;
 const dbg = (...a) => { if (DEBUG) { try { console.log(...a); } catch { /* no console */ } } };
 const ATTACHMENT_FETCH_TIMEOUT_MS = 30 * 1000;
+// The answer panel retains the screenshot its answers came from so «перерешать»
+// is as well-informed as the original solve (see resolveOneQuestion). Bound it
+// so one panel context cannot pin an oversized capture in the worker for the
+// tab's lifetime; the ceiling matches the upload budget the image already
+// cleared, expressed in base64 characters.
+const MAX_PANEL_SCREENSHOT_CHARS = Math.ceil(MAX_STANDARD_UPLOAD_BYTES * 4 / 3);
+const REFERRAL_POINTER_SYNC_KEY = 'referralPointerSyncPending';
+const REFERRAL_POINTER_SYNC_ALARM = 'smesh-referral-pointer-sync';
+let referralPointerStateQueue = Promise.resolve();
+const referralPointerSyncFlights = new Map();
+let referralPointerRecoveryFlight = null;
+
+function mutateReferralPointerState(operation) {
+  const run = referralPointerStateQueue.then(operation);
+  referralPointerStateQueue = run.catch(() => {});
+  return run;
+}
+
+function scheduleReferralPointerRetry(attempts = 0) {
+  const delayInMinutes = Math.min(60, Math.max(1, 2 ** Math.min(6, attempts)));
+  try {
+    // Chrome 106-110 returns void; Chrome 111+ returns a Promise. Handle both
+    // without making successful license activation wait for alarm persistence.
+    chrome.alarms.create(REFERRAL_POINTER_SYNC_ALARM, { delayInMinutes })
+      ?.catch?.(() => { /* a later worker startup reconstructs it from storage */ });
+  }
+  catch { /* startup/manual sync will retry the persisted intent */ }
+}
+
+function referralPointerIntent() {
+  return {
+    id: crypto.randomUUID(),
+    requestedAt: Date.now(),
+    attempts: 0
+  };
+}
+
+async function storeReferralPointerIntent(intent) {
+  await mutateReferralPointerState(() => chrome.storage.local.set({
+    [REFERRAL_POINTER_SYNC_KEY]: intent
+  }));
+  scheduleReferralPointerRetry(0);
+}
+
+async function loadReferralPointerIntent() {
+  return mutateReferralPointerState(async () => {
+    const { [REFERRAL_POINTER_SYNC_KEY]: value } =
+      await chrome.storage.local.get(REFERRAL_POINTER_SYNC_KEY);
+    if (!value || typeof value !== 'object' ||
+        typeof value.id !== 'string' || !value.id) return null;
+    return {
+      id: value.id,
+      requestedAt: Number(value.requestedAt) || 0,
+      attempts: Math.max(0, Number(value.attempts) || 0)
+    };
+  });
+}
+
+async function clearReferralPointerIntent(intentId) {
+  await mutateReferralPointerState(async () => {
+    const { [REFERRAL_POINTER_SYNC_KEY]: current } =
+      await chrome.storage.local.get(REFERRAL_POINTER_SYNC_KEY);
+    // A newer license save may have replaced this intent while its request was
+    // in flight. Never let an older completion erase that newer durable work.
+    if (current?.id === intentId) {
+      await chrome.storage.local.remove(REFERRAL_POINTER_SYNC_KEY);
+      try { await chrome.alarms.clear(REFERRAL_POINTER_SYNC_ALARM); }
+      catch { /* a stray alarm observes no pending intent and exits */ }
+    }
+  });
+}
+
+async function recordReferralPointerFailure(intentId) {
+  let attempts = 0;
+  await mutateReferralPointerState(async () => {
+    const { [REFERRAL_POINTER_SYNC_KEY]: current } =
+      await chrome.storage.local.get(REFERRAL_POINTER_SYNC_KEY);
+    if (current?.id !== intentId) return;
+    attempts = Math.min(30, Math.max(0, Number(current.attempts) || 0) + 1);
+    await chrome.storage.local.set({
+      [REFERRAL_POINTER_SYNC_KEY]: { ...current, attempts }
+    });
+  });
+  if (attempts) scheduleReferralPointerRetry(attempts);
+}
+
+async function performReferralPointerSyncOnce(intent) {
+  try {
+    const code = await getMyReferralCode({ sync: true });
+    await clearReferralPointerIntent(intent.id);
+    return code;
+  } catch (error) {
+    await recordReferralPointerFailure(intent.id);
+    throw error;
+  }
+}
+
+function performReferralPointerSync(intent) {
+  const existing = referralPointerSyncFlights.get(intent.id);
+  if (existing) return existing;
+  // Publish ownership before the one-shot starts. A cold alarm wake evaluates
+  // this module's recovery and then dispatches onAlarm; both callers must join
+  // one POST and one failure/backoff mutation for this durable intent.
+  const run = Promise.resolve().then(() => performReferralPointerSyncOnce(intent));
+  referralPointerSyncFlights.set(intent.id, run);
+  const release = () => {
+    if (referralPointerSyncFlights.get(intent.id) === run) {
+      referralPointerSyncFlights.delete(intent.id);
+    }
+  };
+  run.then(release, release);
+  return run;
+}
+
+async function queueReferralPointerSync() {
+  // Coalesce toward the latest license state. The request itself reads the
+  // authoritative cached license when its turn reaches referral.js's queue.
+  const intent = referralPointerIntent();
+  await storeReferralPointerIntent(intent);
+  void performReferralPointerSync(intent).catch(() => {});
+  return intent;
+}
+
+async function retryPendingReferralPointer(knownIntent = null) {
+  const intent = knownIntent || await loadReferralPointerIntent();
+  if (intent) await performReferralPointerSync(intent);
+}
+
+function restorePendingReferralPointerRetry() {
+  if (referralPointerRecoveryFlight) return referralPointerRecoveryFlight;
+  // Recreate the one-shot alarm before touching the network. Older supported
+  // Chrome releases do not guarantee alarm persistence across browser restarts;
+  // this safety alarm survives a worker killed during the retry itself.
+  const run = (async () => {
+    const intent = await loadReferralPointerIntent();
+    if (!intent) return;
+    scheduleReferralPointerRetry(intent.attempts);
+    return retryPendingReferralPointer(intent);
+  })();
+  referralPointerRecoveryFlight = run;
+  const release = () => {
+    if (referralPointerRecoveryFlight === run) referralPointerRecoveryFlight = null;
+  };
+  run.then(release, release);
+  return run;
+}
+
+async function syncReferralPointer() {
+  const intent = referralPointerIntent();
+  await storeReferralPointerIntent(intent);
+  return performReferralPointerSync(intent);
+}
+
+async function setLicenseKeyAndSyncReferral(key) {
+  const status = await setLicenseKey(key);
+  if (status?.ok) {
+    // Persist the intent before replying, then detach the unreliable network
+    // hop. The named alarm plus startup reconstruction retries until the backend
+    // confirms; a 15-second referral outage no longer stalls activation.
+    await queueReferralPointerSync();
+  }
+  return status;
+}
 
 // Follow-ups re-send prior context. Cap how many MESSAGES we replay: full
 // worked solutions are long, and on a paid provider every re-sent message is
@@ -55,14 +237,31 @@ const MAX_HISTORY_MESSAGES = 8;
 
 // Storage trust split. storage.LOCAL holds the secrets (API keys, license) —
 // lock it to trusted contexts so a compromised mos.ru renderer can't read them
-// through our content scripts (supported since Chrome 130; older builds throw
-// and keep the historical behaviour). storage.SESSION is the deliberately
+// through our content scripts. storage.SESSION is the deliberately
 // UNTRUSTED-readable area: it must only ever hold UI state (panel positions)
 // plus the non-sensitive `theme`/`aiProvider` mirror below — never a secret.
+//
+// setAccessLevel was extended to local/sync storage only in July 2025
+// (Chromium a8f1f33) — Chrome 102 added it for SESSION storage alone. Below
+// Chrome 139 and below may leave storage.local readable by this extension's own content
+// scripts and the isolation invariant does not hold at all, so
+// manifest.json now requires 140 and the store will not install below it.
+// This branch is therefore a should-never-happen guard rather than a supported
+// degraded mode; it stays loud because silently continuing is how the gap went
+// unnoticed. Keep STORAGE_ISOLATION_MIN_CHROME and the manifest in step.
+const STORAGE_ISOLATION_MIN_CHROME = 140;
+
 try {
-  chrome.storage.local.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' })
-    ?.catch?.(() => { /* pre-130 Chrome — accepted residual risk */ });
-} catch { /* pre-130 Chrome */ }
+  if (typeof chrome.storage.local.setAccessLevel !== 'function') {
+    console.error(
+      'storage.local.setAccessLevel unavailable — secrets remain readable by this ' +
+      `extension's content scripts; Chrome ${STORAGE_ISOLATION_MIN_CHROME}+ is required`
+    );
+  } else {
+    chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
+      ?.catch?.((error) => console.error('failed to restrict local storage access', String(error)));
+  }
+} catch (error) { console.error('failed to restrict local storage access', String(error)); }
 try {
   chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
 } catch { /* old Chrome — content script falls back to defaults each time */ }
@@ -81,8 +280,8 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === 'local' && (changes.theme || changes.aiProvider)) mirrorUiPrefsToSession();
 });
 
-// Retention sweep: history (7 d), weekHomework (24 h), pendingUpload (1 h,
-// base64-heavy), taskClassCache + gdzTaskCache lookup caches (30 d). Alarm
+// Retention sweep: history (7 d), weekHomework (24 h), legacy pendingUpload
+// handoffs (1 h), taskClassCache + gdzTaskCache lookup caches (30 d). Alarm
 // survives SW teardown; the startup call covers the gap after a browser
 // restart before the alarm first fires.
 try {
@@ -91,10 +290,22 @@ try {
   chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === 'smesh-retention') void cleanupLocalData();
     if (alarm.name === 'smesh-launch-retention') void cleanupDashboardLaunches();
+    if (alarm.name === REFERRAL_POINTER_SYNC_ALARM) {
+      void restorePendingReferralPointerRetry().catch(() => {});
+    }
   });
 } catch { /* alarms unavailable — startup sweep below still runs */ }
+// Alarm persistence was not controllable on the oldest supported Chrome
+// releases. Register synchronously so a profile restart wakes this worker and
+// reconstructs any named retry from the durable intent.
+try {
+  chrome.runtime.onStartup.addListener(() => {
+    void restorePendingReferralPointerRetry().catch(() => {});
+  });
+} catch { /* runtime startup events unavailable in a test harness */ }
 void cleanupLocalData();
 void cleanupDashboardLaunches();
+void restorePendingReferralPointerRetry().catch(() => {});
 
 // Warm the remote runtime config on every SW spin-up (cheap: a single cached
 // fetch at most once per TTL). Fire-and-forget — a failure is a silent no-op and
@@ -131,10 +342,15 @@ async function migrateNararouter() {
   }
 }
 
-// Open the full-window dashboard when the popup asks to "Solve". The payload
-// itself lives in short-lived storage.session and can only be consumed once by
-// the dashboard through the serialized worker handler below.
+// Open the full-window dashboard when the popup asks to "Solve". Encrypted
+// metadata lives in short-lived storage.session; attachment bodies stay in
+// trusted local storage under the same one-time launch id. The dashboard can
+// consume the pair only through the serialized worker handler below.
 async function openDashboard(payload) {
+  // The scan capability alone binds storage, not the live diary. Reconfirm the
+  // exact account/child + row in the original tab immediately before minting a
+  // dashboard launch, so an old attachment continuation cannot cross profiles.
+  await verifyHomeworkDownloadBinding(payload);
   const id = await storeDashboardLaunch(payload);
   const url = chrome.runtime.getURL(`src/dashboard/dashboard.html?launch=${encodeURIComponent(id)}`);
   await chrome.tabs.create({ url });
@@ -216,6 +432,7 @@ function missingInputGate(category, task, files) {
  * the provider payload (and cost) sane.
  */
 async function fetchGdzMaterial(subject, task) {
+  const MAX_MATERIAL_IMAGES = 6;
   try {
     const sid = mapSubjectToId(subject);
     if (sid == null) return [];
@@ -228,11 +445,14 @@ async function fetchGdzMaterial(subject, task) {
       const res = await resolveForTask(book, task || '');
       for (const a of res.answers) {
         if (!a.found || !Array.isArray(a.images) || !a.images.length) continue;
-        const settled = await Promise.all(a.images.map((u) => fetchTaskImage(u).catch(() => null)));
-        for (const img of settled) if (img && images.length < 6) images.push(img);
-        if (images.length >= 6) break;
+        const settled = await Promise.all(
+          a.images.slice(0, MAX_MATERIAL_IMAGES - images.length)
+            .map((u) => fetchTaskImage(u).catch(() => null))
+        );
+        for (const img of settled) if (img) images.push(img);
+        if (images.length >= MAX_MATERIAL_IMAGES) break;
       }
-      if (images.length >= 6) break;
+      if (images.length >= MAX_MATERIAL_IMAGES) break;
     }
     return images;
   } catch { return []; }
@@ -242,10 +462,11 @@ async function fetchGdzMaterial(subject, task) {
  * Solve a task with the AI provider + chat history. Persist to local history.
  * @param {object} p
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
+ * @param {string} [p.engine] dashboard engine toggle (auto/think) — picks the model
  * @param {(chunk:string)=>void} [onDelta] stream callback (token-by-token)
  */
-async function solve({ subject, task, files = [], sessionId = null, history = [], mode }, onDelta, signal) {
-  // License gate. No-op while LICENSE_ENFORCED is off (preorder window).
+async function solve({ subject, task, files = [], sessionId = null, history = [], mode, engine }, onDelta, signal) {
+  // License gate. No-op until the configured launch instant (preorder window).
   // Throws a Russian-language error the catch path surfaces verbatim.
   await ensureLicensed();
   // Privacy backstop: never send homework to a provider without consent. The
@@ -257,7 +478,11 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // Apply the replay cap before calculating the request-wide file budget: old
   // turns outside this window are not sent at all. Current files win duplicate
   // fingerprints, so an attachment repeated in history is shipped only once.
-  history = history.slice(-MAX_HISTORY_MESSAGES);
+  // Treat client-supplied history flags as part of the trust boundary. An
+  // interrupted stream is useful to show locally, but its truncated assistant
+  // text is not a completed answer and must never steer a later provider call.
+  history = history.filter((message) => message?.error !== true)
+    .slice(-MAX_HISTORY_MESSAGES);
   const deduped = deduplicateRequestFiles(files, history);
   files = deduped.files;
   history = deduped.history;
@@ -302,12 +527,26 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // Shrink big images (phone photos, GDZ page scans) LAST, after every source
   // that can add one: a multi-MB image inside the single /ai/start POST body
   // is exactly what dies on the RU DPI clamp (and blows the proxy's data-URI
-  // cap). History too — the dashboard replays a turn's ORIGINAL files on
-  // follow-ups, so without this a follow-up re-ships the uncompressed photo.
-  // Fail-open — an image that can't be recompressed ships as-is.
+  // cap). History needs the FULL current-file pipeline first: the dashboard
+  // replays each turn's ORIGINAL attachments, so a raw Office/audio file would
+  // otherwise reach the provider adapter on every follow-up and become an
+  // unreadable-file note instead of the extracted text/transcript the first
+  // turn saw. Every step is fail-open and preserves the original on failure.
   files = await compressImageFiles(files);
-  history = await Promise.all(history.map(async (m) =>
-    m?.files?.length ? { ...m, files: await compressImageFiles(m.files) } : m));
+  const preparedHistory = [];
+  for (const m of history) {
+    if (!m?.files?.length) {
+      preparedHistory.push(m);
+      continue;
+    }
+    let historyFiles = await prepareFiles(m.files);
+    historyFiles = await transcribeAudioFiles(historyFiles);
+    // Image decoding is intentionally sequential across history messages too:
+    // parallel 25-megapixel bitmaps can multiply peak memory and kill the MV3
+    // worker before the request is sent.
+    preparedHistory.push({ ...m, files: await compressImageFiles(historyFiles) });
+  }
+  history = preparedHistory;
   const finalAttachments = deduplicateRequestFiles(files, history);
   files = finalAttachments.files;
   history = finalAttachments.history;
@@ -315,16 +554,23 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   if (!finalBudget.ok) throw new Error(finalBudget.error);
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
+  // Dashboard engine toggle («Авто» / «Думать») decides the model for this
+  // solve: auto → DeepSeek at LOW reasoning effort (fastest, cheapest), think
+  // → Qwen (reasons by default; it has no effort knob — see qwen.js). Absent
+  // or unknown values (an older payload) keep the aiProvider setting, so the
+  // toggle stays dashboard-only. Image-bearing auto requests still upgrade
+  // DeepSeek→Qwen inside askAI: DeepSeek has no vision.
+  const engineProvider = engine === 'think' ? 'qwen' : engine === 'auto' ? 'deepseek' : null;
   // PDFs require a PDF-capable backend. The СМЭШ proxy (Qwen/DeepSeek without
   // a BYO Alibaba key) handles them itself — it re-routes a PDF-carrying job
   // to its Gemini chain server-side — so those requests pass through
   // untouched. Everyone else (Groq, OpenRouter, BYO DashScope) is forced to
   // OpenRouter, whose Gemini reads PDFs natively.
-  let provider;
+  let provider = engineProvider || undefined;
   const requestHasPdf = hasPdf(files) || history.some((m) => m?.files?.some(isPdfFile));
   if (requestHasPdf) {
     const { aiProvider } = await chrome.storage.local.get('aiProvider');
-    const chosen = normalizeAIProvider(aiProvider);
+    const chosen = engineProvider || normalizeAIProvider(aiProvider);
     const proxyReadsPdf = (chosen === 'qwen' || chosen === 'deepseek') && !(await getByoKey());
     if (!proxyReadsPdf) {
       provider = 'openrouter';
@@ -353,11 +599,51 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
       'явно не тот номер — не используй его.)';
   }
   let usage = null, usedProvider = null;
-  const answer = await askAI(
-    systemPrompt, userTask, files,
-    history,
-    { onDelta, provider, signal, onUsage: (u, prov) => { usage = u; usedProvider = prov; } }
-  );
+  // LOW reasoning effort for turns that don't need model thinking (pure time-
+  // to-first-answer AND billed thinking tokens). Three routes, all gated on no
+  // NEW files this turn (a fresh attachment usually means real work), and all
+  // no-ops on Qwen which ignores the knob (DeepSeek/OpenRouter honor it):
+  //  - 'easy':    first-turn recall/lookup/choice (isEasyTask);
+  //  - 'chatty':  first-turn greetings / "что ты умеешь" — nothing to solve;
+  //  - 'followup': clarification of an already-solved task («объясни, я не
+  //    понял») — the thinking model's worked answer is replayed in history, so
+  //    re-explaining it is rewording, not solving. Requires a real prior
+  //    assistant answer to lean on (not an errored or gate-refusal turn), and
+  //    isLightFollowup keeps ANY dispute («неправильно», «ты уверен?»), new
+  //    task or fresh math at full effort — doubting the answer means re-solve.
+  // Anything not clearly light keeps the default effort; the answer is one
+  // «спросить ещё раз» away regardless.
+  const askOpts = { onDelta, provider, signal, onUsage: (u, prov) => { usage = u; usedProvider = prov; } };
+  let lowEffortReason = null;
+  if (engineProvider === 'deepseek') {
+    // «Авто» exists to answer FAST: always request low effort. DeepSeek (and
+    // the OpenRouter PDF fallback above) honor the knob; after an image
+    // auto-upgrade to Qwen it's a harmless no-op.
+    lowEffortReason = 'engine_auto';
+  } else if (engineProvider === 'qwen') {
+    // «Думать» is an explicit ask for full reasoning — never downgrade it,
+    // even for turns the heuristics below would call light.
+  } else if (!files.length) {
+    if (history.length === 0) {
+      if (isEasyTask(task)) lowEffortReason = 'easy';
+      else if (isChatty(task)) lowEffortReason = 'chatty';
+    } else if (
+      history.some((m) => m?.role === 'assistant' && !m.error && !m.needsUpload &&
+        typeof m.content === 'string' && m.content.trim()) &&
+      isLightFollowup(task)
+    ) {
+      lowEffortReason = 'followup';
+    }
+  }
+  if (lowEffortReason) askOpts.reasoning = { effort: 'low' };
+  const answer = await askAI(systemPrompt, userTask, files, history, askOpts);
+
+  // An empty completion (no content deltas at all) is a failure, not an answer.
+  // Throw so the caller surfaces a retryable error instead of persisting the
+  // «(пустой ответ)» sentinel and showing it as a real reply with no retry.
+  if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
+    throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  }
 
   // Usage telemetry: one content-free 'solve' event with tokens/cost, subject
   // and attachment counts. Fire-and-forget — never blocks or fails the answer.
@@ -368,22 +654,27 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
     files_img: files.filter(isImageFile).length,
     meta: {
       mode: mode || 'brief',
+      ...(engineProvider ? { engine } : {}),
       followup: history.length > 0 ? 1 : 0,
       gdz_auto: gdzAttached || 0,
-      category
+      category,
+      // Content-free markers of the low-effort routing, so the false-easy rate
+      // of each route (easy / chatty / followup) is observable in the dashboard
+      // instead of guessed.
+      ...(lowEffortReason ? { effort: 'low', effort_reason: lowEffortReason } : {})
     }
   });
 
   // Persist to local history (non-fatal if storage write fails).
   try {
-    let sid = sessionId;
-    if (!sid) {
-      const session = await createSession(subject, task);
-      sid = session.id;
-    }
-    await addMessage(sid, 'user', task || '(файл)');
-    await addMessage(sid, 'assistant', answer);
-    return { answer, sessionId: sid };
+    const committed = await appendSolveTurn({
+      sessionId,
+      subject,
+      taskText: task,
+      userContent: task || '(файл)',
+      assistantContent: answer,
+    });
+    return { answer, sessionId: committed.sessionId };
   } catch (e) {
     return { answer, sessionId, storageError: String(e) };
   }
@@ -393,7 +684,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
  * Solve an in-app Mesh test from a screenshot + extracted page text.
  * Answers are concise («№N: ответ») and intentionally NOT persisted.
  */
-async function solveTest({ text, screenshot, provider } = {}) {
+async function solveTest({ text, screenshot, provider, signal = null } = {}) {
   await ensureLicensed();
   // Same privacy backstop as solve(): no consent → no provider call. Thrown so
   // the popup's requestSolve surfaces it as a clear error instead of a "result".
@@ -417,9 +708,22 @@ async function solveTest({ text, screenshot, provider } = {}) {
   // is still one click away without holding the whole page hostage.
   let usage = null, usedProvider = null;
   const providerOverride = normalizeAIProvider(provider, null);
+  // A page with ENOUGH text and NO math/physics/proof/analysis markers
+  // (vocabulary, dates, matching, multiple-choice) is answered at LOW effort
+  // instead of medium — faster and cheaper on the effort-honoring paths. But a
+  // screenshot-only page whose text extraction failed ('' / short placeholder)
+  // must NOT default to low (it could be a hard math page we simply couldn't
+  // read), so testPageEffort keeps medium when there's too little text to judge.
+  // High is still one «перерешать» click away per question.
+  const testEffort = testPageEffort(text);
   const askOpts = {
     responseFormat: 'json_object',
-    reasoning: { effort: 'medium' },
+    reasoning: { effort: testEffort },
+    // Every provider (groq/qwen/deepseek/openrouter and the СМЭШ proxy) already
+    // honours opts.signal — it just was not being handed down. Without it a
+    // cancelled pill stopped the FILLING and navigation but the paid provider
+    // call kept running to completion and kept spending.
+    signal,
     onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   };
   if (providerOverride) askOpts.provider = providerOverride;
@@ -428,48 +732,81 @@ async function solveTest({ text, screenshot, provider } = {}) {
   // chunks the smaller it is. Fail-open (compressImageFiles returns it as-is).
   const shot = screenshot ? (await compressImageFiles([screenshot]))[0] : null;
   const answer = await askAI(systemPrompt, userText, shot ? [shot] : [], [], askOpts);
+  // An empty completion is a retryable provider failure, not a solved test.
+  if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
+    throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  }
   track('test_solve', {
     ...usageFields(usedProvider, usage),
-    files_img: screenshot ? 1 : 0
+    files_img: screenshot ? 1 : 0,
+    // Same observability as solve(): which effort testPageEffort() picked, so
+    // low-effort mistakes on test pages show up in the dashboard, not in reviews.
+    meta: { effort: testEffort }
   });
   return answer;
 }
 
 /**
  * Re-solve a SINGLE question on the current test page (the answer panel's
- * «перерешать» button). Re-captures the visible page (the page on screen is the
- * source of truth — the original screenshot isn't kept) and asks the model for
- * just that one question, optionally telling it the previous answer so it can
- * confirm or correct. Same licence/consent gate as solveTest. Returns the fresh
- * answer string ('' if nothing parseable came back).
+ * «перерешать» button) and ask the model for just that one question, optionally
+ * telling it the previous answer so it can confirm or correct.
+ *
+ * A page click never confers activeTab, so this path can never take a FRESH
+ * screenshot. When the panel was opened from the popup (which could), that
+ * capture is passed back in and reused — otherwise a re-solve would answer from
+ * strictly less material than the answer it is replacing, which is the opposite
+ * of what «перерешать» promises. Reuse is safe because withMatchingTestCapture
+ * below proves the page is still the exact one the image was taken of; on any
+ * change the whole re-solve fails closed instead.
+ *
+ * Same licence/consent gate as solveTest. Returns the fresh answer string
+ * ('' if nothing parseable came back).
  */
-async function resolveOneQuestion(tabId, windowId, tabUrl, { index, prevAnswer, questionText } = {}) {
+async function resolveOneQuestion(
+  tabId,
+  { index, prevAnswer, questionText } = {},
+  panelCapture,
+  panelScreenshot = null,
+) {
   await ensureLicensed();
   if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
-  const { pageText, screenshot } = await capturePageForPill(tabId, windowId, tabUrl);
+  // A retained screenshot carries the question on its own, so a page whose DOM
+  // exposes almost no readable text (canvas/image questions — exactly where the
+  // screenshot matters most) must not be refused outright.
+  const { pageText, capture } = await capturePageForPill(tabId, { allowThinText: !!panelScreenshot });
+  await withMatchingTestCapture(panelCapture, async () => capture, async () => undefined);
   const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
   const n = String(index ?? '').trim();
+  let usage = null, usedProvider = null;
+  const shot = panelScreenshot ? (await compressImageFiles([panelScreenshot]))[0] : null;
+  // Never promise the model material it did not receive: claiming a screenshot
+  // that was not attached is an invitation to answer from imagination.
+  const sources = shot ? 'текст страницы ниже + скриншот' : 'текст страницы ниже';
   const focus =
-    `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (текст страницы ниже + скриншот).` +
+    `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (${sources}).` +
     (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
     (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
     ` Верни JSON {"answers":[{"n":"${n}","a":"…"}]} ровно с одним элементом для этого вопроса` +
     ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).\n\n' +
     'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
-    (pageText || '(текст не извлечён, смотри скриншот)');
-  let usage = null, usedProvider = null;
-  const shot = screenshot ? (await compressImageFiles([screenshot]))[0] : null;
+    (pageText || (shot ? '(текст не извлечён, смотри скриншот)' : '(текст со страницы не извлечён)'));
   const answer = await askAI(systemPrompt, focus, shot ? [shot] : [], [], {
     responseFormat: 'json_object',
     reasoning: { effort: 'high' },
     onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   });
-  track('test_requestion', { ...usageFields(usedProvider, usage), files_img: screenshot ? 1 : 0 });
+  if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
+    throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  }
+  track('test_requestion', { ...usageFields(usedProvider, usage), files_img: shot ? 1 : 0 });
   const parsed = parseTestAnswers(answer);
   const match = parsed.find((q) => String(q.index) === n) || parsed[0];
   // Return parts too so a re-solved multi-field question (x & y, x₁ & x₂) still
   // fills every box, not just the first.
-  return match ? { answer: match.answer, parts: match.parts || null } : { answer: '', parts: null };
+  const resolved = match
+    ? { answer: match.answer, parts: match.parts || null }
+    : { answer: '', parts: null };
+  return withMatchingTestCapture(capture, readTestCaptureContext, async () => resolved);
 }
 
 /**
@@ -552,17 +889,86 @@ function parseTestAnswers(raw) {
  * keep reading while they fill the form. Best-effort: a restricted page or
  * an in-flight navigation just means no panel; the popup is the fallback.
  */
-async function showAnswersInTab(tabId, questions) {
+const answerPanelContexts = new Map();
+const PANEL_NONCE_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function isPanelNonce(value) {
+  return typeof value === 'string' && PANEL_NONCE_RE.test(value);
+}
+
+function matchingAnswerPanelContext(tabId, panelNonce, { requireReady = true } = {}) {
+  const context = answerPanelContexts.get(tabId);
+  if (!context || context.panelNonce !== panelNonce || (requireReady && !context.ready)) {
+    throw testCaptureChangedError();
+  }
+  return context;
+}
+
+function deleteAnswerPanelContext(tabId, panelNonce) {
+  if (answerPanelContexts.get(tabId)?.panelNonce === panelNonce) {
+    answerPanelContexts.delete(tabId);
+  }
+}
+
+async function showAnswersInTab(tabId, questions, capture, screenshot = null) {
   if (!tabId || !questions.length) return;
+  const capturedTop = capture.documents.find((document) => document.documentId === capture.documentId);
+  if (!capturedTop) throw testCaptureChangedError();
+  // Mint a worker-only panel generation before the first await. This
+  // immediately revokes every older panel in the tab, including an old click
+  // already waiting to request its action token. The context becomes usable
+  // only after SHOW_ANSWERS succeeds and the exact capture is revalidated.
+  const panelNonce = crypto.randomUUID();
+  const retainedScreenshot =
+    screenshot && typeof screenshot.dataBase64 === 'string' &&
+    screenshot.dataBase64.length <= MAX_PANEL_SCREENSHOT_CHARS
+      ? screenshot
+      : null;
+  answerPanelContexts.set(tabId, {
+    capture, panelNonce, ready: false, screenshot: retainedScreenshot
+  });
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId },
+    await executeScriptInCapturedDocuments(capture, {
+      documentIds: [capture.documentId],
       files: ['src/content/answer-panel.js', 'src/content/scraper.js']
     });
   } catch { /* manifest may already have injected, or the page disallows scripting */ }
   try {
-    await chrome.tabs.sendMessage(tabId, { type: 'SHOW_ANSWERS', payload: { questions } });
-  } catch { /* no receiver — content script blocked on this page */ }
+    await withMatchingTestCapture(capture, readTestCaptureContext, async () => {
+      const response = await chrome.tabs.sendMessage(tabId, {
+        type: 'SHOW_ANSWERS',
+        payload: {
+          questions,
+          panelNonce,
+          capture: {
+            url: capture.url,
+            pageId: capturedTop.pageId,
+            signature: capturedTop.signature,
+            principal: capturedTop.principal,
+          },
+        },
+      }, { documentId: capture.documentId });
+      if (!response?.ok) throw new Error(response?.error || 'answer panel unavailable');
+      await withMatchingTestCapture(capture, readTestCaptureContext, async () => {
+        const current = matchingAnswerPanelContext(tabId, panelNonce, { requireReady: false });
+        current.ready = true;
+      });
+    });
+  } catch (error) {
+    deleteAnswerPanelContext(tabId, panelNonce);
+    // A late failure from panel A must not hide panel B. The content-side hide
+    // also checks this nonce before removing anything.
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: 'HIDE_ANSWERS',
+        payload: { panelNonce },
+      }, { documentId: capture.documentId });
+    } catch { /* navigated or content script unavailable */ }
+    if (error?.code === TEST_CAPTURE_CHANGED) throw error;
+    // No receiver — content script blocked on this page. The popup remains the
+    // fallback, and the pending capability was revoked above.
+  }
 }
 
 /* ---------- Attachment downloads (cross-origin, host_permissions) ---------- */
@@ -674,7 +1080,9 @@ async function readBoundedBody(response, maxBytes, controller) {
     if (!controller.signal.aborted) throw e;
     return null;
   }
-  if (!total) return null;
+  // `null` means "refused" (over the cap, unreadable, aborted). A zero-length
+  // body is a legitimate read of an empty file and comes back as empty bytes so
+  // callers can report the two apart instead of logging a size failure.
   const bytes = new Uint8Array(total);
   let offset = 0;
   for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
@@ -703,17 +1111,26 @@ async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
         signal: ctrl.signal
       });
       if ([301, 302, 303, 307, 308].includes(res.status)) {
-        if (redirects >= ATTACHMENT_REDIRECT_LIMIT) return null;
-        const next = parseAttachmentUrl(res.headers.get('location'), current);
-        if (!next) return null;
-        try { await res.body?.cancel('following validated redirect'); } catch { /* already closed */ }
+        let next;
+        try {
+          if (redirects >= ATTACHMENT_REDIRECT_LIMIT) return null;
+          next = parseAttachmentUrl(res.headers.get('location'), current);
+          if (!next) return null;
+        } finally {
+          try { await res.body?.cancel('redirect response discarded'); } catch { /* already closed */ }
+        }
         current = next;
         continue;
       }
-      if (!res.ok) { dbg('[СМЭШ AI] download http', res.status, current.href); return null; }
+      if (!res.ok) {
+        dbg('[СМЭШ AI] download http', res.status, current.href);
+        try { await res.body?.cancel('error response discarded'); } catch { /* already closed */ }
+        return null;
+      }
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('text/html') || ct.includes('text/xml')) {
         dbg('[СМЭШ AI] download got HTML (auth redirect?)', current.href);
+        try { await res.body?.cancel('non-file response discarded'); } catch { /* already closed */ }
         return null;
       }
       const name = nameFromUrl(current.href);
@@ -723,7 +1140,8 @@ async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
         : MAX_STANDARD_UPLOAD_BYTES;
       const maxBytes = Math.min(typeMaxBytes, maxBytesCap);
       const bytes = await readBoundedBody(res, maxBytes, ctrl);
-      if (!bytes) { dbg('[СМЭШ AI] download size/empty skip', current.href); return null; }
+      if (!bytes) { dbg('[СМЭШ AI] download size limit skip', current.href); return null; }
+      if (!bytes.byteLength) { dbg('[СМЭШ AI] download empty file skip', current.href); return null; }
       dbg('[СМЭШ AI] downloaded', name, mimeType, bytes.byteLength + 'b');
       return { mimeType, dataBase64: abToBase64(bytes), name, byteLength: bytes.byteLength };
     }
@@ -757,25 +1175,70 @@ function attachmentHeaders(headers) {
     allowed.has(key.toLowerCase()) && typeof value === 'string'));
 }
 
+async function verifyHomeworkDownloadBinding({
+  tabId,
+  scanId,
+  principal,
+  principalError,
+  rowToken,
+} = {}) {
+  const { weekHomework } = await chrome.storage.local.get('weekHomework');
+  if (!principalBindingMatches({
+    cacheScanId: weekHomework?.scanId,
+    launchScanId: scanId,
+    cachePrincipal: weekHomework?.principal,
+    launchPrincipal: principal,
+    cacheError: weekHomework?.principalError,
+    launchError: principalError,
+  })) {
+    throw new Error(
+      'Скан домашних заданий или профиль МЭШ изменился. Обновите список и повторите.'
+    );
+  }
+  let response = null;
+  try {
+    response = await chrome.tabs.sendMessage(tabId, {
+      type: 'MESH_VERIFY_HOMEWORK_CONTEXT',
+      principal,
+      principalError,
+      rowToken,
+    });
+  } catch { /* navigated, renderer gone, or content script unavailable */ }
+  if (!response?.ok || response.matches !== true) {
+    throw new Error(
+      'Страница, аккаунт или ученик МЭШ изменился. Обновите список и повторите.'
+    );
+  }
+}
+
 // `headers` come straight from the content script's discovery (Bearer token +
-// Mesh's X-mes-* set). A bare `token` is still accepted for backward-compat.
-async function downloadFiles({ urls = [], headers = null, token = null }) {
+// Mesh's X-mes-* set). Every fetch is additionally bound to the exact scan,
+// live tab principal and opaque row that authorized discovery.
+async function downloadFiles(payload = {}) {
+  const { urls = [], headers = null, token = null } = payload;
   const hdrs = attachmentHeaders(headers || (token ? meshHeadersFromToken(token) : {}));
   const files = [];
   let totalBytes = 0;
-  // Mirror validateRequestFileBudget here so local decoded allocation cannot
-  // exceed the provider request-wide budget the downloaded files must fit.
+  await verifyHomeworkDownloadBinding(payload);
+  // Automatic Mesh downloads keep the standard 6 MiB local-allocation cap.
+  // Manually selected audio has its own pre-read 25 MiB guard and is separately
+  // budgeted by validateRequestFileBudget before Whisper transcription.
   for (const url of urls.slice(0, 5)) {
+    await verifyHomeworkDownloadBinding(payload);
     const remainingBytes = MAX_REQUEST_FILE_BYTES - totalBytes;
     if (remainingBytes <= 0) break;
     if (!isAllowedAttachmentUrl(url)) continue;
     const f = await downloadFile(url, hdrs, remainingBytes);
+    // A profile/scan switch while bytes were in flight invalidates the result.
+    // Recheck before retaining even one byte in the response.
+    await verifyHomeworkDownloadBinding(payload);
     if (f) {
       totalBytes += f.byteLength;
       const { byteLength, ...file } = f;
       files.push(file);
     }
   }
+  await verifyHomeworkDownloadBinding(payload);
   return files;
 }
 
@@ -793,8 +1256,20 @@ async function downloadFiles({ urls = [], headers = null, token = null }) {
  * — executeScript serialises it, so it must reference nothing outside. Returns
  * the list of question ids whose fields were filled. NEVER submits.
  */
-function fillMathQuillMain(questions) {
+async function fillMathQuillMain(questions, expectedDocuments) {
   try {
+    var root = document.documentElement;
+    var capturePage = root && root.getAttribute('data-smesh-capture-page');
+    var expectedDocument = capturePage && expectedDocuments && expectedDocuments[capturePage];
+    var expectedSignature = expectedDocument && expectedDocument.signature;
+    var expectedPrincipal = expectedDocument && expectedDocument.principal;
+    var captureStillMatches = function () {
+      return !!expectedSignature && root &&
+        root.getAttribute('data-smesh-capture-page') === capturePage &&
+        root.getAttribute('data-smesh-capture-signature') === expectedSignature &&
+        root.getAttribute('data-smesh-capture-principal') === expectedPrincipal;
+    };
+    if (!captureStillMatches()) return { ok: false, stale: true, filled: [] };
     // Resolve the MathQuill v2 interface (Mesh exposes window.MQ).
     var MQ = (typeof window.MQ === 'function') ? window.MQ : null;
     if (!MQ && window.MathQuill) {
@@ -815,33 +1290,89 @@ function fillMathQuillMain(questions) {
     // stricter length cap and no split-span handling, so a heading rendered
     // inline with a long prompt would be missed and the formula box left unfilled.
     var QRE = /(?:вопрос|задани[ея])\s*[№#]?\s*(\d{1,3})/i;
+    var QALL = /(?:вопрос|задани[ея])\s*[№#]?\s*\d{1,3}/gi;
+    var QINSTRUCTIONPREFIX = /^(?:выполните|решите|ответьте(?:\s+на)?|выберите|укажите|заполните|сопоставьте|прочитайте|рассмотрите|определите|найдите|вычислите)$/i;
+    var QTECHPREFIX = /^(?:id|task)\s*[#№-]?\s*\d+$/i;
+    var QREFSUFFIX = /^(?:(?:в|по)\s+(?:учебник\p{L}*|тетрад\p{L}*|параграф\p{L}*|глав\p{L}*|раздел\p{L}*)|из\s+(?:учебник\p{L}*|параграф\p{L}*|глав\p{L}*|раздел\p{L}*|упражнен\p{L}*|задани\p{L}*)|на\s+(?:страниц\p{L}*|стр(?:аниц\p{L}*|\.)?|сайт\p{L}*|портал\p{L}*))(?=\s|[.,;:!?…)}\]»"'—–-]|$)/iu;
+    var QSEPARATOR = /^[.:—–-]/;
+    var QSCOPE = /^(?:H[1-6]|P|LI|LEGEND|DT|DD|DIV)$/;
+    var isHeadingNode = function (node) {
+      var element = node && node.nodeType === 1 ? node : node && node.parentElement;
+      for (var depth = 0; depth < 4 && element; depth++, element = element.parentElement) {
+        var tag = String(element.tagName || '').toUpperCase();
+        var role = '';
+        try { role = String(element.getAttribute && element.getAttribute('role') || '').toLowerCase(); } catch (eRole) { role = ''; }
+        if (/^H[1-6]$/.test(tag) || tag === 'LEGEND' || role.split(/\s+/).indexOf('heading') !== -1) return true;
+      }
+      return false;
+    };
+    var markerTextScope = function (textNode) {
+      var element = textNode && textNode.parentElement;
+      var fallback = element;
+      for (var depth = 0; depth < 4 && element; depth++, element = element.parentElement) {
+        fallback = element;
+        var tag = String(element.tagName || '').toUpperCase();
+        var role = '';
+        try { role = String(element.getAttribute && element.getAttribute('role') || '').toLowerCase(); } catch (eRole) { role = ''; }
+        if (QSCOPE.test(tag) || role.split(/\s+/).indexOf('heading') !== -1) return element;
+      }
+      return fallback;
+    };
+    var boundedMarkerText = function (scope, maxChars) {
+      maxChars = maxChars || 160;
+      var walker;
+      try { walker = document.createTreeWalker(scope, NodeFilter.SHOW_TEXT, null); }
+      catch (eWalker) { return ''; }
+      var text = '';
+      var node;
+      while ((node = walker.nextNode())) {
+        var part = String(node.nodeValue || '');
+        if (text.length + part.length + 1 > maxChars) return '';
+        text += ' ' + part;
+      }
+      return text.replace(/\s+/g, ' ').trim();
+    };
+    var isAuthoritativeMarker = function (text, match, node) {
+      var prefix = text.slice(0, match.index).trim().replace(/[.:—–-]+$/, '').trim();
+      var instructionPrefix = QINSTRUCTIONPREFIX.test(prefix);
+      var technicalPrefix = QTECHPREFIX.test(prefix);
+      if (prefix && !instructionPrefix && !technicalPrefix) return false;
+      var suffix = text.slice(match.index + match[0].length).trim();
+      var semanticSuffix = suffix.replace(/^[.,;:—–-]+\s*/, '');
+      if (QREFSUFFIX.test(semanticSuffix)) return false;
+      if (!suffix || match.index === 0 || technicalPrefix) return true;
+      return isHeadingNode(node) || QSEPARATOR.test(suffix);
+    };
     var markers = [];
     var qRoot = document.body || document.documentElement;
     if (qRoot) {
       var qWalker = document.createTreeWalker(qRoot, NodeFilter.SHOW_TEXT, null);
-      var checkedParents = new Set();
+      var checkedScopes = new Set();
       var tn;
       while ((tn = qWalker.nextNode())) {
         var raw = tn.nodeValue;
         if (!raw || !/задани|вопрос/i.test(raw)) continue;
         var s = raw.replace(/\s+/g, ' ').trim();
         var mm = s.match(QRE);
+        var markerNode = tn.parentElement || tn;
+        var scope = markerTextScope(tn);
+        if (scope) {
+          var ps = boundedMarkerText(scope, 160);
+          var scopedMarkers = ps ? ps.match(QALL) : null;
+          var pm = scopedMarkers && scopedMarkers.length === 1 ? ps.match(QRE) : null;
+          if (pm) {
+            if (checkedScopes.has(scope)) continue;
+            checkedScopes.add(scope);
+            s = ps;
+            mm = pm;
+            markerNode = scope;
+          }
+        }
         // A real heading is short OR leads its text (a task-id badge may sit just
         // before it); a deep mention inside prose is not a heading.
-        if (mm && (s.length <= 60 || mm.index <= 20)) {
-          markers.push({ n: parseInt(mm[1], 10), node: tn.parentElement || tn });
-          continue;
-        }
-        // The heading may be split across spans («ЗАДАНИЕ» | «№1»): the digit
-        // lives in a sibling node. Check the SHORT parent's combined text once.
-        var pp = tn.parentElement;
-        if (pp && !checkedParents.has(pp)) {
-          checkedParents.add(pp);
-          var ps = (pp.textContent || '').replace(/\s+/g, ' ').trim();
-          if (ps.length <= 40) {
-            mm = ps.match(QRE);
-            if (mm) markers.push({ n: parseInt(mm[1], 10), node: pp });
-          }
+        if (mm && isAuthoritativeMarker(s, mm, markerNode) &&
+            (s.length <= 60 || mm.index <= 20 || isHeadingNode(markerNode))) {
+          markers.push({ n: parseInt(mm[1], 10), node: markerNode });
         }
       }
     }
@@ -869,6 +1400,48 @@ function fillMathQuillMain(questions) {
       if (fm) return fm[1] + '\\frac{' + fm[2] + '}{' + fm[3] + '}';
       return v;
     };
+    // MathQuill may normalize harmless presentation details, but a merely
+    // non-empty readback is not evidence that it accepted THIS answer: a
+    // rejected setter can leave an older wrong value in place. Canonicalize
+    // only known representation-only differences and otherwise require an
+    // exact semantic token sequence.
+    var canonicalLatex = function (value) {
+      var text = String(value == null ? '' : value).trim()
+        .replace(/^\$+|\$+$/g, '')
+        .replace(/\u2212/g, '-')
+        .replace(/\\(?:left|right)/g, '')
+        .replace(/\\(?:dfrac|tfrac)/g, '\\frac')
+        .replace(/\\[,;:! ]/g, '')
+        .replace(/\s+/g, '');
+      var changed = true;
+      while (changed && text.length >= 2 && text[0] === '{' && text[text.length - 1] === '}') {
+        changed = false;
+        var depth = 0;
+        for (var ci = 0; ci < text.length; ci++) {
+          if (text[ci] === '{') depth++;
+          else if (text[ci] === '}') depth--;
+          if (depth === 0 && ci < text.length - 1) break;
+        }
+        if (depth === 0 && ci === text.length) {
+          text = text.slice(1, -1);
+          changed = true;
+        }
+      }
+      // Treat only simple numeric fractions as equivalent across MathQuill's
+      // common sign placement (`-\\frac{8}{3}` vs `\\frac{-8}{3}`).
+      var fraction = text.match(/^(-?)\\frac\{([+-]?\d+(?:[.,]\d+)?)\}\{([+-]?\d+(?:[.,]\d+)?)\}$/);
+      if (fraction) {
+        var numerator = fraction[2].replace(',', '.');
+        if (fraction[1] === '-' && numerator[0] === '-') numerator = numerator.slice(1);
+        else if (fraction[1] === '-' && numerator[0] !== '-') numerator = '-' + numerator;
+        return numerator + '/' + fraction[3].replace(',', '.');
+      }
+      var plainFraction = text.match(/^([+-]?\d+(?:[.,]\d+)?)\/([+-]?\d+(?:[.,]\d+)?)$/);
+      if (plainFraction) {
+        return plainFraction[1].replace(',', '.') + '/' + plainFraction[2].replace(',', '.');
+      }
+      return text;
+    };
     // Per-field values for a question: prefer the model's structured parts, else
     // pull signed numbers / fractions out of the answer in order (handles a
     // coordinate answer like «(2; 3) и (2; -3)» → 2, 3, 2, -3).
@@ -885,10 +1458,14 @@ function fillMathQuillMain(questions) {
       var flds = byNum[id];
       if (!flds || !flds.length) continue;
       var vals = valuesFor(q);
-      var any = false;
+      // A numbered MathQuill unit may contain several answer fields. Pagination
+      // is destructive, so one successful field must not certify the whole
+      // question while another field stayed empty or rejected its value.
+      var complete = flds.length > 0;
       for (var f = 0; f < flds.length; f++) {
+        if (!captureStillMatches()) return { ok: false, stale: true, filled: filled };
         var val = (vals[f] != null) ? vals[f] : (vals.length === 1 ? vals[0] : '');
-        if (val === '' || val == null) continue;
+        if (val === '' || val == null) { complete = false; continue; }
         try {
           // MQ(el) returns the EXISTING field; fall back to (re)wrapping it as a
           // MathField if the interface entry point differs. We still mirror the
@@ -898,29 +1475,64 @@ function fillMathQuillMain(questions) {
           if (!field || typeof field.latex !== 'function') {
             if (typeof MQ.MathField === 'function') { try { field = MQ.MathField(flds[f]); } catch (e0) { field = null; } }
           }
-          if (!field || typeof field.latex !== 'function') continue;
-          field.latex(toLatex(val));
-          // Honest read-back: MathQuill silently ignores LaTeX it can't parse,
-          // leaving the field empty. Confirm it ended non-empty before counting
-          // the question as filled — otherwise the panel would show a false ✓ on
-          // an empty formula box (the very thing the plain-input path guards via
-          // valueTook). Lenient on the exact text, so a field that reformats the
-          // value (e.g. -8/3 → \frac) still counts.
+          if (!field || typeof field.latex !== 'function') { complete = false; continue; }
+          var intendedLatex = toLatex(val);
+          var intendedCanonical = canonicalLatex(intendedLatex);
+          if (!intendedCanonical) { complete = false; continue; }
+          field.latex(intendedLatex);
+          // MathQuill and its page handlers may synchronously replace the SPA
+          // question while reusing a field node. Yield to the isolated-world
+          // capture observer, then stop before read-back or hidden-input writes
+          // if the question/account signature changed.
+          await new Promise(function (resolve) { setTimeout(resolve, 0); });
+          if (!captureStillMatches() || !document.documentElement.contains(flds[f])) {
+            return { ok: false, stale: true, filled: filled };
+          }
+          // Honest read-back: MathQuill can silently ignore LaTeX and retain an
+          // older, non-empty answer. Require the value we intended, allowing
+          // only the representation-only normalizations above.
           var after = '';
           try { var got = field.latex(); after = String(got == null ? '' : got).trim(); } catch (eR) { after = ''; }
-          if (!after) continue;
+          if (!after || canonicalLatex(after) !== intendedCanonical) {
+            complete = false;
+            continue;
+          }
           // Mirror the accepted LaTeX into the hidden input the form submits
           // (same id, "input"→"hidden-input").
           var hid = flds[f].id ? document.getElementById(flds[f].id.replace('i-mathquill-input-', 'i-mathquill-hidden-input-')) : null;
           if (hid) {
             hid.value = after;
             try { hid.dispatchEvent(new Event('input', { bubbles: true })); } catch (e2) { /* */ }
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+            if (!captureStillMatches() || !document.documentElement.contains(flds[f])) {
+              return { ok: false, stale: true, filled: filled };
+            }
             try { hid.dispatchEvent(new Event('change', { bubbles: true })); } catch (e3) { /* */ }
+            await new Promise(function (resolve) { setTimeout(resolve, 0); });
+            if (!captureStillMatches() || !document.documentElement.contains(flds[f])) {
+              return { ok: false, stale: true, filled: filled };
+            }
           }
-          any = true;
-        } catch (e) { /* this field failed; others still try */ }
+          // Controlled fields sometimes accept synchronously and then restore
+          // their prior model value. Verify both the visible MathQuill model and
+          // the hidden submission value after that delayed reconciliation.
+          await new Promise(function (resolve) { setTimeout(resolve, 80); });
+          if (!captureStillMatches() || !document.documentElement.contains(flds[f])) {
+            return { ok: false, stale: true, filled: filled };
+          }
+          var settled = '';
+          try {
+            var settledValue = field.latex();
+            settled = String(settledValue == null ? '' : settledValue).trim();
+          } catch (eS) { settled = ''; }
+          if (canonicalLatex(settled) !== intendedCanonical ||
+              (hid && canonicalLatex(hid.value) !== intendedCanonical)) {
+            complete = false;
+            continue;
+          }
+        } catch (e) { complete = false; /* this field failed; others still try */ }
       }
-      if (any) filled.push(String(id));
+      if (complete) filled.push(String(id));
     }
     return { ok: true, filled: filled };
   } catch (e) {
@@ -929,41 +1541,144 @@ function fillMathQuillMain(questions) {
 }
 
 /**
+ * Capture a bounded, read-only inventory of fillable question units from every
+ * exact document that produced the AI input. The page helper reports no prompt
+ * text or values, only mechanism/type/number/ordinal. Any missing document,
+ * malformed result, duplicate injection result, or oversized page marks the
+ * inventory inexact; autofill may still make useful progress, but autopilot is
+ * then forbidden from leaving the page.
+ */
+const MAX_AUTOPILOT_INVENTORY_UNITS = 512;
+async function readAutopilotCoverage(capture, expectedDocuments) {
+  let results;
+  try {
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (expected) => {
+        try {
+          const pageId = window.__smeshCaptureDocumentId;
+          const expectedDocument = pageId && expected[pageId];
+          const currentSignature = (typeof window.__smeshPageSig === 'function')
+            ? window.__smeshPageSig() : '';
+          const currentPrincipal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedDocument || expectedDocument.signature !== currentSignature ||
+              expectedDocument.principal !== currentPrincipal) return { stale: true };
+          const inventory = (typeof window.__smeshQuestionInventory === 'function')
+            ? window.__smeshQuestionInventory() : null;
+          return { inventory };
+        } catch { return { inventory: null }; }
+      },
+      args: [expectedDocuments]
+    });
+  } catch {
+    throw testCaptureChangedError();
+  }
+
+  if ((results || []).some((entry) => entry?.result?.stale)) {
+    throw testCaptureChangedError();
+  }
+  const expectedIds = new Set(capture.documents.map((document) => document.documentId));
+  const seen = new Set();
+  const units = [];
+  let exact = Array.isArray(results) && results.length === expectedIds.size;
+  for (const entry of (results || [])) {
+    if (!expectedIds.has(entry?.documentId) || seen.has(entry.documentId)) {
+      exact = false;
+      continue;
+    }
+    seen.add(entry.documentId);
+    const inventory = entry?.result?.inventory;
+    if (inventory?.ok !== true || !Array.isArray(inventory.units) ||
+        inventory.units.length > MAX_AUTOPILOT_INVENTORY_UNITS) {
+      exact = false;
+      continue;
+    }
+    for (const unit of inventory.units) {
+      const valid = unit && typeof unit === 'object' &&
+        (unit.source === 'native' || unit.source === 'interactive' || unit.source === 'mathquill') &&
+        typeof unit.type === 'string' && unit.type.length > 0 && unit.type.length <= 32 &&
+        (unit.id == null || (typeof unit.id === 'string' && /^\d{1,3}$/.test(unit.id))) &&
+        Number.isInteger(unit.ordinal) && unit.ordinal >= 0 &&
+        unit.ordinal < MAX_AUTOPILOT_INVENTORY_UNITS;
+      if (!valid) { exact = false; continue; }
+      if (units.length >= MAX_AUTOPILOT_INVENTORY_UNITS) {
+        exact = false;
+        continue;
+      }
+      units.push({
+        documentId: entry.documentId,
+        source: unit.source,
+        type: unit.type,
+        id: unit.id == null ? null : unit.id,
+        ordinal: unit.ordinal,
+      });
+    }
+  }
+  if (seen.size !== expectedIds.size || units.length > MAX_AUTOPILOT_INVENTORY_UNITS) exact = false;
+  return { exact, units: exact ? units : [] };
+}
+
+/**
  * Fill the test form across EVERY frame of the tab. The Mesh test player is
- * sometimes embedded in an iframe (a different *.mos.ru origin), so a fill that
+ * sometimes embedded in an iframe on the exact uchebnik.mos.ru origin, so a fill that
  * only touches the top frame finds no controls and skips everything. We inject
  * the fill logic into all accessible frames, run it in each, then merge: a
  * question counts as filled if ANY frame filled it. Frames the extension can't
  * script (foreign-origin embeds) are skipped silently. Never submits the form.
  */
-async function fillAllFrames(tabId, questions) {
+async function fillAllFrames(tabId, questions, capture) {
   if (!tabId || !Array.isArray(questions) || !questions.length) {
-    return { filled: [], skipped: [] };
+    return { filled: [], skipped: [], coverage: { exact: false, units: [] } };
   }
   const idFor = (q, i) =>
     (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+  const expectedDocuments = Object.fromEntries(
+    capture.documents.map((document) => [document.pageId, {
+      signature: document.signature,
+      principal: document.principal,
+    }])
+  );
 
-  // Make sure the fill logic (window.__smeshFill) exists in every frame.
+  // Make sure the fill logic exists only in the documents that produced the AI
+  // input. A tabId/allFrames target can silently jump to a replacement page.
   try {
-    await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+    await executeScriptInCapturedDocuments(capture, {
       files: ['src/content/scraper.js']
     });
-  } catch { /* some frames disallow injection; the ones that allow it still run */ }
+  } catch {
+    throw testCaptureChangedError();
+  }
+
+  // The file injection above is read-only. Revalidate after it and immediately
+  // before the first form mutation, so a solve from a previous URL, document,
+  // or question cannot reach the current page.
+  await withMatchingTestCapture(capture, readTestCaptureContext, async () => undefined);
+  const coverage = await readAutopilotCoverage(capture, expectedDocuments);
 
   let results = [];
   try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: (qs) => {
-        try { return (typeof window.__smeshFill === 'function') ? window.__smeshFill(qs) : null; }
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (qs, expected) => {
+        try {
+          const pageId = window.__smeshCaptureDocumentId;
+          const expectedDocument = pageId && expected[pageId];
+          const currentSignature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const currentPrincipal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedDocument || expectedDocument.signature !== currentSignature ||
+              expectedDocument.principal !== currentPrincipal) return { stale: true };
+          return (typeof window.__smeshFill === 'function')
+            ? window.__smeshFill(qs, currentSignature, currentPrincipal) : null;
+        }
         catch { return null; }
       },
-      args: [questions]
+      args: [questions, expectedDocuments]
     });
   } catch (e) {
-    return { filled: [], skipped: questions.map(idFor), error: String(e) };
+    return { filled: [], skipped: questions.map(idFor), coverage, error: String(e) };
   }
+
+  if (results.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
 
   const filled = new Set();
   for (const r of (results || [])) {
@@ -981,18 +1696,22 @@ async function fillAllFrames(tabId, questions) {
   // world (the isolated content-script world can't reach window.MQ). Runs in
   // every frame; merge any question it filled into the same set. Best-effort —
   // a page without MathQuill just returns nothing and the standard fill stands.
+  await withMatchingTestCapture(capture, readTestCaptureContext, async () => undefined);
   try {
-    const mqResults = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+    const mqResults = await executeScriptInCapturedDocuments(capture, {
       world: 'MAIN',
       func: fillMathQuillMain,
-      args: [questions]
+      args: [questions, expectedDocuments]
     });
+    if (mqResults.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
     for (const r of (mqResults || [])) {
       const res = r && r.result;
       if (res && Array.isArray(res.filled)) res.filled.forEach((id) => filled.add(String(id)));
     }
-  } catch { /* main-world injection blocked on this page — standard fill stands */ }
+  } catch (error) {
+    if (error?.code === TEST_CAPTURE_CHANGED) throw error;
+    /* main-world injection blocked on this page — standard fill stands */
+  }
 
   // Third pass: custom/ARIA widgets the native + MathQuill passes can't reach —
   // dropdowns (incl. matching done as one dropdown per item), ARIA radio groups,
@@ -1000,11 +1719,15 @@ async function fillAllFrames(tabId, questions) {
   // it runs last and is told which questions are already filled, so it never
   // re-opens or toggles one back off. Best-effort: a page with no such widgets
   // returns nothing and everything above stands.
+  await withMatchingTestCapture(capture, readTestCaptureContext, async () => undefined);
   try {
     const already = [...filled];
-    const interactiveFilled = await fillInteractiveAllFrames(tabId, questions, already);
+    const interactiveFilled = await fillInteractiveAllFrames(capture, questions, already);
     interactiveFilled.forEach((id) => filled.add(String(id)));
-  } catch { /* interactive pass is best-effort */ }
+  } catch (error) {
+    if (error?.code === TEST_CAPTURE_CHANGED) throw error;
+    /* interactive pass is best-effort */
+  }
 
   const filledIds = [];
   const skipped = [];
@@ -1012,7 +1735,7 @@ async function fillAllFrames(tabId, questions) {
     const id = idFor(q, i);
     (filled.has(String(id)) ? filledIds : skipped).push(id);
   });
-  return { filled: filledIds, skipped };
+  return { filled: filledIds, skipped, coverage };
 }
 
 /**
@@ -1024,19 +1747,35 @@ async function fillAllFrames(tabId, questions) {
  * page-side pass skips them (never toggles a set control back off). Frames that
  * disallow scripting are skipped silently; never throws.
  */
-async function fillInteractiveAllFrames(tabId, questions, alreadyFilled = []) {
-  if (!tabId || !Array.isArray(questions) || !questions.length) return [];
+async function fillInteractiveAllFrames(capture, questions, alreadyFilled = []) {
+  if (!capture?.tabId || !Array.isArray(questions) || !questions.length) return [];
+  const expectedDocuments = Object.fromEntries(
+    capture.documents.map((document) => [document.pageId, {
+      signature: document.signature,
+      principal: document.principal,
+    }])
+  );
   let results = [];
   try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: (qs, done) => {
-        try { return (typeof window.__smeshFillInteractive === 'function') ? window.__smeshFillInteractive(qs, done) : null; }
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (qs, done, expected) => {
+        try {
+          const pageId = window.__smeshCaptureDocumentId;
+          const expectedDocument = pageId && expected[pageId];
+          const currentSignature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const currentPrincipal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedDocument || expectedDocument.signature !== currentSignature ||
+              expectedDocument.principal !== currentPrincipal) return { stale: true };
+          return (typeof window.__smeshFillInteractive === 'function')
+            ? window.__smeshFillInteractive(qs, done, currentSignature, currentPrincipal) : null;
+        }
         catch { return null; }
       },
-      args: [questions, alreadyFilled]
+      args: [questions, alreadyFilled, expectedDocuments]
     });
   } catch { return []; }
+  if (results.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
   const filled = [];
   for (const r of (results || [])) {
     const s = r && r.result;
@@ -1046,154 +1785,336 @@ async function fillInteractiveAllFrames(tabId, questions, alreadyFilled = []) {
 }
 
 /* ---------- Multi-page test pagination ---------- */
-// Drive a read-only scraper.js global (currently __smeshPageSig) in EVERY frame
-// and collect the non-null results. Mirrors fillAllFrames: the test player is
-// often inside an iframe, so per-frame is the only thing that reaches it. Frames
-// that disallow scripting are skipped silently.
-async function runInAllFrames(tabId, fnName, arg = null) {
+// Invoke a pagination discovery helper only in the browser documents captured
+// for this page and return each frame's live question signature alongside its
+// result. The signature closes the same-document SPA gap; documentIds close
+// normal navigation/reload races.
+async function runInCapturedDocumentsWithIds(capture, fnName) {
   try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
-  } catch { /* some frames disallow injection; the rest still run */ }
-  let results = [];
+    await executeScriptInCapturedDocuments(capture, { files: ['src/content/scraper.js'] });
+  } catch { /* it is normally already injected; the exact call below is authoritative */ }
+  let results;
   try {
-    results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
-      func: (name, a) => {
-        try { return (typeof window[name] === 'function') ? window[name](a) : null; }
-        catch { return null; }
-      },
-      args: [fnName, arg]
-    });
-  } catch { return []; }
-  return (results || []).map((r) => r && r.result).filter((v) => v != null);
-}
-
-async function runInAllFramesWithIds(tabId, fnName) {
-  try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
-  } catch { /* inaccessible frames are simply absent from discovery */ }
-  try {
-    const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+    results = await executeScriptInCapturedDocuments(capture, {
       func: (name) => {
-        try { return (typeof window[name] === 'function') ? window[name]() : null; }
-        catch { return null; }
+        try {
+          const liveSignature = typeof window.__smeshPageSig === 'function'
+            ? window.__smeshPageSig() : '';
+          const livePrincipal = typeof window.__smeshCurrentPrincipal === 'function'
+            ? window.__smeshCurrentPrincipal() : '';
+          const result = typeof window[name] === 'function' ? window[name]() : null;
+          return { liveSignature, livePrincipal, result };
+        } catch { return null; }
       },
       args: [fnName]
     });
-    return (results || [])
-      .filter((entry) => entry?.result != null && Number.isInteger(entry.frameId))
-      .map((entry) => ({ frameId: entry.frameId, result: entry.result }));
-  } catch { return []; }
+  } catch {
+    throw testCaptureChangedError();
+  }
+  const expected = new Map(capture.documents.map((document) => [document.documentId, document]));
+  const seen = new Set();
+  const normalized = (results || []).filter((entry) => {
+    const expectedDocument = expected.get(entry?.documentId);
+    if (!expectedDocument || entry?.result?.liveSignature !== expectedDocument.signature ||
+        entry?.result?.livePrincipal !== expectedDocument.principal) return false;
+    seen.add(entry.documentId);
+    return entry.result.result != null;
+  }).map((entry) => ({
+    frameId: entry.frameId,
+    documentId: entry.documentId,
+    result: entry.result.result,
+  }));
+  if (seen.size !== capture.documents.length) throw testCaptureChangedError();
+  return normalized;
 }
 
 // Combined signature of the visible test page across all frames — lets the
 // popup detect whether clicking «Далее» actually advanced the page.
 async function testPageSig(tabId) {
   if (!tabId) return '';
-  const sigs = await runInAllFrames(tabId, '__smeshPageSig');
-  return sigs.join('||');
+  const documents = await captureTestDocuments(tabId);
+  return documents.map((document) => `${document.frameId}:${document.signature}`).join('||');
+}
+
+async function captureTestDocuments(tabId) {
+  try {
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
+  } catch { /* inaccessible frames are absent from the capture */ }
+  try {
+    const results = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const key = '__smeshCaptureDocumentId';
+        const observerKey = '__smeshCaptureObserver';
+        const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+        if (!uuid.test(window[key] || '')) window[key] = crypto.randomUUID();
+        const root = document.documentElement;
+        const refreshMarker = () => {
+          const signature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const principal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          root?.setAttribute('data-smesh-capture-page', window[key]);
+          root?.setAttribute('data-smesh-capture-signature', signature);
+          root?.setAttribute('data-smesh-capture-principal', principal);
+          return { signature, principal };
+        };
+        const { signature, principal } = refreshMarker();
+        try { window[observerKey]?.disconnect(); } catch { /* first capture */ }
+        try {
+          window[observerKey] = new MutationObserver((records) => {
+            if (records.every((record) => record.type === 'attributes' &&
+              String(record.attributeName || '').startsWith('data-smesh-capture-'))) return;
+            refreshMarker();
+          });
+          window[observerKey].observe(root, {
+            subtree: true, childList: true, characterData: true, attributes: true,
+          });
+        } catch { /* the real documentId target still protects normal navigation */ }
+        const url = String(location.href || '').slice(0, 4096);
+        const isTestDocument = typeof window.__smeshIsTestDocument === 'function' &&
+          window.__smeshIsTestDocument() === true;
+        return { pageId: window[key], signature, principal, url, isTestDocument };
+      },
+    });
+    return (results || [])
+      .filter((entry) => Number.isInteger(entry?.frameId) && entry.documentId &&
+        entry.result?.pageId && entry.result?.signature && entry.result?.principal &&
+        isMeshContentUrl(entry.result?.url) &&
+        (entry.frameId === 0 || entry.result?.isTestDocument === true))
+      .map((entry) => ({
+        frameId: entry.frameId,
+        documentId: entry.documentId,
+        pageId: entry.result.pageId,
+        signature: entry.result.signature,
+        principal: entry.result.principal,
+        url: entry.result.url,
+        isTestDocument: entry.frameId === 0 || entry.result.isTestDocument === true,
+      }))
+      .sort((a, b) => a.frameId - b.frameId);
+  } catch {
+    return [];
+  }
+}
+
+// A solve target is the exact tab URL + top-level document + question/control
+// signature. URL catches normal navigation, documentId catches reloads and
+// leave-then-return races, and signature catches same-document/SPAs.
+async function readTestCaptureContext(tabId) {
+  const before = await chrome.tabs.get(tabId);
+  requireMeshTestTab(before);
+  const documents = await captureTestDocuments(tabId);
+  const after = await chrome.tabs.get(tabId);
+  const top = documents.find((document) => document.frameId === 0);
+  const signature = documents.map((document) => `${document.frameId}:${document.signature}`).join('||');
+  const capture = {
+    tabId,
+    url: after?.url || '',
+    documentId: top?.documentId || '',
+    signature,
+    documents,
+  };
+  if (before?.url !== after?.url || !isTestCaptureContext(capture)) {
+    throw testCaptureChangedError();
+  }
+  return capture;
 }
 
 // Pagination is deliberately two-phase. Discovery runs in every frame and is
 // read-only; only after one unambiguous frame is selected do we inject a click
 // into that exact frame. The old allFrames click raced duplicate «Далее» buttons
 // and could skip multiple pages at once.
-async function testNextPage(tabId) {
-  if (!tabId) return 'none';
-  const discovery = await runInAllFramesWithIds(tabId, '__smeshNextDiscovery');
-  const exact = discovery.filter(({ result }) => result?.enabledCount === 1);
-  const withSignature = exact.filter(({ result }) => !!result?.signature);
-  const eligible = withSignature.length ? withSignature : exact;
-  if (eligible.length !== 1) {
-    const enabledTotal = discovery.reduce((sum, entry) => sum + (entry.result?.enabledCount || 0), 0);
-    const candidateTotal = discovery.reduce((sum, entry) => sum + (entry.result?.candidateCount || 0), 0);
-    const finishTotal = discovery.reduce((sum, entry) => sum + (entry.result?.finishCount || 0), 0);
-    if (!candidateTotal && finishTotal) return 'finish';
-    return enabledTotal || candidateTotal ? 'ambiguous' : 'none';
-  }
+async function testNextPage(capture, { click = true } = {}) {
+  if (!isTestCaptureContext(capture)) throw testCaptureChangedError();
+  await withMatchingTestCapture(capture, readTestCaptureContext, async () => undefined);
+  const discovery = await runInCapturedDocumentsWithIds(capture, '__smeshNextDiscovery');
+  const { outcome, documentId } = resolvePaginationTarget(discovery);
+  if (outcome !== 'next') return outcome;
+  // The page-cap check needs to distinguish "page 30 is the final page" from
+  // "there is a page 31" without clicking anything. Discovery above is pure;
+  // return its result before the click injection when requested.
+  if (!click) return 'next';
   try {
     const [{ result } = {}] = await chrome.scripting.executeScript({
-      target: { tabId, frameIds: [eligible[0].frameId] },
-      func: () => {
-        try { return (typeof window.__smeshNextClick === 'function') ? window.__smeshNextClick() : null; }
+      target: { tabId: capture.tabId, documentIds: [documentId] },
+      func: (expectedSignature, expectedPrincipal) => {
+        try {
+          const live = typeof window.__smeshPageSig === 'function' ? window.__smeshPageSig() : '';
+          const principal = typeof window.__smeshCurrentPrincipal === 'function'
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedSignature || live !== expectedSignature || principal !== expectedPrincipal) {
+            return { status: 'stale' };
+          }
+          return (typeof window.__smeshNextClick === 'function')
+            ? window.__smeshNextClick(expectedSignature, expectedPrincipal) : null;
+        }
         catch { return null; }
-      }
+      },
+      args: [
+        capture.documents.find((document) => document.documentId === documentId)?.signature || '',
+        capture.documents.find((document) => document.documentId === documentId)?.principal || '',
+      ]
     });
+    if (result?.status === 'stale') throw testCaptureChangedError();
     return result?.status === 'clicked' ? 'clicked' : 'none';
-  } catch { return 'none'; }
+  } catch (error) {
+    if (error?.code === TEST_CAPTURE_CHANGED) throw error;
+    return 'none';
+  }
 }
 
 /* ---------- Floating "Solve" pill (page-triggered test solving) ---------- */
-// The pill (src/content/test-pill.js) is a content script, so it CANNOT call
-// chrome.tabs.captureVisibleTab or chrome.scripting — the screenshot capture +
-// solve + autofill (+ the multi-page advance loop) all have to run HERE. These
+// The pill (src/content/test-pill.js) is a content script, so it cannot call
+// chrome.scripting. The worker reads bounded DOM text from the exact captured
+// documents, then solves + autofills (+ the multi-page advance loop). These
 // handlers lift the orchestration that used to live only in the popup
 // (solveTestOnScreen / solveAllPages) into the worker so it can be driven from
-// the page instead of the toolbar. The popup's own flow is untouched.
+// the page instead of the toolbar. Screen capture remains popup-only because a
+// page click does not grant activeTab and the extension deliberately avoids the
+// broad <all_urls> permission.
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const PILL_MAX_PAGES = 30; // same cap as the popup's solveAllPages
-const CAPTURE_TARGET_CHANGED = 'Переключилась вкладка — попробуйте ещё раз.';
 
-function captureTargetMatches(tab, tabId, tabUrl) {
-  return tab?.id === tabId && tab?.url === tabUrl;
+/**
+ * Cancellable pill operations.
+ *
+ * Closing the pill (×, Esc, SPA route change, page teardown) used to remove
+ * only local UI state: the worker kept solving, filling, navigating and
+ * SPENDING for up to 30 pages against a page the student thought they had
+ * stopped, and the hidden answer panel could reappear mid-run. The pill now
+ * names each run with an operation id and sends PILL_CANCEL on every teardown
+ * path; the worker aborts that exact run.
+ *
+ * Keyed by tab and matched on the operation id so a cancel for a finished run
+ * can never kill the next one.
+ */
+const pillOperations = new Map(); // tabId -> { opId, controller }
+
+/**
+ * Operation ids cancelled BEFORE their solve message arrived.
+ *
+ * PILL_CANCEL and the solve request are two independent messages, so a pill
+ * torn down while its solve was still in flight can have its cancel delivered
+ * first. Without this, that cancel found nothing to stop and the solve then
+ * started normally — the exact case the pill's own pre-await ownership check
+ * cannot cover, because the message had already left.
+ */
+const preCancelledPillOps = new Set();
+const MAX_PRE_CANCELLED_OPS = 200;
+
+function beginPillOperation(tabId, opId) {
+  const id = String(opId || '');
+  if (id && preCancelledPillOps.delete(id)) return null; // cancelled before it began
+  cancelPillOperation(tabId); // one solve per tab; withTabSolveLock enforces it too
+  const controller = new AbortController();
+  pillOperations.set(tabId, { opId: id, controller });
+  return controller.signal;
 }
 
-// captureVisibleTab has no tabId argument: it always photographs whichever tab
-// is active at that instant. Pin both sides of the call to the tab selected when
-// the solve began; the second check makes a raced capture unusable rather than
-// accidentally sending a different page to the model.
-async function requireActiveCaptureTarget(tabId, windowId, tabUrl) {
-  const [active] = await chrome.tabs.query({ active: true, windowId });
-  if (!captureTargetMatches(active, tabId, tabUrl)) throw new Error(CAPTURE_TARGET_CHANGED);
+function endPillOperation(tabId, signal) {
+  const current = pillOperations.get(tabId);
+  if (current && current.controller.signal === signal) pillOperations.delete(tabId);
+}
+
+// opId omitted (tab closed/navigated) cancels whatever is running on the tab.
+function cancelPillOperation(tabId, opId = null) {
+  const current = pillOperations.get(tabId);
+  if (!current || (opId != null && current.opId !== String(opId))) {
+    // Nothing running under that id yet. Remember the cancellation so a solve
+    // message still in flight is refused when it lands.
+    if (opId != null) {
+      if (preCancelledPillOps.size >= MAX_PRE_CANCELLED_OPS) {
+        preCancelledPillOps.delete(preCancelledPillOps.values().next().value);
+      }
+      preCancelledPillOps.add(String(opId));
+    }
+    return false;
+  }
+  pillOperations.delete(tabId);
+  try { current.controller.abort(); } catch { /* already settled */ }
+  return true;
+}
+
+const PILL_CANCELLED = 'PILL_CANCELLED';
+
+// Called before every awaited step and before every page effect (AI call,
+// panel write, autofill, navigation click). Cancellation between two of those
+// is exactly the window that let a closed pill keep mutating the page.
+function throwIfPillCancelled(signal) {
+  if (signal?.aborted) {
+    const error = new Error('Решение отменено.');
+    error.name = PILL_CANCELLED;
+    throw error;
+  }
+}
+
+const isPillCancellation = (error) => error?.name === PILL_CANCELLED;
+
+// Abortable sleep: a cancel during a settle/poll delay must not have to wait
+// out the full timer before the run stops.
+function cancellableSleep(ms, signal) {
+  throwIfPillCancelled(signal);
+  return new Promise((resolve, reject) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    };
+    const onAbort = () => {
+      clearTimeout(timer);
+      const error = new Error('Решение отменено.');
+      error.name = PILL_CANCELLED;
+      reject(error);
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+// A closed tab can never consume the result, and its page effects are moot.
+try {
+  chrome.tabs.onRemoved.addListener((tabId) => cancelPillOperation(tabId));
+} catch { /* tabs events unavailable in this context */ }
+
+function isMeshTestTab(tab) {
+  try {
+    const url = new URL(tab?.url || '');
+    return url.protocol === 'https:' &&
+      (url.hostname === 'school.mos.ru' || url.hostname === 'uchebnik.mos.ru');
+  } catch {
+    return false;
+  }
+}
+
+function requireMeshTestTab(tab) {
+  if (!isMeshTestTab(tab)) {
+    throw new Error('Для решения теста откройте тест МЭШ на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+  }
 }
 
 /**
- * Capture the visible test page: top-frame text + a JPEG screenshot. Mirrors
- * popup.js capturePage, but runs in the worker (the pill can't reach these APIs).
- * windowId pins captureVisibleTab to the pill's own window.
+ * Read the visible test DOM across every captured frame. Unlike the popup path,
+ * an in-page click does not confer activeTab, so this path intentionally never
+ * calls captureVisibleTab. Pages that expose too little readable DOM fail with
+ * a truthful popup instruction instead of asking for a permission the manifest
+ * does not request — unless the caller already holds a screenshot of this exact
+ * page (see resolveOneQuestion), in which case thin DOM text is not a dead end.
  */
-async function capturePageForPill(tabId, windowId, tabUrl) {
-  const textPromise = chrome.scripting
-    .executeScript({ target: { tabId }, func: () => document.body.innerText.slice(0, 15000) })
-    .then(([inj]) => inj?.result || '')
-    .catch(() => '');
-  // captureVisibleTab needs ACTIVE host access to the tab. Triggered from the
-  // in-page pill there is no toolbar click, so `activeTab` isn't armed and Chrome
-  // relies on the *.mos.ru host permission — which only counts while the
-  // extension's site access is actually enabled. After a permissions change +
-  // reload Chrome can quietly reset that to "On click", and capture then fails
-  // with a raw English "Either '<all_urls>' or 'activeTab' permission is
-  // required". Map that to a clear, actionable Russian instruction (the pill's
-  // errText passes Cyrillic through verbatim).
-  // JPEG, not PNG: a retina PNG of a test page is 1.5–4 MB of base64 and the
-  // whole thing rides ONE /ai/start POST — too slow for the RU DPI clamp
-  // window (see smesh-proxy.js). q90 JPEG is 5–10× smaller and test text /
-  // formulas stay perfectly readable for the vision model.
-  const shotPromise = (async () => {
-    try {
-      await requireActiveCaptureTarget(tabId, windowId, tabUrl);
-      const dataUrl = await chrome.tabs.captureVisibleTab(windowId, { format: 'jpeg', quality: 90 });
-      await requireActiveCaptureTarget(tabId, windowId, tabUrl);
-      return dataUrl;
-    } catch (e) {
-      const m = String(e?.message || e);
-      if (/all_urls|activeTab|permission|cannot be captured/i.test(m)) {
-        throw new Error(
-          'Нет доступа к снимку экрана. Сейчас решите через значок расширения СМЭШ AI на панели ' +
-          'браузера → вкладка «Тест» → «Решить тест» (этот способ работает всегда). Чтобы заработала ' +
-          'кнопка прямо на странице: chrome://extensions → СМЭШ AI → «Доступ к сайтам» → «На всех сайтах», ' +
-          'затем перезагрузите расширение и обновите страницу.'
-        );
-      }
-      throw e;
-    }
-  })();
-  const [pageText, dataUrl] = await Promise.all([textPromise, shotPromise]);
-  const b64 = (dataUrl || '').split(',')[1];
-  if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
-  return { pageText, screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' } };
+async function capturePageForPill(tabId, { allowThinText = false } = {}) {
+  const captured = await readTestCaptureContext(tabId);
+  const pageText = await capturePillDomText(captured);
+  if (!allowThinText && pageText.trim().length < 20) {
+    throw new Error(
+      'Не удалось прочитать условие теста со страницы. Откройте значок СМЭШ AI на панели браузера, ' +
+      'перейдите на вкладку «Тест» и нажмите «Решить тест» — там доступен снимок экрана.'
+    );
+  }
+  const capture = await withMatchingTestCapture(
+    captured,
+    readTestCaptureContext,
+    async (current) => current,
+  );
+  return { pageText, capture };
 }
 
 /**
@@ -1201,38 +2122,55 @@ async function capturePageForPill(tabId, windowId, tabUrl) {
  * the in-page panel (showAnswersInTab) and autofill the form across every frame
  * (fillAllFrames). Returns the parsed questions + fill summary.
  */
-async function pillSolveOnePage(tabId, windowId, tabUrl, provider) {
-  const { pageText, screenshot } = await capturePageForPill(tabId, windowId, tabUrl);
-  const answer = await solveTest({ text: pageText, screenshot, provider });
+async function pillSolveOnePage(tabId, provider, signal = null) {
+  // No screenshot on this path by construction: a page click grants no
+  // activeTab, so the pill solves from the captured DOM text alone.
+  throwIfPillCancelled(signal);
+  const { pageText, capture } = await capturePageForPill(tabId);
+  // Last gate before the PAID call.
+  throwIfPillCancelled(signal);
+  const answer = await solveTest({ text: pageText, provider, signal });
   const questions = parseTestAnswers(answer);
-  if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
-  await showAnswersInTab(tabId, questions);
-  const summary = await fillAllFrames(tabId, questions);
-  return { questions, summary };
+  throwIfPillCancelled(signal);
+  return withMatchingTestCapture(capture, readTestCaptureContext, async () => {
+    if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
+    // Each of these mutates the student's page; re-check between them so a
+    // cancel cannot be overtaken by a panel that reappears or a late autofill.
+    throwIfPillCancelled(signal);
+    await showAnswersInTab(tabId, questions, capture);
+    throwIfPillCancelled(signal);
+    const summary = await fillAllFrames(tabId, questions, capture);
+    return { questions, summary };
+  });
 }
 
 // Poll the page signature until it differs from `beforeSig` (page advanced) or
 // the budget runs out. Mirrors popup.js waitForChange.
-async function waitForPillPageChange(tabId, beforeSig, timeout) {
+async function waitForPillPageChange(tabId, beforeSig, timeout, signal = null) {
   const start = Date.now();
-  await sleep(600);
+  await cancellableSleep(600, signal);
   while (Date.now() - start < timeout) {
     const sig = await testPageSig(tabId);
     if (sig && sig !== beforeSig) return true;
-    await sleep(500);
+    await cancellableSleep(500, signal);
   }
   return false;
 }
 
-// Try to advance to the next page. Mirrors popup.js advancePage: 'ok' | 'finish'
-// | 'none' | 'stuck'. NEVER clicks a submit/finish control (testNextPage refuses).
-async function advancePillPage(tabId, beforeSig) {
+// Try to advance to the next page. Mirrors popup.js advancePage: 'ok' |
+// 'finish' | 'blocked' | 'none' | 'stuck'. NEVER clicks a submit/finish control
+// (testNextPage refuses).
+async function advancePillPage(capture, signal = null) {
+  const tabId = capture.tabId;
+  const beforeSig = capture.signature;
   for (let attempt = 0; attempt < 2; attempt++) {
-    const status = await testNextPage(tabId);
+    throwIfPillCancelled(signal); // testNextPage clicks the page
+    const status = await testNextPage(capture);
     if (status === 'finish') return 'finish';
+    if (status === 'blocked') return 'blocked';
     if (status === 'ambiguous') return 'none';
     if (status === 'none') return attempt === 0 ? 'none' : 'stuck';
-    if (await waitForPillPageChange(tabId, beforeSig, attempt === 0 ? 8000 : 4000)) return 'ok';
+    if (await waitForPillPageChange(tabId, beforeSig, attempt === 0 ? 8000 : 4000, signal)) return 'ok';
   }
   return 'stuck';
 }
@@ -1248,28 +2186,51 @@ function notifyPill(tabId, payload) {
 /**
  * Multi-page autopilot: for each page — solve, fill, then advance — until the
  * end. NEVER submits; mirrors popup.js solveAllPages exactly. Returns
- * { outcome, solved } so the pill can render the same Russian summary.
+ * { outcome, solved, partial, unrecognized } so the pill can render the same
+ * fail-closed summary as the popup.
  */
-async function pillSolveAllPages(tabId, windowId, tabUrl, provider) {
+async function pillSolveAllPages(tabId, provider, signal = null) {
   let solved = 0;
+  let partial = 0;
+  let unrecognized = 0;
   let outcome = 'done';
   for (let page = 1; page <= PILL_MAX_PAGES; page++) {
+    throwIfPillCancelled(signal);
     notifyPill(tabId, { phase: 'solve', page });
-    const { questions } = await pillSolveOnePage(tabId, windowId, tabUrl, provider);
-    if (questions.length) solved++;
+    const { questions, summary } = await pillSolveOnePage(tabId, provider, signal);
+    const fillState = classifyAutopilotFill(questions, summary);
+    if (fillState === 'unrecognized') {
+      unrecognized++;
+      outcome = 'unrecognized';
+      break;
+    }
+    if (fillState === 'partial') {
+      partial++;
+      outcome = 'partial';
+      break;
+    }
+    solved++;
     // Let the fill's React re-render settle so the signature reflects the filled
     // state — otherwise a late repaint could look like a navigation.
-    await sleep(700);
+    await cancellableSleep(700, signal);
+    const navigationCapture = await readTestCaptureContext(tabId);
+    if (page === PILL_MAX_PAGES) {
+      const finalState = await testNextPage(navigationCapture, { click: false });
+      outcome = finalState === 'finish' ? 'finish' : 'max';
+      break;
+    }
+    // The next step CLICKS through to another page. Never do that for a run
+    // the student has already stopped.
+    throwIfPillCancelled(signal);
     notifyPill(tabId, { phase: 'next', page });
-    const beforeSig = await testPageSig(tabId);
-    const nav = await advancePillPage(tabId, beforeSig);
+    const nav = await advancePillPage(navigationCapture, signal);
     if (nav === 'finish') { outcome = 'finish'; break; }
+    if (nav === 'blocked') { outcome = 'blocked'; break; }
     if (nav === 'none') { outcome = 'none'; break; }
     if (nav === 'stuck') { outcome = 'stuck'; break; }
-    if (page === PILL_MAX_PAGES) { outcome = 'max'; break; }
-    await sleep(500);
+    await cancellableSleep(500, signal);
   }
-  return { outcome, solved };
+  return { outcome, solved, partial, unrecognized };
 }
 
 // One screen-solve operation per tab: the pill and popup drive capture →
@@ -1288,6 +2249,13 @@ async function withTabSolveLock(tabId, fn) {
   }
 }
 
+try {
+  chrome.tabs.onRemoved.addListener((tabId) => {
+    tabSolveOps.delete(tabId);
+    answerPanelContexts.delete(tabId);
+  });
+} catch { /* tabs events unavailable in a test harness */ }
+
 /* ---------- Runtime message trust boundary ---------- */
 
 const EXTENSION_PAGE_PREFIX = `chrome-extension://${chrome.runtime.id}/`;
@@ -1304,17 +2272,21 @@ const CONTENT_ACTIONS = new Set([
   'PILL_SOLVE_ALL',
   'RESOLVE_QUESTION'
 ]);
+const PANEL_ACTIONS = new Set(['FILL_ANSWERS_ALL', 'RESOLVE_QUESTION']);
 
 // This is intentionally exhaustive. Adding a switch case without assigning it
 // to a sender class leaves it unreachable instead of silently widening access.
 const SENDER_MESSAGE_TYPES = {
-  content: new Set(['GET_ACTION_TOKEN', ...CONTENT_ACTIONS]),
+  // PILL_CANCEL is deliberately outside CONTENT_ACTIONS: it only stops the
+  // sender tab's own run, so it must not require an action token.
+  content: new Set(['GET_ACTION_TOKEN', 'PILL_CANCEL', ...CONTENT_ACTIONS]),
   extension: new Set([
     'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
-    'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG', 'CLASSIFY_TASKS',
-    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES', 'GET_HISTORY_SNAPSHOT',
-    'GDZ_CATALOG', 'GDZ_SEARCH', 'GDZ_RESOLVE', 'GDZ_FOR_TASK', 'GDZ_SELFTEST',
-    'CONSUME_DASH_LAUNCH'
+    'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG',
+    'GET_DEVICE_ID', 'SET_LICENSE_KEY', 'DEACTIVATE_LICENSE', 'SYNC_REFERRAL_POINTER', 'DELETE_LOCAL_DATA',
+    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES',
+    'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
+    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY'
   ])
 };
 
@@ -1328,12 +2300,6 @@ const isBoolean = (v) => typeof v === 'boolean';
 const isOptionalBoolean = (v) => v == null || isBoolean(v);
 const hasOnlyKeys = (obj, allowed) => isRecord(obj) && Object.keys(obj).every((k) => allowed.includes(k));
 const validArray = (v, check) => Array.isArray(v) && v.length <= MAX_ARRAY_ITEMS && v.every(check);
-
-function isHttpUrl(v) {
-  if (!isString(v, MAX_URL_CHARS)) return false;
-  try { return ['http:', 'https:'].includes(new URL(v).protocol); }
-  catch { return false; }
-}
 
 function validFile(file) {
   return hasOnlyKeys(file, ['mimeType', 'dataBase64', 'name']) &&
@@ -1362,6 +2328,35 @@ function validQuestion(q) {
 
 const validQuestions = (v) => validArray(v, validQuestion);
 
+function validTestCapture(capture, tabId) {
+  return hasOnlyKeys(capture, ['tabId', 'url', 'documentId', 'signature', 'documents']) &&
+    isTestCaptureContext(capture) && capture.tabId === tabId &&
+    isMeshContentUrl(capture.url);
+}
+
+const GDZ_BOOK_KEYS = [
+  'url', 'title', 'breadcrumb', 'year', 'authors', 'study_level', 'subtype',
+  'cover_url', 'classes', 'is_paid', 'subjectId', 'subject_id'
+];
+const isGdzSubjectId = (value) => {
+  const text = String(value ?? '');
+  const number = text.length <= 32 && /^\d+$/.test(text) ? Number(text) : NaN;
+  return Number.isSafeInteger(number) && number >= 0;
+};
+function validGdzBook(book) {
+  return hasOnlyKeys(book, GDZ_BOOK_KEYS) && isString(book.url, MAX_URL_CHARS) &&
+    !!normalizeGdzApiUrl(book.url) &&
+    isGdzSubjectId(book.subject_id) &&
+    isOptionalString(book.title, 2048) && isOptionalString(book.breadcrumb, 4096) &&
+    (book.year == null || isSafeId(book.year) || isString(book.year, 32)) &&
+    (book.authors == null || validArray(book.authors, (author) => isString(author, 1024))) &&
+    isOptionalString(book.study_level, 512) && isOptionalString(book.subtype, 512) &&
+    isOptionalString(book.cover_url, MAX_URL_CHARS) &&
+    (book.classes == null || validArray(book.classes, (grade) => isSafeId(Number(grade)))) &&
+    (book.is_paid == null || isBoolean(book.is_paid)) &&
+    (book.subjectId == null || isGdzSubjectId(book.subjectId));
+}
+
 function validHistoryMessage(item) {
   return hasOnlyKeys(item, ['role', 'content', 'files', 'needsUpload', 'error']) &&
     isString(item.role, 32) && isString(item.content) &&
@@ -1381,66 +2376,103 @@ const payloadRecord = (msg, keys) => hasOnlyKeys(msg.payload, keys);
 // so an ignored field cannot be used to smuggle an unbounded object through the
 // privileged boundary.
 const MESSAGE_SCHEMAS = {
-  GET_ACTION_TOKEN: (msg) => noPayload(msg) && CONTENT_ACTIONS.has(msg.action),
-  OPEN_DASHBOARD: (msg) => payloadRecord(msg, ['subject', 'task', 'day', 'homeworkId', 'homeworkItemId', 'rowToken']) &&
+  GET_ACTION_TOKEN: (msg) => noPayload(msg) && CONTENT_ACTIONS.has(msg.action) &&
+    (PANEL_ACTIONS.has(msg.action) ? isPanelNonce(msg.panelNonce) : msg.panelNonce == null),
+  GET_DEVICE_ID: noPayload,
+  SET_LICENSE_KEY: (msg) => payloadRecord(msg, ['key']) && isString(msg.payload.key, 512),
+  DEACTIVATE_LICENSE: noPayload,
+  SYNC_REFERRAL_POINTER: noPayload,
+  DELETE_LOCAL_DATA: noPayload,
+  OPEN_DASHBOARD: (msg) => payloadRecord(msg, ['subject', 'task', 'day', 'homeworkId', 'homeworkItemId', 'rowToken', 'tabId', 'scanId', 'principal', 'principalError', 'files']) &&
     isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task) &&
     isOptionalString(msg.payload.day, 1024) && isOpaqueId(msg.payload.homeworkId) &&
-    isOpaqueId(msg.payload.homeworkItemId) && isOptionalString(msg.payload.rowToken, 128),
-  SOLVE: (msg) => payloadRecord(msg, ['subject', 'task', 'files', 'sessionId', 'history', 'mode']) &&
+    isOpaqueId(msg.payload.homeworkItemId) && isHomeworkScanId(msg.payload.rowToken) &&
+    isSafeId(msg.payload.tabId) &&
+    isHomeworkScanId(msg.payload.scanId) &&
+    isOptionalString(msg.payload.principal, 512) &&
+    isOptionalString(msg.payload.principalError, 1024) &&
+    (msg.payload.files == null || validFiles(msg.payload.files)),
+  SOLVE: (msg) => payloadRecord(msg, ['subject', 'task', 'files', 'sessionId', 'history', 'mode', 'engine']) &&
     isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task) &&
     (msg.payload.files == null || validFiles(msg.payload.files)) &&
     isOptionalString(msg.payload.sessionId, 512) &&
     (msg.payload.history == null || validArray(msg.payload.history, validHistoryMessage)) &&
-    isOptionalString(msg.payload.mode, 64),
-  SOLVE_TEST: (msg) => payloadRecord(msg, ['text', 'screenshot', 'tabId', 'provider']) &&
+    isOptionalString(msg.payload.mode, 64) &&
+    isOptionalString(msg.payload.engine, 16),
+  SOLVE_TEST: (msg) => payloadRecord(msg, ['text', 'screenshot', 'tabId', 'provider', 'capture']) &&
     isOptionalString(msg.payload.text) && (msg.payload.screenshot == null || validFile(msg.payload.screenshot)) &&
-    isSafeId(msg.payload.tabId) && isOptionalString(msg.payload.provider, 64),
-  FILL_ANSWERS_ALL: (msg) => payloadRecord(msg, ['questions']) && validQuestions(msg.payload.questions),
-  FILL_ANSWERS_TAB: (msg) => payloadRecord(msg, ['tabId', 'questions']) &&
-    isSafeId(msg.payload.tabId) && validQuestions(msg.payload.questions),
+    isSafeId(msg.payload.tabId) && isOptionalString(msg.payload.provider, 64) &&
+    validTestCapture(msg.payload.capture, msg.payload.tabId),
+  FILL_ANSWERS_ALL: (msg) => payloadRecord(msg, ['questions', 'panelNonce']) &&
+    validQuestions(msg.payload.questions) && isPanelNonce(msg.payload.panelNonce),
+  FILL_ANSWERS_TAB: (msg) => payloadRecord(msg, ['tabId', 'questions', 'capture']) &&
+    isSafeId(msg.payload.tabId) && validQuestions(msg.payload.questions) &&
+    validTestCapture(msg.payload.capture, msg.payload.tabId),
   TEST_PAGE_SIG: (msg) => payloadRecord(msg, ['tabId']) && isSafeId(msg.payload.tabId),
-  TEST_NEXT_PAGE: (msg) => payloadRecord(msg, ['tabId']) && isSafeId(msg.payload.tabId),
-  PILL_SOLVE_PAGE: (msg) => payloadRecord(msg, ['provider']) && isOptionalString(msg.payload.provider, 64),
-  PILL_SOLVE_ALL: (msg) => payloadRecord(msg, ['provider']) && isOptionalString(msg.payload.provider, 64),
-  RESOLVE_QUESTION: (msg) => payloadRecord(msg, ['index', 'prevAnswer', 'questionText']) &&
+  TEST_NEXT_PAGE: (msg) => payloadRecord(msg, ['tabId', 'capture', 'inspectOnly']) &&
+    isSafeId(msg.payload.tabId) && validTestCapture(msg.payload.capture, msg.payload.tabId) &&
+    isOptionalBoolean(msg.payload.inspectOnly),
+  PILL_SOLVE_PAGE: (msg) => payloadRecord(msg, ['provider', 'opId']) &&
+    isOptionalString(msg.payload.provider, 64) && isOptionalString(msg.payload.opId, 128),
+  PILL_SOLVE_ALL: (msg) => payloadRecord(msg, ['provider', 'opId']) &&
+    isOptionalString(msg.payload.provider, 64) && isOptionalString(msg.payload.opId, 128),
+  PILL_CANCEL: (msg) => payloadRecord(msg, ['opId']) && isOptionalString(msg.payload.opId, 128),
+  RESOLVE_QUESTION: (msg) => payloadRecord(msg, ['index', 'prevAnswer', 'questionText', 'panelNonce']) &&
     (isSafeId(msg.payload.index) || isString(msg.payload.index, 512)) &&
-    isOptionalString(msg.payload.prevAnswer) && isOptionalString(msg.payload.questionText),
+    isOptionalString(msg.payload.prevAnswer) && isOptionalString(msg.payload.questionText) &&
+    isPanelNonce(msg.payload.panelNonce),
   GET_RUNTIME_CONFIG: (msg) => noPayload(msg) ||
     (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
   CONSUME_DASH_LAUNCH: (msg) => payloadRecord(msg, ['id']) &&
     isString(msg.payload.id, 128) && /^[0-9a-f-]{36}$/i.test(msg.payload.id),
-  CLASSIFY_TASKS: (msg) => payloadRecord(msg, ['tasks']) &&
-    validArray(msg.payload.tasks, (task) => isString(task)),
   OPENROUTER_CREDITS: noPayload,
-  DOWNLOAD_FILES: (msg) => payloadRecord(msg, ['urls', 'headers', 'token']) &&
+  VERIFY_PROVIDER_KEY: (msg) => payloadRecord(msg, ['provider', 'apiKey']) &&
+    isString(msg.payload.provider, 32) && isString(msg.payload.apiKey, 512),
+  DOWNLOAD_FILES: (msg) => payloadRecord(msg, [
+    'urls', 'headers', 'token', 'tabId', 'scanId', 'principal',
+    'principalError', 'rowToken'
+  ]) &&
     validArray(msg.payload.urls, isAllowedAttachmentUrl) && validHeaders(msg.payload.headers) &&
-    isOptionalString(msg.payload.token, 8192),
+    isOptionalString(msg.payload.token, 8192) &&
+    isSafeId(msg.payload.tabId) && isHomeworkScanId(msg.payload.scanId) &&
+    isString(msg.payload.principal, 512) &&
+    isOptionalString(msg.payload.principalError, 1024) &&
+    isHomeworkScanId(msg.payload.rowToken),
   LIST_SESSIONS: noPayload,
   LIST_MESSAGES: (msg) => noPayload(msg) && isString(msg.sessionId, 512),
-  GET_HISTORY_SNAPSHOT: noPayload,
-  GDZ_CATALOG: (msg) => noPayload(msg) ||
-    (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
   GDZ_SEARCH: (msg) => payloadRecord(msg, ['grade', 'subjectId', 'subtype', 'query']) &&
     (msg.payload.grade == null || isSafeId(msg.payload.grade) || isString(msg.payload.grade, 32)) &&
     (msg.payload.subjectId == null || isSafeId(msg.payload.subjectId) || isString(msg.payload.subjectId, 32)) &&
     isOptionalString(msg.payload.subtype, 256) && isOptionalString(msg.payload.query),
-  GDZ_RESOLVE: (msg) => payloadRecord(msg, ['bookUrl', 'number']) &&
-    isHttpUrl(msg.payload.bookUrl) && (isSafeId(msg.payload.number) || isString(msg.payload.number, 512)),
   GDZ_FOR_TASK: (msg) => payloadRecord(msg, ['subject', 'task']) &&
     isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task),
-  GDZ_SELFTEST: noPayload
+  GDZ_BOOK_ADD: (msg) => payloadRecord(msg, ['book']) && validGdzBook(msg.payload.book),
+  GDZ_BOOK_REMOVE: (msg) => payloadRecord(msg, ['subjectId', 'url']) &&
+    isGdzSubjectId(msg.payload.subjectId) &&
+    isString(msg.payload.url, MAX_URL_CHARS) &&
+    !!normalizeGdzApiUrl(msg.payload.url)
 };
 
 function isMeshContentUrl(url) {
-  return typeof url === 'string' &&
-    (url.startsWith('https://school.mos.ru/') || url.startsWith('https://uchebnik.mos.ru/'));
+  if (typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === 'https:' &&
+      (parsed.hostname === 'school.mos.ru' || parsed.hostname === 'uchebnik.mos.ru');
+  } catch {
+    return false;
+  }
 }
 
 function classifyMessageSender(sender) {
   if (sender?.id !== chrome.runtime.id) return null;
   // Dashboard pages have sender.tab too, so the extension origin must win first.
   if (typeof sender.url === 'string' && sender.url.startsWith(EXTENSION_PAGE_PREFIX)) return 'extension';
-  if (sender.tab && isSafeId(sender.tab.id) && isMeshContentUrl(sender.tab.url)) return 'content';
+  // tab.url is only the top-level page. Also validate sender.url so an injected
+  // foreign-origin iframe inside a Mesh tab cannot inherit the top frame's
+  // authority and request content-script capabilities.
+  if (sender.tab && isSafeId(sender.tab.id) &&
+      isMeshContentUrl(sender.tab.url) && isMeshContentUrl(sender.url)) return 'content';
   return null;
 }
 
@@ -1449,7 +2481,7 @@ function validateMessage(senderClass, msg) {
   if (!isString(msg.type, 64) || !msg.type) return 'Некорректный тип сообщения.';
   if (!SENDER_MESSAGE_TYPES[senderClass]?.has(msg.type)) return 'Действие недоступно для этого источника.';
   const allowedTopKeys = msg.type === 'GET_ACTION_TOKEN'
-    ? ['type', 'action']
+    ? ['type', 'action', 'panelNonce']
     : (msg.type === 'LIST_MESSAGES' ? ['type', 'sessionId'] : ['type', 'payload', 'token']);
   if (!hasOnlyKeys(msg, allowedTopKeys)) return 'Некорректная структура сообщения.';
   if (msg.token != null && !isString(msg.token, 128)) return 'Некорректный токен действия.';
@@ -1460,6 +2492,10 @@ function validateMessage(senderClass, msg) {
     const budget = validateRequestFileBudget(deduped.allFiles);
     if (!budget.ok) return budget.error;
   }
+  if (msg.type === 'OPEN_DASHBOARD') {
+    const budget = validateRequestFileBudget(msg.payload?.files || []);
+    if (!budget.ok) return budget.error;
+  }
   return null;
 }
 
@@ -1467,21 +2503,22 @@ function clearExpiredActionTokens(now = Date.now()) {
   for (const [token, grant] of actionTokens) if (grant.expiresAt <= now) actionTokens.delete(token);
 }
 
-function issueActionToken(tabId, action) {
+function issueActionToken(tabId, action, panelNonce = null) {
   const now = Date.now();
   clearExpiredActionTokens(now);
   const token = crypto.randomUUID();
   const expiresAt = now + ACTION_TOKEN_TTL_MS;
-  actionTokens.set(token, { tabId, action, expiresAt });
+  actionTokens.set(token, { tabId, action, panelNonce, expiresAt });
   return { token, expiresAt };
 }
 
-function consumeActionToken(token, tabId, action) {
+function consumeActionToken(token, tabId, action, panelNonce = null) {
   const grant = actionTokens.get(token);
   // Any presentation burns the capability, including a mismatched one. That
   // keeps it single-use and prevents repeated probing of its binding.
   if (grant) actionTokens.delete(token);
-  if (!grant || grant.expiresAt <= Date.now() || grant.tabId !== tabId || grant.action !== action) {
+  if (!grant || grant.expiresAt <= Date.now() || grant.tabId !== tabId ||
+      grant.action !== action || grant.panelNonce !== panelNonce) {
     return false;
   }
   return true;
@@ -1499,18 +2536,47 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === 'GET_ACTION_TOKEN') {
-    const grant = issueActionToken(sender.tab.id, msg.action);
+    if (PANEL_ACTIONS.has(msg.action)) {
+      try {
+        matchingAnswerPanelContext(sender.tab.id, msg.panelNonce);
+      } catch {
+        sendResponse({ ok: false, error: 'Панель ответов устарела.' });
+        return false;
+      }
+    }
+    const grant = issueActionToken(sender.tab.id, msg.action, msg.panelNonce ?? null);
     sendResponse({ ok: true, ...grant });
     return false;
   }
   if (senderClass === 'content' && CONTENT_ACTIONS.has(msg.type) &&
-      !consumeActionToken(msg.token, sender.tab.id, msg.type)) {
+      !consumeActionToken(
+        msg.token,
+        sender.tab.id,
+        msg.type,
+        PANEL_ACTIONS.has(msg.type) ? msg.payload?.panelNonce : null,
+      )) {
     sendResponse({ ok: false, error: 'Токен действия недействителен или истёк.' });
     return false;
   }
   (async () => {
     try {
       switch (msg?.type) {
+        case 'GET_DEVICE_ID':
+          sendResponse({ ok: true, deviceId: await getDeviceId() });
+          break;
+        case 'SET_LICENSE_KEY':
+          sendResponse({ ok: true, status: await setLicenseKeyAndSyncReferral(msg.payload.key) });
+          break;
+        case 'DEACTIVATE_LICENSE':
+          sendResponse({ ok: true, status: await deactivateCurrentLicense() });
+          break;
+        case 'SYNC_REFERRAL_POINTER':
+          sendResponse({ ok: true, code: await syncReferralPointer() });
+          break;
+        case 'DELETE_LOCAL_DATA':
+          await deleteAllLocalData();
+          sendResponse({ ok: true });
+          break;
         case 'OPEN_DASHBOARD':
           await openDashboard(msg.payload);
           sendResponse({ ok: true });
@@ -1520,17 +2586,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, result: await withKeepAlive(() => solve(msg.payload)) });
           break;
         case 'SOLVE_TEST': {
-          const tabId = msg.payload?.tabId;
-          const answer = await (tabId
-            ? withTabSolveLock(tabId, () => withKeepAlive(() => solveTest(msg.payload)))
-            : withKeepAlive(() => solveTest(msg.payload)));
-          // Parse once: the panel needs it now, and the popup's «Решить все
-          // страницы» loop needs the structured questions to auto-fill the page.
-          const questions = parseTestAnswers(answer);
-          // Fire-and-forget: surfacing the panel must NOT delay the popup reply.
-          // The popup is also where errors get rendered, so a panel failure has
-          // no user-visible impact beyond "no on-page panel this time".
-          if (tabId && questions.length) showAnswersInTab(tabId, questions);
+          const { tabId, capture } = msg.payload;
+          const { answer, questions } = await withTabSolveLock(tabId, () => withKeepAlive(async () => {
+            const solved = await solveTest(msg.payload);
+            // Parse once: the panel needs it now, and the popup's «Решить все
+            // страницы» loop needs the structured questions to auto-fill.
+            const parsed = parseTestAnswers(solved);
+            await withMatchingTestCapture(capture, readTestCaptureContext, async () => {
+              // Hand the screenshot to the panel: the popup can take one, the
+              // panel's «перерешать» cannot, so this is the only way a re-solve
+              // sees the same material the first answer did.
+              if (parsed.length) await showAnswersInTab(tabId, parsed, capture, msg.payload.screenshot);
+            });
+            return { answer: solved, questions: parsed };
+          }));
           sendResponse({ ok: true, answer, questions });
           break;
         }
@@ -1540,28 +2609,51 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // is the tab the panel lives in.
           const tabId = sender?.tab?.id;
           const questions = msg.payload?.questions || [];
+          const panelNonce = msg.payload?.panelNonce;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          sendResponse({ ok: true, summary: await fillAllFrames(tabId, questions) });
+          const summary = await withTabSolveLock(tabId, async () => {
+            const context = matchingAnswerPanelContext(tabId, panelNonce);
+            return withMatchingTestCapture(context.capture, readTestCaptureContext, async () => {
+              // Match again inside the mutation lock. A pending replacement
+              // invalidates the old nonce before any asynchronous setup runs.
+              matchingAnswerPanelContext(tabId, panelNonce);
+              return fillAllFrames(tabId, questions, context.capture);
+            });
+          });
+          sendResponse({ ok: true, summary });
           break;
         }
         case 'FILL_ANSWERS_TAB': {
           // Same fill, but driven by the POPUP (no sender.tab) for the multi-page
-          // loop — the tab id is passed explicitly.
-          const { tabId, questions } = msg.payload || {};
+          // loop — the tab id is passed explicitly. It mutates the form, so it
+          // takes the same per-tab lock as every other screen-solve step: the
+          // in-page pill's autopilot can be mid-run on this very tab.
+          const { tabId, questions, capture } = msg.payload || {};
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          sendResponse({ ok: true, summary: await fillAllFrames(tabId, questions || []) });
+          sendResponse({
+            ok: true,
+            summary: await withTabSolveLock(tabId, () => fillAllFrames(tabId, questions || [], capture)),
+          });
           break;
         }
         case 'TEST_PAGE_SIG': {
           const { tabId } = msg.payload || {};
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          sendResponse({ ok: true, sig: await testPageSig(tabId) });
+          const capture = await readTestCaptureContext(tabId);
+          sendResponse({ ok: true, sig: capture.signature, capture });
           break;
         }
         case 'TEST_NEXT_PAGE': {
-          const { tabId } = msg.payload || {};
+          // Navigating the tab is the most destructive step in the loop, so it
+          // holds the per-tab lock too — except for the read-only inspection the
+          // page-cap check makes, which must stay callable while nothing runs.
+          const { tabId, capture } = msg.payload || {};
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          sendResponse({ ok: true, status: await testNextPage(tabId) });
+          const click = !msg.payload?.inspectOnly;
+          const status = click
+            ? await withTabSolveLock(tabId, () => testNextPage(capture, { click }))
+            : await testNextPage(capture, { click });
+          sendResponse({ ok: true, status });
           break;
         }
         case 'PILL_SOLVE_PAGE': {
@@ -1569,32 +2661,79 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // pill (a content script) can't screenshot/script, so the worker does
           // it all: capture → solve → panel → autofill the visible page.
           const tabId = sender?.tab?.id;
-          const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { questions, summary } = await withTabSolveLock(tabId, () =>
-            withKeepAlive(() => pillSolveOnePage(tabId, windowId, sender.tab.url, msg.payload?.provider)));
-          sendResponse({ ok: true, count: questions.length, summary });
+          const signal = beginPillOperation(tabId, msg.payload?.opId);
+          // The pill was torn down while this message was in flight.
+          if (!signal) { sendResponse({ ok: false, cancelled: true, error: 'отменено' }); break; }
+          try {
+            const { questions, summary } = await withTabSolveLock(tabId, () =>
+              withKeepAlive(() => pillSolveOnePage(tabId, msg.payload?.provider, signal)));
+            sendResponse({ ok: true, count: questions.length, summary });
+          } catch (e) {
+            if (!isPillCancellation(e)) throw e;
+            sendResponse({ ok: false, cancelled: true, error: e.message });
+          } finally {
+            endPillOperation(tabId, signal);
+          }
           break;
         }
         case 'PILL_SOLVE_ALL': {
           // The pill's «все страницы» autopilot: solve+fill every page, advancing
           // with «Далее», stopping before any submit/finish control.
           const tabId = sender?.tab?.id;
-          const windowId = sender?.tab?.windowId;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
-          const { outcome, solved } = await withTabSolveLock(tabId, () =>
-            withKeepAlive(() => pillSolveAllPages(tabId, windowId, sender.tab.url, msg.payload?.provider)));
-          sendResponse({ ok: true, outcome, solved });
+          const signal = beginPillOperation(tabId, msg.payload?.opId);
+          // The pill was torn down while this message was in flight.
+          if (!signal) { sendResponse({ ok: false, cancelled: true, error: 'отменено' }); break; }
+          try {
+            const { outcome, solved, partial, unrecognized } = await withTabSolveLock(tabId, () =>
+              withKeepAlive(() => pillSolveAllPages(tabId, msg.payload?.provider, signal)));
+            sendResponse({ ok: true, outcome, solved, partial, unrecognized });
+          } catch (e) {
+            if (!isPillCancellation(e)) throw e;
+            sendResponse({ ok: false, cancelled: true, error: e.message });
+          } finally {
+            endPillOperation(tabId, signal);
+          }
+          break;
+        }
+        case 'PILL_CANCEL': {
+          // De-escalation only: it can stop the sender tab's own run and
+          // nothing else, so unlike the solve actions it needs no capability
+          // token — requiring one would make cancelling fail exactly when the
+          // worker was recycled and the student most needs it to stop.
+          const tabId = sender?.tab?.id;
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          sendResponse({ ok: true, cancelled: cancelPillOperation(tabId, msg.payload?.opId) });
           break;
         }
         case 'RESOLVE_QUESTION': {
           // The answer panel's per-line «перерешать» button: re-solve ONE
           // question on the panel's tab. sender.tab is that (test) tab.
           const tabId = sender?.tab?.id;
-          const windowId = sender?.tab?.windowId;
+          const panelNonce = msg.payload?.panelNonce;
           if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
           const resolved = await withTabSolveLock(tabId, () =>
-            withKeepAlive(() => resolveOneQuestion(tabId, windowId, sender.tab.url, msg.payload || {})));
+            withKeepAlive(async () => {
+              const context = matchingAnswerPanelContext(tabId, panelNonce);
+              return withMatchingTestCapture(
+                context.capture,
+                readTestCaptureContext,
+                async () => {
+                  matchingAnswerPanelContext(tabId, panelNonce);
+                  const answer = await resolveOneQuestion(
+                    tabId,
+                    msg.payload || {},
+                    context.capture,
+                    context.screenshot,
+                  );
+                  // Do not release an old AI result to content after a panel
+                  // replacement, even when both captures happen to look alike.
+                  matchingAnswerPanelContext(tabId, panelNonce);
+                  return answer;
+                },
+              );
+            }));
           sendResponse({ ok: true, answer: resolved.answer, parts: resolved.parts });
           break;
         }
@@ -1612,18 +2751,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, payload: await consumeDashboardLaunch(msg.payload?.id) });
           break;
         }
-        case 'CLASSIFY_TASKS':
-          // Remote classification ships homework text to an AI provider — the
-          // same consent gate as a solve, not a free pass because it's "meta".
-          if (!(await hasConsent())) { sendResponse({ ok: false, error: CONSENT_REQUIRED_MESSAGE }); break; }
-          sendResponse({ ok: true, kinds: await classifyTasksAI(msg.payload?.tasks || []) });
-          break;
         case 'OPENROUTER_CREDITS': {
           // Settings usage dashboard: OpenRouter balance (+ a daily spend
           // snapshot recorded as a side effect) and the derived spend history.
           const credits = await fetchOpenRouterCredits();
           const spendHistory = await getSpendHistory();
           sendResponse({ ...credits, spendHistory });
+          break;
+        }
+        case 'VERIFY_PROVIDER_KEY': {
+          // Popup onboarding checks a typed Groq/OpenRouter key BEFORE it is
+          // persisted, so the first «Решить» can't dead-end on a bad key. The
+          // provider libraries stay service-worker-only; the popup just asks.
+          const verify = msg.payload.provider === 'groq'
+            ? verifyGroqKey
+            : (msg.payload.provider === 'openrouter' ? verifyOpenRouterKey : null);
+          if (!verify) { sendResponse({ ok: false, reason: 'bad_provider' }); break; }
+          sendResponse(await verify(msg.payload.apiKey));
           break;
         }
         case 'DOWNLOAD_FILES':
@@ -1635,38 +2779,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'LIST_MESSAGES':
           sendResponse({ ok: true, messages: await listMessages(msg.sessionId) });
           break;
-        case 'GET_HISTORY_SNAPSHOT':
-          sendResponse({ ok: true, snapshot: await getHistorySnapshot() });
-          break;
         // ---------- GDZ ----------
-        case 'GDZ_CATALOG': {
-          const catalog = await getCatalog({ force: !!msg.payload?.force });
-          // Return only what the picker needs in one shot; books are already trimmed.
-          sendResponse({ ok: true, catalog });
-          break;
-        }
         case 'GDZ_SEARCH': {
           const catalog = await getCatalog();
           sendResponse({ ok: true, books: searchBooks(catalog, msg.payload || {}) });
-          break;
-        }
-        case 'GDZ_RESOLVE': {
-          // payload: { bookUrl, number }
-          const { bookUrl, number } = msg.payload || {};
-          if (!bookUrl || number == null) { sendResponse({ ok: false, error: 'bookUrl + number required' }); break; }
-          const result = await resolveTask(bookUrl, number);
-          if (!result) { sendResponse({ ok: false, error: 'not found' }); break; }
-          // Inline EVERY answer image as base64 — multi-page answers have more
-          // than one — so the chat can render them directly. Fetch them in
-          // parallel (independent network calls) and drop any that fail, keeping
-          // source order.
-          const settled = await Promise.all(
-            result.images.map((url) => fetchTaskImage(url).catch(() => null))
-          );
-          const inlined = settled.filter(Boolean);
-          if (!inlined.length) { sendResponse({ ok: false, error: 'images unavailable' }); break; }
-          track('gdz_pull', { meta: { source: 'manual', images: inlined.length } });
-          sendResponse({ ok: true, result: { ...result, inlined } });
           break;
         }
         case 'GDZ_FOR_TASK': {
@@ -1716,25 +2832,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           });
           break;
         }
-        case 'GDZ_SELFTEST': {
-          // End-to-end smoke test from the popup/devtools: search → resolve →
-          // image. If this returns ok:true, the DNR UA rule is firing and the
-          // whole chain works from inside the extension.
-          const catalog = await getCatalog();
-          const hits = searchBooks(catalog, { grade: 9, subjectId: 4, query: 'макарычев углубл' });
-          if (!hits.length) { sendResponse({ ok: false, error: 'catalog: book not found' }); break; }
-          const r = await resolveTask(hits[0].url, '25');
-          if (!r) { sendResponse({ ok: false, error: 'resolve: task not found' }); break; }
-          const img = await fetchTaskImage(r.images[0]);
+        case 'GDZ_BOOK_ADD':
           sendResponse({
             ok: true,
-            book: hits[0].title,
-            taskLink: r.link,
-            imageBytes: Math.round((img.dataBase64.length * 3) / 4),
-            mimeType: img.mimeType
+            gdzBooks: await addGdzBook({
+              ...msg.payload.book,
+              url: normalizeGdzApiUrl(msg.payload.book.url),
+            }),
           });
           break;
-        }
+        case 'GDZ_BOOK_REMOVE':
+          sendResponse({
+            ok: true,
+            gdzBooks: await removeGdzBook(
+              msg.payload.subjectId,
+              normalizeGdzApiUrl(msg.payload.url),
+            ),
+          });
+          break;
         default:
           sendResponse({ ok: false, error: 'Unknown message type' });
       }
@@ -1748,7 +2863,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       // errorCode() vocabulary — raw message text (which can echo provider
       // output or file names) never leaves the device.
       track('error', { meta: { code: errorCode(e), op: msg?.type || null } });
-      sendResponse({ ok: false, error: emsg });
+      sendResponse({ ok: false, error: emsg, code: e?.code || undefined });
     }
   })();
   return true; // async
@@ -1828,7 +2943,10 @@ chrome.runtime.onConnect.addListener((port) => {
     const validationError = msg?.type === 'SOLVE' ? validateMessage('extension', msg) : 'Недопустимый тип сообщения.';
     if (validationError) {
       safePost({ type: 'error', error: validationError });
-      try { port.disconnect(); } catch { /* already closed */ }
+      // Only tear the port down when nothing is running on it. Disconnecting
+      // fires onDisconnect → activeCtrl.abort(), so a stray/invalid message must
+      // NOT disconnect while a legitimate solve is streaming on this same port.
+      if (!activeCtrl) { try { port.disconnect(); } catch { /* already closed */ } }
       return;
     }
     const ctrl = new AbortController();

@@ -65,9 +65,12 @@ export const EXERCISE_SUBJECTS = [
 ];
 
 // Workbook signal — "Р.т.", "рабочая тетрадь", "р/т", English "workbook/activity book".
-// NOTE: \w is ASCII-only in JS and never matches Cyrillic — use [а-яё]* for the
-// spelled-out "рабочая тетрадь" / "рабочей тетради" forms (it's a workbook too).
-const WB_MARKER = /(р\.?\s*т\.?|рабоч[а-яё]*\s+тетрад[а-яё]*|р\/т|activity\s*book|workbook)/i;
+// The short abbreviation needs Cyrillic-aware letter boundaries because its
+// dots are optional: bare «рт» must not match inside «карта» or «четверть».
+// JS \b/\w are ASCII-only; [а-яё]* still covers inflected spelled-out forms.
+const WB_MARKER = /((?<![а-яёa-z])р\.?\s*т\.?(?![а-яёa-z])|рабоч[а-яё]*\s+тетрад[а-яё]*|р\/т|activity\s*book|workbook)/i;
+// An explicit «учебник» marker hands a sticky line context back to the textbook.
+const TEXTBOOK_MARKER = /учебник/i;
 // Page refs: "с. 112", "стр 74", "страница 108-109". The single-letter "с" form
 // REQUIRES its period: bare "с" + number is the Russian preposition «с» ("начни
 // с 5 примера"), and matching that injects a wrong page → a confidently wrong
@@ -97,9 +100,9 @@ function expandNums(str) {
 
 /**
  * Parse a homework task into page/exercise numbers, grouped by book context.
- * Sentences are split on a period followed by an uppercase letter (so the
- * abbreviation dots in "Р.т.", "с.", "упр." don't split mid-reference), and a
- * sentence mentioning a workbook marker contributes to the workbook bucket.
+ * Each Mesh task line starts in textbook context. Within that line a workbook
+ * marker makes the context sticky for following sentence fragments until an
+ * explicit «учебник» marker hands it back; the context resets at the newline.
  *
  * @returns {{textbook:{pages:number[],exercises:number[]}, workbook:{pages:number[],exercises:number[]}}}
  */
@@ -108,20 +111,43 @@ export function parseRefs(text = '') {
     textbook: { pages: new Set(), exercises: new Set() },
     workbook: { pages: new Set(), exercises: new Set() }
   };
-  // Split on newlines (homework is often one task per line) AND on a period
-  // followed by an uppercase letter — the abbreviation dots in "Р.т."/"с."/"упр."
-  // are followed by lowercase or a digit, so they don't split mid-reference.
-  for (const sentence of String(text).split(/\n+|(?<=\.)\s+(?=[А-ЯЁA-Za-z])/)) {
-    const bucket = WB_MARKER.test(sentence) ? ctx.workbook : ctx.textbook;
-    let m;
-    PAGE_RE.lastIndex = 0;
-    while ((m = PAGE_RE.exec(sentence))) {
-      const a = +m[1];
-      bucket.pages.add(a);
-      if (m[2]) for (let p = a + 1; p <= +m[2] && p - a < 20; p++) bucket.pages.add(p);
+  for (const line of String(text).split(/\n+/)) {
+    let wbActive = false;
+    // Context markers and references can share one sentence (for example,
+    // «Р.т. упр. 1, учебник упр. 2»). Process every event in document order;
+    // assigning one bucket to a whole sentence would put at least one of those
+    // references in the wrong book. Context remains sticky until the opposite
+    // marker and resets only at the next line, as the homework UI intends.
+    const events = [];
+    const collect = (re, type) => {
+      const global = new RegExp(re.source, re.flags.includes('g') ? re.flags : re.flags + 'g');
+      let match;
+      while ((match = global.exec(line))) {
+        events.push({ index: match.index, type, match });
+        if (match[0] === '') global.lastIndex++;
+      }
+    };
+    collect(WB_MARKER, 'workbook');
+    collect(TEXTBOOK_MARKER, 'textbook');
+    collect(PAGE_RE, 'page');
+    collect(EX_RE, 'exercise');
+    const priority = (event) => (event.type === 'workbook' || event.type === 'textbook') ? 0 : 1;
+    events.sort((a, b) => a.index - b.index || priority(a) - priority(b));
+
+    for (const event of events) {
+      if (event.type === 'workbook') { wbActive = true; continue; }
+      if (event.type === 'textbook') { wbActive = false; continue; }
+      const bucket = wbActive ? ctx.workbook : ctx.textbook;
+      if (event.type === 'page') {
+        const a = +event.match[1];
+        bucket.pages.add(a);
+        if (event.match[2]) {
+          for (let p = a + 1; p <= +event.match[2] && p - a < 20; p++) bucket.pages.add(p);
+        }
+      } else {
+        for (const n of expandNums(event.match[1])) bucket.exercises.add(n);
+      }
     }
-    EX_RE.lastIndex = 0;
-    while ((m = EX_RE.exec(sentence))) for (const n of expandNums(m[1])) bucket.exercises.add(n);
   }
   const arr = (o) => ({ pages: [...o.pages], exercises: [...o.exercises] });
   return { textbook: arr(ctx.textbook), workbook: arr(ctx.workbook) };

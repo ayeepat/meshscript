@@ -1,0 +1,35 @@
+{
+  "name": "smesh-ai-motion-ad",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "studio": "remotion studio src/index.jsx",
+    "still": "remotion still src/index.jsx SmeshAd",
+    "test": "node --test tests/release-guards.test.mjs",
+    "audio": "node scripts/run_audio.mjs",
+    "preflight": "node scripts/check_prerequisites.mjs",
+    "check:assets": "node scripts/check_release_assets.mjs",
+    "check:audio-source": "node scripts/check_audio_determinism.mjs",
+    "check:bundle": "node scripts/check_bundle.mjs",
+    "check:scene-render": "node scripts/check_scene_render.mjs",
+    "check:audio-render": "node scripts/check_audio_render.mjs",
+    "check": "npm run preflight && npm test && npm run check:assets && npm run check:audio-source && npm run check:bundle && npm run check:scene-render && npm run check:audio-render",
+    "render": "npm run preflight && npm run check:assets && npm run check:audio-source && remotion render src/index.jsx SmeshAd output/smesh-ai-v1-final-source-1080p60.mp4 --codec=h264 --audio-codec=aac --audio-bitrate=192K --enforce-audio-track --crf=15 --pixel-format=yuv420p --concurrency=4 && node scripts/transcode_release.mjs output/smesh-ai-v1-final-source-1080p60.mp4 output/smesh-ai-v1-final-16x9-1080p60.mp4"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.498",
+    "@remotion/media": "4.0.498",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "remotion": "4.0.498"
+  },
+  "overrides": {
+    "fast-uri": "3.1.5",
+    "js-yaml": "5.2.3",
+    "postcss": "8.5.26"
+  }
+}

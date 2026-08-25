@@ -40,14 +40,15 @@
  * 96 KB upload chunks died with 0 bytes through. So EVERY request — including
  * /ai/start itself — must fit under that allowance. The upload fix mirrors
  * the polling download fix: when the /ai/start body would be big (screenshot,
- * PDF, long replayed history), the whole `messages` JSON is sliced into ~8 KB
- * chunks, each POSTed to /ai/blob on its own short-lived connection (a few in
- * parallel — each connection brings its own allowance), reassembled server-
- * side, and referenced from a tiny /ai/start via { messages_blob } (see
- * uploadBlob below).
+ * PDF, long replayed history), the whole `messages` JSON is split into chunks
+ * whose JSON-escaped UTF-8 payload stays under ~8 KB, each POSTed to /ai/blob
+ * on its own short-lived connection (a few in parallel — each connection
+ * brings its own allowance), reassembled server-side, and referenced from a
+ * tiny /ai/start via { messages_blob } (see uploadBlob below).
  */
+import { hasConsent } from './consent.js';
 
-import { createSseSink } from './http.js';
+import { createSseSink, readResponseTextBounded } from './http.js';
 import { AI_BACKEND_URL } from './config.js';
 import { getLicenseStatus } from './license.js';
 import { getDeviceId } from './history.js';
@@ -59,17 +60,20 @@ const CANCEL_URL = `${AI_BACKEND_URL}/ai/cancel`;
 const BLOB_URL = `${AI_BACKEND_URL}/ai/blob`;
 const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;
 
-// Chunked upload for large attachments (see the module header). A part whose
-// data URI exceeds INLINE_MAX_CHARS is uploaded in small pieces instead of
-// inlined.
+// Chunked upload for large attachments (see the module header). A start body
+// whose serialized UTF-8 size exceeds START_INLINE_MAX_BYTES is uploaded in
+// small pieces instead of inlined.
 //
 // CHUNK SIZE IS THE WHOLE FIX FOR RU — the TSPU clamp is not just a time
 // window, it is a per-connection TRANSFER ALLOWANCE of ~16 KB: a large upload
 // measured from RU delivered EXACTLY 16 KB and then crawled to a 408, and
 // 96 KB chunks died with 0 bytes through (net::ERR_TIMED_OUT at ~19 s). Small
 // requests (/ai/start with text, every poll) always work because they fit
-// under the allowance. So a RU-safe chunk must fit WELL under 16 KB
-// *including* the JSON envelope, TLS records and headers → 8 KB of payload.
+// under the allowance. The DPI meters BYTES, so a RU-safe chunk is budgeted by
+// the exact UTF-8 byte length of its JSON-escaped string payload, not by JS
+// UTF-16 characters (Cyrillic is usually 2 bytes; emoji can be 4). It must fit
+// WELL under 16 KB *including* the JSON envelope, TLS records and headers →
+// 8 KB of serialized payload bytes.
 //
 // BUT most students are NOT behind that clamp, and 8 KB chunks are needlessly
 // slow for them: a 5 MB PDF is ~850 requests, and since every request opens a
@@ -81,13 +85,13 @@ const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;
 //
 // So chunk size is ADAPTIVE, not fixed: start large (fast on any normal
 // connection), and only fall back to the RU-safe floor if the large size
-// provably can't get ANY bytes through — see uploadBlob. The learned size is
-// remembered for the rest of this service-worker's lifetime, so only the
-// FIRST upload after a worker restart ever pays the probe cost.
-const START_INLINE_MAX_CHARS = 10 * 1024; // /ai/start bodies under this go as-is (fit the RU allowance with headroom)
-const PROBE_CHUNK_CHARS = 128 * 1024;  // first try — fast for any normal (non-clamped) connection
-const SAFE_CHUNK_CHARS = 8 * 1024;     // RU-DPI-safe floor — used once PROBE is proven to not get through at all
-const BLOB_PARALLEL = 3;               // the allowance is per-connection, so parallel sockets multiply throughput
+// provably can't get a full-budget chunk through — see uploadBlob. The learned
+// size is remembered for the browser session, so worker respawns do not repeat
+// the probe.
+const START_INLINE_MAX_BYTES = 10 * 1024; // /ai/start bodies under this go as-is (fit the RU allowance with headroom)
+const PROBE_CHUNK_BYTES = 128 * 1024;  // first try — fast for any normal (non-clamped) connection
+const SAFE_CHUNK_BYTES = 8 * 1024;     // RU-DPI-safe floor — used once PROBE is proven to not get through at all
+const BLOB_PARALLEL = 6;               // the allowance is per-connection, so parallel sockets multiply throughput; 6 = Chrome's HTTP/1.1 per-host connection cap (Caddy runs Connection: close, so h1 — more sockets than this just queue)
 const BLOB_CHUNK_TIMEOUT_MS = 10000;   // an 8 KB chunk should take ~0.5–1 s; 10 s means "stalled, retry/give up"
 const BLOB_CHUNK_RETRIES = 4;          // retries at the SAFE size, with growing backoff — worth trying hard here
 // Retries at the PROBE size. NOT 1 (i.e. zero retries): a large upload is
@@ -101,6 +105,38 @@ const BLOB_CHUNK_RETRIES = 4;          // retries at the SAFE size, with growing
 const PROBE_CHUNK_RETRIES = 3;
 let learnedChunkChars = null;          // set once an upload actually completes; reused as the starting size next time
 
+// MV3 service workers are torn down after ~30s idle, so an in-memory-only
+// learnedChunkChars is lost constantly — an RU-clamped user would re-run the
+// full 128KB→8KB probe/fallback on EVERY respawn. chrome.storage.session is
+// session-scoped (survives SW restarts, cleared on browser restart) — exactly
+// the lifetime of a "this connection is clamped" fact — so it carries the
+// learned size across respawns. Trusts ONLY the two sizes uploadBlob can learn,
+// so a corrupt/hostile stored value can never widen a chunk past the RU floor.
+// Tradeoff: a user whose network un-clamps mid-session stays on the safe (slow
+// but always-working) size until a browser restart; that self-heals and never
+// breaks an upload, whereas re-probing a still-clamped connection is the exact
+// cost this avoids. TSPU clamping is per-network, so it rarely toggles anyway.
+// The storage key name is legacy: persisted values are now byte budgets, but
+// keeping the key preserves already-learned 131072/8192 values across updates.
+const LEARNED_CHUNK_KEY = 'smeshLearnedChunkChars';
+async function loadLearnedChunkChars() {
+  if (learnedChunkChars) return learnedChunkChars;
+  try {
+    const { [LEARNED_CHUNK_KEY]: v } = await chrome.storage.session.get(LEARNED_CHUNK_KEY);
+    if (v === PROBE_CHUNK_BYTES || v === SAFE_CHUNK_BYTES) learnedChunkChars = v;
+  } catch { /* storage.session unavailable → probe as before */ }
+  return learnedChunkChars;
+}
+function rememberLearnedChunkChars(size) {
+  learnedChunkChars = size;
+  // storage.session.set() returns a Promise — a synchronous try/catch does NOT
+  // catch a rejected write, so guard the sync throw (area missing) AND the
+  // async rejection (?.catch). Persistence is best-effort; the in-memory value
+  // is authoritative regardless, so a failed write is silently ignored.
+  try { chrome.storage.session.set({ [LEARNED_CHUNK_KEY]: size })?.catch(() => {}); }
+  catch { /* storage.session unavailable */ }
+}
+
 // The server long-polls: each /ai/poll is HELD up to ~4s and returns the
 // instant new tokens exist. So the client re-polls IMMEDIATELY (no setTimeout
 // gap) — that keeps a fetch permanently pending, which is what keeps the MV3
@@ -113,6 +149,14 @@ const HOTSPIN_GUARD_MS = 400;      // if a poll returns empty in <this, briefly 
 const IDLE_TIMEOUT_MS = 90000;     // no NEW bytes for this long → give up
 const FAILURE_BACKOFF_MS = 1000;   // wait after a transport hiccup before retrying
 const MAX_POLL_FAILURES = 4;       // consecutive transport failures tolerated
+const UUID_V4_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const isUuidV4 = (value) => typeof value === 'string' && UUID_V4_RE.test(value);
+// The VPS intentionally returns a 256-bit base64url capability for uploads
+// (`crypto.randomBytes(32).toString('base64url')`), not a UUID. Keep this
+// separate from blob/job identifiers so tightening one wire type cannot break
+// the other cross-component contract again.
+const UPLOAD_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+export const isUploadToken = (value) => typeof value === 'string' && UPLOAD_TOKEN_RE.test(value);
 
 // Proxy errors are ready-made Russian sentences in { error: { message } }.
 function proxyMessage(text, fallback) {
@@ -132,13 +176,27 @@ function proxyMessage(text, fallback) {
 // aborted read also tears the dead connection out of Chrome's pool, so the
 // retry opens a fresh one instead of stalling on the same clamped socket.
 async function fetchText(url, init, signal, timeoutMs) {
+  // An ALREADY-aborted signal never fires 'abort' again, so registering a
+  // listener is not by itself a gate. Without this check a request prepared
+  // while the caller was cancelling — e.g. an abort landing during the device
+  // lookup — was still dispatched with a fresh, un-aborted internal signal,
+  // which is how a cancelled solve could still create an upload ticket and a
+  // paid job. Re-read the CURRENT state immediately before every external
+  // effect, not just at the start of the operation.
+  if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   const onAbort = () => ctrl.abort();
   if (signal) signal.addEventListener('abort', onAbort, { once: true });
   try {
-    const res = await fetch(url, { ...init, signal: ctrl.signal });
-    const text = await res.text();
+    const res = await fetch(url, { ...init, redirect: 'error', signal: ctrl.signal });
+    // A full poll can contain the VPS's 2 MiB output ceiling plus JSON string
+    // escaping. Keep generous headroom while still bounding a hostile server.
+    const text = await readResponseTextBounded(res, 6 * 1024 * 1024);
+    // readResponseTextBounded intentionally converts reader failures to a
+    // bounded partial/empty string. A timeout, however, is transport failure —
+    // never misreport headers + a stalled body as a successful empty response.
+    if (ctrl.signal.aborted) throw new DOMException('Aborted', 'AbortError');
     return { ok: res.ok, status: res.status, text };
   } finally {
     clearTimeout(timer);
@@ -156,26 +214,78 @@ function sleep(ms, signal) {
   });
 }
 
+const CHUNK_TEXT_ENCODER = new TextEncoder();
+
+// JSON.stringify is the exact wire representation for quotes, backslashes,
+// controls and lone surrogates. Subtract the two surrounding quote bytes to
+// meter only the string payload embedded in the /ai/blob request envelope.
+function serializedChunkBytes(chunk) {
+  return CHUNK_TEXT_ENCODER.encode(JSON.stringify(chunk)).byteLength - 2;
+}
+
+/** Split text into substrings whose JSON-escaped UTF-8 cost fits byteBudget. */
+export function splitChunks(text, byteBudget) {
+  if (!Number.isSafeInteger(byteBudget) || byteBudget <= 0) {
+    throw new RangeError('byteBudget must be a positive integer');
+  }
+  const chunks = [];
+  for (let start = 0; start < text.length;) {
+    // ASCII/base64 fast path: start with byteBudget CHARACTERS, which is exact
+    // for the common payload and avoids a binary search or per-character scan.
+    let charCount = Math.min(byteBudget, text.length - start);
+    let chunk = text.slice(start, start + charCount);
+    let measuredBytes = serializedChunkBytes(chunk);
+    while (measuredBytes > byteBudget) {
+      // Usually one proportional shrink is enough (e.g. Cyrillic halves).
+      // Force progress around floor/escaping edges and never emit empty data.
+      let nextCount = Math.floor(charCount * byteBudget / measuredBytes);
+      if (nextCount >= charCount) nextCount = charCount - 1;
+      charCount = Math.max(1, nextCount);
+      chunk = text.slice(start, start + charCount);
+      measuredBytes = serializedChunkBytes(chunk);
+      if (charCount === 1 && measuredBytes > byteBudget) {
+        throw new RangeError('byteBudget is too small for one serialized character');
+      }
+    }
+    // A boundary may bisect a surrogate pair. That is safe: JSON.stringify
+    // escapes each lone surrogate and JSON.parse + concatenation restores the
+    // original pair server-side.
+    chunks.push(chunk);
+    start += charCount;
+  }
+  return chunks;
+}
+
 // Upload one long STRING (here: the messages JSON) as many small /ai/blob
-// POSTs at a FIXED chunk size and return the server blob id. Chunks are plain
-// substrings — the server just concatenates them back in seq order, no
-// base64 round-trip (a base64 wrapper would inflate the already-base64 image
-// payloads by 33%). Each chunk rides its own short-lived connection (fresh
-// under Connection: close) and fits under the per-connection transfer
-// allowance; a few upload in parallel because each connection has its OWN
-// allowance. Throws once every retry at every chunk is exhausted; the thrown
-// Error carries `.sentAny` (were ANY chunks delivered before the failure?) so
-// the adaptive wrapper below can tell "this size doesn't work at all" (retry
-// smaller) apart from "a real error mid-upload" (surface it, don't retry).
-async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, dbg, blobId, uploadToken }) {
-  const total = Math.max(1, Math.ceil(text.length / chunkChars));
+// POSTs at a FIXED serialized UTF-8 BYTE budget and return the server blob id.
+// All boundaries are computed before parallel workers pull sequence numbers.
+// Chunks stay plain substrings — the server concatenates them in seq order, no
+// base64 round-trip (which would inflate already-base64 images by 33%). Each
+// chunk rides its own short-lived connection and fits the per-connection
+// allowance. Throws once retries are exhausted; `.sentAny` now means a chunk
+// large enough to PROVE this byte budget works was delivered, not merely any
+// short remainder, so the adaptive wrapper can distinguish clamp from a real
+// mid-upload failure.
+async function uploadBlobSized(
+  text,
+  mime,
+  name,
+  chunkBytes,
+  retries,
+  { signal, dbg, blobId, uploadToken, generation }
+) {
+  const chunks = splitChunks(text, chunkBytes);
+  const chunkCosts = chunks.map(serializedChunkBytes);
+  const fullSize = chunkCosts.map((bytes) => bytes >= chunkBytes * 0.5);
+  const total = chunks.length;
   const tUp = Date.now();
   let nextSeq = 0;
   let sent = 0;
+  let sizeProven = false;
   let failure = null; // first fatal error — stops all workers
 
   const pushChunk = async (seq) => {
-    const chunk = text.slice(seq * chunkChars, (seq + 1) * chunkChars);
+    const chunk = chunks[seq];
     let lastErr = 'unknown';
     for (let attempt = 0; attempt < retries; attempt++) {
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -184,13 +294,23 @@ async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, 
         const r = await fetchText(BLOB_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ blob_id: blobId, upload_token: uploadToken, seq, total, chunk, mime, name })
+          body: JSON.stringify({
+            blob_id: blobId,
+            upload_token: uploadToken,
+            generation,
+            seq,
+            total,
+            chunk,
+            mime,
+            name
+          })
         }, signal, BLOB_CHUNK_TIMEOUT_MS);
         if (r.ok) {
           sent += 1;
+          if (fullSize[seq]) sizeProven = true;
           // Log sparsely: first chunks, then every 10th, then the last.
           if (sent <= 3 || sent % 10 === 0 || sent === total) {
-            dbg?.('blob', blobId.slice(0, 8), sent + '/' + total, chunkChars + 'B/chunk', '+' + (Date.now() - tUp) + 'ms');
+            dbg?.('blob', blobId.slice(0, 8), sent + '/' + total, chunkBytes + 'B budget', '+' + (Date.now() - tUp) + 'ms');
           }
           return;
         }
@@ -213,33 +333,40 @@ async function uploadBlobSized(text, mime, name, chunkChars, retries, { signal, 
     }
   };
   await Promise.all(Array.from({ length: Math.min(BLOB_PARALLEL, total) }, worker));
-  // Evaluated AFTER every parallel worker has settled, so `sent` is the true
-  // final count — a sibling chunk that succeeded a moment after this one gave
-  // up still proves the size works, and should NOT trigger a size fallback.
-  if (failure) { failure.sentAny = sent > 0; throw failure; }
-  dbg?.('blob', blobId.slice(0, 8), 'DONE', total + ' chunks @ ' + chunkChars + 'B', text.length + 'ch', '+' + (Date.now() - tUp) + 'ms');
+  // Evaluated AFTER every worker settles. Only a >= half-budget success proves
+  // the size; a tiny final remainder can pass a clamp while full chunks fail.
+  if (failure) { failure.sentAny = sizeProven; throw failure; }
+  dbg?.('blob', blobId.slice(0, 8), 'DONE', total + ' chunks @ ' + chunkBytes + 'B budget', text.length + 'ch', '+' + (Date.now() - tUp) + 'ms');
   return blobId;
 }
 
 // Adaptive entry point: try the large PROBE size first (fast on any normal
-// connection); if it fails with ZERO chunks delivered — the signature of a
-// hard per-connection clamp, not a one-off blip — retry the WHOLE upload at
-// the RU-safe floor size instead. A size that gets even one chunk through but
-// then fails is a real error (network drop, tab closed), not a size problem,
-// so that's surfaced as-is rather than retried smaller. The size that works
-// is remembered for the rest of this service-worker's lifetime.
-async function uploadBlob(text, mime, name, opts) {
-  const startSize = learnedChunkChars || PROBE_CHUNK_CHARS;
-  const startRetries = startSize <= SAFE_CHUNK_CHARS ? BLOB_CHUNK_RETRIES : PROBE_CHUNK_RETRIES;
+// connection); if it fails without delivering a FULL-SIZE (>= half-budget)
+// chunk — the signature of a hard per-connection clamp — retry the WHOLE
+// upload at the RU-safe floor. A successful tiny final remainder does not
+// suppress fallback; a proven-size success followed by failure is surfaced as
+// a real network error. The working size is remembered for the browser session.
+export async function uploadBlob(text, mime, name, opts) {
+  const startSize = (await loadLearnedChunkChars()) || PROBE_CHUNK_BYTES;
+  const startRetries = startSize <= SAFE_CHUNK_BYTES ? BLOB_CHUNK_RETRIES : PROBE_CHUNK_RETRIES;
   try {
-    const id = await uploadBlobSized(text, mime, name, startSize, startRetries, opts);
-    learnedChunkChars = startSize;
+    const id = await uploadBlobSized(text, mime, name, startSize, startRetries, {
+      ...opts,
+      generation: 0
+    });
+    rememberLearnedChunkChars(startSize);
     return id;
   } catch (e) {
-    if (e?.name === 'AbortError' || e.sentAny || startSize <= SAFE_CHUNK_CHARS) throw e;
-    opts.dbg?.('probe size', startSize + 'B failed with 0 bytes through — falling back to RU-safe', SAFE_CHUNK_CHARS + 'B');
-    const id = await uploadBlobSized(text, mime, name, SAFE_CHUNK_CHARS, BLOB_CHUNK_RETRIES, opts);
-    learnedChunkChars = SAFE_CHUNK_CHARS;
+    if (e?.name === 'AbortError' || e.sentAny || startSize <= SAFE_CHUNK_BYTES) throw e;
+    opts.dbg?.('probe size', startSize + 'B failed with no full-size chunk through — falling back to RU-safe', SAFE_CHUNK_BYTES + 'B');
+    // A timed-out probe can still reach the VPS after this fallback begins.
+    // Advance the upload generation so those late chunks are acknowledged but
+    // can never reset or corrupt the authoritative safe-size attempt.
+    const id = await uploadBlobSized(text, mime, name, SAFE_CHUNK_BYTES, BLOB_CHUNK_RETRIES, {
+      ...opts,
+      generation: 1
+    });
+    rememberLearnedChunkChars(SAFE_CHUNK_BYTES);
     return id;
   }
 }
@@ -247,13 +374,18 @@ async function uploadBlob(text, mime, name, opts) {
 // Blob chunks are intentionally tiny and numerous, so they cannot each afford
 // a remote /verify request. Obtain one short-lived, license-bound capability
 // first; the VPS binds every chunk and the final /ai/start to it.
-async function createUploadTicket(licenseKey, deviceId, signal) {
+async function createUploadTicket(licenseKey, deviceId, activationToken, size, signal) {
   let res;
   try {
     res = await fetchText(UPLOAD_TICKET_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ license_key: licenseKey, device_id: deviceId })
+      body: JSON.stringify({
+        license_key: licenseKey,
+        device_id: deviceId,
+        activation_token: activationToken,
+        size
+      })
     }, signal, START_TIMEOUT_MS);
   } catch (e) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -262,7 +394,7 @@ async function createUploadTicket(licenseKey, deviceId, signal) {
   if (!res.ok) throw new Error(proxyMessage(res.text, 'Не удалось подтвердить загрузку вложения. Попробуйте ещё раз.'));
   let ticket;
   try { ticket = JSON.parse(res.text); } catch { ticket = null; }
-  if (!ticket?.ok || typeof ticket.upload_token !== 'string' || typeof ticket.blob_id !== 'string') {
+  if (!ticket?.ok || !isUploadToken(ticket.upload_token) || !isUuidV4(ticket.blob_id)) {
     throw new Error('Не удалось подтвердить загрузку вложения. Попробуйте ещё раз.');
   }
   return ticket;
@@ -285,10 +417,25 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   const dbg = (...a) => console.log('[smesh-poll]', '+' + (Date.now() - t0) + 'ms', ...a);
 
   const deviceId = await getDeviceId();
+  // Server-side usage reporting follows the same explicit opt-in as client
+  // telemetry. Treat every missing, malformed, or unreadable value as false.
+  let telemetryOptIn = false;
+  try {
+    const stored = await chrome.storage.local.get('telemetryEnabled');
+    telemetryOptIn = stored.telemetryEnabled === true && await hasConsent();
+  } catch { /* privacy-safe default */ }
+  // Bound to this logical solve for the whole attempt, including retries: the
+  // server launches the upstream job once the RESPONSE is flushed, not once
+  // the client reads it, so a lost /ai/start reply would otherwise leave a
+  // paid job running and the retry would start a second one.
+  const idempotencyKey = crypto.randomUUID();
   const body = {
     provider,
     license_key: status.key,
     device_id: deviceId,
+    activation_token: status.activation_token,
+    telemetry_opt_in: telemetryOptIn,
+    idempotency_key: idempotencyKey,
     messages
   };
   if (responseFormat) body.response_format = responseFormat;
@@ -302,7 +449,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   // When it doesn't fit, ship `messages` via chunked /ai/blob upload and send
   // a tiny start that references the blob instead.
   let payload = JSON.stringify(body);
-  if (payload.length > START_INLINE_MAX_CHARS) {
+  if (new TextEncoder().encode(payload).byteLength > START_INLINE_MAX_BYTES) {
     // This is the exact object the VPS reassembles under MAX_BLOB_CHARS. Check
     // its serialized length before obtaining a ticket or uploading any chunk;
     // the attachment-only budget cannot account for long prompts/history.
@@ -312,7 +459,9 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
     dbg('start body', payload.length + 'ch — externalizing messages (' + messagesJson.length + 'ch) via /ai/blob');
     let blobId;
     try {
-      const ticket = await createUploadTicket(status.key, deviceId, signal);
+      const ticket = await createUploadTicket(
+        status.key, deviceId, status.activation_token, messagesJson.length, signal
+      );
       blobId = await uploadBlob(messagesJson, 'application/json', 'messages', {
         signal, dbg, blobId: ticket.blob_id, uploadToken: ticket.upload_token
       });
@@ -327,16 +476,29 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   }
 
   // ---- start: license check + quota charge + server-side stream kickoff ----
+  // One retry, carrying the SAME idempotency key. A transport failure here is
+  // ambiguous — the server may already have flushed a reply we never read and
+  // launched the job — so retrying blind would double the spend. With the key
+  // the server answers the retry with the ORIGINAL job instead of starting a
+  // second one, which turns a lost reply from wasted quota into a recovery.
   let res;
-  try {
-    res = await fetchText(START_URL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: payload
-    }, signal, START_TIMEOUT_MS);
-  } catch (e) {
+  for (let attempt = 1; ; attempt++) {
     if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    throw new Error(`${label}: не удалось связаться с сервером СМЭШ. Проверьте интернет и попробуйте ещё раз.`);
+    try {
+      res = await fetchText(START_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: payload
+      }, signal, START_TIMEOUT_MS);
+      break;
+    } catch (e) {
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (attempt >= 2) {
+        throw new Error(`${label}: не удалось связаться с сервером СМЭШ. Проверьте интернет и попробуйте ещё раз.`);
+      }
+      dbg('START transport failure, retrying with the same idempotency key');
+      await sleep(FAILURE_BACKOFF_MS, signal);
+    }
   }
   const startText = res.text;
   if (!res.ok) {
@@ -346,19 +508,19 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   }
   let started;
   try { started = JSON.parse(startText); } catch { started = null; }
-  const jobId = started?.ok && typeof started.job_id === 'string' ? started.job_id : '';
-  const jobToken = started?.ok && typeof started.job_token === 'string' ? started.job_token : '';
-  if (!jobId) throw new Error(`${label}: некорректный ответ сервера. Попробуйте ещё раз.`);
+  const jobId = started?.ok && isUuidV4(started.job_id) ? started.job_id : '';
+  const jobToken = started?.ok && isUuidV4(started.job_token) ? started.job_token : '';
+  if (!jobId || !jobToken) throw new Error(`${label}: некорректный ответ сервера. Попробуйте ещё раз.`);
   dbg('START ok', res.status, 'job', jobId.slice(0, 8));
 
   // Fire-and-forget: free the job / stop the upstream spend. Idempotent.
   const cancelJob = () => {
-    const headers = { 'Content-Type': 'application/json' };
-    if (jobToken) headers['X-Job-Token'] = jobToken;
+    const headers = { 'Content-Type': 'application/json', 'X-Job-Token': jobToken };
     fetch(CANCEL_URL, {
       method: 'POST',
       headers,
-      body: JSON.stringify({ job: jobId })
+      body: JSON.stringify({ job: jobId }),
+      redirect: 'error'
     }).catch(() => { });
   };
 
@@ -377,7 +539,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
       let poll = null; // parsed poll body, or null on any transport hiccup
       let notFound = null;
       try {
-        const headers = jobToken ? { 'X-Job-Token': jobToken } : undefined;
+        const headers = { 'X-Job-Token': jobToken };
         const r = await fetchText(
           `${POLL_URL}?job=${encodeURIComponent(jobId)}&cursor=${cursor}`,
           { method: 'GET', headers },

@@ -5,6 +5,7 @@ const { default: worker } = await import('../backend/src/worker.js');
 
 const env = {
   ADMIN_SECRET: 'a'.repeat(64),
+  STATS_SECRET: 's'.repeat(64),
   LICENSES: { get: async () => null }
 };
 const ctx = { waitUntil() {} };
@@ -23,6 +24,22 @@ assert.equal(browserResponse.status, 401, 'browser-origin admin requests must be
 const dashboardOnCliRoute = await invoke({ Origin: DASHBOARD });
 assert.equal(dashboardOnCliRoute.status, 401, 'dashboard origin must not reach non-stats admin routes');
 
+const retryFromBrowser = await worker.fetch(new Request(
+  'https://smeshapi.site/admin/referral/retry-pending', {
+    method: 'POST', headers: { Origin: DASHBOARD, 'x-admin-token': env.ADMIN_SECRET }
+  }
+), env, ctx);
+assert.equal(retryFromBrowser.status, 401,
+  'pending-referral recovery must remain CLI-only even for the dashboard origin');
+
+const retryFromCli = await worker.fetch(new Request(
+  'https://smeshapi.site/admin/referral/retry-pending', {
+    method: 'POST', headers: { 'x-admin-token': env.ADMIN_SECRET }
+  }
+), env, ctx);
+assert.equal(retryFromCli.status, 503,
+  'authenticated CLI pending-referral recovery must reach its D1 availability check');
+
 const cliResponse = await invoke();
 assert.equal(cliResponse.status, 404, 'token-authenticated CLI request must reach the route');
 
@@ -34,13 +51,16 @@ const preflight = await worker.fetch(new Request('https://smeshapi.site/admin/li
     'Access-Control-Request-Headers': 'x-admin-token'
   }
 }), env, ctx);
-assert.equal(preflight.headers.get('access-control-allow-headers'), 'Content-Type');
+assert.equal(
+  preflight.headers.get('access-control-allow-headers'),
+  'Content-Type, X-Telemetry-Token, X-Erasure-Token'
+);
 
 /* ---- stats routes: the owner dashboard origin (and only it) may call ---- */
 
 async function stats(headers = {}, extraEnv = {}) {
   return worker.fetch(new Request('https://smeshapi.site/admin/stats/overview?days=1', {
-    headers: { 'x-admin-token': env.ADMIN_SECRET, ...headers }
+    headers: { 'x-stats-token': env.STATS_SECRET, ...headers }
   }), { ...env, ...extraEnv }, ctx);
 }
 
@@ -55,16 +75,16 @@ const foreignStats = await stats({ Origin: 'https://owner.github.io' });
 assert.equal(foreignStats.status, 401, 'foreign origins must not reach stats even with the token');
 assert.equal(foreignStats.headers.get('access-control-allow-origin'), null);
 
-// Stats preflight from the dashboard origin must whitelist X-Admin-Token…
+// Stats preflight from the dashboard origin must whitelist only the read token…
 const statsPreflight = await worker.fetch(new Request('https://smeshapi.site/admin/stats/overview', {
   method: 'OPTIONS',
   headers: {
     Origin: DASHBOARD,
     'Access-Control-Request-Method': 'GET',
-    'Access-Control-Request-Headers': 'x-admin-token'
+    'Access-Control-Request-Headers': 'x-stats-token'
   }
 }), env, ctx);
-assert.equal(statsPreflight.headers.get('access-control-allow-headers'), 'Content-Type, X-Admin-Token');
+assert.equal(statsPreflight.headers.get('access-control-allow-headers'), 'Content-Type, X-Stats-Token');
 assert.equal(statsPreflight.headers.get('access-control-allow-origin'), DASHBOARD);
 
 // …while a stats preflight from anywhere else keeps the public header set.
@@ -72,7 +92,10 @@ const foreignPreflight = await worker.fetch(new Request('https://smeshapi.site/a
   method: 'OPTIONS',
   headers: { Origin: 'https://owner.github.io', 'Access-Control-Request-Method': 'GET' }
 }), env, ctx);
-assert.equal(foreignPreflight.headers.get('access-control-allow-headers'), 'Content-Type');
+assert.equal(
+  foreignPreflight.headers.get('access-control-allow-headers'),
+  'Content-Type, X-Telemetry-Token, X-Erasure-Token'
+);
 
 /* ---- brute-force limiter: over the daily fail budget ⇒ 429 up front ---- */
 

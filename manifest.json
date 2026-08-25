@@ -1,13 +1,13 @@
 {
   "manifest_version": 3,
+  "minimum_chrome_version": "140",
   "name": "СМЭШ AI",
   "version": "0.5.0",
   "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest", "alarms"],
   "host_permissions": [
-    "<all_urls>",
     "https://school.mos.ru/*",
-    "https://*.mos.ru/*",
+    "https://uchebnik.mos.ru/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
     "https://dashscope-intl.aliyuncs.com/*",
@@ -61,7 +61,7 @@
   "web_accessible_resources": [
     {
       "resources": ["assets/fonts/*.woff2", "assets/icons/logo-mark.png"],
-      "matches": ["https://*.mos.ru/*"]
+      "matches": ["https://school.mos.ru/*", "https://uchebnik.mos.ru/*"]
     }
   ]
 }

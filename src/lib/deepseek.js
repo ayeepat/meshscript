@@ -26,6 +26,7 @@ import { base64ToUtf8 } from './extract.js';
 import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
 import { getByoKey } from './qwen.js';
 import { getLicenseStatus } from './license.js';
+import { clipText } from './clip-text.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
 // PROXY_DEEPSEEK_MODEL, now served via 302.AI) — see the matching comment in
@@ -47,11 +48,13 @@ function fileToContentPart(f, allowPdf) {
     };
   }
   if (isTextFile(f)) {
+    // Inline a marked prefix so clipped source material is never presented as
+    // if DeepSeek received the complete attachment.
     const text = base64ToUtf8(f.dataBase64);
     return {
       type: 'text',
       text: text
-        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
+        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${clipText(text, 50000)}`
         : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
     };
   }

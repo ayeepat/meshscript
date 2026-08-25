@@ -38,6 +38,7 @@ body {
   transition: background 0.18s var(--ease), transform 0.18s var(--ease); margin-bottom: 2px;
 }
 .week .lesson:hover { background: var(--hover); transform: translateX(2px); }
+.week .lesson:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .week .lesson.active {
   background: var(--accent-soft-strong);
   box-shadow: inset 3px 0 0 var(--accent);
@@ -76,7 +77,6 @@ body {
 }
 .modeseg button:hover:not(.active) { color: var(--text); }
 .modeseg button.active { background: var(--card); color: var(--accent); box-shadow: var(--shadow-btn); }
-.history-mode .modeseg button:disabled { cursor: default; }
 
 .iconbtn {
   background: var(--card); border: 1px solid var(--separator); color: var(--secondary); cursor: pointer;
@@ -145,6 +145,23 @@ body {
 .msg.assistant:hover .copybtn { opacity: 1; }
 .msg.assistant .copybtn:hover { background: var(--accent); color: var(--on-accent); }
 
+/* Typing caret at the tail of a streaming answer. The span is inserted after
+   the last text node by appendStreamCaret (dashboard.js) so it hugs the last
+   character inside lists/paragraphs; the final clean render drops it. */
+.mdbody .type-caret {
+  display: inline-block;
+  width: 2px; height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  border-radius: 1px;
+  animation: caret-blink 0.9s steps(1, end) infinite;
+}
+@keyframes caret-blink { 0%, 60% { opacity: 1; } 61%, 100% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .mdbody .type-caret { animation: none; }
+}
+
 /* A failed solve ("Ошибка: …") gets a retry button next to the copy button.
    Unlike copybtn it stays visible without hover — a broken answer is worth
    surfacing immediately, not just on discovery. */
@@ -184,11 +201,21 @@ body {
 .ai-notice a:hover { text-decoration: underline; }
 :root[data-theme="dark"] .ai-notice a { color: #60a5fa; }
 
-/* Rendered markdown */
+/* Rendered markdown. Headings keep the model's level (1-6) for document
+   structure; the chat stays compact by pinning every level to a tight scale. */
 .msg p { margin: 0 0 9px; }
 .msg p:last-child { margin-bottom: 0; }
-.msg h4 { font-family: var(--font-display); margin: 15px 0 7px; font-size: 14.5px; font-weight: 700; letter-spacing: -0.3px; text-wrap: balance; line-height: 1.25; }
-.msg h4:first-child { margin-top: 0; }
+.msg h1, .msg h2, .msg h3, .msg h4, .msg h5, .msg h6 {
+  font-family: var(--font-display); margin: 15px 0 7px; font-weight: 700;
+  letter-spacing: -0.3px; text-wrap: balance; line-height: 1.25;
+}
+.msg h1 { font-size: 17px; }
+.msg h2 { font-size: 16px; }
+.msg h3 { font-size: 15px; }
+.msg h4 { font-size: 14.5px; }
+.msg h5, .msg h6 { font-size: 13.5px; }
+.msg h1:first-child, .msg h2:first-child, .msg h3:first-child,
+.msg h4:first-child, .msg h5:first-child, .msg h6:first-child { margin-top: 0; }
 .msg ul, .msg ol { margin: 5px 0 11px; padding-left: 22px; }
 .msg li { margin: 4px 0; }
 .msg li::marker { color: var(--tertiary); }
@@ -263,14 +290,6 @@ body {
 }
 .send:hover { background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 16px -4px var(--accent-glow); }
 .send:active { transform: scale(0.92); background: var(--accent-press); }
-.history-mode .composer button:disabled,
-.history-mode .composer textarea:disabled {
-  cursor: default;
-}
-.history-mode .composer textarea:disabled {
-  color: var(--secondary);
-  -webkit-text-fill-color: var(--secondary);
-}
 
 .week .lesson.active .spinner { border-color: var(--accent-soft); border-top-color: var(--accent); }
 

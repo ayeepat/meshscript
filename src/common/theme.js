@@ -6,6 +6,8 @@
  */
 const KEY = 'theme';
 const media = window.matchMedia('(prefers-color-scheme: dark)');
+let themeGeneration = 0;
+let controllerWired = false;
 
 function resolve(pref) {
   return pref === 'light' || pref === 'dark' ? pref : (media.matches ? 'dark' : 'light');
@@ -23,8 +25,20 @@ export async function getThemePref() {
 }
 
 export async function setThemePref(pref) {
-  await chrome.storage.local.set({ [KEY]: pref });
-  apply(pref);
+  const generation = ++themeGeneration;
+  try {
+    await chrome.storage.local.set({ [KEY]: pref });
+    if (generation === themeGeneration) apply(pref);
+  } catch (error) {
+    // The attempted write still invalidated any older initialization snapshot.
+    // Repaint from durable state, then preserve the storage failure for callers.
+    const recoveryGeneration = ++themeGeneration;
+    try {
+      const stored = await getThemePref();
+      if (recoveryGeneration === themeGeneration) apply(stored);
+    } catch { /* storage remains unavailable */ }
+    throw error;
+  }
 }
 
 /** Flip between light and dark (an explicit choice overrides 'system'). */
@@ -35,9 +49,24 @@ export async function toggleTheme() {
 }
 
 export async function initTheme() {
-  apply(await getThemePref());
-  media.addEventListener('change', async () => apply(await getThemePref()));
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes[KEY]) apply(changes[KEY].newValue || 'system');
-  });
+  // Wire live changes BEFORE the asynchronous initial read. Otherwise a user
+  // selection/storage event can land during that await and then be repainted by
+  // the older snapshot when it finally resolves.
+  if (!controllerWired) {
+    controllerWired = true;
+    media.addEventListener('change', async () => {
+      const generation = themeGeneration;
+      const pref = await getThemePref();
+      if (generation === themeGeneration) apply(pref);
+    });
+    chrome.storage.onChanged.addListener((changes, area) => {
+      if (area === 'local' && changes[KEY]) {
+        themeGeneration++;
+        apply(changes[KEY].newValue || 'system');
+      }
+    });
+  }
+  const generation = themeGeneration;
+  const pref = await getThemePref();
+  if (generation === themeGeneration) apply(pref);
 }

@@ -19,10 +19,13 @@ On first run the popup shows a consent screen that states plainly that task
 text, test screenshots and attached files (including audio clips sent for
 transcription) go to the chosen AI provider — OpenRouter, Groq, Qwen (Alibaba)
 or DeepSeek, the latter two via our proxy `ai.smeshapi.site` on the license
-path. No AI request of any kind (solving, task classification, transcription)
-is made until the user accepts (`src/lib/consent.js`; every outbound handler in
-`src/background/service-worker.js` re-checks it). Consent is reviewable and
-revocable in Settings → «Конфиденциальность и данные».
+path. No AI request of any kind (solving, transcription) is made until the
+user accepts (`src/lib/consent.js`; every outbound handler in
+`src/background/service-worker.js` re-checks it). The shared provider and
+transcription network boundaries perform one final storage-backed check
+immediately before `fetch`, and a storage-change listener aborts pending work
+when consent is withdrawn. Consent is reviewable and revocable in Settings →
+«Конфиденциальность и данные».
 
 ## Permissions
 
@@ -38,13 +41,12 @@ revocable in Settings → «Конфиденциальность и данные
 
 | Host | Why |
 |---|---|
-| `<all_urls>` | **Required by `chrome.tabs.captureVisibleTab` alone.** The in-page «Решить» pill on a Mesh test triggers the screenshot from a content script, where no `activeTab` gesture exists, and Chrome only honours the capture with `<all_urls>` (plain per-site host permissions do not work for this API). The code still refuses to capture anything but `school.mos.ru` / `uchebnik.mos.ru`: the capture target's URL is verified immediately before **and** after every capture (`requireActiveCaptureTarget` in `service-worker.js`, `captureVisibleTarget` in `popup.js`), and attachment downloads are separately allowlisted to the two Mesh hosts. No other request ever uses this permission. |
-| `https://school.mos.ru/*`, `https://*.mos.ru/*` | Read the user's **own** diary/homework and download attachments from the Mesh file store, inside the user's already-authenticated session. |
+| `https://school.mos.ru/*`, `https://uchebnik.mos.ru/*` | Read the user's **own** diary/homework/test player and download attachments from the two exact Mesh origins, inside the user's already-authenticated session. Scripted child-frame capture additionally requires a positively identified test-player document; unrelated MOS frames are excluded. |
 | `https://openrouter.ai/*`, `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*` | The BYO-key AI providers that generate answers (OpenRouter, Groq, and Alibaba Model Studio for power users' own Qwen/DeepSeek keys). |
-| `https://ai.smeshapi.site/*` | Our AI proxy for licensed users: Qwen/DeepSeek requests authenticated by the license key, so students never handle a provider key. Receives the same consent-gated task content as a direct provider call, plus the license key and anonymous device id for quota enforcement. |
+| `https://ai.smeshapi.site/*` | Our AI proxy for licensed users: Qwen/DeepSeek requests require the license, anonymous device id and the random one-device activation bearer; the key and public UUID alone are insufficient. Receives the same consent-gated task content as a direct provider call. |
 | `https://gdz-ru.com/*`, `https://*.gdz-ru.com/*`, `https://gdz.ru/*` | Fetch ready textbook answers (GDZ) when the user pins a textbook, so common exercises don't need an AI call. |
 | `https://*.smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. |
-| `https://smeshapi.site/*` | License check (`GET /verify?key=…&device_id=…`) and, **only if the user opts in**, anonymous usage statistics (see below). |
+| `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body) and, **only if the user opts in**, anonymous usage statistics (see below). |
 
 ## The declarativeNetRequest rule (the part reviewers ask about)
 
@@ -68,23 +70,33 @@ traffic to another host.
 - **AI providers** receive task text / screenshots / attachments (and audio
   clips for transcription on listening tasks) over HTTPS — authenticated with
   the user's own key on the BYO path, or with the license key on the proxy
-  path. This is the core function and is gated by consent. Remote task
-  classification (deciding whether a homework card needs a file) sends only the
-  task text, uses the same consent gate, and runs **only after the user acts on
-  a specific row** — never during a passive scan.
+  path. This is the core function and is gated by consent. Nothing leaves the
+  device during a passive week scan: whether a homework card needs a file is
+  decided on-device by regex heuristics (`src/lib/task-classifier.js`), and the
+  first network request for a row happens only after the user presses «Решить»
+  on that row.
 - **The Mesh session token** is read from the page's own `localStorage` solely
   to download the user's own attachments. Downloads are restricted to an
   explicit `school.mos.ru`/`uchebnik.mos.ru` allowlist (HTTPS only, redirects
   re-validated hop by hop) and the token is never sent anywhere else.
-- **Anonymous usage statistics are OPT-IN and off by default.** If (and only
+- **Pseudonymous usage statistics are OPT-IN and off by default.** If (and only
   if) the user enables the separate «Анонимная статистика» toggle in Settings,
-  small content-free batches go to `smeshapi.site/t`: event type, subject name,
-  token counts, browser family, extension version, license *type* and the same
-  anonymous random device UUID used by `/verify`. Never task text, answers,
-  files, the raw user agent, or the license key (`src/lib/telemetry.js`;
-  `backend/src/analytics.js` additionally hashes any legacy-client key). A
-  Settings button deletes the device's statistics server-side (`POST
-  /t/delete`), and another wipes all locally collected data.
+  small content-free batches go to `smeshapi.site/t` with a short-lived,
+  device-bound capability issued by a successful license verification;
+  licensed proxy calls may additionally send provider-observed token/cost
+  facts server-side to `/t/ai`. The client batch contains event type,
+  canonical subject name, provider/model, browser family, extension version,
+  license *type* and the same random device UUID used by `/verify`. Never task
+  text, answers, files, client-asserted financial totals, the raw user agent,
+  or the license key (`src/lib/telemetry.js`;
+  `backend/src/analytics.js` ignores legacy credential fields and purges any
+  previously stored raw or pseudonymous license identifiers). Server-side
+  event/device rows expire after 90 days by default (bounded configuration
+  range: 30–365 days). A
+  Settings button disables further statistics and deletes the device's rows
+  server-side (`POST /t/delete`) using a separate long-lived, deletion-only
+  HMAC capability; a public device UUID cannot delete another installation's
+  data. Another button wipes all locally collected data.
 - **History is local-only** with a 7-day TTL (`src/lib/history.js`), enforced
   both on read and by a periodic `alarms` sweep.
 

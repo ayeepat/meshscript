@@ -4,8 +4,8 @@
  * service worker. Key is entered in Settings and stored in
  * chrome.storage.local, which the worker locks to TRUSTED_CONTEXTS at startup
  * (service-worker.js) — extension pages can read it, content scripts cannot
- * on Chrome ≥130 (older builds accept the residual risk), and page scripts
- * never could. Never hardcoded.
+ * on the manifest's Chrome 102+ baseline, and page scripts never could. Never
+ * hardcoded.
  *
  * Groq is the cheap workhorse: classification and other menial tasks go here
  * so the paid OpenRouter budget is spent only on real solving.
@@ -19,10 +19,12 @@
  * for structured replies. (json_object disables streaming — parsed whole.)
  */
 
-import { postStream, httpError } from './http.js';
+import { postStream, httpError, readResponseTextBounded, fetchTextBounded } from './http.js';
 import { isImageFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8, base64ToBytes } from './extract.js';
 import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
+import { clipText } from './clip-text.js';
+import { consentNetworkSignal } from './consent.js';
 
 const ENDPOINT = 'https://api.groq.com/openai/v1/chat/completions';
 const TEXT_MODEL = 'llama-3.3-70b-versatile';
@@ -34,10 +36,37 @@ const TRANSCRIBE_ENDPOINT = 'https://api.groq.com/openai/v1/audio/transcriptions
 const WHISPER_MODEL = 'whisper-large-v3';
 const TRANSCRIBE_TIMEOUT_MS = 90000; // a few-MB clip can take a while to process
 
+// Cheapest authenticated endpoint: lists models without spending tokens.
+const MODELS_ENDPOINT = 'https://api.groq.com/openai/v1/models';
+
 async function getKey() {
   const { groqApiKey } = await chrome.storage.local.get('groqApiKey');
   if (!groqApiKey) throw new Error('Ключ Groq не задан. Откройте настройки расширения.');
   return groqApiKey;
+}
+
+/**
+ * Validate a Groq API key for onboarding: 200 = works, 401/403 = definitively
+ * rejected. Anything else (network error, 5xx, rate limit) is ambiguous and
+ * reported as 'unreachable' so callers can keep a possibly-good key instead of
+ * bouncing the user — mirroring license.js's keep-last-good policy.
+ * @param {string} apiKey the candidate key (NOT read from storage)
+ * @returns {Promise<{ok:true}|{ok:false,reason:'bad_key'|'unreachable'}>}
+ */
+export async function verifyGroqKey(apiKey) {
+  const key = typeof apiKey === 'string' ? apiKey.trim() : '';
+  if (!key) return { ok: false, reason: 'bad_key' };
+  try {
+    const res = await fetchTextBounded(MODELS_ENDPOINT, {
+      headers: { Authorization: `Bearer ${key}` },
+      redirect: 'error'
+    });
+    if (res.ok) return { ok: true };
+    if (res.status === 401 || res.status === 403) return { ok: false, reason: 'bad_key' };
+    return { ok: false, reason: 'unreachable' };
+  } catch {
+    return { ok: false, reason: 'unreachable' };
+  }
 }
 
 /**
@@ -57,13 +86,13 @@ function fileToContentPart(f) {
     return { type: 'image_url', image_url: { url: `data:${m};base64,${f.dataBase64}` } };
   }
   if (isTextFile(f)) {
-    // Plain text and locally-extracted Office docs (see extract.js) — inline
-    // the contents so Groq actually reads them instead of refusing.
+    // Plain text and locally-extracted Office docs (see extract.js) — inline a
+    // marked prefix so Groq reads them and knows if the source is clipped.
     const text = base64ToUtf8(f.dataBase64);
     return {
       type: 'text',
       text: text
-        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${text.slice(0, 50000)}`
+        ? `[Содержимое приложенного файла «${f.name || 'файл'}»]:\n${clipText(text, 50000)}`
         : `[Приложен файл ${f.name || ''}, не удалось прочитать его как текст.]`
     };
   }
@@ -169,29 +198,53 @@ export async function transcribeAudio(file, opts = {}) {
     if (language) form.append('language', language);
     if (prompt) form.append('prompt', prompt);
 
+    // Re-read consent after hashing/cache/key/quota preparation, at the actual
+    // transcription network boundary. An already-aborted combined signal
+    // prevents fetch from emitting a request at all.
+    const networkSignal = await consentNetworkSignal(signal);
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), TRANSCRIBE_TIMEOUT_MS);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ctrl.abort();
+    }, TRANSCRIBE_TIMEOUT_MS);
     const onAbort = () => ctrl.abort();
-    if (signal) signal.addEventListener('abort', onAbort, { once: true });
+    if (networkSignal) networkSignal.addEventListener('abort', onAbort, { once: true });
+    const throwIfReadAborted = () => {
+      if (!ctrl.signal.aborted) return;
+      if (networkSignal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (timedOut) {
+        throw new Error('Groq (расшифровка аудио): превышено время ожидания. Попробуйте ещё раз.');
+      }
+      throw new DOMException('Aborted', 'AbortError');
+    };
     try {
       const res = await fetch(TRANSCRIBE_ENDPOINT, {
         method: 'POST',
         // Authorization only — let fetch set the multipart Content-Type boundary.
         headers: { Authorization: `Bearer ${key}` },
         body: form,
+        redirect: 'error',
         signal: ctrl.signal
       });
       if (!res.ok) {
-        const text = await res.text().catch(() => '');
+        const text = await readResponseTextBounded(res);
+        // The bounded reader deliberately converts body-stream failures into a
+        // partial/empty string. Restore timeout/caller-abort semantics before
+        // interpreting that string as a provider response.
+        throwIfReadAborted();
         throw httpError('Groq (расшифровка аудио)', res.status, text);
       }
-      const json = await res.json().catch(() => null);
+      let json = null;
+      const responseText = await readResponseTextBounded(res);
+      throwIfReadAborted();
+      try { json = JSON.parse(responseText || 'null'); } catch { /* malformed */ }
       const text = (json && typeof json.text === 'string') ? json.text.trim() : '';
       await commitOne(reservation);
       return text;
     } finally {
       clearTimeout(timer);
-      if (signal) signal.removeEventListener('abort', onAbort);
+      if (networkSignal) networkSignal.removeEventListener('abort', onAbort);
     }
   } catch (e) {
     try { await cancelOne(reservation); } catch { /* orphan expires without becoming usage */ }

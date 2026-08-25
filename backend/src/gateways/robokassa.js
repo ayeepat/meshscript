@@ -13,7 +13,14 @@
  * Docs: https://docs.robokassa.ru/ru/notifications-and-redirects
  */
 
+import { readBodyBounded } from '../request-body.js';
+
 const ROBOKASSA_IPS = new Set(['185.59.216.65', '185.59.217.65']);
+const MAX_RESULT_BODY_BYTES = 16 * 1024;
+const MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024;
+const OP_STATE_URL = 'https://auth.robokassa.ru/Merchant/WebService/Service.asmx/OpStateExt';
+const REFUND_CREATE_URL = 'https://services.robokassa.ru/RefundService/Refund/Create';
+const REFUND_STATE_URL = 'https://services.robokassa.ru/RefundService/Refund/GetState';
 
 const SHA_ALGORITHMS = {
   SHA1: 'SHA-1',
@@ -26,6 +33,22 @@ const SHA_ALGORITHMS = {
   'SHA-512': 'SHA-512'
 };
 
+export function isSupportedHashAlgorithm(algorithm = 'MD5') {
+  const normalized = String(algorithm || 'MD5').toUpperCase().replace(/_/g, '-');
+  return normalized === 'MD5' || !!SHA_ALGORITHMS[normalized];
+}
+
+// The refund API signs a JWT, so it accepts only the HMAC family — a narrower
+// set than the callback signature above. Readiness must check THIS allowlist:
+// validating a refund algorithm against isSupportedHashAlgorithm would pass
+// something like RS256 and only fail later, inside createRefund, after the
+// order had already been moved into an unretryable refund state.
+const REFUND_HASH_ALGORITHMS = new Set(['HS256', 'HS384', 'HS512']);
+
+export function isSupportedRefundHashAlgorithm(algorithm = 'HS256') {
+  return REFUND_HASH_ALGORITHMS.has(String(algorithm || 'HS256').toUpperCase());
+}
+
 export function shouldEnforceIpAllowlist(env) {
   return String(env.ROBOKASSA_ENFORCE_IP_ALLOWLIST || '').toLowerCase() === 'true';
 }
@@ -36,28 +59,38 @@ export function isRobokassaIp(ip) {
 
 export async function readResultFields(request) {
   if (request.method === 'GET') {
-    return fieldsFromParams(new URL(request.url).searchParams);
+    const url = new URL(request.url);
+    if (new TextEncoder().encode(url.search).byteLength > MAX_RESULT_BODY_BYTES) {
+      throw Object.assign(new Error('result payload too large'), { status: 413 });
+    }
+    return fieldsFromParams(url.searchParams);
   }
 
   const contentType = request.headers.get('content-type') || '';
+  const body = await readBodyBounded(request, MAX_RESULT_BODY_BYTES);
+  if (!body.ok) throw Object.assign(new Error(body.reason), { status: body.status });
   if (contentType.includes('application/x-www-form-urlencoded') || contentType.includes('multipart/form-data')) {
-    const form = await request.formData();
-    const out = {};
+    if (contentType.includes('application/x-www-form-urlencoded')) {
+      return fieldsFromParams(new URLSearchParams(body.text));
+    }
+    const form = await new Response(body.bytes, { headers: { 'Content-Type': contentType } }).formData();
+    const out = Object.create(null);
     for (const [key, value] of form.entries()) out[key] = typeof value === 'string' ? value : '';
     return out;
   }
 
   if (contentType.includes('application/json')) {
-    const body = await request.json();
-    return body && typeof body === 'object' ? Object.fromEntries(Object.entries(body).map(([k, v]) => [k, String(v ?? '')])) : {};
+    const parsed = JSON.parse(body.text);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+      ? Object.fromEntries(Object.entries(parsed).map(([k, v]) => [k, String(v ?? '')]))
+      : Object.create(null);
   }
 
-  const text = await request.text();
-  return fieldsFromParams(new URLSearchParams(text));
+  return fieldsFromParams(new URLSearchParams(body.text));
 }
 
 export function fieldsFromParams(params) {
-  const out = {};
+  const out = Object.create(null);
   for (const [key, value] of params.entries()) out[key] = value;
   return out;
 }
@@ -69,17 +102,35 @@ export function invoiceId(fields) {
 export function normalizeResult(fields) {
   const invId = invoiceId(fields);
   if (!invId) return { ok: false, reason: 'missing_invoice' };
+  // Robokassa's InvId is a decimal order number. Preserve the signed spelling
+  // for the required OK{InvId} acknowledgement, but canonicalize the payment
+  // identity below so "42" and "00042" cannot claim two licenses.
+  if (!/^\d{1,20}$/.test(invId)) return { ok: false, reason: 'bad_invoice' };
+  const paymentId = BigInt(invId).toString();
 
   const outSum = first(fields, 'OutSum');
-  const amount = Number(outSum);
-  if (!Number.isFinite(amount) || amount <= 0) return { ok: false, reason: 'bad_amount' };
-
+  // Production ResultURL notifications use six fractional digits, while the
+  // test environment may use two. RUB is still accounted in kopecks: accept
+  // the provider's wider spelling only when the sub-kopeck digits are zero.
+  // Number() also accepts whitespace, exponents and hex, so parse the exact
+  // signed decimal representation instead of coercing it.
+  const amountMatch = /^(\d+)(?:\.(\d{1,6}))?$/.exec(outSum);
+  if (!amountMatch) return { ok: false, reason: 'bad_amount' };
+  const fractional = (amountMatch[2] || '').padEnd(6, '0');
+  if (fractional.slice(2) !== '0000') return { ok: false, reason: 'bad_amount' };
+  const wholeRub = Number(amountMatch[1]);
+  const kopecks = wholeRub * 100 + Number(fractional.slice(0, 2));
+  if (!Number.isSafeInteger(kopecks) || kopecks <= 0) {
+    return { ok: false, reason: 'bad_amount' };
+  }
   return {
     ok: true,
     gateway: 'robokassa',
     invoice_id: invId,
-    payment_id: invId,
-    amount_rub: amount,
+    payment_id: paymentId,
+    amount_kopecks: kopecks,
+    // Compatibility/display only. Authorization and accounting use kopecks.
+    amount_rub: kopecks / 100,
     raw: fields
   };
 }
@@ -114,6 +165,155 @@ export function paymentSignatureBase({ merchantLogin, outSum, invId, password1, 
   return parts.join(':');
 }
 
+export function formatKopecks(kopecks) {
+  if (!Number.isSafeInteger(kopecks) || kopecks <= 0) throw new Error('invalid kopecks');
+  return `${Math.floor(kopecks / 100)}.${String(kopecks % 100).padStart(2, '0')}`;
+}
+
+const ROBOKASSA_EXPIRATION_TIME_ZONE = 'Europe/Moscow';
+
+/**
+ * Robokassa's gateway-side payment deadline. The payment-interface contract
+ * requires exactly `YYYY-MM-DDThh:mm` (no seconds or offset). Robokassa treats
+ * zone-less timestamps as Moscow wall time, so format in that zone explicitly
+ * instead of relying on the Worker's locale.
+ *
+ * Not signed — it is not part of any SignatureValue base string — so it is
+ * added to the field set only.
+ */
+function formatExpirationDate(expiresAt) {
+  const at = new Date(Number(expiresAt));
+  if (!Number.isFinite(at.getTime())) return '';
+  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-CA', {
+    timeZone: ROBOKASSA_EXPIRATION_TIME_ZONE,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hourCycle: 'h23'
+  }).formatToParts(at).map(({ type, value }) => [type, value]));
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+
+export async function createPaymentFields({
+  merchantLogin, password1, algorithm = 'MD5', amountKopecks, invId,
+  description = '', email = null, isTest = false, receipt = '', shp = {},
+  expiresAt = null
+}) {
+  const outSum = formatKopecks(amountKopecks);
+  // Robokassa requires the compact UTF-8 Receipt JSON to be URL-encoded both
+  // in the field value and in the SignatureValue base string. The browser's
+  // form encoding adds the transport layer on top of this provider encoding.
+  const encodedReceipt = receipt ? encodeURIComponent(String(receipt)) : '';
+  const fields = {
+    MerchantLogin: String(merchantLogin || ''),
+    OutSum: outSum,
+    InvId: String(invId || ''),
+    Description: String(description || '').slice(0, 100),
+    ...Object.fromEntries(Object.entries(shp).sort(([a], [b]) => a.localeCompare(b)))
+  };
+  if (!fields.MerchantLogin || !password1 || !/^\d+$/.test(fields.InvId)) {
+    throw new Error('invalid payment fields');
+  }
+  if (email) fields.Email = String(email);
+  if (encodedReceipt) fields.Receipt = encodedReceipt;
+  // Without this the 30-minute order TTL was purely LOCAL: the customer could
+  // leave the provider checkout open and pay after our deadline, and the signed
+  // callback then landed on an expired order — acknowledged into manual review
+  // instead of issuing the licence they had just paid for.
+  if (expiresAt != null) {
+    const expiration = formatExpirationDate(expiresAt);
+    if (!expiration) throw new Error('invalid payment expiry');
+    fields.ExpirationDate = expiration;
+  }
+  if (isTest) fields.IsTest = '1';
+  fields.SignatureValue = await hashHex(paymentSignatureBase({
+    merchantLogin: fields.MerchantLogin,
+    outSum,
+    invId: fields.InvId,
+    password1,
+    receipt: encodedReceipt,
+    shp
+  }), algorithm);
+  return fields;
+}
+
+export async function queryOperationState({
+  merchantLogin, invoiceId: id, password2, algorithm = 'MD5', fetcher = fetch
+}) {
+  const invoice = String(id || '');
+  if (!merchantLogin || !password2 || !/^\d+$/.test(invoice)) {
+    throw new Error('invalid operation-state request');
+  }
+  const signature = await hashHex(`${merchantLogin}:${invoice}:${password2}`, algorithm);
+  const url = new URL(OP_STATE_URL);
+  url.searchParams.set('MerchantLogin', merchantLogin);
+  url.searchParams.set('InvoiceID', invoice);
+  url.searchParams.set('Signature', signature);
+  const response = await fetcher(url.toString(), {
+    method: 'GET', headers: { Accept: 'application/xml' }, redirect: 'error'
+  });
+  if (!response.ok) throw new Error(`operation-state http ${response.status}`);
+  const body = await readBodyBounded(response, MAX_PROVIDER_RESPONSE_BYTES);
+  if (!body.ok || /<!DOCTYPE|<!ENTITY/i.test(body.text)) {
+    throw new Error('invalid operation-state response');
+  }
+  const resultBlock = xmlBlock(body.text, 'Result');
+  const stateBlock = xmlBlock(body.text, 'State');
+  const infoBlock = xmlBlock(body.text, 'Info');
+  const resultCode = strictInteger(xmlText(resultBlock, 'Code'));
+  if (resultCode == null) throw new Error('invalid operation-state result');
+  return {
+    result_code: resultCode,
+    state_code: strictInteger(xmlText(stateBlock, 'Code')),
+    out_currency: xmlText(infoBlock, 'OutCurrLabel'),
+    out_sum: xmlText(infoBlock, 'OutSum'),
+    op_key: xmlText(infoBlock, 'OpKey')
+  };
+}
+
+export async function createRefund({
+  opKey, password3, invoiceItems = null, algorithm = 'HS256', fetcher = fetch
+}) {
+  const normalizedAlgorithm = String(algorithm || 'HS256').toUpperCase();
+  if (!isSupportedRefundHashAlgorithm(normalizedAlgorithm) || !opKey || !password3) {
+    throw new Error('invalid refund request');
+  }
+  const payload = { OpKey: String(opKey) };
+  if (invoiceItems) payload.InvoiceItems = invoiceItems;
+  const token = await signJwt(payload, password3, normalizedAlgorithm);
+  const response = await fetcher(REFUND_CREATE_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', Accept: 'application/json' },
+    body: token,
+    redirect: 'error'
+  });
+  if (!response.ok) throw new Error(`refund-create http ${response.status}`);
+  const parsed = await readProviderJson(response);
+  const requestId = String(parsed?.requestId || '');
+  if (parsed?.success !== true || !isGuid(requestId)) {
+    return { ok: false, reason: safeProviderLabel(parsed?.message) || 'refund_rejected' };
+  }
+  return { ok: true, request_id: requestId };
+}
+
+export async function queryRefundState({ requestId, fetcher = fetch }) {
+  const id = String(requestId || '');
+  if (!isGuid(id)) throw new Error('invalid refund state request');
+  const url = new URL(REFUND_STATE_URL);
+  url.searchParams.set('id', id);
+  const response = await fetcher(url.toString(), {
+    method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error'
+  });
+  if (!response.ok) throw new Error(`refund-state http ${response.status}`);
+  const parsed = await readProviderJson(response);
+  if (String(parsed?.requestId || '').toLowerCase() !== id.toLowerCase()) {
+    throw new Error('invalid refund state response');
+  }
+  const label = String(parsed?.label || '').toLowerCase();
+  if (!['processing', 'finished', 'canceled'].includes(label)) {
+    throw new Error('invalid refund state label');
+  }
+  return { request_id: id, label, amount: String(parsed.amount ?? '') };
+}
+
 export function okResponse(invId) {
   return new Response(`OK${invId}`, {
     status: 200,
@@ -131,6 +331,69 @@ async function hashHex(input, algorithm) {
   const bytes = new TextEncoder().encode(input);
   const digest = await crypto.subtle.digest(subtleName, bytes);
   return bytesToHex(new Uint8Array(digest));
+}
+
+async function signJwt(payload, password, algorithm) {
+  const header = { alg: algorithm, typ: 'JWT' };
+  const unsigned = `${base64UrlJson(header)}.${base64UrlJson(payload)}`;
+  const subtleAlgorithm = `SHA-${algorithm.slice(2)}`;
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(password),
+    { name: 'HMAC', hash: subtleAlgorithm }, false, ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(unsigned));
+  return `${unsigned}.${base64UrlBytes(new Uint8Array(signature))}`;
+}
+
+function base64UrlJson(value) {
+  return base64UrlBytes(new TextEncoder().encode(JSON.stringify(value)));
+}
+
+function base64UrlBytes(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+async function readProviderJson(response) {
+  const body = await readBodyBounded(response, MAX_PROVIDER_RESPONSE_BYTES);
+  if (!body.ok) throw new Error('invalid provider response');
+  try {
+    const parsed = JSON.parse(body.text);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error();
+    return parsed;
+  } catch {
+    throw new Error('invalid provider response');
+  }
+}
+
+function xmlBlock(xml, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const match = new RegExp(
+    `<(?:[A-Za-z_][\\w.-]*:)?${escaped}\\b[^>]*>([\\s\\S]*?)<\\/(?:[A-Za-z_][\\w.-]*:)?${escaped}>`,
+    'i'
+  ).exec(String(xml || ''));
+  return match ? match[1] : '';
+}
+
+function xmlText(xml, name) {
+  const raw = xmlBlock(xml, name);
+  if (!raw || /<[^>]+>/.test(raw)) return '';
+  return raw.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'").replace(/&amp;/g, '&').trim();
+}
+
+function strictInteger(value) {
+  return /^-?\d+$/.test(String(value || '')) ? Number(value) : null;
+}
+
+function isGuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function safeProviderLabel(value) {
+  const label = String(value || '').trim();
+  return /^[A-Za-z0-9_.-]{1,80}$/.test(label) ? label : '';
 }
 
 function shpPairs(fields) {
