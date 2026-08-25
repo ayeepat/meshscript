@@ -124,9 +124,12 @@ key is stored in D1, returned to the browser, or committed to the repository.
 Browser and Telegram capabilities use distinct domains, so neither token is
 accepted at the other channel's authoritative endpoint.
 
-- The payment response includes integrity-bound `Shp_environment` and `Shp_order_id`.
-  The ResultURL handler requires both and an exact D1 order match before it can
-  mint anything.
+- New payment responses use Robokassa's documented minimal receipt form and
+  intentionally omit optional `Shp_*` fields. The ResultURL handler verifies
+  Password #2, then requires the signed `InvId` and `OutSum` to match the exact
+  authoritative D1 order before it can mint anything. Complete legacy
+  `Shp_environment`/`Shp_order_id` callback pairs remain verifiable during the
+  migration; partial or conflicting pairs are rejected.
 - Test checkout uses a separate Worker, D1 database and test credentials. The
   production Worker always creates production orders.
 - Before charging, the page can call `GET /referral/check?code=REF-…` →
