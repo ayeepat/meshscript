@@ -5,8 +5,8 @@
  *  1. enqueueDelivery persists a delivery_outbox row BEFORE the webhook acks
  *     (worker.js returns non-OK when it cannot).
  *  2. The cron sweep (retryPendingDeliveries) re-drives due rows with backoff,
- *     marks delivered_at on the first confirmed channel, and stops at the
- *     attempt cap.
+ *     marks delivered_at only on the promised channel (Telegram whenever a
+ *     Telegram recipient is bound), and stops at the attempt cap.
  *  3. The delivered:<key> marker still guarantees a recovered outage cannot
  *     resend the same bearer key twice.
  */
@@ -14,11 +14,16 @@ import assert from 'node:assert/strict';
 
 const calls = [];
 let providersUp = false;
+let telegramUp = null;
+let emailUp = null;
 let providerGate = null;
 globalThis.fetch = async (url, init) => {
   calls.push({ url: String(url), body: JSON.parse(init?.body || 'null') });
   if (providerGate) await providerGate.promise;
-  return providersUp
+  const channelUp = String(url).includes('api.telegram.org')
+    ? (telegramUp == null ? providersUp : telegramUp)
+    : (emailUp == null ? providersUp : emailUp);
+  return channelUp
     ? { ok: true, status: 200, json: async () => ({ ok: true }), text: async () => '{}' }
     : { ok: false, status: 503, body: { cancel: async () => {} } };
 };
@@ -35,6 +40,7 @@ class MarkerKV {
 
 class OutboxD1 {
   rows = new Map();
+  issuance = new Map();
   prepare(sql) {
     const db = this;
     return {
@@ -114,7 +120,7 @@ class OutboxD1 {
                 .filter((r) => r.lease_until == null || r.lease_until <= now)
                 .sort((a, b) => a.next_attempt_at - b.next_attempt_at)
                 .slice(0, limit)
-                .map((r) => ({ ...r }));
+                .map((r) => ({ ...r, license_json: db.issuance.get(r.license_key) || null }));
               return { results: due };
             }
             return { results: [] };
@@ -175,6 +181,51 @@ calls.length = 0;
 sweep = await retryPendingDeliveries(env);
 assert.deepEqual(sweep, { retried: 0, delivered: 0 });
 assert.equal(calls.length, 0);
+
+// Telegram-bound checkout is not delivered merely because the fallback email
+// worked. The outbox must keep retrying the bot, and a delayed retry must
+// rebuild the full payment/subscription message from payment_issuance.
+const mandatoryTgLicense = {
+  key: 'SMESH-OUTB-TG-MANDATORY',
+  email: 'telegram-required@example.com',
+  telegram_user_id: 787878,
+  amount_kopecks: 1000,
+  expires_at: '2026-09-24T09:00:00.000Z',
+  payment_id: '424242'
+};
+await enqueueDelivery(env, mandatoryTgLicense, false);
+db.issuance.set(mandatoryTgLicense.key, JSON.stringify(mandatoryTgLicense));
+const mandatoryTgRow = db.rows.get(mandatoryTgLicense.key);
+mandatoryTgRow.next_attempt_at = Date.now() - 1;
+providersUp = false;
+telegramUp = false;
+emailUp = true;
+calls.length = 0;
+sweep = await retryPendingDeliveries(env);
+assert.deepEqual(sweep, { retried: 1, delivered: 0 });
+assert.equal(mandatoryTgRow.delivered_at, null,
+  'email success cannot settle a Telegram-bound checkout');
+assert.equal(calls.length, 2, 'the first pass still attempts both configured channels');
+
+mandatoryTgRow.next_attempt_at = Date.now() - 1;
+telegramUp = true;
+calls.length = 0;
+sweep = await retryPendingDeliveries(env);
+assert.deepEqual(sweep, { retried: 1, delivered: 1 });
+assert.ok(mandatoryTgRow.delivered_at, 'Telegram recovery settles the outbox');
+assert.equal(calls.length, 1, 'successful email is deduped while Telegram alone retries');
+const recoveredTelegram = calls[0].body.text;
+assert.match(recoveredTelegram, /Оплата подтверждена: 10 ₽/,
+  'delayed Telegram delivery retains the frozen amount');
+assert.match(recoveredTelegram, /Подписка действует до/,
+  'delayed Telegram delivery retains subscription expiry');
+assert.match(recoveredTelegram, /Заказ №424242/,
+  'delayed Telegram delivery retains the order number');
+assert.ok(recoveredTelegram.includes(mandatoryTgLicense.key),
+  'delayed Telegram delivery still contains the exact key');
+telegramUp = null;
+emailUp = null;
+providersUp = true;
 
 // 4. A row whose key was already delivered elsewhere (marker says ok) settles
 //    WITHOUT resending the bearer key.
@@ -325,6 +376,39 @@ assert.equal(calls.length, 0, 'a canonical legacy timestamp remains a valid dedu
   assert.equal(calls.length, 2);
   assert.ok(Date.now() - started < 1000,
     'a non-resolving marker read must be abandoned well inside the D1 lease');
+}
+
+// 11. A corrupt immutable issuance snapshot is an operational error, but the
+// diagnostic must never copy the bearer key or routing contacts into logs.
+{
+  const privateLicense = {
+    key: 'SMESH-OUTB-PRIVATE-LOG9',
+    email: 'private-log@example.com',
+    telegram_user_id: 919191
+  };
+  await enqueueDelivery(env, privateLicense, false);
+  db.issuance.set(privateLicense.key, '{not-json');
+  const privateRow = db.rows.get(privateLicense.key);
+  privateRow.next_attempt_at = Date.now() - 1;
+  providersUp = true;
+  const captured = [];
+  const originalConsoleError = console.error;
+  console.error = (...args) => { captured.push(args.map(String).join(' ')); };
+  try {
+    assert.deepEqual(await retryPendingDeliveries(env), { retried: 1, delivered: 1 });
+  } finally {
+    console.error = originalConsoleError;
+  }
+  const diagnostic = captured.join('\n');
+  assert.match(diagnostic, /delivery outbox snapshot invalid/);
+  for (const secret of [
+    privateLicense.key,
+    privateLicense.email,
+    String(privateLicense.telegram_user_id)
+  ]) {
+    assert.equal(diagnostic.includes(secret), false,
+      'snapshot diagnostics must contain no bearer key or delivery contact');
+  }
 }
 
 console.log('delivery outbox regression passed');

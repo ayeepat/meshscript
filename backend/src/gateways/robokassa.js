@@ -18,6 +18,9 @@ import { readBodyBounded } from '../request-body.js';
 const ROBOKASSA_IPS = new Set(['185.59.216.65', '185.59.217.65']);
 const MAX_RESULT_BODY_BYTES = 16 * 1024;
 const MAX_PROVIDER_RESPONSE_BYTES = 64 * 1024;
+const DEFAULT_PROVIDER_TIMEOUT_MS = 10 * 1000;
+const MIN_PROVIDER_TIMEOUT_MS = 10;
+const MAX_PROVIDER_TIMEOUT_MS = 60 * 1000;
 const OP_STATE_URL = 'https://auth.robokassa.ru/Merchant/WebService/Service.asmx/OpStateExt';
 const REFUND_CREATE_URL = 'https://services.robokassa.ru/RefundService/Refund/Create';
 const REFUND_STATE_URL = 'https://services.robokassa.ru/RefundService/Refund/GetState';
@@ -158,9 +161,23 @@ export function resultSignatureBase(fields, password2) {
   return [outSum, invId, password2, ...shpPairs(fields)].join(':');
 }
 
-export function paymentSignatureBase({ merchantLogin, outSum, invId, password1, receipt = '', shp = {} }) {
+export function paymentSignatureBase({
+  merchantLogin, outSum, invId, password1, receipt = '', stepByStep = '',
+  resultUrl2 = '', successUrl2 = '', successUrl2Method = '',
+  failUrl2 = '', failUrl2Method = '', token = '', shp = {}
+}) {
   const parts = [merchantLogin, outSum, invId];
-  if (receipt) parts.push(receipt);
+  // Robokassa's extended payment-interface fields are signature modifiers,
+  // not decorative form values. They must appear in this exact provider
+  // order before Password #1 whenever they are sent. In particular, leaving
+  // alternative return URLs out of the signature lets the provider reject a
+  // checkout that otherwise looks valid in the browser.
+  for (const modifier of [
+    receipt, stepByStep, resultUrl2, successUrl2, successUrl2Method,
+    failUrl2, failUrl2Method, token
+  ]) {
+    if (modifier !== '' && modifier != null) parts.push(String(modifier));
+  }
   parts.push(password1, ...shpPairs(shp));
   return parts.join(':');
 }
@@ -192,16 +209,54 @@ function formatExpirationDate(expiresAt) {
   return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
 }
 
+function providerTimeoutMs(value) {
+  const configured = Number(value);
+  return Number.isSafeInteger(configured) &&
+    configured >= MIN_PROVIDER_TIMEOUT_MS && configured <= MAX_PROVIDER_TIMEOUT_MS
+    ? configured
+    : DEFAULT_PROVIDER_TIMEOUT_MS;
+}
+
+// Abort real fetches and independently reject the caller. The Promise.race is
+// essential for injected or non-compliant fetchers that ignore AbortSignal;
+// the signal still cancels the network/body stream in production.
+async function withProviderDeadline(timeoutMs, operation) {
+  const controller = new AbortController();
+  let timer = null;
+  try {
+    return await Promise.race([
+      Promise.resolve().then(() => operation(controller.signal)),
+      new Promise((_, reject) => {
+        timer = setTimeout(() => {
+          const error = new Error('robokassa provider timeout');
+          error.name = 'TimeoutError';
+          reject(error);
+          controller.abort();
+        }, providerTimeoutMs(timeoutMs));
+      })
+    ]);
+  } finally {
+    if (timer !== null) clearTimeout(timer);
+  }
+}
+
 export async function createPaymentFields({
   merchantLogin, password1, algorithm = 'MD5', amountKopecks, invId,
   description = '', email = null, isTest = false, receipt = '', shp = {},
-  expiresAt = null
+  expiresAt = null, resultUrl2 = '', successUrl2 = '', failUrl2 = ''
 }) {
   const outSum = formatKopecks(amountKopecks);
   // Robokassa requires the compact UTF-8 Receipt JSON to be URL-encoded both
   // in the field value and in the SignatureValue base string. The browser's
   // form encoding adds the transport layer on top of this provider encoding.
   const encodedReceipt = receipt ? encodeURIComponent(String(receipt)) : '';
+  // URL2 has two representations in Robokassa's classic interface: the raw
+  // URL is the form-field value (ordinary form transport encodes it once),
+  // while SignatureValue covers encodeURIComponent(raw URL). Receipt differs:
+  // its already-encoded value is deliberately sent in the field as well.
+  const encodedResultUrl2 = resultUrl2 ? encodeURIComponent(String(resultUrl2)) : '';
+  const encodedSuccessUrl2 = successUrl2 ? encodeURIComponent(String(successUrl2)) : '';
+  const encodedFailUrl2 = failUrl2 ? encodeURIComponent(String(failUrl2)) : '';
   const fields = {
     MerchantLogin: String(merchantLogin || ''),
     OutSum: outSum,
@@ -214,6 +269,15 @@ export async function createPaymentFields({
   }
   if (email) fields.Email = String(email);
   if (encodedReceipt) fields.Receipt = encodedReceipt;
+  if (resultUrl2) fields.ResultUrl2 = String(resultUrl2);
+  if (successUrl2) {
+    fields.SuccessUrl2 = String(successUrl2);
+    fields.SuccessUrl2Method = 'GET';
+  }
+  if (failUrl2) {
+    fields.FailUrl2 = String(failUrl2);
+    fields.FailUrl2Method = 'GET';
+  }
   // Without this the 30-minute order TTL was purely LOCAL: the customer could
   // leave the provider checkout open and pay after our deadline, and the signed
   // callback then landed on an expired order — acknowledged into manual review
@@ -230,13 +294,19 @@ export async function createPaymentFields({
     invId: fields.InvId,
     password1,
     receipt: encodedReceipt,
+    resultUrl2: encodedResultUrl2,
+    successUrl2: encodedSuccessUrl2,
+    successUrl2Method: fields.SuccessUrl2Method || '',
+    failUrl2: encodedFailUrl2,
+    failUrl2Method: fields.FailUrl2Method || '',
     shp
   }), algorithm);
   return fields;
 }
 
 export async function queryOperationState({
-  merchantLogin, invoiceId: id, password2, algorithm = 'MD5', fetcher = fetch
+  merchantLogin, invoiceId: id, password2, algorithm = 'MD5', fetcher = fetch,
+  timeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS
 }) {
   const invoice = String(id || '');
   if (!merchantLogin || !password2 || !/^\d+$/.test(invoice)) {
@@ -247,30 +317,33 @@ export async function queryOperationState({
   url.searchParams.set('MerchantLogin', merchantLogin);
   url.searchParams.set('InvoiceID', invoice);
   url.searchParams.set('Signature', signature);
-  const response = await fetcher(url.toString(), {
-    method: 'GET', headers: { Accept: 'application/xml' }, redirect: 'error'
+  return withProviderDeadline(timeoutMs, async (signal) => {
+    const response = await fetcher(url.toString(), {
+      method: 'GET', headers: { Accept: 'application/xml' }, redirect: 'error', signal
+    });
+    if (!response.ok) throw new Error(`operation-state http ${response.status}`);
+    const body = await readBodyBounded(response, MAX_PROVIDER_RESPONSE_BYTES);
+    if (!body.ok || /<!DOCTYPE|<!ENTITY/i.test(body.text)) {
+      throw new Error('invalid operation-state response');
+    }
+    const resultBlock = xmlBlock(body.text, 'Result');
+    const stateBlock = xmlBlock(body.text, 'State');
+    const infoBlock = xmlBlock(body.text, 'Info');
+    const resultCode = strictInteger(xmlText(resultBlock, 'Code'));
+    if (resultCode == null) throw new Error('invalid operation-state result');
+    return {
+      result_code: resultCode,
+      state_code: strictInteger(xmlText(stateBlock, 'Code')),
+      out_currency: xmlText(infoBlock, 'OutCurrLabel'),
+      out_sum: xmlText(infoBlock, 'OutSum'),
+      op_key: xmlText(infoBlock, 'OpKey')
+    };
   });
-  if (!response.ok) throw new Error(`operation-state http ${response.status}`);
-  const body = await readBodyBounded(response, MAX_PROVIDER_RESPONSE_BYTES);
-  if (!body.ok || /<!DOCTYPE|<!ENTITY/i.test(body.text)) {
-    throw new Error('invalid operation-state response');
-  }
-  const resultBlock = xmlBlock(body.text, 'Result');
-  const stateBlock = xmlBlock(body.text, 'State');
-  const infoBlock = xmlBlock(body.text, 'Info');
-  const resultCode = strictInteger(xmlText(resultBlock, 'Code'));
-  if (resultCode == null) throw new Error('invalid operation-state result');
-  return {
-    result_code: resultCode,
-    state_code: strictInteger(xmlText(stateBlock, 'Code')),
-    out_currency: xmlText(infoBlock, 'OutCurrLabel'),
-    out_sum: xmlText(infoBlock, 'OutSum'),
-    op_key: xmlText(infoBlock, 'OpKey')
-  };
 }
 
 export async function createRefund({
-  opKey, password3, invoiceItems = null, algorithm = 'HS256', fetcher = fetch
+  opKey, password3, invoiceItems = null, algorithm = 'HS256', fetcher = fetch,
+  timeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS
 }) {
   const normalizedAlgorithm = String(algorithm || 'HS256').toUpperCase();
   if (!isSupportedRefundHashAlgorithm(normalizedAlgorithm) || !opKey || !password3) {
@@ -279,39 +352,46 @@ export async function createRefund({
   const payload = { OpKey: String(opKey) };
   if (invoiceItems) payload.InvoiceItems = invoiceItems;
   const token = await signJwt(payload, password3, normalizedAlgorithm);
-  const response = await fetcher(REFUND_CREATE_URL, {
-    method: 'POST',
-    headers: { 'Content-Type': 'text/plain; charset=utf-8', Accept: 'application/json' },
-    body: token,
-    redirect: 'error'
+  return withProviderDeadline(timeoutMs, async (signal) => {
+    const response = await fetcher(REFUND_CREATE_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'text/plain; charset=utf-8', Accept: 'application/json' },
+      body: token,
+      redirect: 'error',
+      signal
+    });
+    if (!response.ok) throw new Error(`refund-create http ${response.status}`);
+    const parsed = await readProviderJson(response);
+    const requestId = String(parsed?.requestId || '');
+    if (parsed?.success !== true || !isGuid(requestId)) {
+      return { ok: false, reason: safeProviderLabel(parsed?.message) || 'refund_rejected' };
+    }
+    return { ok: true, request_id: requestId };
   });
-  if (!response.ok) throw new Error(`refund-create http ${response.status}`);
-  const parsed = await readProviderJson(response);
-  const requestId = String(parsed?.requestId || '');
-  if (parsed?.success !== true || !isGuid(requestId)) {
-    return { ok: false, reason: safeProviderLabel(parsed?.message) || 'refund_rejected' };
-  }
-  return { ok: true, request_id: requestId };
 }
 
-export async function queryRefundState({ requestId, fetcher = fetch }) {
+export async function queryRefundState({
+  requestId, fetcher = fetch, timeoutMs = DEFAULT_PROVIDER_TIMEOUT_MS
+}) {
   const id = String(requestId || '');
   if (!isGuid(id)) throw new Error('invalid refund state request');
   const url = new URL(REFUND_STATE_URL);
   url.searchParams.set('id', id);
-  const response = await fetcher(url.toString(), {
-    method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error'
+  return withProviderDeadline(timeoutMs, async (signal) => {
+    const response = await fetcher(url.toString(), {
+      method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', signal
+    });
+    if (!response.ok) throw new Error(`refund-state http ${response.status}`);
+    const parsed = await readProviderJson(response);
+    if (String(parsed?.requestId || '').toLowerCase() !== id.toLowerCase()) {
+      throw new Error('invalid refund state response');
+    }
+    const label = String(parsed?.label || '').toLowerCase();
+    if (!['processing', 'finished', 'canceled'].includes(label)) {
+      throw new Error('invalid refund state label');
+    }
+    return { request_id: id, label, amount: String(parsed.amount ?? '') };
   });
-  if (!response.ok) throw new Error(`refund-state http ${response.status}`);
-  const parsed = await readProviderJson(response);
-  if (String(parsed?.requestId || '').toLowerCase() !== id.toLowerCase()) {
-    throw new Error('invalid refund state response');
-  }
-  const label = String(parsed?.label || '').toLowerCase();
-  if (!['processing', 'finished', 'canceled'].includes(label)) {
-    throw new Error('invalid refund state label');
-  }
-  return { request_id: id, label, amount: String(parsed.amount ?? '') };
 }
 
 export function okResponse(invId) {

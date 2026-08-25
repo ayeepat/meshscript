@@ -36,6 +36,7 @@ class FakeD1 {
   purchaseRows = [];
   exhausted = 3;
   reviewOpen = 2;
+  reconciliationErrors = 6;
   refundUnknown = 0;
   refundPollStalled = 0;
   referralUnsettled = 4;
@@ -147,6 +148,9 @@ class FakeD1 {
         }
         if (sql.includes('FROM delivery_outbox')) return { n: db.exhausted };
         if (sql.includes('FROM payment_review')) return { n: db.reviewOpen };
+        if (sql.includes("event_type = 'reconciliation_provider_error'")) {
+          return { n: db.reconciliationErrors };
+        }
         if (sql.includes('FROM payment_refund_poll')) return { n: db.refundPollStalled };
         if (sql.includes('FROM payment_orders')) return { n: db.refundUnknown };
         if (sql.includes('FROM referral_credits c')) return { n: db.referralLegacyUnjournaled };
@@ -286,6 +290,16 @@ for (const table of HEALTH_TABLES) {
     MIN_PAYMENT_RUB: '199',
     SUBSCRIPTION_PRICE_RUB: '199',
     LIFETIME_PRICE_RUB: '199',
+    MONTHLY_PRICE_RUB: '149',
+    MONTHLY_DAYS: '30',
+    SCHOOL_YEAR_PRICE_RUB: '999',
+    SCHOOL_YEAR_DAYS: '273',
+    CHECKOUT_PROMO_CODE: 'TEST654',
+    CHECKOUT_PROMO_MONTH_PRICE_RUB: '10',
+    CHECKOUT_TELEGRAM_BOT_USERNAME: 'smeshaibot',
+    CHECKOUT_CAPABILITY_SECRET: 'checkout-capability-secret-that-is-at-least-32-bytes',
+    ROBOKASSA_SUCCESS_URL2: 'https://site.example/checkout/success/',
+    ROBOKASSA_FAIL_URL2: 'https://site.example/checkout/?payment=cancelled',
     PAYMENT_ENVIRONMENT: 'production',
     ROBOKASSA_MERCHANT_LOGIN: 'merchant',
     ROBOKASSA_PASSWORD1_PRODUCTION: 'p1',
@@ -296,6 +310,7 @@ for (const table of HEALTH_TABLES) {
     ROBOKASSA_RECEIPT_PAYMENT_METHOD: 'full_payment',
     ROBOKASSA_RECEIPT_PAYMENT_OBJECT: 'service',
     TELEGRAM_BOT_TOKEN: 'tg',
+    TELEGRAM_WEBHOOK_SECRET: 'telegram-webhook-secret-that-is-strong',
     SUPPORT_CHAT_ID: '42',
     AI_PROXY_API_KEY: 'k',
     INGEST_KEY: 'test-ingest-key-that-is-at-least-32-bytes',
@@ -317,6 +332,7 @@ for (const table of HEALTH_TABLES) {
   assert.deepEqual(body.worklists, {
     delivery_exhausted: 3,
     payment_review_open: 2,
+    payment_reconciliation_errors: 6,
     refund_submission_unknown: 0,
     refund_poll_stalled: 0,
     referral_unsettled: 4,
@@ -398,6 +414,30 @@ for (const table of HEALTH_TABLES) {
   assert.equal(noIngestKey.status, 503,
     'telemetry attestation cannot operate without a strong signing secret');
   assert.equal((await noIngestKey.json()).checks.ingest_key, false);
+
+  const noCheckoutCapabilitySecret = await get({
+    ...healthy, CHECKOUT_CAPABILITY_SECRET: undefined
+  });
+  assert.equal(noCheckoutCapabilitySecret.status, 503,
+    'checkout capabilities require a dedicated Worker-only signing secret');
+  assert.equal((await noCheckoutCapabilitySecret.json()).checks.checkout_capability_secret, false);
+
+  const sharedCheckoutCapabilitySecret = await get({
+    ...healthy, CHECKOUT_CAPABILITY_SECRET: healthy.INGEST_KEY
+  });
+  assert.equal(sharedCheckoutCapabilitySecret.status, 503,
+    'the VPS-shared ingest key must never double as checkout identity authority');
+  assert.equal(
+    (await sharedCheckoutCapabilitySecret.json()).checks.checkout_capability_secret,
+    false
+  );
+
+  const weakTelegramWebhookSecret = await get({
+    ...healthy, TELEGRAM_WEBHOOK_SECRET: 'too-short'
+  });
+  assert.equal(weakTelegramWebhookSecret.status, 503,
+    'Telegram identity authority must fail readiness on a weak webhook secret');
+  assert.equal((await weakTelegramWebhookSecret.json()).checks.telegram_webhook_secret, false);
 
   const invalidSupportOwner = await get({ ...healthy, SUPPORT_CHAT_ID: 'not-a-chat' });
   assert.equal(invalidSupportOwner.status, 503,
@@ -625,6 +665,7 @@ for (const table of HEALTH_TABLES) {
   assert.deepEqual(wf.worklists, {
     delivery_exhausted: null,
     payment_review_open: null,
+    payment_reconciliation_errors: null,
     refund_submission_unknown: null,
     refund_poll_stalled: null,
     referral_unsettled: null,

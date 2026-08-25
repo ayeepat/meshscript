@@ -203,7 +203,7 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
 
 /* ---- H-3: one failing row must not starve the rows behind it ---- */
 {
-  const { sqlite, env } = await environment();
+  const { sqlite, env } = await environment({ ROBOKASSA_PROVIDER_TIMEOUT_MS: '20' });
   seedRefundPending(sqlite, { orderId: 1, licenseKey: 'SMESH-A', requestId: GUID(1) });
   seedRefundPending(sqlite, { orderId: 2, licenseKey: 'SMESH-B', requestId: GUID(2) });
 
@@ -213,14 +213,22 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
     polled.push(id);
     // The LOWEST order id is permanently broken — the shape that used to end
     // the whole sweep on its very first call, every single run.
-    if (id === GUID(1)) throw new Error('provider unreachable');
+    if (id === GUID(1)) return new Promise(() => {});
     return new Response(
       JSON.stringify({ requestId: id, label: 'finished', amount: '990.00' }),
       { status: 200, headers: { 'Content-Type': 'application/json' } }
     );
   };
 
-  const finished = await payments.inspectPendingRefunds(env, 20, fetcher);
+  let guard;
+  const finished = await Promise.race([
+    payments.inspectPendingRefunds(env, 20, fetcher),
+    new Promise((_, reject) => {
+      guard = setTimeout(() => reject(new Error('refund poll timeout guard')), 1_000);
+    })
+  ]).finally(() => {
+    if (guard) clearTimeout(guard);
+  });
   assert.equal(polled.length, 2, 'the second refund must still be polled');
   assert.equal(finished.length, 1, 'the healthy refund must still settle');
   assert.equal(String(finished[0].order_id), '2');
@@ -230,7 +238,7 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
   ).get();
   assert.equal(backoff.attempts, 1, 'the failing row records its attempt');
   assert.ok(backoff.next_poll_at > Date.now(), 'and backs off out of the eligible set');
-  assert.match(backoff.last_error, /provider unreachable/);
+  assert.match(backoff.last_error, /provider timeout/);
 
   // Settle the healthy refund the way the cron does, then sweep again: while
   // order 1 sits in backoff it is not selected AT ALL, so it can never again
@@ -338,6 +346,41 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
   assert.equal(orderRow(sqlite, 4).refund_status, 'processing');
 }
 
+/* ---- a hung refund-create request is bounded and left operator-safe ---- */
+{
+  const { sqlite, env } = await environment({ ROBOKASSA_PROVIDER_TIMEOUT_MS: '20' });
+  sqlite.prepare(
+    `INSERT INTO payment_orders
+       (order_id, gateway, environment, status, amount_kopecks, currency, plan_type,
+        is_preorder, fiscalization_mode, receipt_json, created_at, expires_at,
+        paid_at, fulfilled_at, provider_op_key)
+     VALUES (12, 'robokassa', 'production', 'fulfilled', 99000, 'RUB', 'lifetime',
+             0, 'provider', ?, 1, 2, 3, 4, 'op-key')`
+  ).run(RECEIPT);
+
+  let guard;
+  try {
+    await assert.rejects(
+      Promise.race([
+        payments.initiateRobokassaRefund(env, {
+          order_id: '12', reason: 'timeout test', confirm_full_refund: true
+        }, async () => new Promise(() => {})),
+        new Promise((_, reject) => {
+          guard = setTimeout(() => reject(new Error('refund create timeout guard')), 1_000);
+        })
+      ]),
+      /robokassa provider timeout/
+    );
+  } finally {
+    if (guard) clearTimeout(guard);
+  }
+  const row = orderRow(sqlite, 12);
+  assert.equal(row.status, 'refund_pending');
+  assert.equal(row.refund_status, 'submission_unknown',
+    'a create timeout is ambiguous and must never be retried automatically');
+  assert.ok(eventTypes(sqlite, 12).includes('refund_submission_unknown'));
+}
+
 /* ---- M-6: an unsupported refund algorithm is caught before reservation ---- */
 {
   const { sqlite, env } = await environment({ ROBOKASSA_REFUND_HASH_ALGO: 'RS256' });
@@ -370,6 +413,7 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
 {
   const { sqlite, env } = await environment();
   const old = Date.now() - 40 * 24 * 60 * 60 * 1000;
+  const reconciledAt = Date.now();
   sqlite.prepare(
     `INSERT INTO payment_orders
        (order_id, gateway, environment, status, amount_kopecks, currency, plan_type,
@@ -378,7 +422,14 @@ const eventTypes = (sqlite, orderId) => sqlite.prepare(
      VALUES (6, 'robokassa', 'production', 'pending', 99000, 'RUB', 'lifetime',
              'buyer@example.com', '12345', 'device-abcdefgh', 0, 'provider',
              ?, ?, ?, ?)`
-  ).run(RECEIPT, old, old + 30 * 60 * 1000, Date.now());
+  ).run(RECEIPT, old, old + 30 * 60 * 1000, reconciledAt);
+  sqlite.prepare(
+    `INSERT INTO payment_events
+       (gateway, payment_id, order_id, environment, event_type, amount_kopecks,
+        currency, details_json, created_at)
+     VALUES ('robokassa', '6', 6, 'production', 'reconciliation_observed',
+             NULL, 'RUB', '{"state_code":5}', ?)`
+  ).run(reconciledAt);
 
   const summary = await payments.pruneExpiredPaymentOrders(env);
   assert.equal(summary.expired, 1);

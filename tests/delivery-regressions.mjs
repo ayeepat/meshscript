@@ -6,8 +6,9 @@
  *  2. The support bot routes an owner reply by the #id tag it APPENDS to a
  *     forwarded ticket. A user writing «#id<victim>» in their ticket body must
  *     not hijack the routing — the LAST tag (ours) wins.
- *  3. License delivery markers retain per-channel success/failure state so a
- *     total failure retries, while any success and legacy markers still dedup.
+ *  3. License delivery markers retain per-channel success/failure state. A
+ *     Telegram-bound purchase dedups only after Telegram succeeds; legacy
+ *     email-only purchases still complete on email.
  */
 import assert from 'node:assert/strict';
 
@@ -141,7 +142,25 @@ try {
   const partialAttempts = calls.length;
   await deliverKey(deliveryEnv(partialKv), deliveryLicense, false);
   assert.equal(calls.length, partialAttempts,
-    'one successful channel must dedup later webhook deliveries entirely');
+    'successful Telegram must dedup later webhook deliveries entirely');
+
+  const telegramRequiredKv = new MarkerKV();
+  calls.length = 0;
+  fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), body: JSON.parse(init?.body || 'null'), headers: init?.headers || {} });
+    return String(url).includes('api.telegram.org') ? failedResponse() : successResponse();
+  };
+  await deliverKey(deliveryEnv(telegramRequiredKv), deliveryLicense, false);
+  marker = JSON.parse(await telegramRequiredKv.get(`delivered:${deliveryLicense.key}`));
+  assert.deepEqual({ tg: marker.tg, email: marker.email }, { tg: 'failed', email: 'ok' });
+  assert.equal(calls.length, 3,
+    'email success must not suppress the in-process Telegram retry');
+  const beforeTelegramRecovery = calls.length;
+  await deliverKey(
+    deliveryEnv(telegramRequiredKv), deliveryLicense, false, { retry: false }
+  );
+  assert.equal(calls.length, beforeTelegramRecovery + 1,
+    'an email-only marker remains retryable and retries Telegram without resending email');
 
   const legacyKv = new MarkerKV();
   await legacyKv.put(`delivered:${deliveryLicense.key}`, '2026-07-16T12:00:00.000Z');

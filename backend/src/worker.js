@@ -15,6 +15,9 @@
  *   GET  /admin/referral     Inspect a referral record by code or device
  *   POST /admin/referral/retry-pending  Recover durable incomplete referral credits
  *   POST /telegram/webhook   Support bot: user tickets → owner, replies → user
+ *   POST /checkout/session   Create a short-lived server-priced checkout
+ *   POST /checkout/status    Poll checkout/payment/delivery state by capability
+ *   POST /checkout/payment   Create signed hosted-payment fields after Telegram binding
  *   GET  /health             Liveness ping
  *
  * Everything else 404s. CORS is wide-open only on the public extension APIs
@@ -34,6 +37,7 @@ import * as robokassa from './gateways/robokassa.js';
 import * as payments from './payments.js';
 import { sendLicenseEmail } from './delivery/email.js';
 import { sendLicenseTelegram } from './delivery/telegram.js';
+import { processCheckoutStart } from './delivery/checkout.js';
 import {
   processSupportUpdate, retryPendingSupportForwards,
   supportConfigValid, SUPPORT_FORWARD_MAX_ATTEMPTS
@@ -82,7 +86,7 @@ const isStatsPath = (path) => path.startsWith('/admin/stats/');
 
 const isPublicExtensionPath = (path) =>
   path === '/verify' || path === '/deactivate' || path === '/ai/chat' || path.startsWith('/referral/') ||
-  path === '/payments/robokassa/order' ||
+  path === '/payments/robokassa/order' || path.startsWith('/checkout/') ||
   path === '/t' || path === '/t/ai' || path === '/t/delete';
 
 function backupMaintenanceEnabled(env) {
@@ -125,7 +129,8 @@ function safeErrorText(errorValue, env = {}) {
     'ROBOKASSA_PASSWORD1_PRODUCTION', 'ROBOKASSA_PASSWORD2_PRODUCTION',
     'ROBOKASSA_PASSWORD1_TEST', 'ROBOKASSA_PASSWORD2_TEST',
     'ROBOKASSA_PASSWORD3_PRODUCTION', 'ROBOKASSA_PASSWORD3_TEST', 'RESEND_API_KEY',
-    'AI_PROXY_API_KEY', 'INGEST_KEY', 'OWNER_LICENSE_KEY'
+    'AI_PROXY_API_KEY', 'INGEST_KEY', 'CHECKOUT_CAPABILITY_SECRET',
+    'CHECKOUT_PROMO_CODE', 'OWNER_LICENSE_KEY'
   ]) {
     const secret = String(env[name] || '');
     if (secret.length >= 4) text = text.split(secret).join('[REDACTED]');
@@ -194,7 +199,22 @@ export default {
         return await handleRobokassa(request, env, ctx);
       }
       if (path === '/payments/robokassa/order' && method === 'POST') {
+        // The retired route trusted a browser-supplied Telegram id. Make the
+        // exceptional compatibility path opt-in, never fail-open on an unset
+        // or misspelled flag.
+        if (String(env.LEGACY_PAYMENT_ORDER_ENABLED || '').trim().toLowerCase() !== 'true') {
+          return error(410, 'legacy_checkout_disabled', VERIFY_CORS);
+        }
         return await handleCreateRobokassaOrder(request, env);
+      }
+      if (path === '/checkout/session' && method === 'POST') {
+        return await handleCreateCheckoutSession(request, env);
+      }
+      if (path === '/checkout/status' && method === 'POST') {
+        return await handleCheckoutStatus(request, env);
+      }
+      if (path === '/checkout/payment' && method === 'POST') {
+        return await handleCreateCheckoutPayment(request, env);
       }
 
       if (path === '/referral/code' && method === 'POST') return await handleReferralCode(request, env);
@@ -551,8 +571,8 @@ async function handleTelegramWebhook(request, env, ctx) {
   // Fail closed on a missing secret. Treating "secret not configured" as
   // "authentication disabled" lets anyone forge Telegram update objects,
   // including an owner reply that makes the bot DM an arbitrary chat.
-  if (!env.TELEGRAM_WEBHOOK_SECRET) {
-    console.error('telegram webhook disabled: TELEGRAM_WEBHOOK_SECRET is not set');
+  if (!payments.telegramWebhookSecretValid(env)) {
+    console.error('telegram webhook disabled: TELEGRAM_WEBHOOK_SECRET is missing or weak');
     return error(503, 'webhook_not_configured');
   }
   const got = request.headers.get('X-Telegram-Bot-Api-Secret-Token') || '';
@@ -599,10 +619,13 @@ async function handleTelegramWebhook(request, env, ctx) {
   let result;
   let failed = false;
   try {
-    result = await processSupportUpdate(env, update, {
-      updateId: claim.updateId,
-      claimVersion: claim.claimVersion
-    });
+    const checkout = await processCheckoutStart(env, update);
+    result = checkout.handled
+      ? checkout
+      : await processSupportUpdate(env, update, {
+          updateId: claim.updateId,
+          claimVersion: claim.claimVersion
+        });
   }
   catch (e) {
     const safeError = safeErrorText(e, env);
@@ -757,7 +780,16 @@ function summarizeUpdate(u = {}) {
   const m = u.message;
   const cq = u.callback_query;
   if (cq) return { type: 'callback_query', data: cq.data, from: cq.from?.id };
-  if (m) return { type: 'message', from: m.from?.id, chat: m.chat?.id, text: m.text || m.caption || null, is_reply: !!m.reply_to_message };
+  if (m) {
+    const rawText = m.text || m.caption || null;
+    const text = typeof rawText === 'string'
+      ? rawText.replace(/\bpay_[A-Za-z0-9_-]{20,64}\b/g, 'pay_[REDACTED]')
+      : rawText;
+    return {
+      type: 'message', from: m.from?.id, chat: m.chat?.id,
+      text, is_reply: !!m.reply_to_message
+    };
+  }
   return { type: 'other', keys: Object.keys(u).filter((k) => k !== 'update_id') };
 }
 
@@ -768,7 +800,7 @@ function summarizeUpdate(u = {}) {
 async function handleTelegramSetup(request, env) {
   const gate = await adminGate(request, env);
   if (gate) return gate;
-  if (!env.TELEGRAM_WEBHOOK_SECRET) return error(400, 'no_webhook_secret');
+  if (!payments.telegramWebhookSecretValid(env)) return error(400, 'invalid_webhook_secret');
   if (!env.TELEGRAM_BOT_TOKEN) return error(400, 'no_bot_token');
 
   const url = new URL(request.url);
@@ -850,15 +882,63 @@ async function handleTelegramDebug(request, env) {
 
 /* ------------------------- /webhook/robokassa ------------------------ */
 
+async function handleCreateCheckoutSession(request, env) {
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const malformedExhausted = await payments.malformedOrderBudgetExhausted(env, ip);
+  const parsed = await readJsonBounded(request, 4096);
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' ||
+      Array.isArray(parsed.value)) {
+    if (malformedExhausted) return error(429, 'rate_limited', VERIFY_CORS);
+    await payments.recordMalformedOrderAttempt(env, ip);
+    return error(
+      parsed.ok ? 400 : parsed.status,
+      parsed.ok ? 'bad_json' : (parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json'),
+      VERIFY_CORS
+    );
+  }
+  const result = await payments.createCheckoutSession(
+    env, parsed.value, ip, malformedExhausted
+  );
+  if (!result.ok) return error(result.status, result.reason, VERIFY_CORS);
+  return json(result, { headers: VERIFY_CORS });
+}
+
+async function handleCheckoutStatus(request, env) {
+  const parsed = await readJsonBounded(request, 4096);
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' ||
+      Array.isArray(parsed.value)) {
+    return error(
+      parsed.ok ? 400 : parsed.status,
+      parsed.ok ? 'bad_json' : (parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json'),
+      VERIFY_CORS
+    );
+  }
+  const result = await payments.checkoutStatus(env, parsed.value.token);
+  if (!result.ok) return error(result.status, result.reason, VERIFY_CORS);
+  return json(result, { headers: VERIFY_CORS });
+}
+
+async function handleCreateCheckoutPayment(request, env) {
+  const parsed = await readJsonBounded(request, 16 * 1024);
+  if (!parsed.ok || !parsed.value || typeof parsed.value !== 'object' ||
+      Array.isArray(parsed.value)) {
+    return error(
+      parsed.ok ? 400 : parsed.status,
+      parsed.ok ? 'bad_json' : (parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json'),
+      VERIFY_CORS
+    );
+  }
+  const result = await payments.createCheckoutPayment(env, parsed.value);
+  if (!result.ok) return error(result.status, result.reason, VERIFY_CORS);
+  return json(result, { headers: VERIFY_CORS });
+}
+
 async function handleCreateRobokassaOrder(request, env) {
   const ip = request.headers.get('cf-connecting-ip') || 'unknown';
-  // Enforce the malformed budget before parsing; merely maintaining a counter
-  // after every rejection did not actually bound attacker work.
-  if (await payments.malformedOrderBudgetExhausted(env, ip)) {
-    return error(429, 'rate_limited', VERIFY_CORS);
-  }
+  const malformedExhausted = await payments.malformedOrderBudgetExhausted(env, ip);
   const parsed = await readJsonBounded(request, 16 * 1024);
   if (!parsed.ok) {
+    if (malformedExhausted) return error(429, 'rate_limited', VERIFY_CORS);
     await payments.recordMalformedOrderAttempt(env, ip);
     return error(
       parsed.status,
@@ -867,13 +947,15 @@ async function handleCreateRobokassaOrder(request, env) {
     );
   }
   if (!parsed.value || typeof parsed.value !== 'object' || Array.isArray(parsed.value)) {
+    if (malformedExhausted) return error(429, 'rate_limited', VERIFY_CORS);
     await payments.recordMalformedOrderAttempt(env, ip);
     return error(400, 'bad_json', VERIFY_CORS);
   }
   const result = await payments.createRobokassaOrder(
     env,
     parsed.value,
-    ip
+    ip,
+    malformedExhausted
   );
   if (!result.ok) return error(result.status, result.reason, VERIFY_CORS);
   return json(result, { headers: VERIFY_CORS });
@@ -1112,12 +1194,10 @@ async function settleIssuedRobokassaPayment(
 async function ackUnissuedPayment(env, n, fields, reason, order = null) {
   try {
     if (!env.DB) throw new Error('payment review journal unavailable');
-    const stored = { ...fields };
-    for (const key of Object.keys(stored)) {
-      // The signature is a hash over "...:Password#2" with every other input
-      // known — persisting it hands out an offline brute-force target.
-      if (key.toLowerCase() === 'signaturevalue') delete stored[key];
-    }
+    // Keep only non-PII evidence needed to reconcile the provider invoice.
+    // This also excludes SignatureValue, which would be an offline target for
+    // Password #2 guessing.
+    const stored = payments.robokassaResultEvidence(fields);
     await env.DB.prepare(
       `INSERT OR IGNORE INTO payment_review
          (gateway, payment_id, invoice_id, amount_rub, environment,
@@ -1259,6 +1339,17 @@ function isLegacyDeliveryMarker(raw) {
   catch { return false; }
 }
 
+// Telegram-bound checkout makes the bot the promised delivery channel. Email
+// remains a useful fallback copy, but it must not close the durable outbox or
+// make checkout status say "delivered" while the bot is still failing. Legacy
+// email-only purchases complete on email as before.
+function requiredDeliverySucceeded(state, recipient) {
+  if (!state || !recipient) return false;
+  if (recipient.telegram_user_id) return state.tg === 'ok';
+  if (recipient.email) return state.email === 'ok';
+  return false;
+}
+
 // Returns the final per-channel state ({ tg, email } of ok|failed|skipped) so
 // callers can settle the durable delivery_outbox row. `retry:false` skips the
 // in-process second attempt — the cron sweep IS the retry when it's the caller.
@@ -1276,7 +1367,7 @@ export async function deliverKey(env, license, isPreorder, { force = false, retr
           // Anything else is an unreadable marker: fall through and deliver
           // rather than dereferencing the null this branch just proved.
           if (isLegacyDeliveryMarker(raw)) return { tg: 'ok', email: 'ok' };
-        } else if (previous.tg === 'ok' || previous.email === 'ok') {
+        } else if (requiredDeliverySucceeded(previous, license)) {
           return { tg: previous.tg, email: previous.email };
         }
       }
@@ -1287,7 +1378,13 @@ export async function deliverKey(env, license, isPreorder, { force = false, retr
   const sendTg = () => sendLicenseTelegram(env, {
     user_id: license.telegram_user_id,
     key: license.key,
-    isPreorder
+    isPreorder,
+    amount_kopecks: Number.isSafeInteger(license.amount_kopecks)
+      ? license.amount_kopecks
+      : null,
+    expires_at: license.expires_at,
+    payment_id: license.payment_id,
+    email: license.email
   });
   const sendEmail = () => sendLicenseEmail(env, {
     to: license.email,
@@ -1308,7 +1405,7 @@ export async function deliverKey(env, license, isPreorder, { force = false, retr
   // outage has had time to clear. Retry failed channels only: skipped contacts
   // cannot become configured mid-call, and a successful channel must not send
   // the same bearer key twice.
-  if (retry && state.tg !== 'ok' && state.email !== 'ok' &&
+  if (retry && !requiredDeliverySucceeded(state, license) &&
       (state.tg === 'failed' || state.email === 'failed')) {
     await new Promise((resolve) => setTimeout(resolve, DELIVERY_RETRY_DELAY_MS));
     const [tgRetry, emailRetry] = await Promise.allSettled([
@@ -1399,18 +1496,18 @@ async function claimDeliveryOutboxAttempt(env, licenseKey, expectedAttempts) {
   return (claim?.meta?.changes || 0) > 0 ? claimToken : null;
 }
 
-// Proven delivery on one channel closes the row. Failed attempts need no
-// extra mutation: their exclusive claim already scheduled the next cron run,
-// including when the isolate dies after an external send.
-async function settleDeliveryOutbox(env, licenseKey, claimToken, state) {
-  if (!env.DB || !claimToken ||
-      !(state && (state.tg === 'ok' || state.email === 'ok'))) return false;
+// Proven delivery on the promised channel closes the row. Failed attempts
+// need no extra mutation: their exclusive claim already scheduled the next
+// cron run, including when the isolate dies after an external send.
+async function settleDeliveryOutbox(env, license, claimToken, state) {
+  if (!env.DB || !claimToken || !license?.key ||
+      !requiredDeliverySucceeded(state, license)) return false;
   try {
     const settled = await env.DB.prepare(
       `UPDATE delivery_outbox
        SET delivered_at = ?2, claim_token = NULL, lease_until = NULL
        WHERE license_key = ?1 AND delivered_at IS NULL AND claim_token = ?3`
-    ).bind(licenseKey, Date.now(), claimToken).run();
+    ).bind(license.key, Date.now(), claimToken).run();
     return (settled?.meta?.changes || 0) > 0;
   } catch (e) {
     console.error('delivery outbox settle failed', safeErrorText(e, env));
@@ -1445,7 +1542,7 @@ export async function deliverAndSettle(env, license, isPreorder) {
   let state = null;
   try { state = await deliverKey(env, license, isPreorder); }
   catch (e) { console.error('deliver', safeErrorText(e, env)); }
-  const settled = await settleDeliveryOutbox(env, license.key, claimToken, state);
+  const settled = await settleDeliveryOutbox(env, license, claimToken, state);
   if (!settled) await releaseDeliveryOutboxClaim(env, license.key, claimToken);
   return { claimed: true, state };
 }
@@ -1456,11 +1553,15 @@ export async function retryPendingDeliveries(env, limit = 25) {
   let rows;
   try {
     rows = await env.DB.prepare(
-      `SELECT license_key, email, telegram_user_id, is_preorder, attempts
-       FROM delivery_outbox
-       WHERE delivered_at IS NULL AND attempts < ?1 AND next_attempt_at <= ?2
-         AND (lease_until IS NULL OR lease_until <= ?2)
-       ORDER BY next_attempt_at LIMIT ?3`
+      `SELECT outbox.license_key, outbox.email, outbox.telegram_user_id,
+              outbox.is_preorder, outbox.attempts, issuance.license_json
+       FROM delivery_outbox AS outbox
+       LEFT JOIN payment_issuance AS issuance
+         ON issuance.license_key = outbox.license_key
+       WHERE outbox.delivered_at IS NULL AND outbox.attempts < ?1
+         AND outbox.next_attempt_at <= ?2
+         AND (outbox.lease_until IS NULL OR outbox.lease_until <= ?2)
+       ORDER BY outbox.next_attempt_at LIMIT ?3`
     ).bind(DELIVERY_MAX_ATTEMPTS, Date.now(), Math.max(1, Math.min(50, limit))).all();
   } catch (e) {
     console.error('delivery outbox scan failed', safeErrorText(e, env));
@@ -1487,7 +1588,20 @@ export async function retryPendingDeliveries(env, limit = 25) {
     }
     if (!claimToken) continue;
     retried += 1;
+    let frozen = null;
+    try {
+      const candidate = row.license_json ? JSON.parse(row.license_json) : null;
+      if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
+          candidate.key === row.license_key) frozen = candidate;
+    } catch (e) {
+      console.error('delivery outbox snapshot invalid', safeErrorText(e, env));
+    }
+    // D1 outbox contacts remain the routing authority. The immutable issuance
+    // snapshot restores payment/subscription metadata for the Telegram copy
+    // after a delayed recovery without allowing a malformed snapshot to
+    // redirect the bearer key.
     const license = {
+      ...(frozen || {}),
       key: row.license_key,
       email: row.email || null,
       telegram_user_id: row.telegram_user_id || null
@@ -1498,8 +1612,8 @@ export async function retryPendingDeliveries(env, limit = 25) {
     catch (e) { console.error('outbox delivery retry failed', safeErrorText(e, env)); }
     // The claim already scheduled the next retry; settle only on success so
     // the loser-safe attempt counter is never bumped twice for one attempt.
-    if (state && (state.tg === 'ok' || state.email === 'ok')) {
-      if (await settleDeliveryOutbox(env, row.license_key, claimToken, state)) {
+    if (requiredDeliverySucceeded(state, license)) {
+      if (await settleDeliveryOutbox(env, license, claimToken, state)) {
         delivered += 1;
       } else {
         await releaseDeliveryOutboxClaim(env, row.license_key, claimToken);
@@ -1946,12 +2060,15 @@ async function handleAdminHealth(request, env) {
     payment_floor: minPaymentRub(env) > 0,
     payment_plan: paymentPlanConfigValid(env),
     payment_config: payments.paymentConfigValid(env),
+    checkout_config: payments.checkoutConfigValid(env),
+    checkout_capability_secret: payments.checkoutCapabilitySecretValid(env),
     payment_refunds: payments.paymentRefundConfigValid(env),
     device_limit: deviceLimitConfigValid(env),
     robokassa_password2: !!payments.robokassaCredential(env, 2),
     robokassa_hash: robokassa.isSupportedHashAlgorithm(env.ROBOKASSA_HASH_ALGO),
     delivery_channel: !!(env.RESEND_API_KEY || env.TELEGRAM_BOT_TOKEN),
     support_owner: supportConfigValid(env),
+    telegram_webhook_secret: payments.telegramWebhookSecretValid(env),
     admin_secret: typeof env.ADMIN_SECRET === 'string' && env.ADMIN_SECRET.length >= 32,
     stats_secret: typeof env.STATS_SECRET === 'string' && env.STATS_SECRET.length >= 32,
     // Production has one quota/admission authority: the VPS. The Worker route
@@ -1973,6 +2090,7 @@ async function handleAdminHealth(request, env) {
   const worklists = {
     delivery_exhausted: null,
     payment_review_open: null,
+    payment_reconciliation_errors: null,
     refund_submission_unknown: null,
     refund_poll_stalled: null,
     referral_unsettled: null,
@@ -2113,7 +2231,7 @@ async function handleAdminHealth(request, env) {
     if (checks.schema) {
       try {
         const [
-          exhausted, review, refundUnknown, refundStalled,
+          exhausted, review, reconciliationErrors, refundUnknown, refundStalled,
           referralUnsettled, referralLegacy, supportExhausted
         ] = await Promise.all([
           env.DB.prepare(
@@ -2121,6 +2239,21 @@ async function handleAdminHealth(request, env) {
           ).bind(DELIVERY_MAX_ATTEMPTS).first(),
           env.DB.prepare(
             'SELECT COUNT(*) AS n FROM payment_review WHERE resolved_at IS NULL'
+          ).first(),
+          // Last-attempt provider/signature errors remain fail-closed and
+          // retryable. Surface them so a bad merchant credential or a lasting
+          // Robokassa outage cannot become an invisible ten-minute loop.
+          env.DB.prepare(
+            `SELECT COUNT(*) AS n FROM payment_orders AS orders
+             WHERE orders.environment = 'production' AND orders.status = 'pending'
+               AND orders.reconciled_at IS NOT NULL
+               AND EXISTS (
+                 SELECT 1 FROM payment_events AS failed
+                 WHERE failed.gateway = 'robokassa'
+                   AND failed.payment_id = CAST(orders.order_id AS TEXT)
+                   AND failed.event_type = 'reconciliation_provider_error'
+                   AND failed.created_at >= orders.reconciled_at
+               )`
           ).first(),
           env.DB.prepare(
             `SELECT COUNT(*) AS n FROM payment_orders
@@ -2155,6 +2288,7 @@ async function handleAdminHealth(request, env) {
         ]);
         worklists.delivery_exhausted = Number(exhausted?.n) || 0;
         worklists.payment_review_open = Number(review?.n) || 0;
+        worklists.payment_reconciliation_errors = Number(reconciliationErrors?.n) || 0;
         worklists.refund_submission_unknown = Number(refundUnknown?.n) || 0;
         worklists.refund_poll_stalled = Number(refundStalled?.n) || 0;
         worklists.referral_unsettled = Number(referralUnsettled?.n) || 0;
@@ -2169,7 +2303,7 @@ async function handleAdminHealth(request, env) {
 
   const ok = checks.backup_maintenance && checks.write_fence &&
     checks.kv && checks.db && checks.schema && checks.worklists &&
-    checks.payment_config && checks.payment_refunds && checks.device_limit &&
+    checks.payment_config && checks.checkout_config && checks.payment_refunds && checks.device_limit &&
     checks.robokassa_password2 && checks.robokassa_hash &&
     checks.delivery_channel && checks.support_owner &&
     checks.ai_proxy_key && checks.ingest_key;

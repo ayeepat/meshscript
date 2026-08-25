@@ -69,7 +69,17 @@ const missingConfig = await worker.fetch(webhookRequest(), baseEnv, ctx);
 assert.equal(missingConfig.status, 503, 'missing webhook secret must disable the route, not disable authentication');
 assert.equal(telegramCalls.length, 0, 'misconfigured webhook must cause no Telegram side effect');
 
-const configuredEnv = { ...baseEnv, TELEGRAM_WEBHOOK_SECRET: 'required-secret' };
+const weakConfig = await worker.fetch(
+  webhookRequest('short-secret'),
+  { ...baseEnv, TELEGRAM_WEBHOOK_SECRET: 'short-secret' },
+  ctx
+);
+assert.equal(weakConfig.status, 503,
+  'a weak webhook secret must not become checkout identity authority');
+assert.equal(telegramCalls.length, 0);
+
+const WEBHOOK_SECRET = 'required_telegram_webhook_secret_0123456789';
+const configuredEnv = { ...baseEnv, TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET };
 telegramCalls.length = 0;
 const wrongSecret = await worker.fetch(webhookRequest('wrong-secret'), configuredEnv, ctx);
 assert.equal(wrongSecret.status, 401);
@@ -77,7 +87,7 @@ assert.equal(telegramCalls.length, 0, 'wrong secret must cause no Telegram side 
 
 const timingSafePrimitive = crypto.subtle.timingSafeEqual;
 delete crypto.subtle.timingSafeEqual;
-const missingPrimitive = await worker.fetch(webhookRequest('required-secret'), configuredEnv, ctx);
+const missingPrimitive = await worker.fetch(webhookRequest(WEBHOOK_SECRET), configuredEnv, ctx);
 assert.equal(missingPrimitive.status, 401, 'missing timing-safe primitive must fail authentication closed');
 assert.equal(telegramCalls.length, 0);
 Object.defineProperty(crypto.subtle, 'timingSafeEqual', {
@@ -86,7 +96,7 @@ Object.defineProperty(crypto.subtle, 'timingSafeEqual', {
 });
 
 telegramCalls.length = 0;
-const valid = await worker.fetch(webhookRequest('required-secret'), configuredEnv, ctx);
+const valid = await worker.fetch(webhookRequest(WEBHOOK_SECRET), configuredEnv, ctx);
 assert.equal(valid.status, 200);
 assert.ok(telegramCalls.some((call) => call.body.chat_id === '123456'),
   'a correctly authenticated Telegram update must still reach the intended handler');
@@ -103,13 +113,13 @@ const operatorEnv = {
 
 telegramCalls.length = 0;
 const legacySetup = await worker.fetch(new Request(
-  'https://smeshapi.site/telegram/setup?secret=required-secret'
+  `https://smeshapi.site/telegram/setup?secret=${WEBHOOK_SECRET}`
 ), operatorEnv, ctx);
 assert.equal(legacySetup.status, 404, 'legacy GET setup route must no longer exist');
 assert.equal(telegramCalls.length, 0);
 
 const querySecretInfo = await worker.fetch(new Request(
-  'https://smeshapi.site/telegram/info?secret=required-secret'
+  `https://smeshapi.site/telegram/info?secret=${WEBHOOK_SECRET}`
 ), operatorEnv, ctx);
 assert.equal(querySecretInfo.status, 401, 'webhook secret in a query must not authorize operator helpers');
 assert.equal(telegramCalls.length, 0);
@@ -118,6 +128,13 @@ const wrongAdmin = await worker.fetch(new Request('https://smeshapi.site/telegra
   method: 'POST', headers: { 'X-Admin-Token': 'wrong-admin-secret' }
 }), operatorEnv, ctx);
 assert.equal(wrongAdmin.status, 401);
+assert.equal(telegramCalls.length, 0);
+
+const weakSetup = await worker.fetch(new Request('https://smeshapi.site/telegram/setup', {
+  method: 'POST', headers: { 'X-Admin-Token': operatorEnv.ADMIN_SECRET }
+}), { ...operatorEnv, TELEGRAM_WEBHOOK_SECRET: 'short-secret' }, ctx);
+assert.equal(weakSetup.status, 400,
+  'setup must refuse to register a webhook credential below the identity-security floor');
 assert.equal(telegramCalls.length, 0);
 
 const validAdmin = await worker.fetch(new Request('https://smeshapi.site/telegram/setup', {
@@ -129,7 +146,7 @@ assert.equal(telegramCalls[0].body.secret_token, operatorEnv.TELEGRAM_WEBHOOK_SE
 
 telegramCalls.length = 0;
 const legacyTest = await worker.fetch(new Request(
-  'https://smeshapi.site/telegram/test?secret=required-secret&chat=123456'
+  `https://smeshapi.site/telegram/test?secret=${WEBHOOK_SECRET}&chat=123456`
 ), operatorEnv, ctx);
 assert.equal(legacyTest.status, 404, 'legacy GET test route must no longer produce side effects');
 assert.equal(telegramCalls.length, 0);

@@ -26,7 +26,10 @@ are set, both fire and the buyer gets the key in both places.
 | `POST /verify`            | key on first activation; activation bearer thereafter | Activate or verify the one authorized installation. |
 | `POST /deactivate`        | key + device id + activation bearer         | Explicitly release device number 1 for another device. |
 | `POST /ai/chat`           | disabled by default (`410 Gone`)            | Retired Worker proxy; production AI goes through the VPS. |
-| `POST /payments/robokassa/order` | none (CORS open; per-IP budget) | Create the authoritative checkout order and signed payment fields. |
+| `POST /checkout/session`  | none (CORS open; per-IP budget)     | Freeze a plan/promo and return a short-lived Telegram capability. |
+| `POST /checkout/status`   | checkout capability                     | Poll Telegram, payment, fulfillment and delivery state without exposing PII/key. |
+| `POST /checkout/payment`  | checkout capability + verified Telegram binding | Freeze email/consent and return signed hosted-payment fields. |
+| `POST /payments/robokassa/order` | legacy; disabled in production | Former direct order route; it must not bypass Telegram ownership binding. |
 | `POST /webhook/robokassa` | `SignatureValue` with password #2         | Auto-issue on a successful ResultURL.    |
 | `GET /webhook/robokassa`  | same as POST                              | Accepted for dashboards configured as GET. |
 | `POST /referral/code`     | 256-bit install capability + per-IP budget | Get/create an install's invite code.    |
@@ -100,16 +103,28 @@ already-recorded active license is already bound to that device.
 - Refund or fraud revocation cancels a pending reward or subtracts an already
   applied reward exactly once, then rebuilds the public counters from D1.
 
-**Checkout integration (site side, `meshsitereal`).** The pay page first calls
-`POST /payments/robokassa/order` with `{ plan, email|telegram_user_id,
-referral_code?, device_id? }`. The Worker creates `InvId`, freezes the exact
-kopecks, currency, environment, plan, contact and referral in D1, and returns
-the Robokassa URL plus signed form fields. The browser must submit those fields
-unchanged; it never chooses `OutSum` or signs a payment itself. Direct/static
-Robokassa links and the historical `order:<InvId>` KV convention are not an
-authorized checkout path.
+**Checkout integration (site side, `meshsitereal`).** The pay page calls
+`POST /checkout/session` with `{ plan: "month"|"school", promo_code? }`.
+The Worker freezes the exact kopecks, duration, currency, environment and
+receipt in D1 and returns a short-lived browser HMAC capability plus a
+separate, purpose-bound `t.me/smeshaibot?start=pay_<telegram-capability>`.
+Telegram's authenticated private
+`/start` update binds its trusted numeric `from.id`; the browser never asks for
+or accepts a Telegram username/id. The page polls `POST /checkout/status` and,
+after binding, calls `POST /checkout/payment` with the capability, email and
+explicit terms acceptance. That final call returns the Robokassa URL plus
+signed form fields. The browser submits the fields unchanged; it never chooses
+`OutSum`, signs a payment, or treats the browser return as proof. Direct/static
+Robokassa links are not an authorized checkout path.
 
-- The response includes integrity-bound `Shp_environment` and `Shp_order_id`.
+The capability MAC uses a dedicated 32+ character
+`CHECKOUT_CAPABILITY_SECRET`, stored only in the Worker. It is deliberately
+separate from `INGEST_KEY`, which is shared with the VPS. No checkout signing
+key is stored in D1, returned to the browser, or committed to the repository.
+Browser and Telegram capabilities use distinct domains, so neither token is
+accepted at the other channel's authoritative endpoint.
+
+- The payment response includes integrity-bound `Shp_environment` and `Shp_order_id`.
   The ResultURL handler requires both and an exact D1 order match before it can
   mint anything.
 - Test checkout uses a separate Worker, D1 database and test credentials. The
@@ -123,6 +138,10 @@ never fails over a referral.
 ## Setup
 
 ### 1. Install Wrangler and log in
+
+Cloudflare account email for this deployment: `ermd20199@gmail.com`.
+This is an account-recovery/operator note, not a secret; never record the
+account password, API tokens, or recovery codes in the repository.
 
 ```sh
 cd backend
@@ -152,6 +171,10 @@ npx wrangler secret put ROBOKASSA_PASSWORD3_PRODUCTION
 npx wrangler secret put RESEND_API_KEY
 npx wrangler secret put TELEGRAM_BOT_TOKEN
 
+# Required for authenticated Telegram support and checkout identity binding.
+# Use 32+ random characters from A-Z, a-z, 0-9, _ and -.
+npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
+
 # Optional: dev-bypass key. Type this into your own extension Settings and
 # the gate always passes for you without a real purchase.
 npx wrangler secret put OWNER_LICENSE_KEY
@@ -162,11 +185,16 @@ npx wrangler secret put AI_PROXY_API_KEY
 # At least 32 random bytes. Signs /verify telemetry capabilities and also
 # authenticates the VPS provider-observed /t/ai feed.
 npx wrangler secret put INGEST_KEY
+
+# At least 32 random bytes and Worker-only. Signs browser/Telegram checkout
+# capabilities; never copy it to the site, extension, VPS or Telegram.
+npx wrangler secret put CHECKOUT_CAPABILITY_SECRET
 ```
 
 Also check `[vars]` in `wrangler.toml`:
 
 ```toml
+ROBOKASSA_MERCHANT_LOGIN = "<exact MerchantLogin from Robokassa>"
 ROBOKASSA_HASH_ALGO = "SHA256"
 PAYMENT_ENVIRONMENT = "production"
 ROBOKASSA_OUT_CURRENCY_LABEL = "RUB"
@@ -175,18 +203,50 @@ ROBOKASSA_FISCALIZATION_MODE = "provider"
 ROBOKASSA_RECEIPT_TAX = "none"
 ROBOKASSA_RECEIPT_PAYMENT_METHOD = "full_payment"
 ROBOKASSA_RECEIPT_PAYMENT_OBJECT = "service"
-SUBSCRIPTION_PRICE_RUB = "199"
-LIFETIME_PRICE_RUB = "990"
+SUBSCRIPTION_PRICE_RUB = "149"
+LIFETIME_PRICE_RUB = "0"
+MONTHLY_PRICE_RUB = "149"
+MONTHLY_DAYS = "30"
+SCHOOL_YEAR_PRICE_RUB = "999"
+SCHOOL_YEAR_DAYS = "273"
+CHECKOUT_PROMO_MONTH_PRICE_RUB = "10"
+CHECKOUT_TELEGRAM_BOT_USERNAME = "smeshaibot"
+ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
+ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/?payment=cancelled"
+LEGACY_PAYMENT_ORDER_ENABLED = "false"
 ROBOKASSA_ENFORCE_IP_ALLOWLIST = "true"
 DEVICE_LIMIT = "1"
 AI_PROXY_LEGACY_ENABLED = "false"
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 ```
 
+Keep the optional promo code out of tracked configuration and set it as a
+Worker secret only while it should be accepted:
+
+```bash
+npx wrangler secret put CHECKOUT_PROMO_CODE
+```
+
 `ROBOKASSA_HASH_ALGO` must match the algorithm selected in Robokassa technical
 settings. Production is configured for `SHA256`; select the same algorithm in
 the Robokassa cabinet before deployment. The ResultURL IP allowlist remains
 enabled in addition to mandatory signature verification.
+
+Configure the authoritative standard ResultURL in the Robokassa cabinet as
+`https://smeshapi.site/webhook/robokassa` with method `POST`. The
+Worker deliberately does not send `ResultUrl2`: that option uses Robokassa's
+separate JWS notification format, while `/webhook/robokassa` verifies the
+classic Password #2 `SignatureValue`. `ROBOKASSA_SUCCESS_URL2` and
+`ROBOKASSA_FAIL_URL2` are raw browser-return URLs. Checkout signs their
+percent-encoded representations, returns the raw values as form fields, and
+lets the browser apply the one transport-encoding pass. Do not pre-encode them
+on the site.
+
+`ROBOKASSA_MERCHANT_LOGIN` is required and must exactly match the shop's
+MerchantLogin. It is not a password, but this repository deliberately does not
+guess it; keep the verified value as a Cloudflare dashboard variable (preserved
+by `keep_vars = true`) or add the exact value to the deployment configuration.
+
 The four fiscalization values above are examples, not tax advice. Before
 launch, have the merchant's accountant select the real tax, payment-method and
 payment-object codes. With `ROBOKASSA_FISCALIZATION_MODE=provider`, checkout
@@ -331,7 +391,8 @@ Robokassa dashboard → shop → technical settings:
 
 - **ResultURL**: `https://<your-worker-url>/webhook/robokassa`
 - **ResultURL method**: `POST` recommended. `GET` also works.
-- **SuccessURL / FailURL**: your public thanks/fail pages.
+- **SuccessURL**: `https://smeshai.xyz/checkout/success/` (GET).
+- **FailURL**: `https://smeshai.xyz/checkout/?payment=cancelled` (GET).
 - **Production Password #1/#2/#3**: store them only in the corresponding
   `ROBOKASSA_PASSWORD{1,2,3}_PRODUCTION` secrets.
 - **Hash algorithm**: select `SHA256`, matching `ROBOKASSA_HASH_ALGO`.
@@ -360,20 +421,29 @@ The built-in allowlist is `185.59.216.65` and `185.59.217.65`, matching the
 current Robokassa ResultURL documentation. Signature verification is always
 required, even when IP filtering is disabled.
 
-### 6. Build the order page
+### 6. Build the checkout page
 
-The pay page must ask the Worker to create the order. It sends product intent
-and delivery contact, never `InvId`, `OutSum` or a gateway password:
+The pay page first creates a server-priced checkout and sends the user through
+the bot deep link. Only after `/checkout/status` reports `telegram_bound` does
+it request provider fields. It sends product intent, email and consent, never a
+Telegram id, `InvId`, `OutSum` or gateway password:
 
 ```js
-const order = await fetch('https://smeshapi.site/payments/robokassa/order', {
+const session = await fetch('https://smeshapi.site/checkout/session', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ plan: 'month', promo_code: promoCode || undefined })
+}).then((response) => response.json());
+
+// User opens session.telegram_url; the authenticated bot binds Telegram's
+// private from.id. Poll /checkout/status with { token: session.token }.
+const order = await fetch('https://smeshapi.site/checkout/payment', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
-    plan: 'subscription',
+    token: session.token,
     email: buyerEmail,
-    referral_code: referralCode || undefined,
-    device_id: deviceId || undefined
+    accepted_terms: true
   })
 }).then((response) => response.json());
 
@@ -453,7 +523,8 @@ Setup:
 # 1. Your numeric Telegram id — message @userinfobot, it replies with your id.
 npx wrangler secret put SUPPORT_CHAT_ID
 
-# 2. Any long random string — authenticates Telegram's webhook calls.
+# 2. A 32+ character random string using A-Z, a-z, 0-9, _ or - — authenticates
+# Telegram's webhook calls and therefore its trusted checkout identity.
 npx wrangler secret put TELEGRAM_WEBHOOK_SECRET
 
 npx wrangler deploy
@@ -467,9 +538,10 @@ curl -fsS -X POST \
   https://smeshapi.site/telegram/setup
 ```
 
-The webhook fails closed with HTTP 503 when `TELEGRAM_WEBHOOK_SECRET` is not
-configured; a missing secret never disables authentication. Telegram operator
-helpers use `ADMIN_SECRET` through `X-Admin-Token`, never the webhook credential:
+The webhook fails closed with HTTP 503 when `TELEGRAM_WEBHOOK_SECRET` is
+missing, weak or outside Telegram's allowed alphabet; bad configuration never
+disables authentication. Telegram operator helpers use `ADMIN_SECRET` through
+`X-Admin-Token`, never the webhook credential:
 
 ```sh
 curl -fsS -H "X-Admin-Token: $ADMIN_TOKEN" https://smeshapi.site/telegram/info
@@ -507,9 +579,10 @@ A subscription is a license with a finite `expires_at`. The order endpoint owns
 the catalog and freezes one exact price in integer kopecks before redirecting:
 
 ```toml
-SUBSCRIPTION_PRICE_RUB = "199"
-LIFETIME_PRICE_RUB     = "990"
-SUBSCRIPTION_DAYS    = "30"
+MONTHLY_PRICE_RUB       = "149"
+MONTHLY_DAYS            = "30"
+SCHOOL_YEAR_PRICE_RUB   = "999"
+SCHOOL_YEAR_DAYS        = "273"
 ```
 
 Prices use canonical positive RUB decimals with at most two fractional digits.

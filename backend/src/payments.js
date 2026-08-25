@@ -1,7 +1,21 @@
 import * as robokassa from './gateways/robokassa.js';
 
 const ORDER_TTL_MS = 30 * 60 * 1000;
-const ORDER_CREATE_DAILY_LIMIT = 20;
+const ROBOKASSA_PRODUCTION_INVOICE_BASE = 7_000_000_000_000_000n;
+const ROBOKASSA_TEST_INVOICE_BASE = 8_000_000_000_000_000n;
+const ROBOKASSA_INVOICE_RANDOM_BYTES = 6;
+const ROBOKASSA_INVOICE_INSERT_ATTEMPTS = 8;
+const ORDER_EXPIRY_GRACE_MS = 24 * 60 * 60 * 1000;
+const RECONCILIATION_BACKOFF_MS = 10 * 60 * 1000;
+// A school or office can place many independent orders behind one public NAT.
+// Keep a finite abuse ceiling without letting twenty abandoned drafts deny the
+// whole building checkout for the rest of the Moscow day.
+const ORDER_CREATE_DAILY_LIMIT = 500;
+const CHECKOUT_TOKEN_VERSION = 1;
+const CHECKOUT_TOKEN_NONCE_BYTES = 8;
+const CHECKOUT_TOKEN_MAC_BYTES = 16;
+const CHECKOUT_BOT_USERNAME_DEFAULT = 'smeshaibot';
+const CHECKOUT_TOKEN_PURPOSES = new Set(['browser', 'telegram']);
 const RECEIPT_TAXES = new Set([
   'none', 'vat0', 'vat5', 'vat7', 'vat10', 'vat20', 'vat22',
   'vat105', 'vat107', 'vat110', 'vat120', 'vat122'
@@ -58,13 +72,15 @@ function receiptSettings(env) {
   return { tax, payment_method: paymentMethod, payment_object: paymentObject, sno };
 }
 
-function buildReceiptJson(env, plan, amountKopecks) {
+function buildReceiptJson(env, plan, amountKopecks, itemName = '') {
   const settings = receiptSettings(env);
   if (!settings) return null;
   const receipt = {
     ...(settings.sno ? { sno: settings.sno } : {}),
     items: [{
-      name: plan === 'subscription' ? 'СМЭШ AI — подписка' : 'СМЭШ AI — бессрочная лицензия',
+      name: itemName || (plan === 'subscription'
+        ? 'СМЭШ AI — подписка'
+        : 'СМЭШ AI — бессрочная лицензия'),
       quantity: 1,
       sum: Number(robokassa.formatKopecks(amountKopecks)),
       payment_method: settings.payment_method,
@@ -112,6 +128,140 @@ function subscriptionDays(env) {
   if (!/^\d+$/.test(raw)) return null;
   const days = Number(raw);
   return Number.isSafeInteger(days) && days >= 1 && days <= 3650 ? days : null;
+}
+
+function checkoutDays(raw, fallback = null) {
+  const value = raw == null || raw === '' ? fallback : raw;
+  if (!/^\d+$/.test(String(value ?? ''))) return null;
+  const days = Number(value);
+  return Number.isSafeInteger(days) && days >= 1 && days <= 3650 ? days : null;
+}
+
+function checkoutBotUsername(env) {
+  const username = String(env.CHECKOUT_TELEGRAM_BOT_USERNAME || CHECKOUT_BOT_USERNAME_DEFAULT)
+    .trim().replace(/^@/, '');
+  return /^[A-Za-z][A-Za-z0-9_]{4,31}$/.test(username) ? username : '';
+}
+
+function checkoutUrl(raw) {
+  try {
+    const url = new URL(String(raw || ''));
+    if (url.protocol !== 'https:' || url.username || url.password || url.hash || url.href.length > 2048) {
+      return '';
+    }
+    return url.href;
+  } catch {
+    return '';
+  }
+}
+
+function checkoutReturnUrls(env) {
+  return {
+    successUrl2: checkoutUrl(env.ROBOKASSA_SUCCESS_URL2),
+    failUrl2: checkoutUrl(env.ROBOKASSA_FAIL_URL2)
+  };
+}
+
+export function telegramWebhookSecretValid(env) {
+  const secret = String(env?.TELEGRAM_WEBHOOK_SECRET || '');
+  // Telegram accepts only this alphabet for secret_token. Requiring 32+
+  // characters keeps forged authenticated updates outside practical reach;
+  // those updates are an identity authority for checkout binding.
+  return /^[A-Za-z0-9_-]{32,256}$/.test(secret);
+}
+
+export function checkoutCapabilitySecretValid(env) {
+  const secret = String(env?.CHECKOUT_CAPABILITY_SECRET || '');
+  return secret.length >= 32 &&
+    secret !== String(env?.INGEST_KEY || '') &&
+    secret !== String(env?.TELEGRAM_WEBHOOK_SECRET || '');
+}
+
+function checkoutCapabilitySecret(env) {
+  return checkoutCapabilitySecretValid(env)
+    ? String(env.CHECKOUT_CAPABILITY_SECRET)
+    : '';
+}
+
+function checkoutPromoCode(env) {
+  const code = String(env.CHECKOUT_PROMO_CODE || '').trim().toUpperCase();
+  return /^[A-Z0-9_-]{4,32}$/.test(code) ? code : '';
+}
+
+function requestedPromoCode(value) {
+  const code = String(value || '').trim().toUpperCase();
+  return code && /^[A-Z0-9_-]{4,32}$/.test(code) ? code : (code ? null : '');
+}
+
+function checkoutCatalogPlan(env, requestedPlan, requestedPromo = '') {
+  const code = String(requestedPlan || '').trim().toLowerCase();
+  const promo = requestedPromoCode(requestedPromo);
+  if (!promo && promo !== '') return { ok: false, reason: 'bad_promo' };
+
+  const monthlyPrice = rublesToKopecks(
+    env.MONTHLY_PRICE_RUB == null || env.MONTHLY_PRICE_RUB === ''
+      ? env.SUBSCRIPTION_PRICE_RUB
+      : env.MONTHLY_PRICE_RUB
+  );
+  const monthlyDays = checkoutDays(env.MONTHLY_DAYS, env.SUBSCRIPTION_DAYS ?? '30');
+  const schoolPrice = rublesToKopecks(env.SCHOOL_YEAR_PRICE_RUB);
+  const schoolDays = checkoutDays(env.SCHOOL_YEAR_DAYS);
+
+  if (code === 'month') {
+    let amountKopecks = monthlyPrice;
+    let promoApplied = false;
+    if (promo) {
+      const configuredCode = checkoutPromoCode(env);
+      if (!configuredCode || promo !== configuredCode) return { ok: false, reason: 'bad_promo' };
+      amountKopecks = rublesToKopecks(env.CHECKOUT_PROMO_MONTH_PRICE_RUB);
+      if (!amountKopecks) return { ok: false, reason: 'promo_unavailable' };
+      promoApplied = true;
+    }
+    if (!amountKopecks || !monthlyDays) return { ok: false, reason: 'plan_unavailable' };
+    return {
+      ok: true,
+      code: 'month',
+      name: '30 дней',
+      description: 'СМЭШ AI — доступ на 30 дней',
+      plan_type: 'subscription',
+      amount_kopecks: amountKopecks,
+      duration_days: monthlyDays,
+      promo_applied: promoApplied
+    };
+  }
+
+  if (code === 'school') {
+    if (promo) return { ok: false, reason: 'promo_not_applicable' };
+    if (!schoolPrice || !schoolDays) return { ok: false, reason: 'plan_unavailable' };
+    return {
+      ok: true,
+      code: 'school',
+      name: 'Учебный период',
+      description: 'СМЭШ AI — доступ на 9 месяцев',
+      plan_type: 'subscription',
+      amount_kopecks: schoolPrice,
+      duration_days: schoolDays,
+      promo_applied: false
+    };
+  }
+
+  return { ok: false, reason: 'bad_plan' };
+}
+
+export function checkoutConfigValid(env) {
+  if (!paymentConfigValid(env)) return false;
+  const month = checkoutCatalogPlan(env, 'month');
+  const school = checkoutCatalogPlan(env, 'school');
+  const promoCode = checkoutPromoCode(env);
+  const promoPrice = rublesToKopecks(env.CHECKOUT_PROMO_MONTH_PRICE_RUB);
+  const urls = checkoutReturnUrls(env);
+  return !!(
+    month.ok && school.ok && checkoutBotUsername(env) &&
+    String(env.TELEGRAM_BOT_TOKEN || '') && telegramWebhookSecretValid(env) &&
+    checkoutCapabilitySecretValid(env) &&
+    urls.successUrl2 && urls.failUrl2 &&
+    (!promoCode || promoPrice)
+  );
 }
 
 export function paymentConfigValid(env) {
@@ -163,6 +313,56 @@ async function reserveOrderCreation(env, ip) {
   return !!row;
 }
 
+function robokassaInvoiceIdCandidate(environment) {
+  const base = environment === 'production'
+    ? ROBOKASSA_PRODUCTION_INVOICE_BASE
+    : environment === 'test'
+      ? ROBOKASSA_TEST_INVOICE_BASE
+      : null;
+  if (base == null) throw new Error('invalid Robokassa payment environment');
+
+  const bytes = new Uint8Array(ROBOKASSA_INVOICE_RANDOM_BYTES);
+  crypto.getRandomValues(bytes);
+  let random = 0n;
+  for (const byte of bytes) random = (random << 8n) | BigInt(byte);
+
+  const orderId = Number(base + random);
+  if (!Number.isSafeInteger(orderId) || orderId <= 0) {
+    throw new Error('unsafe Robokassa invoice id');
+  }
+  return orderId;
+}
+
+async function insertRobokassaOrder(env, order) {
+  for (let attempt = 0; attempt < ROBOKASSA_INVOICE_INSERT_ATTEMPTS; attempt += 1) {
+    const orderId = robokassaInvoiceIdCandidate(order.environment);
+    const row = await env.DB.prepare(
+      `INSERT INTO payment_orders
+         (order_id, gateway, environment, status, amount_kopecks, currency,
+          plan_type, subscription_days, email, telegram_user_id, referral_code,
+          device_id, is_preorder, fiscalization_mode, receipt_json, created_at,
+          expires_at)
+       VALUES (?1, 'robokassa', ?2, 'pending', ?3, 'RUB', ?4, ?5, ?6, ?7,
+               ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+       ON CONFLICT(order_id) DO NOTHING
+       RETURNING order_id`
+    ).bind(
+      orderId, order.environment, order.amountKopecks, order.planType,
+      order.subscriptionDays, order.email, order.telegramUserId,
+      order.referralCode, order.deviceId, order.isPreorder,
+      order.fiscalizationMode, order.receiptJson, order.createdAt, order.expiresAt
+    ).first();
+    if (!row) continue;
+
+    const insertedId = Number(row.order_id);
+    if (!Number.isSafeInteger(insertedId) || insertedId !== orderId) {
+      throw new Error('invalid Robokassa invoice id result');
+    }
+    return orderId;
+  }
+  throw new Error('Robokassa invoice id allocation exhausted');
+}
+
 // Malformed requests still need a bound — they are the cheap-to-generate half
 // of the abuse surface — but on their OWN, much larger budget, so exhausting
 // it cannot deny checkout to a legitimate buyer sharing the address.
@@ -200,15 +400,407 @@ export async function malformedOrderBudgetExhausted(env, ip) {
   }
 }
 
-export async function createRobokassaOrder(env, body, ip = '') {
+function base64UrlBytes(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function decodeBase64Url(value) {
+  if (!/^[A-Za-z0-9_-]+$/.test(String(value || ''))) return null;
+  const padded = String(value).replace(/-/g, '+').replace(/_/g, '/')
+    .padEnd(Math.ceil(String(value).length / 4) * 4, '=');
+  try {
+    const binary = atob(padded);
+    return Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  } catch {
+    return null;
+  }
+}
+
+async function checkoutTokenMac(env, payloadBytes, purpose) {
+  // Checkout capabilities are payment/TG identity authority. Keep their key
+  // Worker-only: INGEST_KEY is intentionally shared with the separate VPS and
+  // a VPS compromise must not become authority to bind or mutate checkout.
+  const secret = checkoutCapabilitySecret(env);
+  if (!secret || !CHECKOUT_TOKEN_PURPOSES.has(purpose)) return null;
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    'raw', encoder.encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
+  );
+  const prefix = encoder.encode(`smesh-checkout-${purpose}:`);
+  const message = new Uint8Array(prefix.byteLength + payloadBytes.byteLength);
+  message.set(prefix);
+  message.set(payloadBytes, prefix.byteLength);
+  const signed = new Uint8Array(await crypto.subtle.sign('HMAC', key, message));
+  return signed.slice(0, CHECKOUT_TOKEN_MAC_BYTES);
+}
+
+async function createCheckoutToken(env, orderId, expiresAt, purpose) {
+  const nonce = new Uint8Array(CHECKOUT_TOKEN_NONCE_BYTES);
+  crypto.getRandomValues(nonce);
+  const expirySeconds = Math.floor(Number(expiresAt) / 1000);
+  // Telegram start payloads allow only base64url characters and cap the full
+  // value at 64 characters. A fixed binary payload keeps `pay_<token>` at 54:
+  // version(1) + order id(8) + expiry seconds(4) + nonce(8) + MAC(16).
+  const payload = new Uint8Array(21);
+  payload[0] = CHECKOUT_TOKEN_VERSION;
+  let order = BigInt(orderId);
+  for (let i = 8; i >= 1; i -= 1) {
+    payload[i] = Number(order & 0xffn);
+    order >>= 8n;
+  }
+  new DataView(payload.buffer).setUint32(9, expirySeconds, false);
+  payload.set(nonce, 13);
+  const mac = await checkoutTokenMac(env, payload, purpose);
+  if (!mac) throw new Error('checkout token secret unavailable');
+  const tokenBytes = new Uint8Array(payload.byteLength + mac.byteLength);
+  tokenBytes.set(payload);
+  tokenBytes.set(mac, payload.byteLength);
+  return base64UrlBytes(tokenBytes);
+}
+
+async function verifyCheckoutToken(env, rawToken, purpose) {
+  const token = String(rawToken || '');
+  if (!/^[A-Za-z0-9_-]{50}$/.test(token)) {
+    return { ok: false, reason: 'bad_checkout_token' };
+  }
+  const bytes = decodeBase64Url(token);
+  if (!bytes || bytes.byteLength !== 37 || bytes[0] !== CHECKOUT_TOKEN_VERSION) {
+    return { ok: false, reason: 'bad_checkout_token' };
+  }
+  let orderBigInt = 0n;
+  for (let i = 1; i <= 8; i += 1) orderBigInt = (orderBigInt << 8n) | BigInt(bytes[i]);
+  const orderId = Number(orderBigInt);
+  const expiresSeconds = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+    .getUint32(9, false);
+  if (!Number.isSafeInteger(orderId) || orderId <= 0 ||
+      !Number.isSafeInteger(expiresSeconds) || expiresSeconds <= 0) {
+    return { ok: false, reason: 'bad_checkout_token' };
+  }
+  const payload = bytes.slice(0, 21);
+  const [expected, supplied] = await Promise.all([
+    checkoutTokenMac(env, payload, purpose),
+    Promise.resolve(bytes.slice(21))
+  ]);
+  if (!expected || !supplied || expected.byteLength !== supplied.byteLength ||
+      typeof crypto.subtle.timingSafeEqual !== 'function' ||
+      !crypto.subtle.timingSafeEqual(expected, supplied)) {
+    return { ok: false, reason: 'bad_checkout_token' };
+  }
+  return {
+    ok: true,
+    token,
+    order_id: String(orderId),
+    expires_at_seconds: expiresSeconds,
+    expired: expiresSeconds * 1000 <= Date.now()
+  };
+}
+
+function publicCheckoutPlan(plan) {
+  return {
+    code: plan.code,
+    name: plan.name,
+    price_kopecks: Number(plan.amount_kopecks),
+    duration_days: Number(plan.duration_days),
+    promo_applied: !!plan.promo_applied
+  };
+}
+
+function checkoutPlanFromOrder(env, order) {
+  const days = Number(order?.subscription_days);
+  const amount = Number(order?.amount_kopecks);
+  const month = checkoutCatalogPlan(env, 'month');
+  const promo = checkoutPromoCode(env)
+    ? checkoutCatalogPlan(env, 'month', checkoutPromoCode(env))
+    : null;
+  const school = checkoutCatalogPlan(env, 'school');
+  if (school.ok && days === school.duration_days && amount === school.amount_kopecks) return school;
+  if (promo?.ok && days === promo.duration_days && amount === promo.amount_kopecks) return promo;
+  if (month.ok && days === month.duration_days && amount === month.amount_kopecks) return month;
+  return {
+    ok: true,
+    code: days > 60 ? 'school' : 'month',
+    name: days > 60 ? 'Учебный период' : '30 дней',
+    description: days > 60 ? 'СМЭШ AI — доступ на 9 месяцев' : 'СМЭШ AI — доступ на 30 дней',
+    plan_type: 'subscription',
+    amount_kopecks: amount,
+    duration_days: days,
+    promo_applied: false
+  };
+}
+
+async function loadCheckoutOrder(env, capability) {
+  if (!capability.ok) return { ok: false, status: 403, reason: capability.reason };
+  const order = await loadRobokassaOrder(env, capability.order_id);
+  if (!order || Math.floor(Number(order.expires_at) / 1000) !== capability.expires_at_seconds) {
+    return { ok: false, status: 403, reason: 'bad_checkout_token' };
+  }
+  return { ok: true, order };
+}
+
+/**
+ * Create a contact-free, server-priced draft order. The opaque capability is
+ * The browser and Telegram receive different purpose-bound capabilities for
+ * the same order. A token exposed in a Telegram deep link therefore cannot
+ * poll the browser status endpoint or create payment fields, and the browser
+ * token cannot bind a Telegram identity. Neither raw capability is stored.
+ */
+export async function createCheckoutSession(env, body, ip = '', malformedBudgetExhausted = false) {
+  if (!checkoutConfigValid(env)) return { ok: false, status: 503, reason: 'checkout_config' };
+  const plan = checkoutCatalogPlan(env, body?.plan, body?.promo_code);
+  if (!plan.ok) {
+    if (malformedBudgetExhausted) {
+      return { ok: false, status: 429, reason: 'rate_limited' };
+    }
+    await chargeMalformedOrderAttempt(env, ip);
+    return { ok: false, status: 400, reason: plan.reason };
+  }
+  if (!(await reserveOrderCreation(env, ip))) {
+    return { ok: false, status: 429, reason: 'rate_limited' };
+  }
+
+  const environment = paymentEnvironment(env);
+  const fiscalMode = fiscalizationMode(env);
+  const receiptJson = fiscalMode === 'provider'
+    ? buildReceiptJson(env, plan.plan_type, plan.amount_kopecks, plan.description)
+    : null;
+  if (fiscalMode === 'provider' && !receiptJson) {
+    return { ok: false, status: 503, reason: 'receipt_config' };
+  }
+
+  const now = Date.now();
+  const gatewayExpiresAt = Math.floor((now + ORDER_TTL_MS) / 60_000) * 60_000;
+  const expiresAt = gatewayExpiresAt + 60_000;
+  const orderId = await insertRobokassaOrder(env, {
+    environment,
+    amountKopecks: plan.amount_kopecks,
+    planType: plan.plan_type,
+    subscriptionDays: plan.duration_days,
+    email: null,
+    telegramUserId: null,
+    referralCode: null,
+    deviceId: null,
+    isPreorder: 0,
+    fiscalizationMode: fiscalMode,
+    receiptJson,
+    createdAt: now,
+    expiresAt
+  });
+
+  await env.DB.prepare(
+    `INSERT INTO payment_events
+       (gateway, payment_id, order_id, environment, event_type, amount_kopecks,
+        currency, details_json, created_at)
+     VALUES ('robokassa', ?1, ?1, ?2, 'checkout_created', ?3, 'RUB', ?4, ?5)`
+  ).bind(
+    String(orderId), environment, plan.amount_kopecks,
+    JSON.stringify({ plan_code: plan.code, promo_applied: plan.promo_applied }), now
+  ).run();
+
+  const [token, telegramToken] = await Promise.all([
+    createCheckoutToken(env, orderId, expiresAt, 'browser'),
+    createCheckoutToken(env, orderId, expiresAt, 'telegram')
+  ]);
+  const username = checkoutBotUsername(env);
+  return {
+    ok: true,
+    token,
+    order_id: String(orderId),
+    plan: publicCheckoutPlan(plan),
+    expires_at: new Date(expiresAt).toISOString(),
+    telegram_url: `https://t.me/${username}?start=pay_${telegramToken}`
+  };
+}
+
+export async function bindCheckoutTelegram(env, token, telegramUserId) {
+  const capability = await verifyCheckoutToken(env, token, 'telegram');
+  const loaded = await loadCheckoutOrder(env, capability);
+  if (!loaded.ok) return loaded;
+  const userId = cleanTelegramUserId(telegramUserId);
+  if (!userId) return { ok: false, status: 400, reason: 'bad_telegram_user' };
+  const order = loaded.order;
+  if (capability.expired || Number(order.expires_at) <= Date.now()) {
+    return { ok: false, status: 410, reason: 'checkout_expired' };
+  }
+  if (order.telegram_user_id && String(order.telegram_user_id) !== userId) {
+    return { ok: false, status: 409, reason: 'checkout_already_bound' };
+  }
+  if (!['pending', 'paid', 'fulfilled'].includes(order.status)) {
+    return { ok: false, status: 409, reason: 'checkout_unavailable' };
+  }
+  if (String(order.telegram_user_id || '') === userId) {
+    return { ok: true, already_bound: true, order_id: String(order.order_id) };
+  }
+
+  const now = Date.now();
+  const bound = await env.DB.prepare(
+    `UPDATE payment_orders SET telegram_user_id = ?2
+     WHERE order_id = ?1 AND status = 'pending' AND telegram_user_id IS NULL
+       AND expires_at > ?3
+     RETURNING order_id`
+  ).bind(String(order.order_id), userId, now).first();
+  if (!bound?.order_id) {
+    const current = await loadRobokassaOrder(env, String(order.order_id));
+    if (String(current?.telegram_user_id || '') === userId) {
+      return { ok: true, already_bound: true, order_id: String(order.order_id) };
+    }
+    return {
+      ok: false,
+      status: current?.telegram_user_id ? 409 : 410,
+      reason: current?.telegram_user_id ? 'checkout_already_bound' : 'checkout_expired'
+    };
+  }
+  await env.DB.prepare(
+    `INSERT INTO payment_events
+       (gateway, payment_id, order_id, environment, event_type, amount_kopecks,
+        currency, details_json, created_at)
+     VALUES ('robokassa', ?1, ?1, ?2, 'telegram_bound', ?3, 'RUB', NULL, ?4)`
+  ).bind(String(order.order_id), order.environment, Number(order.amount_kopecks), now).run();
+  return { ok: true, already_bound: false, order_id: String(order.order_id) };
+}
+
+export async function checkoutStatus(env, rawToken) {
+  const capability = await verifyCheckoutToken(env, rawToken, 'browser');
+  const loaded = await loadCheckoutOrder(env, capability);
+  if (!loaded.ok) return loaded;
+  const order = loaded.order;
+  const plan = checkoutPlanFromOrder(env, order);
+  let state;
+  if (order.status === 'fulfilled') {
+    const delivery = await env.DB.prepare(
+      `SELECT outbox.delivered_at
+       FROM payment_issuance AS issuance
+       LEFT JOIN delivery_outbox AS outbox ON outbox.license_key = issuance.license_key
+       WHERE issuance.gateway = 'robokassa' AND issuance.payment_id = ?1`
+    ).bind(String(order.order_id)).first();
+    state = delivery?.delivered_at ? 'delivered' : 'fulfilled';
+  } else if (order.status === 'paid') state = 'paid';
+  else if (order.status === 'review' || order.status === 'refund_pending') state = 'review';
+  else if (order.status === 'refunded' || order.status === 'expired' || capability.expired ||
+           Number(order.expires_at) <= Date.now()) state = 'expired';
+  else if (!order.telegram_user_id) state = 'waiting_telegram';
+  else {
+    const ready = await env.DB.prepare(
+      `SELECT 1 AS ready FROM payment_events
+       WHERE gateway = 'robokassa' AND payment_id = ?1
+         AND event_type = 'checkout_payment_started' LIMIT 1`
+    ).bind(String(order.order_id)).first();
+    state = ready ? 'payment_ready' : 'telegram_bound';
+  }
+  return {
+    ok: true,
+    order_id: String(order.order_id),
+    state,
+    plan: publicCheckoutPlan(plan),
+    expires_at: new Date(Number(order.expires_at)).toISOString()
+  };
+}
+
+export async function createCheckoutPayment(env, body) {
+  if (!checkoutConfigValid(env)) return { ok: false, status: 503, reason: 'checkout_config' };
+  const capability = await verifyCheckoutToken(env, body?.token, 'browser');
+  const loaded = await loadCheckoutOrder(env, capability);
+  if (!loaded.ok) return loaded;
+  const order = loaded.order;
+  if (capability.expired || Number(order.expires_at) <= Date.now()) {
+    return { ok: false, status: 410, reason: 'checkout_expired' };
+  }
+  if (order.status !== 'pending') {
+    return { ok: false, status: 409, reason: 'checkout_unavailable' };
+  }
+  if (!order.telegram_user_id) {
+    return { ok: false, status: 409, reason: 'telegram_not_bound' };
+  }
+  const email = cleanEmail(body?.email);
+  if (!email) return { ok: false, status: 400, reason: 'bad_email' };
+  if (body?.accepted_terms !== true) {
+    return { ok: false, status: 400, reason: 'terms_required' };
+  }
+
+  const now = Date.now();
+  // The first accepted payment-start call freezes the recovery/receipt email
+  // directly on the authoritative order with a compare-and-set. Do not use an
+  // append-only event without a unique constraint as the concurrency lock:
+  // the order column is the value later consumed to create provider fields.
+  const emailClaim = await env.DB.prepare(
+    `UPDATE payment_orders SET email = ?2
+     WHERE order_id = ?1 AND status = 'pending' AND telegram_user_id IS NOT NULL
+       AND expires_at > ?3 AND email IS NULL
+     RETURNING order_id`
+  ).bind(String(order.order_id), email, now).first();
+  if (!emailClaim?.order_id) {
+    const current = await loadRobokassaOrder(env, String(order.order_id));
+    if (!current || current.status !== 'pending' || !current.telegram_user_id ||
+        Number(current.expires_at) <= now || current.email !== email) {
+      return { ok: false, status: 409, reason: 'checkout_already_started' };
+    }
+  }
+
+  // Keep one append-only consent/audit marker. The order email above—not this
+  // journal row—is the security claim, so a retry after a partial failure can
+  // safely restore a missing event without reopening recipient selection.
+  await env.DB.prepare(
+    `INSERT INTO payment_events
+       (gateway, payment_id, order_id, environment, event_type, amount_kopecks,
+        currency, details_json, created_at)
+     SELECT 'robokassa', ?1, ?1, ?2, 'checkout_payment_started', ?3, 'RUB', ?4, ?5
+     WHERE NOT EXISTS (
+       SELECT 1 FROM payment_events
+       WHERE gateway = 'robokassa' AND payment_id = ?1
+         AND event_type = 'checkout_payment_started'
+     )`
+  ).bind(
+    String(order.order_id), order.environment, Number(order.amount_kopecks),
+    JSON.stringify({
+      agreement: 'https://smeshai.xyz/agreement/',
+      privacy: 'https://smeshai.xyz/privacy/',
+      accepted: true
+    }), now
+  ).run();
+  const frozen = await loadRobokassaOrder(env, String(order.order_id));
+  if (!frozen || frozen.status !== 'pending' || !frozen.telegram_user_id ||
+      Number(frozen.expires_at) <= now || frozen.email !== email) {
+    return { ok: false, status: 409, reason: 'checkout_unavailable' };
+  }
+  const plan = checkoutPlanFromOrder(env, frozen);
+  const fields = await robokassa.createPaymentFields({
+    merchantLogin: String(env.ROBOKASSA_MERCHANT_LOGIN),
+    password1: robokassaCredential(env, 1),
+    algorithm: env.ROBOKASSA_HASH_ALGO,
+    amountKopecks: Number(frozen.amount_kopecks),
+    invId: String(frozen.order_id),
+    description: plan.description,
+    email: frozen.email,
+    isTest: frozen.environment === 'test',
+    receipt: frozen.receipt_json || '',
+    expiresAt: Number(frozen.expires_at) - 60_000,
+    shp: {
+      Shp_environment: frozen.environment,
+      Shp_order_id: String(frozen.order_id)
+    },
+    ...checkoutReturnUrls(env)
+  });
+  return {
+    ok: true,
+    order_id: String(frozen.order_id),
+    payment_url: 'https://auth.robokassa.ru/Merchant/Index.aspx',
+    fields
+  };
+}
+
+export async function createRobokassaOrder(env, body, ip = '', malformedBudgetExhausted = false) {
   if (!paymentConfigValid(env)) return { ok: false, status: 503, reason: 'payment_config' };
 
-  // Cheap validation BEFORE reserving order capacity. Reserving first meant 20
+  // Cheap validation BEFORE reserving order capacity. Reserving first meant
   // malformed 400s burned the whole day's budget for that address, and the
   // next CORRECT request got a 429 — a trivial way to deny checkout to a user
   // or to everyone behind a shared NAT for the entire Moscow day.
   const plan = String(body?.plan || '').trim().toLowerCase();
   if (plan !== 'subscription' && plan !== 'lifetime') {
+    if (malformedBudgetExhausted) {
+      return { ok: false, status: 429, reason: 'rate_limited' };
+    }
     await chargeMalformedOrderAttempt(env, ip);
     return { ok: false, status: 400, reason: 'bad_plan' };
   }
@@ -221,6 +813,9 @@ export async function createRobokassaOrder(env, body, ip = '') {
   const email = cleanEmail(body?.email);
   const telegramUserId = cleanTelegramUserId(body?.telegram_user_id);
   if (!email && !telegramUserId) {
+    if (malformedBudgetExhausted) {
+      return { ok: false, status: 429, reason: 'rate_limited' };
+    }
     await chargeMalformedOrderAttempt(env, ip);
     return { ok: false, status: 400, reason: 'missing_contact' };
   }
@@ -246,21 +841,21 @@ export async function createRobokassaOrder(env, body, ip = '') {
   // gateway's interpretation of the same minute.
   const gatewayExpiresAt = Math.floor((now + ORDER_TTL_MS) / 60_000) * 60_000;
   const expiresAt = gatewayExpiresAt + 60_000;
-  const row = await env.DB.prepare(
-    `INSERT INTO payment_orders
-       (gateway, environment, status, amount_kopecks, currency, plan_type,
-        subscription_days, email, telegram_user_id, referral_code, device_id,
-        is_preorder, fiscalization_mode, receipt_json, created_at, expires_at)
-     VALUES ('robokassa', ?1, 'pending', ?2, 'RUB', ?3, ?4, ?5, ?6, ?7, ?8,
-             ?9, ?10, ?11, ?12, ?13)
-     RETURNING order_id`
-  ).bind(
-    environment, amountKopecks, plan, days, email, telegramUserId,
-    cleanReferralCode(body?.referral_code), cleanDeviceId(body?.device_id),
-    body?.is_preorder ? 1 : 0, fiscalMode, receiptJson, now, expiresAt
-  ).first();
-  const orderId = Number(row?.order_id);
-  if (!Number.isSafeInteger(orderId) || orderId <= 0) throw new Error('payment order creation failed');
+  const orderId = await insertRobokassaOrder(env, {
+    environment,
+    amountKopecks,
+    planType: plan,
+    subscriptionDays: days,
+    email,
+    telegramUserId,
+    referralCode: cleanReferralCode(body?.referral_code),
+    deviceId: cleanDeviceId(body?.device_id),
+    isPreorder: body?.is_preorder ? 1 : 0,
+    fiscalizationMode: fiscalMode,
+    receiptJson,
+    createdAt: now,
+    expiresAt
+  });
 
   const fields = await robokassa.createPaymentFields({
     merchantLogin: String(env.ROBOKASSA_MERCHANT_LOGIN),
@@ -342,7 +937,32 @@ export async function markOrderPaid(env, order, normalized, fields) {
        AND status IN ('pending', 'expired', 'paid', 'fulfilled')`
   ).bind(String(order.order_id), now, order.environment, normalized.amount_kopecks).run();
   if ((result?.meta?.changes || 0) < 1) throw new Error('payment order state changed');
-  await appendPaymentEvent(env, order, 'payment_confirmed', normalized.amount_kopecks, fields, now);
+  await appendPaymentEvent(
+    env,
+    order,
+    'payment_confirmed',
+    normalized.amount_kopecks,
+    robokassaResultEvidence(fields),
+    now
+  );
+}
+
+// ResultURL can contain EMail and provider-specific extras. The authoritative
+// order already owns the delivery email; payment evidence needs only the
+// amount/invoice/binding facts. Whitelisting prevents an append-only audit row
+// from becoming a second, indefinite PII store.
+export function robokassaResultEvidence(fields = {}) {
+  const allowed = new Set([
+    'OutSum', 'InvId', 'Fee', 'IncSum', 'IncCurrLabel', 'PaymentMethod',
+    'Shp_environment', 'Shp_order_id'
+  ]);
+  const evidence = {};
+  for (const [key, value] of Object.entries(fields || {})) {
+    if (!allowed.has(key) || value == null) continue;
+    const text = String(value);
+    if (text.length <= 256) evidence[key] = text;
+  }
+  return evidence;
 }
 
 export async function markOrderFulfilled(env, order, licenseKey) {
@@ -368,24 +988,111 @@ export async function reconcileRobokassaOrder(env, orderId, fetcher = fetch) {
   if (!merchantLogin || !password2) {
     return { ok: false, status: 503, reason: 'payment_config' };
   }
-  const state = await robokassa.queryOperationState({
-    merchantLogin, invoiceId: String(order.order_id), password2,
-    algorithm: env.ROBOKASSA_HASH_ALGO, fetcher
-  });
+  let providerContacted = false;
+  let state;
+  try {
+    state = await robokassa.queryOperationState({
+      merchantLogin, invoiceId: String(order.order_id), password2,
+      algorithm: env.ROBOKASSA_HASH_ALGO,
+      timeoutMs: env.ROBOKASSA_PROVIDER_TIMEOUT_MS,
+      fetcher: async (...args) => {
+        providerContacted = true;
+        return fetcher(...args);
+      }
+    });
+  } catch (error) {
+    if (providerContacted) {
+      const attemptedAt = Date.now();
+      await transitionWithEvent(
+        env,
+        env.DB.prepare(
+          `UPDATE payment_orders SET reconciled_at = ?2
+           WHERE order_id = ?1 AND gateway = 'robokassa'`
+        ).bind(String(order.order_id), attemptedAt),
+        order, 'reconciliation_provider_error', null,
+        { transport_error: true }, attemptedAt
+      );
+    }
+    throw error;
+  }
   const now = Date.now();
   if (state.result_code !== 0) {
-    await appendPaymentEvent(env, order, 'reconciliation_provider_error', null, {
-      result_code: state.result_code
-    }, now);
+    // Robokassa result code 3 means that no operation exists for this InvId.
+    // Our checkout records `checkout_payment_started` before the browser posts
+    // to Robokassa, so code 3 is expected when a buyer closes the tab. Keep it
+    // retryable through the lost-callback grace period; only a fresh code-3
+    // observation after that boundary is durable evidence that no payment
+    // operation was ever created and allows contact erasure.
+    if (state.result_code === 3 &&
+        Number(order.expires_at) <= now - ORDER_EXPIRY_GRACE_MS) {
+      await transitionWithEvent(
+        env,
+        env.DB.prepare(
+          `UPDATE payment_orders SET reconciled_at = ?2
+           WHERE order_id = ?1 AND gateway = 'robokassa' AND status = 'pending'`
+        ).bind(String(order.order_id), now),
+        order, 'reconciliation_observed', null,
+        { result_code: 3, operation_missing: true }, now
+      );
+      return { ok: true, paid: false, order, provider: state };
+    }
+
+    // Code 4 means Robokassa found more than one operation for one InvId. It
+    // must never be interpreted as unpaid: quarantine it for an operator while
+    // preserving any already-fulfilled entitlement until reviewed.
+    if (state.result_code === 4) {
+      const evidence = { result_code: 4, duplicate_invoice: true };
+      await env.DB.batch([
+        env.DB.prepare(
+          `UPDATE payment_orders
+           SET status = CASE WHEN status IN ('pending', 'paid') THEN 'review' ELSE status END,
+               reconciled_at = ?2
+           WHERE order_id = ?1 AND gateway = 'robokassa'`
+        ).bind(String(order.order_id), now),
+        paymentEventStatement(
+          env, order, 'reconciliation_duplicate_invoice', null, evidence, now
+        ),
+        env.DB.prepare(
+          `INSERT INTO payment_review
+             (gateway, payment_id, invoice_id, amount_rub, reason, fields_json,
+              created_at, environment, amount_kopecks)
+           VALUES ('robokassa', ?1, ?1, ?2, 'reconciliation_duplicate_invoice',
+                   ?3, ?4, ?5, ?6)
+           ON CONFLICT(gateway, payment_id) DO UPDATE SET
+             reason = 'reconciliation_duplicate_invoice', fields_json = ?3,
+             created_at = ?4, amount_rub = ?2, amount_kopecks = ?6,
+             resolved_at = NULL, resolution = NULL, resolution_note = NULL`
+        ).bind(
+          String(order.order_id), Number(order.amount_kopecks) / 100,
+          JSON.stringify(evidence), now, order.environment, Number(order.amount_kopecks)
+        )
+      ]);
+      return {
+        ok: false, status: 409, reason: 'reconciliation_duplicate_invoice', provider: state
+      };
+    }
+
+    await transitionWithEvent(
+      env,
+      env.DB.prepare(
+        `UPDATE payment_orders SET reconciled_at = ?2
+         WHERE order_id = ?1 AND gateway = 'robokassa'`
+      ).bind(String(order.order_id), now),
+      order, 'reconciliation_provider_error', null,
+      { result_code: state.result_code }, now
+    );
     return { ok: false, status: 409, reason: 'provider_result', provider: state };
   }
   if (state.state_code !== 100) {
-    await env.DB.prepare(
-      'UPDATE payment_orders SET reconciled_at = ?2 WHERE order_id = ?1'
-    ).bind(String(order.order_id), now).run();
-    await appendPaymentEvent(env, order, 'reconciliation_observed', null, {
-      state_code: state.state_code
-    }, now);
+    await transitionWithEvent(
+      env,
+      env.DB.prepare(
+        `UPDATE payment_orders SET reconciled_at = ?2
+         WHERE order_id = ?1 AND gateway = 'robokassa'`
+      ).bind(String(order.order_id), now),
+      order, 'reconciliation_observed', null,
+      { state_code: state.state_code }, now
+    );
     return { ok: true, paid: false, order, provider: state };
   }
   const providerKopecks = rublesToKopecks(state.out_sum);
@@ -493,7 +1200,10 @@ export async function initiateRobokassaRefund(env, body, fetcher = fetch) {
   }
   let created;
   try {
-    created = await robokassa.createRefund({ opKey, password3, invoiceItems, algorithm, fetcher });
+    created = await robokassa.createRefund({
+      opKey, password3, invoiceItems, algorithm, fetcher,
+      timeoutMs: env.ROBOKASSA_PROVIDER_TIMEOUT_MS
+    });
   } catch (error) {
     // The provider may have accepted the request before the connection failed.
     // Keep the row in an explicit unknown state; retrying automatically could
@@ -582,7 +1292,8 @@ export async function inspectPendingRefunds(env, limit = 20, fetcher = fetch) {
 // Returns the row to finalize when the refund is genuinely complete, else null.
 async function settleRefundPoll(env, order, fetcher) {
   const state = await robokassa.queryRefundState({
-    requestId: order.refund_request_id, fetcher
+    requestId: order.refund_request_id, fetcher,
+    timeoutMs: env.ROBOKASSA_PROVIDER_TIMEOUT_MS
   });
   const amountKopecks = rublesToKopecks(state.amount);
   const orderId = String(order.order_id);
@@ -707,7 +1418,6 @@ export async function finalizeRobokassaRefund(env, order) {
 // definitively dead its contact details are dropped and the row is closed.
 // Everything reconciliation actually needs — amount, plan, environment,
 // timestamps, and the append-only payment_events log — is preserved.
-const ORDER_EXPIRY_GRACE_MS = 24 * 60 * 60 * 1000;
 // Settled orders keep contact details for one Russian accounting cycle plus a
 // margin, then keep only the money evidence.
 const ORDER_CONTACT_RETENTION_MS = 400 * 24 * 60 * 60 * 1000;
@@ -716,25 +1426,53 @@ const SETTLED_ORDER_STATUSES = ['refunded', 'expired', 'fulfilled'];
 /**
  * Recover ResultURL callbacks lost in transit. A pending order is checked once
  * when its checkout TTL expires, and once more immediately before the 24-hour
- * contact-erasure boundary. Provider/network failures never stamp
- * reconciled_at, so prune remains fail-closed and retries later.
+ * contact-erasure boundary. Provider failures persist a ten-minute retry
+ * cursor so one bad invoice cannot monopolize the fixed cron batch. Checkout
+ * drafts that never created provider fields are excluded entirely and expire
+ * locally in pruneExpiredPaymentOrders.
  */
 export async function reconcileDueRobokassaOrders(env, limit = 10, now = Date.now(), fetcher = fetch) {
   if (!env.DB || paymentEnvironment(env) !== 'production') {
     return { checked: 0, paid: [], failed: 0 };
   }
   const bounded = Math.max(1, Math.min(50, Number(limit) || 10));
-  const finalCheckCutoff = now - 10 * 60 * 1000;
+  const retryCutoff = now - RECONCILIATION_BACKOFF_MS;
   const due = await env.DB.prepare(
-    `SELECT order_id FROM payment_orders
-     WHERE environment = 'production' AND status = 'pending' AND expires_at <= ?1
+    `SELECT orders.order_id FROM payment_orders AS orders
+     WHERE orders.environment = 'production' AND orders.status = 'pending'
+       AND orders.expires_at <= ?1
        AND (
-         reconciled_at IS NULL OR
-         (expires_at <= ?2 AND reconciled_at < ?3)
+         NOT EXISTS (
+           SELECT 1 FROM payment_events AS created
+           WHERE created.gateway = 'robokassa'
+             AND created.payment_id = CAST(orders.order_id AS TEXT)
+             AND created.event_type = 'checkout_created'
+         )
+         OR EXISTS (
+           SELECT 1 FROM payment_events AS started
+           WHERE started.gateway = 'robokassa'
+             AND started.payment_id = CAST(orders.order_id AS TEXT)
+             AND started.event_type = 'checkout_payment_started'
+         )
        )
-     ORDER BY CASE WHEN reconciled_at IS NULL THEN 0 ELSE 1 END, order_id
+       AND (
+         orders.reconciled_at IS NULL OR
+         (
+           orders.reconciled_at < ?3 AND (
+             orders.expires_at <= ?2 OR EXISTS (
+               SELECT 1 FROM payment_events AS failed
+               WHERE failed.gateway = 'robokassa'
+                 AND failed.payment_id = CAST(orders.order_id AS TEXT)
+                 AND failed.event_type = 'reconciliation_provider_error'
+                 AND failed.created_at >= orders.reconciled_at
+             )
+           )
+         )
+       )
+     ORDER BY CASE WHEN orders.reconciled_at IS NULL THEN 0 ELSE 1 END,
+              orders.reconciled_at, orders.order_id
      LIMIT ?4`
-  ).bind(now, now - ORDER_EXPIRY_GRACE_MS, finalCheckCutoff, bounded).all();
+  ).bind(now, now - ORDER_EXPIRY_GRACE_MS, retryCutoff, bounded).all();
   const paid = [];
   let checked = 0;
   let failed = 0;
@@ -756,15 +1494,46 @@ export async function pruneExpiredPaymentOrders(env, limit = 100, now = Date.now
   if (!env.DB) return { expired: 0, anonymized: 0 };
   const bounded = Math.max(1, Math.min(500, Number(limit) || 100));
 
-  // 1. Close abandoned checkouts. Per row so one bad row cannot abort the
-  //    sweep, and state+event commit together like every other transition.
+  // 1. Close never-started drafts at their local TTL. Provider-started orders
+  //    wait for the final successful nonpayment observation; a provider error
+  //    advances the retry cursor but is never evidence that money did not move.
+  //    Per row so one bad row cannot abort the sweep, and state+event commit
+  //    together like every other transition.
   const due = await env.DB.prepare(
-    `SELECT order_id, environment, amount_kopecks
-     FROM payment_orders
-     WHERE status = 'pending' AND expires_at <= ?1
-       AND reconciled_at IS NOT NULL AND reconciled_at >= ?3
-     ORDER BY order_id LIMIT ?2`
-  ).bind(now - ORDER_EXPIRY_GRACE_MS, bounded, now - 10 * 60 * 1000).all();
+    `SELECT orders.order_id, orders.environment, orders.amount_kopecks
+     FROM payment_orders AS orders
+     WHERE orders.status = 'pending' AND (
+       (
+         orders.expires_at <= ?1
+         AND EXISTS (
+           SELECT 1 FROM payment_events AS created
+           WHERE created.gateway = 'robokassa'
+             AND created.payment_id = CAST(orders.order_id AS TEXT)
+             AND created.event_type = 'checkout_created'
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM payment_events AS started
+           WHERE started.gateway = 'robokassa'
+             AND started.payment_id = CAST(orders.order_id AS TEXT)
+             AND started.event_type = 'checkout_payment_started'
+         )
+       ) OR (
+         orders.expires_at <= ?2
+         AND orders.reconciled_at IS NOT NULL
+         AND orders.reconciled_at >= ?3
+         AND EXISTS (
+           SELECT 1 FROM payment_events AS observed
+           WHERE observed.gateway = 'robokassa'
+             AND observed.payment_id = CAST(orders.order_id AS TEXT)
+             AND observed.event_type = 'reconciliation_observed'
+             AND observed.created_at >= orders.reconciled_at
+         )
+       )
+     )
+     ORDER BY orders.order_id LIMIT ?4`
+  ).bind(
+    now, now - ORDER_EXPIRY_GRACE_MS, now - RECONCILIATION_BACKOFF_MS, bounded
+  ).all();
   let expired = 0;
   for (const order of due?.results || []) {
     try {
@@ -808,7 +1577,12 @@ export async function pruneExpiredPaymentOrders(env, limit = 100, now = Date.now
 
 async function appendPaymentEvent(env, order, type, amountKopecks, details, now = Date.now()) {
   const safeDetails = { ...details };
-  delete safeDetails.SignatureValue;
+  for (const key of Object.keys(safeDetails)) {
+    // Defense in depth for every present and future audit-event call site.
+    if (/^(?:signaturevalue|e-?mail|email_address|user_?ip)$/i.test(key)) {
+      delete safeDetails[key];
+    }
+  }
   await env.DB.prepare(
     `INSERT INTO payment_events
        (gateway, payment_id, order_id, environment, event_type, amount_kopecks,
@@ -822,7 +1596,11 @@ async function appendPaymentEvent(env, order, type, amountKopecks, details, now 
 
 function paymentEventStatement(env, order, type, amountKopecks, details, now) {
   const safeDetails = { ...details };
-  delete safeDetails.SignatureValue;
+  for (const key of Object.keys(safeDetails)) {
+    if (/^(?:signaturevalue|e-?mail|email_address|user_?ip)$/i.test(key)) {
+      delete safeDetails[key];
+    }
+  }
   // Gated on the preceding statement in the same batch: SQLite's changes()
   // reports the rows the last DML touched, so the event is written only when
   // the guarded transition actually matched.

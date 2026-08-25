@@ -103,10 +103,10 @@ const oversizedTelegram = await worker.fetch(new Request('https://api.example/te
   method: 'POST',
   headers: {
     'Content-Type': 'application/json',
-    'X-Telegram-Bot-Api-Secret-Token': 'webhook-secret'
+    'X-Telegram-Bot-Api-Secret-Token': 'webhook_secret_0123456789abcdefghijkl'
   },
   body: JSON.stringify({ padding: 'x'.repeat(140 * 1024) })
-}), { ...env, TELEGRAM_WEBHOOK_SECRET: 'webhook-secret' }, ctx);
+}), { ...env, TELEGRAM_WEBHOOK_SECRET: 'webhook_secret_0123456789abcdefghijkl' }, ctx);
 assert.equal(oversizedTelegram.status, 200,
   'oversized authenticated Telegram updates must be bounded and acknowledged without processing');
 assert.deepEqual(await oversizedTelegram.json(), { ok: true });

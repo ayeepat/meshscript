@@ -14,7 +14,7 @@ import { DatabaseSync } from 'node:sqlite';
 import './helpers/worker-runtime-shim.mjs';
 import worker from '../backend/src/worker.js';
 
-const SECRET = 'telegram-webhook-secret-token';
+const SECRET = 'telegram_webhook_secret_token_0123456789';
 const schemaSql = await readFile(new URL('../backend/schema.sql', import.meta.url), 'utf8');
 
 class MemoryKV {

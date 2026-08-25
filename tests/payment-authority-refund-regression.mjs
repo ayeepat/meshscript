@@ -76,6 +76,7 @@ async function environment(overrides = {}) {
       SUBSCRIPTION_PRICE_RUB: '199',
       LIFETIME_PRICE_RUB: '990',
       SUBSCRIPTION_DAYS: '30',
+      LEGACY_PAYMENT_ORDER_ENABLED: 'true',
       RUNTIME_WRITE_EPOCH: '1',
       ADMIN_SECRET: ADMIN,
       ...overrides

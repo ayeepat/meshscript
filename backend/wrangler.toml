@@ -17,6 +17,8 @@
 #        npx wrangler secret put OWNER_LICENSE_KEY           # optional dev-bypass key
 #        npx wrangler secret put SUPPORT_CHAT_ID             # your numeric Telegram id (support bot)
 #        npx wrangler secret put TELEGRAM_WEBHOOK_SECRET     # random string (support bot webhook auth)
+#        npx wrangler secret put CHECKOUT_CAPABILITY_SECRET # >=32 random bytes, Worker-only checkout HMAC
+#        npx wrangler secret put CHECKOUT_PROMO_CODE         # optional private test/discount code
 #        npx wrangler secret put AI_PROXY_API_KEY            # only if the legacy Worker proxy is explicitly enabled
 #        npx wrangler secret put INGEST_KEY                  # >=32 random bytes: /verify telemetry HMAC + VPS /t/ai
 #  4. Apply every schema migration BEFORE deploying payment code:
@@ -77,12 +79,20 @@ BACKUP_MAINTENANCE = "false"
 # or mismatched.
 # Must match the hash algorithm selected in Robokassa technical settings.
 ROBOKASSA_HASH_ALGO = "SHA256"
+# Exact MerchantLogin confirmed in the active Robokassa shop.
+ROBOKASSA_MERCHANT_LOGIN = "smeshai"
 # This production Worker accepts only production orders and production
 # credentials. Test mode belongs in a separate Worker + D1 database; never
 # swap test Password#2 into this deployment.
 PAYMENT_ENVIRONMENT = "production"
 ROBOKASSA_OUT_CURRENCY_LABEL = "RUB"
 ROBOKASSA_REFUND_HASH_ALGO = "HS256"
+# Every hosted checkout carries its browser return routes in the Password #1
+# signature. The authoritative standard ResultURL is configured in the
+# Robokassa cabinet; ResultUrl2 uses a different JWS callback format and is not
+# sent to the classic ResultURL handler.
+ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
+ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/?payment=cancelled"
 # REQUIRED before launch: choose `provider` or `external`. Provider mode also
 # requires ROBOKASSA_RECEIPT_TAX, ROBOKASSA_RECEIPT_PAYMENT_METHOD and
 # ROBOKASSA_RECEIPT_PAYMENT_OBJECT (plus optional ROBOKASSA_RECEIPT_SNO).
@@ -97,7 +107,7 @@ ROBOKASSA_ENFORCE_IP_ALLOWLIST = "true"
 # Email "from" address. Must be a verified sender in your Resend account.
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 # Product type when no pricing threshold below matches (or none is set).
-DEFAULT_LICENSE_TYPE = "lifetime"
+DEFAULT_LICENSE_TYPE = "subscription"
 # Anti-abuse: hard cap on how many devices a single license can activate.
 DEVICE_LIMIT = "1"
 
@@ -105,15 +115,29 @@ DEVICE_LIMIT = "1"
 # All amounts in RUB, all OPTIONAL. Leave unset to keep everything lifetime.
 #   amount >= LIFETIME_MIN_RUB                     → lifetime (expires_at = null)
 #   SUBSCRIPTION_MIN_RUB <= amount < LIFETIME_MIN  → subscription for SUBSCRIPTION_DAYS
-# Monthly 199₽, lifetime 990₽:
-SUBSCRIPTION_MIN_RUB = "199"
-LIFETIME_MIN_RUB = "990"
+# The paid site sells finite subscriptions only. A former public `lifetime`
+# order code is explicitly unavailable; the 9-month plan is a subscription.
+SUBSCRIPTION_MIN_RUB = "149"
+LIFETIME_MIN_RUB = "0"
 # Exact server-owned catalog prices frozen into payment_orders at checkout.
 # The *_MIN_RUB values above remain only for historical compatibility.
-SUBSCRIPTION_PRICE_RUB = "199"
-LIFETIME_PRICE_RUB = "990"
+SUBSCRIPTION_PRICE_RUB = "149"
+LIFETIME_PRICE_RUB = "0"
 # Subscription length in days (default 30 when unset).
 SUBSCRIPTION_DAYS = "30"
+
+# Public checkout catalog. Prices/durations are frozen into payment_orders;
+# the browser sends plan/promo labels, never an amount or Telegram id. The
+# optional promo code is a Worker secret and must never be committed here.
+MONTHLY_PRICE_RUB = "149"
+MONTHLY_DAYS = "30"
+SCHOOL_YEAR_PRICE_RUB = "999"
+# Nine paid months (273 days); no automatic summer renewal or summer charge.
+SCHOOL_YEAR_DAYS = "273"
+CHECKOUT_PROMO_MONTH_PRICE_RUB = "10"
+CHECKOUT_TELEGRAM_BOT_USERNAME = "smeshaibot"
+# The old browser-supplied contact route bypasses Telegram ownership binding.
+LEGACY_PAYMENT_ORDER_ENABLED = "false"
 
 # ── Referral program (referrals.js; all OPTIONAL, defaults shown) ────────────
 # Friend enters your code at checkout and PAYS → you earn this many free days.
@@ -164,4 +188,4 @@ PROXY_GLOBAL_DAILY = "3000"
 # key (the worker still returns OK{InvId} so Robokassa does not retry forever).
 # Falls back to the lowest plan floor above when unset; with everything unset
 # there is NO floor and the worker logs a warning on every issuance.
-MIN_PAYMENT_RUB = "199"
+MIN_PAYMENT_RUB = "10"
