@@ -94,14 +94,15 @@
                 <h3>Лицензия</h3>
                 <p>Один ключ работает на одном устройстве. Чтобы перенести его, сначала деактивируйте ключ здесь.</p>
               </div>
-              <span class="licstatus" id="licStatus" data-state="idle">Проверка…</span>
+              <span class="licstatus" id="licStatus" data-state="idle" role="status" aria-live="polite">Проверка…</span>
             </div>
 
             <div class="field">
               <label for="licenseKey">Ключ доступа</label>
               <div class="inputwrap">
-                <input id="licenseKey" type="text" placeholder="SMESH-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" />
+                <input id="licenseKey" type="text" placeholder="SMESH-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" spellcheck="false" aria-describedby="licenseKeyHelp" />
               </div>
+              <p class="field-hint" id="licenseKeyHelp">Формат: SMESH-XXXX-XXXX-XXXX. Старые 16-значные ключи тоже поддерживаются.</p>
             </div>
             <div class="consent-actions">
               <button id="deactivateLicense" class="resetbtn" type="button" hidden>Деактивировать ключ на этом устройстве</button>
@@ -376,7 +377,7 @@
 
   <div class="savebar">
     <div class="savebar-inner">
-      <span id="status" class="ok"></span>
+      <span id="status" class="ok" role="status" aria-live="polite"></span>
       <button id="save" type="button" disabled aria-busy="true"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>Сохранить изменения</button>
     </div>
   </div>

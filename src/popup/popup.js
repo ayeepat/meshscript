@@ -11,7 +11,9 @@ import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge, PROVIDER_ABBR } from '../common/provider-badge.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
-import { getLicenseStatus, setLicenseKey, reasonMessage } from '../lib/license.js';
+import {
+  getLicenseStatus, setLicenseKey, reasonMessage, validateEnteredLicenseKey
+} from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { SUPPORT_BOT_URL } from '../lib/config.js';
 import { assertUploadAllowed } from '../lib/upload-limits.js';
@@ -1239,7 +1241,10 @@ async function finishOnboarding() {
       // here so the very first «Решить» can't fail on a bad license. An already
       // active license (entered earlier in Settings) passes without retyping.
       if (typed) {
-        const r = await setLicenseKey(typed);
+        const validation = validateEnteredLicenseKey(typed);
+        if (!validation.ok) { showObError(validation.message); return; }
+        document.getElementById('obKey').value = validation.key;
+        const r = await setLicenseKey(validation.key);
         if (!r.ok) { showObError(reasonMessage(r.reason)); return; }
       } else {
         const status = await getLicenseStatus();

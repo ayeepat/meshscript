@@ -6,7 +6,7 @@ import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 import { DEFAULT_LIMITS, MAX_DAILY_LIMIT, getUsage, getUsageHistory } from '../lib/rate-limit.js';
 import {
   setLicenseKey, getLicenseStatus, reasonMessage, deactivateCurrentLicense,
-  normalizeEnteredLicenseKey
+  normalizeEnteredLicenseKey, validateEnteredLicenseKey
 } from '../lib/license.js';
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
@@ -166,21 +166,25 @@ async function loadLicenseUi() {
 
 function renderLicenseStatus(status) {
   const pill = document.getElementById('licStatus');
+  const input = document.getElementById('licenseKey');
   const deactivate = document.getElementById('deactivateLicense');
   if (deactivate) deactivate.hidden = !(status?.key && status?.activation_token);
   if (!status || !status.key) {
     pill.textContent = 'Не активирована';
     pill.dataset.state = 'idle';
+    input.removeAttribute('aria-invalid');
     return;
   }
   if (status.ok) {
     const label = status.type === 'subscription' ? 'Активна · подписка' : 'Активна';
     pill.textContent = label;
     pill.dataset.state = 'ok';
+    input.removeAttribute('aria-invalid');
     return;
   }
   pill.textContent = reasonMessage(status.reason);
   pill.dataset.state = status.reason === 'network' ? 'warn' : 'err';
+  input.setAttribute('aria-invalid', 'true');
 }
 
 const deactivateLicenseButton = document.getElementById('deactivateLicense');
@@ -693,6 +697,22 @@ function hideSaveConfirmation() {
   document.getElementById('status').classList.remove('show');
 }
 
+function showSaveFailure(message) {
+  const status = document.getElementById('status');
+  status.textContent = message;
+  status.dataset.state = 'err';
+  status.classList.add('show');
+}
+
+function showLicenseInputError(message) {
+  const input = document.getElementById('licenseKey');
+  const pill = document.getElementById('licStatus');
+  input.setAttribute('aria-invalid', 'true');
+  pill.textContent = message;
+  pill.dataset.state = 'err';
+  showSaveFailure('Ключ не сохранён — проверьте сообщение выше.');
+}
+
 // Visible edits after a click are not part of that immutable save intent. Hide
 // its confirmation immediately; the completion guard below also prevents a
 // delayed writer from labelling those newer values as saved.
@@ -710,6 +730,7 @@ for (const id of [
     hideSaveConfirmation();
     if (id !== 'licenseKey') return;
     licenseUiGeneration++;
+    control.removeAttribute('aria-invalid');
     const pill = document.getElementById('licStatus');
     pill.textContent = 'Изменено · сохраните';
     pill.dataset.state = 'idle';
@@ -724,6 +745,17 @@ function requestSettingsSave() {
   // hydrated, untouched controls still contain document defaults and must
   // never be snapshotted into storage.
   if (!settingsFormReady) return Promise.resolve(false);
+  const licenseInput = document.getElementById('licenseKey');
+  const validation = validateEnteredLicenseKey(licenseInput.value);
+  if (!validation.ok) {
+    hideSaveConfirmation();
+    showLicenseInputError(validation.message);
+    return Promise.resolve(false);
+  }
+  // Store and show one canonical spelling, including keys pasted with spaces,
+  // Markdown escapes, or without visual grouping hyphens.
+  licenseInput.value = validation.key;
+  licenseInput.removeAttribute('aria-invalid');
   // Ownership begins at the click, not when this request eventually reaches
   // the serialized writer. Snapshot every persisted value now so later edits
   // remain genuinely unsaved rather than leaking into a queued request.
@@ -746,22 +778,37 @@ function save(intent) {
 async function saveOnce(intent) {
   const saveGeneration = intent.owner;
   await chrome.storage.local.set(intent.data);
-  await refreshUsage();
+  // Usage tiles are secondary UI. A stale/corrupt counter must never prevent
+  // the independently valid settings and license transaction from completing.
+  try { await refreshUsage(); } catch { /* best-effort dashboard repaint */ }
   if (usageDashboardLoaded) {
     // reflect the new limit in the «Сегодня · N / лимит» tile; this refresh is
     // intentionally detached from save/license latency, but never unhandled.
     void refreshUsageDashboard().catch(() => {});
   }
-  // Verify license against the backend ONLY when the key changed — saves a
-  // network round-trip when the user is just editing settings or limits.
+  // A deliberate Save retries a failed same-key verdict. Otherwise a temporary
+  // outage or a previously mistyped value stays cached forever even after the
+  // user corrects the underlying problem and clicks Save again.
   const newKey = intent.licenseKey;
   const priorStatus = await getLicenseStatus();
   let currentStatus = priorStatus;
-  if ((priorStatus?.key || '') !== newKey) {
+  const expiresAt = priorStatus?.expires_at ? Date.parse(priorStatus.expires_at) : NaN;
+  const activationTokenValid = /^[A-Za-z0-9_-]{43}$/.test(priorStatus?.activation_token || '');
+  const needsVerification = (priorStatus?.key || '') !== newKey || (
+    !!newKey && (
+      !priorStatus?.ok || !activationTokenValid ||
+      (Number.isFinite(expiresAt) && expiresAt <= Date.now())
+    )
+  );
+  if (needsVerification) {
     currentStatus = await setLicenseKey(newKey);
   }
   if (licenseIntentOwnsUi(intent)) renderLicenseStatus(currentStatus);
-  if (!saveIntentOwnsUi(intent)) return;
+  if (!saveIntentOwnsUi(intent)) return false;
+  if (newKey && !currentStatus?.ok) {
+    showSaveFailure('Настройки сохранены, но ключ не активирован.');
+    return false;
+  }
   const s = document.getElementById('status');
   s.innerHTML = `${iconSvg('check', 14)}Сохранено`;
   s.dataset.state = 'ok';
@@ -776,6 +823,39 @@ async function saveOnce(intent) {
     s.classList.remove('show');
   }, 2200);
   saveToastTimer = timer;
+  return true;
+}
+
+function userFacingSaveError(error) {
+  const message = String(error?.message || '').trim();
+  if (/extension context invalidated|receiving end does not exist/i.test(message)) {
+    return 'Расширение обновилось. Перезагрузите страницу настроек и попробуйте снова.';
+  }
+  // Our license layer already emits short, localized, actionable messages.
+  if (/^[А-ЯЁ]/.test(message) && message.length <= 240) return message;
+  return 'Не удалось сохранить настройки. Перезагрузите страницу и попробуйте ещё раз.';
+}
+
+function isLicenseSaveError(error) {
+  const message = String(error?.message || '').trim();
+  return /^(Сначала деактивируйте|Ключ |Ключ$|Срок действия ключа|Этот ключ|Не удалось подтвердить (устройство|активацию)|Лицензия |Сервер лицензий|Не удалось связаться с сервером)/.test(message);
+}
+
+async function handleSettingsSave(saveButton) {
+  if (!settingsFormReady || saveButton.disabled) return false;
+  saveButton.disabled = true;
+  saveButton.setAttribute('aria-busy', 'true');
+  try {
+    return await requestSettingsSave();
+  } catch (error) {
+    const message = userFacingSaveError(error);
+    if (isLicenseSaveError(error)) showLicenseInputError(message);
+    else showSaveFailure(message);
+    return false;
+  } finally {
+    if (settingsFormReady) saveButton.disabled = false;
+    saveButton.setAttribute('aria-busy', 'false');
+  }
 }
 
 async function initializeSettingsForm(saveButton) {
@@ -1304,7 +1384,7 @@ wirePrivacy();
 wireReferral();
 wireUsageDashboard();
 const saveButton = document.getElementById('save');
-saveButton.onclick = () => { void requestSettingsSave(); };
+saveButton.onclick = () => { void handleSettingsSave(saveButton); };
 document.getElementById('aiProvider').addEventListener('change', syncProviderKeys);
 document.getElementById('reload').onclick = () => { historyLoaded = true; loadHistory(); };
 void initializeSettingsForm(saveButton);

@@ -32,12 +32,63 @@ let licenseMutationQueue = Promise.resolve();
  * visual grouping hyphens omitted. Legacy keys remain untouched.
  */
 export function normalizeEnteredLicenseKey(raw) {
-  let normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
+  let normalized = String(raw || '')
+    .trim()
+    // Older Telegram delivery escaped Markdown hyphens and wrapped the key in
+    // code ticks. Repair those harmless copy artefacts at the input boundary.
+    .replace(/^`+|`+$/g, '')
+    .replace(/\\-/g, '-')
+    .replace(/[‐‑‒–—−]/g, '-')
+    .toUpperCase()
+    .replace(/\s+/g, '');
   const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
+  const compactLegacy = /^SMESH-([A-Z0-9]{16})$/.exec(normalized);
   if (compact) {
     normalized = `SMESH-${compact[1].slice(0, 4)}-${compact[1].slice(4, 8)}-${compact[1].slice(8)}`;
+  } else if (compactLegacy) {
+    normalized = `SMESH-${compactLegacy[1].match(/.{4}/g).join('-')}`;
   }
   return normalized;
+}
+
+/**
+ * Validate the human-entered shape before a network request. This is UX only:
+ * the backend remains authoritative for whether a well-formed key exists,
+ * expired, was revoked, or belongs to another device.
+ */
+export function validateEnteredLicenseKey(raw) {
+  const key = normalizeEnteredLicenseKey(raw);
+  if (!key) return { ok: true, key: '', empty: true };
+  if (!key.startsWith('SMESH-')) {
+    return {
+      ok: false, key, reason: 'bad_prefix',
+      message: 'Ключ должен начинаться с SMESH-.'
+    };
+  }
+
+  const bodyLength = key.slice('SMESH-'.length).replace(/-/g, '').length;
+  if (bodyLength < 12) {
+    return {
+      ok: false, key, reason: 'too_short',
+      message: 'Ключ слишком короткий. Ожидаемый формат: SMESH-XXXX-XXXX-XXXX.'
+    };
+  }
+  if (bodyLength > 16) {
+    return {
+      ok: false, key, reason: 'too_long',
+      message: 'Ключ слишком длинный. Проверьте, что скопировали только сам ключ.'
+    };
+  }
+
+  const publicKey = /^SMESH-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{4}-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{4}-[23456789ABCDEFGHJKMNPQRSTVWXYZ]{4}$/;
+  const legacyKey = /^SMESH-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/;
+  if (!publicKey.test(key) && !legacyKey.test(key)) {
+    return {
+      ok: false, key, reason: 'bad_format',
+      message: 'Неверный формат ключа. Скопируйте его целиком из сообщения Telegram.'
+    };
+  }
+  return { ok: true, key, empty: false };
 }
 
 function isExtensionPageContext() {
@@ -257,7 +308,9 @@ async function setLicenseKeyHere(key) {
   const requested = normalizeEnteredLicenseKey(key);
   const current = await loadStatus();
   if (!requested) return deactivateLicenseHere();
-  if (current?.key && current.key !== requested) {
+  const currentHasActivation = current?.ok === true ||
+    /^[A-Za-z0-9_-]{43}$/.test(current?.activation_token || '');
+  if (current?.key && current.key !== requested && currentHasActivation) {
     throw new Error('Сначала деактивируйте текущий ключ на этом устройстве, затем введите другой.');
   }
   // Bump BEFORE mutating so every verify already in flight (background
@@ -274,6 +327,13 @@ async function deactivateLicenseHere() {
     return { key: '', ok: false, reason: 'no_key', checkedAt: Date.now() };
   }
   const token = typeof status.activation_token === 'string' ? status.activation_token : '';
+  // A rejected draft never created a server-side device binding. Clearing it
+  // is a purely local edit and must not require a deactivation capability.
+  if (!status.ok && !token) {
+    await bumpGeneration();
+    await clearStatus();
+    return { key: '', ok: false, reason: 'no_key', checkedAt: Date.now() };
+  }
   if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
     // A pre-migration cache must first exchange its historical device binding
     // for the server-issued capability; never clear locally and strand the key.

@@ -260,6 +260,16 @@ input:focus, textarea:focus, select:focus {
   box-shadow: 0 0 0 3px var(--focus-ring);
   background: var(--card);
 }
+input[aria-invalid="true"] {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 3px var(--danger-soft);
+}
+.field-hint {
+  margin: 7px 2px 0;
+  color: var(--tertiary);
+  font-size: 11.5px;
+  line-height: 1.45;
+}
 textarea {
   min-height: 112px;
   resize: vertical;
@@ -954,7 +964,7 @@ body.has-savebar .savebar { display: block; }
   transition: opacity 0.2s ease, transform 0.2s ease;
 }
 .ok.show { opacity: 1; transform: none; }
-.ok[data-state="err"] { color: var(--danger); }
+.ok[data-state="err"] { max-width: 430px; color: var(--danger); text-align: right; }
 
 @media (max-width: 980px) {
   .settings-shell {

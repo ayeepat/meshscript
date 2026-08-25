@@ -286,11 +286,21 @@ function classListHarness() {
   };
 }
 
-function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {}) {
+function createSaveHarness({
+  ready = true,
+  hydration = Promise.resolve(),
+  priorStatus = { key: '', ok: false },
+  validate = null,
+  refreshUsageError = null,
+  storageError = null
+} = {}) {
   const input = (value = '') => {
     const listeners = new Map();
     return {
       value,
+      attributes: new Map(),
+      setAttribute(name, next) { this.attributes.set(name, String(next)); },
+      removeAttribute(name) { this.attributes.delete(name); },
       addEventListener(type, callback) {
         if (!listeners.has(type)) listeners.set(type, []);
         listeners.get(type).push(callback);
@@ -311,7 +321,7 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
     licenseKey: input(''),
     status: { innerHTML: '', textContent: '', dataset: {}, classList: classListHarness() },
     save: {
-      disabled: true,
+      disabled: !ready,
       title: '',
       attributes: new Map(),
       setAttribute(name, value) { this.attributes.set(name, String(value)); }
@@ -336,13 +346,17 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
     usageDashboardLoaded: false,
     document: { getElementById: (id) => fields[id] },
     chrome: { storage: { local: { set: async (data) => {
+      if (storageError) throw storageError;
       storageWrites.push(JSON.parse(JSON.stringify(data)));
     } } } },
-    refreshUsage: async () => true,
+    refreshUsage: async () => {
+      if (refreshUsageError) throw refreshUsageError;
+      return true;
+    },
     refreshUsageDashboard: async () => true,
     hydrateSettingsForm: () => hydration,
     loadSecondaryUi: async () => {},
-    getLicenseStatus: async () => ({ key: '', ok: false }),
+    getLicenseStatus: async () => priorStatus,
     normalizeEnteredLicenseKey(raw) {
       let normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
       const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
@@ -350,6 +364,11 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
         normalized = `SMESH-${compact[1].slice(0, 4)}-${compact[1].slice(4, 8)}-${compact[1].slice(8)}`;
       }
       return normalized;
+    },
+    validateEnteredLicenseKey(raw) {
+      if (validate) return validate(raw);
+      const key = String(raw || '').trim().toUpperCase();
+      return { ok: true, key, empty: !key };
     },
     setLicenseKey(key) {
       const pending = deferred();
@@ -374,6 +393,7 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
      globalThis.__saveApi = {
        requestSettingsSave,
        initializeSettingsForm,
+       handleSettingsSave,
        generation: () => licenseUiGeneration,
        toastTimer: () => saveToastTimer
      };`,
@@ -383,6 +403,70 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
   return {
     context, fields, licenseCalls, licensePaints, storageWrites, timers, clearedTimers
   };
+}
+
+// A malformed key is rejected before storage/network work and the reason is
+// visible beside the field instead of making the Save button appear inert.
+{
+  const harness = createSaveHarness({
+    validate: () => ({
+      ok: false,
+      key: 'SMESH-123',
+      reason: 'too_short',
+      message: 'Ключ слишком короткий. Ожидаемый формат: SMESH-XXXX-XXXX-XXXX.'
+    })
+  });
+  harness.fields.licenseKey.value = 'SMESH-123';
+  assert.equal(await harness.context.__saveApi.requestSettingsSave(), false);
+  assert.deepEqual(harness.storageWrites, []);
+  assert.deepEqual(harness.licenseCalls, []);
+  assert.match(harness.fields.licStatus.textContent, /слишком короткий/i);
+  assert.equal(harness.fields.licenseKey.attributes.get('aria-invalid'), 'true');
+}
+
+// An explicit save retries a same-key failed verdict. Otherwise a transient
+// network/not-found result remains cached forever even after the cause is fixed.
+{
+  const harness = createSaveHarness({
+    priorStatus: { key: 'LICENSE-A', ok: false, reason: 'network' },
+    refreshUsageError: new Error('unrelated usage tile failed')
+  });
+  harness.fields.licenseKey.value = 'license-a';
+  const saving = harness.context.__saveApi.requestSettingsSave();
+  await waitUntil(() => harness.licenseCalls.length === 1, 'same failed key retry');
+  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true });
+  assert.equal(await saving, true,
+    'an unrelated usage-dashboard error must not abort license activation');
+}
+
+// A rejected async save is caught at the button boundary, leaves the button
+// usable, and gives the student an actionable message.
+{
+  const harness = createSaveHarness();
+  harness.fields.licenseKey.value = 'license-a';
+  const saving = harness.context.__saveApi.handleSettingsSave(harness.fields.save);
+  await waitUntil(() => harness.licenseCalls.length === 1, 'visible save failure');
+  harness.licenseCalls[0].reject(new Error(
+    'Сначала деактивируйте текущий ключ на этом устройстве, затем введите другой.'
+  ));
+  assert.equal(await saving, false);
+  assert.match(harness.fields.licStatus.textContent, /Сначала деактивируйте/);
+  assert.equal(harness.fields.status.dataset.state, 'err');
+  assert.equal(harness.fields.status.classList.contains('show'), true);
+  assert.equal(harness.fields.save.disabled, false);
+  assert.equal(harness.fields.save.attributes.get('aria-busy'), 'false');
+}
+
+// A general persistence failure belongs in the Save status, not in the license
+// field: unrelated storage trouble must not falsely label a valid key as bad.
+{
+  const harness = createSaveHarness({ storageError: new Error('disk unavailable') });
+  const saving = harness.context.__saveApi.handleSettingsSave(harness.fields.save);
+  assert.equal(await saving, false);
+  assert.equal(harness.fields.licenseKey.attributes.has('aria-invalid'), false);
+  assert.equal(harness.fields.licStatus.textContent, '');
+  assert.match(harness.fields.status.textContent, /Не удалось сохранить настройки/);
+  assert.equal(harness.fields.save.disabled, false);
 }
 
 // Exercise the production hydration path itself with storage and license reads

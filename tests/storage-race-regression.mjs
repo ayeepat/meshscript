@@ -388,6 +388,27 @@ function keyedSlowFetch(slowKey) {
   return { started, releaseSlow: () => releaseSlow() };
 }
 
+// A rejected/unactivated key is only an editable draft, not a device binding.
+// The user must be able to correct it directly; requiring deactivation here
+// traps Settings because there is no server activation token to release.
+{
+  store.licenseStatus = {
+    key: 'SMESH-AAAA-BBBB-CCCC', ok: false, reason: 'not_found', checkedAt: Date.now()
+  };
+  keyedSlowFetch('never-paused');
+  const corrected = await setLicenseKey('SMESH-2345-6789-ABCD');
+  assert.equal(corrected.ok, true);
+  assert.equal(store.licenseStatus?.key, 'SMESH-2345-6789-ABCD',
+    'a correct key must replace a cached rejected key without deactivation');
+
+  store.licenseStatus = {
+    key: 'SMESH-AAAA-BBBB-CCCC', ok: false, reason: 'not_found', checkedAt: Date.now()
+  };
+  await assert.doesNotReject(setLicenseKey(''),
+    'a cached rejected key must also be clearable without a server activation');
+  assert.equal(Object.hasOwn(store, 'licenseStatus'), false);
+}
+
 {
   const oldKey = 'SMESH-GENA-OLD1-KEY3';
   const slow = keyedSlowFetch(oldKey);
