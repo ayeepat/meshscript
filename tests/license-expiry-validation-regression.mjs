@@ -94,7 +94,7 @@ const seed = (kv, key, patch) => kv.store.set(key, JSON.stringify({
 {
   const env = { LICENSES: new FakeKV() };
   await assert.rejects(issueLicense(env, { type: 'subscription' }),
-    /subscription requires expires_at/);
+    /subscription requires expires_at or duration/);
   await assert.rejects(issueLicense(env, { type: 'subscription', expires_at: 'soon' }),
     /invalid expires_at/);
   for (const ambiguous of [
@@ -116,6 +116,22 @@ const seed = (kv, key, patch) => kv.store.set(key, JSON.stringify({
     expires_at: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString()
   });
   assert.equal(issued.type, 'subscription');
+
+  const activationBound = await issueLicense(env, {
+    type: 'subscription', subscription_days: 30
+  });
+  assert.equal(activationBound.expires_at, null);
+  assert.equal(activationBound.subscription_days, 30);
+  assert.equal(activationBound.subscription_duration_ms, 30 * 24 * 60 * 60 * 1000);
+  assert.equal(activationBound.subscription_started_at, null);
+  await assert.rejects(
+    issueLicense(env, { type: 'subscription', subscription_days: 0 }),
+    /invalid subscription_days/
+  );
+  await assert.rejects(
+    issueLicense(env, { type: 'lifetime', subscription_days: 30 }),
+    /lifetime cannot have subscription duration/
+  );
 }
 
 /* ---- /admin/issue reports bad shapes as 400, not a 500 or an eternal key ---- */
@@ -136,6 +152,10 @@ const seed = (kv, key, patch) => kv.store.set(key, JSON.stringify({
   assert.equal(badExpiry.status, 400);
   assert.equal((await badExpiry.json()).reason, 'bad_expiry');
 
+  const badDays = await post({ type: 'subscription', subscription_days: 0, deliver: false });
+  assert.equal(badDays.status, 400);
+  assert.equal((await badDays.json()).reason, 'bad_subscription_days');
+
   const badType = await post({ type: 'trial', deliver: false });
   assert.equal(badType.status, 400);
   assert.equal((await badType.json()).reason, 'bad_type');
@@ -143,6 +163,12 @@ const seed = (kv, key, patch) => kv.store.set(key, JSON.stringify({
   const ok = await post({ type: 'lifetime', deliver: false });
   assert.equal(ok.status, 200, 'valid manual issuance still works');
   assert.equal((await ok.json()).license.type, 'lifetime');
+
+  const pending = await post({ type: 'subscription', subscription_days: 273, deliver: false });
+  assert.equal(pending.status, 200, 'manual duration issuance supports activation-bound plans');
+  const pendingLicense = (await pending.json()).license;
+  assert.equal(pendingLicense.expires_at, null);
+  assert.equal(pendingLicense.subscription_days, 273);
 }
 
 console.log('license expiry validation regressions passed');

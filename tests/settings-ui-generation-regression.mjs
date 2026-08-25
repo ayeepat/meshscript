@@ -343,6 +343,14 @@ function createSaveHarness({ ready = true, hydration = Promise.resolve() } = {})
     hydrateSettingsForm: () => hydration,
     loadSecondaryUi: async () => {},
     getLicenseStatus: async () => ({ key: '', ok: false }),
+    normalizeEnteredLicenseKey(raw) {
+      let normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
+      const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
+      if (compact) {
+        normalized = `SMESH-${compact[1].slice(0, 4)}-${compact[1].slice(4, 8)}-${compact[1].slice(8)}`;
+      }
+      return normalized;
+    },
     setLicenseKey(key) {
       const pending = deferred();
       licenseCalls.push({ key, ...pending });

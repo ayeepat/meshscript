@@ -12,7 +12,10 @@
  *     email: string | null,
  *     telegram_user_id: number | null,
  *     issued_at: ISO,
- *     expires_at: ISO | null,         // null = never (lifetime)
+ *     expires_at: ISO | null,         // null = lifetime OR paid subscription awaiting first activation
+ *     subscription_days: integer | null,
+ *     subscription_duration_ms: integer | null,
+ *     subscription_started_at: ISO | null,
  *     payment_id: string | null,      // gateway's payment id, for idempotency
  *     gateway: "robokassa" | "tpay" | "manual",
  *     amount_kopecks: integer | null,     // authoritative money representation
@@ -32,6 +35,8 @@ import { mirrorLicense } from './analytics.js';
 // fails and the buyer has to copy it from email.
 const ALPHABET = '23456789ABCDEFGHJKMNPQRSTVWXYZ';
 const SINGLE_DEVICE_LIMIT = 1;
+const DAY_MS = 24 * 60 * 60 * 1000;
+const MAX_SUBSCRIPTION_DAYS = 3650;
 
 /**
  * Uniform symbols from ALPHABET. Shared with referrals.js so the two credential
@@ -65,10 +70,58 @@ export function generateKey() {
 /** Normalize user-supplied keys before lookup (lower→upper, strip spaces). */
 export function normalizeKey(raw) {
   if (typeof raw !== 'string') return '';
-  const normalized = raw.trim().toUpperCase().replace(/\s+/g, '');
+  let normalized = raw.trim().toUpperCase().replace(/\s+/g, '');
+  // The public format contains 12 random characters. Accept the same key when
+  // copied without the two visual grouping hyphens and restore its canonical
+  // representation before the KV lookup. Existing 16-character/legacy keys
+  // remain untouched and therefore keep working.
+  const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
+  if (compact) {
+    normalized = `SMESH-${compact[1].slice(0, 4)}-${compact[1].slice(4, 8)}-${compact[1].slice(8)}`;
+  }
   // KV keys are bounded and license credentials contain only this alphabet.
   // Reject malformed/oversized caller input before it reaches a storage lookup.
   return normalized.length <= 128 && /^[A-Z0-9-]+$/.test(normalized) ? normalized : '';
+}
+
+function subscriptionDays(raw) {
+  const days = Number(raw);
+  return Number.isSafeInteger(days) && days >= 1 && days <= MAX_SUBSCRIPTION_DAYS
+    ? days
+    : null;
+}
+
+function subscriptionDurationMs(raw) {
+  const duration = Number(raw);
+  return Number.isSafeInteger(duration) && duration >= DAY_MS &&
+    duration <= MAX_SUBSCRIPTION_DAYS * DAY_MS
+    ? duration
+    : null;
+}
+
+// Paid subscriptions issued before activation-bound expiry stored only an
+// absolute issue-time expiry. If such a Robokassa key has never been activated,
+// recover the purchased duration from its immutable issuance row so that the
+// buyer still receives the full period from first activation.
+function activationDurationForLicense(license) {
+  const stored = subscriptionDurationMs(license?.subscription_duration_ms);
+  if (stored) return stored;
+  const days = subscriptionDays(license?.subscription_days);
+  if (days) return days * DAY_MS;
+  if (license?.gateway !== 'robokassa') return null;
+  const issued = Date.parse(license?.issued_at || '');
+  const expires = Date.parse(license?.expires_at || '');
+  const inferred = expires - issued;
+  return subscriptionDurationMs(inferred);
+}
+
+function activationBoundExpiry(entitlement, activatedAt) {
+  if (!entitlement) return null;
+  const start = Number(activatedAt);
+  if (!Number.isSafeInteger(start) || start <= 0) return null;
+  const base = start + entitlement.duration_ms;
+  if (!Number.isSafeInteger(base)) return null;
+  return Math.max(base, entitlement.existing_expiry_ms || 0);
 }
 
 // Stored expiries are a security boundary, not free-form dates. JavaScript's
@@ -417,6 +470,8 @@ export async function issueLicense(env, params) {
     telegram_user_id = null,
     type = 'lifetime',
     expires_at = null,
+    subscription_days = null,
+    subscription_duration_ms = null,
     amount_kopecks = null,
     amount_rub = null,
     is_preorder = false,
@@ -452,8 +507,22 @@ export async function issueLicense(env, params) {
   if (expires_at != null && !canonicalExpiry) {
     throw new Error('invalid expires_at');
   }
-  if (type === 'subscription' && canonicalExpiry == null) {
-    throw new Error('subscription requires expires_at');
+  const canonicalDays = subscription_days == null ? null : subscriptionDays(subscription_days);
+  if (subscription_days != null && !canonicalDays) {
+    throw new Error('invalid subscription_days');
+  }
+  let canonicalDuration = subscription_duration_ms == null
+    ? null
+    : subscriptionDurationMs(subscription_duration_ms);
+  if (subscription_duration_ms != null && !canonicalDuration) {
+    throw new Error('invalid subscription_duration_ms');
+  }
+  if (!canonicalDuration && canonicalDays) canonicalDuration = canonicalDays * DAY_MS;
+  if (type === 'subscription' && canonicalExpiry == null && canonicalDuration == null) {
+    throw new Error('subscription requires expires_at or duration');
+  }
+  if (type === 'lifetime' && (canonicalDays != null || canonicalDuration != null)) {
+    throw new Error('lifetime cannot have subscription duration');
   }
 
   // D1, not KV, is the authority for paid issuance. KV has no compare-and-swap:
@@ -468,7 +537,7 @@ export async function issueLicense(env, params) {
     if (existing) return existing;
   }
 
-  // Collision-avoid loop. With 28^12 keyspace and preorder volumes this
+  // Collision-avoid loop. With 30^12 keyspace and preorder volumes this
   // basically never retries, but the check is free.
   let key, attempts = 0;
   do {
@@ -486,6 +555,9 @@ export async function issueLicense(env, params) {
     telegram_user_id,
     issued_at: new Date().toISOString(),
     expires_at: canonicalExpiry,
+    subscription_days: type === 'subscription' ? canonicalDays : null,
+    subscription_duration_ms: type === 'subscription' ? canonicalDuration : null,
+    subscription_started_at: null,
     payment_id,
     gateway,
     amount_kopecks: canonicalAmountKopecks,
@@ -684,16 +756,28 @@ async function seedHistoricalDevices(env, key, knownDevices, now) {
  * deactivation must prove possession of it. A competing installation that only
  * knows the license key receives `device_in_use` and cannot take over.
  */
-async function claimActiveInstallation(env, key, deviceId, rawToken, knownDevices, attempt = 0) {
+async function claimActiveInstallation(
+  env, key, deviceId, rawToken, knownDevices, entitlement = null, attempt = 0
+) {
   if (!env.DB) return { ok: false, reason: 'registry_unavailable' };
   try {
     const now = Date.now();
     const suppliedToken = cleanActivationToken(rawToken);
     const suppliedHash = suppliedToken ? await activationTokenHash(suppliedToken) : '';
     const row = await env.DB.prepare(
-      `SELECT status, device_id, token_hash, generation
+      `SELECT status, device_id, token_hash, generation, activated_at
        FROM license_activations WHERE license_key = ?1`
     ).bind(key).first();
+
+    const existingExpiry = row?.activated_at == null
+      ? null
+      : activationBoundExpiry(entitlement, row.activated_at);
+    if (entitlement && row && existingExpiry == null) {
+      return { ok: false, reason: 'registry_unavailable' };
+    }
+    if (existingExpiry != null && existingExpiry <= now) {
+      return { ok: false, reason: 'expired' };
+    }
 
     if (row?.status === 'active') {
       if (row.device_id !== deviceId || !suppliedHash || row.token_hash !== suppliedHash) {
@@ -704,10 +788,20 @@ async function claimActiveInstallation(env, key, deviceId, rawToken, knownDevice
          WHERE license_key = ?1 AND status = 'active' AND device_id = ?2 AND token_hash = ?3`
       ).bind(key, deviceId, suppliedHash, now).run();
       if ((touched?.meta?.changes || 0) < 1) {
-        if (attempt < 1) return claimActiveInstallation(env, key, deviceId, rawToken, knownDevices, attempt + 1);
+        if (attempt < 1) {
+          return claimActiveInstallation(
+            env, key, deviceId, rawToken, knownDevices, entitlement, attempt + 1
+          );
+        }
         return { ok: false, reason: 'device_in_use', device_number: 1 };
       }
-      return { ok: true, activated: false, generation: Number(row.generation) || 1 };
+      return {
+        ok: true,
+        activated: false,
+        generation: Number(row.generation) || 1,
+        activated_at: Number(row.activated_at) || null,
+        expires_at: existingExpiry == null ? null : new Date(existingExpiry).toISOString()
+      };
     }
 
     // Before this migration `license_devices` was the only record. Preserve
@@ -731,7 +825,7 @@ async function claimActiveInstallation(env, key, deviceId, rawToken, knownDevice
       const updated = await env.DB.prepare(
         `UPDATE license_activations
          SET status = 'active', device_id = ?2, token_hash = ?3,
-             generation = generation + 1, activated_at = ?4,
+             generation = generation + 1, activated_at = COALESCE(activated_at, ?4),
              last_seen_at = ?4, deactivated_at = NULL
          WHERE license_key = ?1 AND status = 'inactive'`
       ).bind(key, deviceId, tokenHash, now).run();
@@ -749,9 +843,24 @@ async function claimActiveInstallation(env, key, deviceId, rawToken, knownDevice
       await env.DB.prepare(
         'INSERT OR IGNORE INTO license_devices (license_key, device_id, added_at) VALUES (?1, ?2, ?3)'
       ).bind(key, deviceId, now).run();
-      return { ok: true, activated: true, activation_token: token };
+      const activatedAt = Number(row?.activated_at) || now;
+      const expiresAt = activationBoundExpiry(entitlement, activatedAt);
+      if (entitlement && expiresAt == null) {
+        return { ok: false, reason: 'registry_unavailable' };
+      }
+      return {
+        ok: true,
+        activated: true,
+        activated_at: activatedAt,
+        expires_at: expiresAt == null ? null : new Date(expiresAt).toISOString(),
+        activation_token: token
+      };
     }
-    if (attempt < 2) return claimActiveInstallation(env, key, deviceId, rawToken, knownDevices, attempt + 1);
+    if (attempt < 2) {
+      return claimActiveInstallation(
+        env, key, deviceId, rawToken, knownDevices, entitlement, attempt + 1
+      );
+    }
     return { ok: false, reason: 'device_in_use', device_number: 1 };
   } catch (error) {
     console.warn('license activation registry unavailable; failing closed', error?.name || 'error');
@@ -760,14 +869,45 @@ async function claimActiveInstallation(env, key, deviceId, rawToken, knownDevice
 }
 
 async function mirrorHistoricalDevice(env, key, deviceId, license) {
-  const known = Array.isArray(license.device_ids) ? license.device_ids : [];
-  if (known.includes(deviceId)) return license;
   let fresh;
   try { fresh = (await getLicense(env, key)) || license; }
   catch { return license; }
+
+  // A first-activation KV projection may fail, while this later historical
+  // device mirror succeeds. Never let that recovery write restore the old
+  // issue-time expiry. Preserve the activation start/frozen duration and the
+  // later of the two expiry projections; durable referral promises are still
+  // overlaid again inside putLicense().
+  let projectionChanged = false;
+  const projectedStart = normalizeExpiry(license.subscription_started_at);
+  const projectedDuration = subscriptionDurationMs(license.subscription_duration_ms);
+  const projectedExpiry = normalizeExpiry(license.expires_at);
+  if (projectedStart && projectedDuration && projectedExpiry) {
+    const freshExpiry = normalizeExpiry(fresh.expires_at);
+    const laterExpiry = !freshExpiry ||
+      (projectedExpiry && Date.parse(projectedExpiry) > Date.parse(freshExpiry))
+      ? projectedExpiry
+      : freshExpiry;
+    const projectedDays = subscriptionDays(license.subscription_days);
+    projectionChanged = fresh.subscription_started_at !== projectedStart ||
+      fresh.subscription_duration_ms !== projectedDuration ||
+      (projectedDays != null && fresh.subscription_days !== projectedDays) ||
+      fresh.expires_at !== laterExpiry;
+    if (projectionChanged) {
+      fresh = {
+        ...fresh,
+        subscription_started_at: projectedStart,
+        subscription_duration_ms: projectedDuration,
+        ...(projectedDays != null ? { subscription_days: projectedDays } : {}),
+        expires_at: laterExpiry
+      };
+    }
+  }
+
   const freshKnown = Array.isArray(fresh.device_ids) ? fresh.device_ids : [];
-  if (!freshKnown.includes(deviceId)) {
+  if (!freshKnown.includes(deviceId) || projectionChanged) {
     fresh.device_ids = [...freshKnown, deviceId];
+    if (freshKnown.includes(deviceId)) fresh.device_ids = freshKnown;
     try { return await putLicense(env, fresh); }
     catch (error) { console.warn('license device mirror failed', error?.name || 'error'); }
   }
@@ -837,13 +977,31 @@ export async function verifyLicense(env, rawKey, deviceId, activationToken = '')
   if (license.type !== 'lifetime' && license.type !== 'subscription') {
     return { ok: false, reason: 'service_unavailable' };
   }
-  if (license.type === 'subscription' || license.expires_at != null) {
-    // Fail closed on time-bound licenses: a subscription with a missing or
-    // unparseable expires_at (corruption, bad migration, sloppy manual issue)
-    // must never read as "never expires". Only a lifetime row with a null
-    // expiry legitimately skips this check.
-    const canonical = normalizeExpiry(license.expires_at);
-    const expiresMs = canonical ? Date.parse(canonical) : NaN;
+  const canonicalExpiry = license.expires_at == null
+    ? null
+    : normalizeExpiry(license.expires_at);
+  const durationMs = license.type === 'subscription'
+    ? activationDurationForLicense(license)
+    : null;
+  const activationEntitlement = durationMs == null
+    ? null
+    : {
+        duration_ms: durationMs,
+        existing_expiry_ms: canonicalExpiry ? Date.parse(canonicalExpiry) : 0
+      };
+
+  // Legacy/manual subscriptions without a purchased duration keep their
+  // absolute expiry. New paid subscriptions (and unactivated historical
+  // Robokassa rows) are checked against D1's immutable first activated_at in
+  // claimActiveInstallation below. A corrupt row matches neither shape and
+  // fails closed instead of becoming eternal.
+  if (license.type === 'subscription' && !activationEntitlement) {
+    const expiresMs = canonicalExpiry ? Date.parse(canonicalExpiry) : NaN;
+    if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
+      return { ok: false, reason: 'expired' };
+    }
+  } else if (license.type === 'lifetime' && license.expires_at != null) {
+    const expiresMs = canonicalExpiry ? Date.parse(canonicalExpiry) : NaN;
     if (!Number.isFinite(expiresMs) || expiresMs <= Date.now()) {
       return { ok: false, reason: 'expired' };
     }
@@ -853,7 +1011,7 @@ export async function verifyLicense(env, rawKey, deviceId, activationToken = '')
   }
   if (configuredDeviceLimit(env) == null) return { ok: false, reason: 'service_unavailable' };
   const activation = await claimActiveInstallation(
-    env, key, deviceId, activationToken, license.device_ids
+    env, key, deviceId, activationToken, license.device_ids, activationEntitlement
   );
   if (!activation.ok) {
     return activation.reason === 'registry_unavailable'
@@ -861,6 +1019,32 @@ export async function verifyLicense(env, rawKey, deviceId, activationToken = '')
       : activation;
   }
   if (!ownerLicense) {
+    if (activationEntitlement) {
+      const effectiveExpiry = normalizeExpiry(activation.expires_at);
+      const startMs = Number(activation.activated_at);
+      if (!effectiveExpiry || !Number.isSafeInteger(startMs) || startMs <= 0) {
+        return { ok: false, reason: 'service_unavailable' };
+      }
+      const startedAt = new Date(startMs).toISOString();
+      if (license.expires_at !== effectiveExpiry ||
+          license.subscription_started_at !== startedAt ||
+          license.subscription_duration_ms !== durationMs) {
+        const activatedLicense = {
+          ...license,
+          expires_at: effectiveExpiry,
+          subscription_started_at: startedAt,
+          subscription_duration_ms: durationMs
+        };
+        try { license = await putLicense(env, activatedLicense); }
+        catch (error) {
+          // D1 activated_at + the frozen duration remain authoritative, so a
+          // failed KV mirror cannot shorten, restart, or make the subscription
+          // eternal. A later verified request repairs the projection.
+          console.warn('subscription activation mirror failed', error?.name || 'error');
+          license = activatedLicense;
+        }
+      }
+    }
     license = await mirrorHistoricalDevice(env, key, deviceId, license);
     const finalRevocation = await revocationVerdict(env, key, license);
     if (finalRevocation) return finalRevocation;

@@ -26,6 +26,20 @@ const GENERATION_KEY = 'licenseGeneration';
 const ERASURE_CAPABILITY_KEY = 'telemetryErasureCapability';
 let licenseMutationQueue = Promise.resolve();
 
+/**
+ * Canonical public keys contain 12 random Crockford Base32 characters. Accept
+ * either the grouped form copied from Telegram or the same value with its two
+ * visual grouping hyphens omitted. Legacy keys remain untouched.
+ */
+export function normalizeEnteredLicenseKey(raw) {
+  let normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
+  const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
+  if (compact) {
+    normalized = `SMESH-${compact[1].slice(0, 4)}-${compact[1].slice(4, 8)}-${compact[1].slice(8)}`;
+  }
+  return normalized;
+}
+
 function isExtensionPageContext() {
   try {
     return typeof document !== 'undefined' && location.protocol === 'chrome-extension:' &&
@@ -132,7 +146,7 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
     if (await saveIfCurrent(status)) return status;
     return (await loadStatus()) || { key: '', ok: false, reason: 'no_key', checkedAt: Date.now() };
   };
-  const trimmed = (key || '').trim().toUpperCase();
+  const trimmed = normalizeEnteredLicenseKey(key);
   if (!trimmed) {
     const status = { key: '', ok: false, reason: 'no_key', checkedAt: Date.now() };
     return currentOrNoKey(status);
@@ -240,7 +254,7 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
 }
 
 async function setLicenseKeyHere(key) {
-  const requested = String(key || '').trim().toUpperCase();
+  const requested = normalizeEnteredLicenseKey(key);
   const current = await loadStatus();
   if (!requested) return deactivateLicenseHere();
   if (current?.key && current.key !== requested) {

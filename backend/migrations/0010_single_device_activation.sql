@@ -1,6 +1,7 @@
 -- 0010_single_device_activation — one authenticated active installation per
 -- license. Historical license_devices rows remain intact for audit/referral
--- migration; only this table authorizes current use.
+-- migration; only this table authorizes current use. activated_at is retained
+-- across transfers and is the first-use clock for activation-bound plans.
 
 CREATE TABLE IF NOT EXISTS license_activations (
   license_key    TEXT    PRIMARY KEY,

@@ -12,12 +12,20 @@
  */
 import { fetchDelivery } from './http.js';
 
-export async function sendLicenseEmail(env, { to, key, isPreorder, dedupe = true }) {
+export async function sendLicenseEmail(env, {
+  to, key, isPreorder, type = null, expires_at = null, dedupe = true
+}) {
   if (!env.RESEND_API_KEY || !to) return { skipped: true };
 
   const launchNote = isPreorder
     ? 'Расширение выйдет в конце июля. Мы напишем вам, как только установочный файл будет готов — ваш ключ заработает сразу же.'
     : 'Откройте настройки расширения и вставьте ключ в поле «Лицензия».';
+  const formattedExpiry = expires_at ? formatExpiry(expires_at) : '';
+  const subscriptionNote = type === 'subscription'
+    ? (formattedExpiry
+        ? `Подписка действует до ${formattedExpiry}.`
+        : 'Срок подписки начнётся при первой активации ключа.')
+    : '';
 
   const html = `
     <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:520px;margin:0 auto;padding:24px;color:#0d0d0d;">
@@ -27,6 +35,9 @@ export async function sendLicenseEmail(env, { to, key, isPreorder, dedupe = true
         ${escapeHtml(key)}
       </div>
       <p style="font-size:14px;line-height:1.55;margin:0 0 12px;">${escapeHtml(launchNote)}</p>
+      ${subscriptionNote
+        ? `<p style="font-size:14px;line-height:1.55;margin:0 0 12px;">${escapeHtml(subscriptionNote)}</p>`
+        : ''}
       <p style="font-size:12px;color:#5d5d66;line-height:1.5;margin:24px 0 0;">
         Ключ активируется на одном устройстве. Чтобы перенести его на другой компьютер, нажмите «Деактивировать ключ на этом устройстве» в настройках расширения и активируйте ключ там. Если возникли вопросы — просто ответьте на это письмо.
       </p>
@@ -71,4 +82,12 @@ function escapeHtml(s) {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+function formatExpiry(value) {
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return '';
+  return new Intl.DateTimeFormat('ru-RU', {
+    timeZone: 'Europe/Moscow', day: '2-digit', month: '2-digit', year: 'numeric'
+  }).format(date);
 }

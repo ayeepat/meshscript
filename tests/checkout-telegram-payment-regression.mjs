@@ -640,8 +640,14 @@ try {
     assert.equal(purchase.amount_kopecks, 1_000);
     assert.equal(purchase.email, 'buyer@example.com');
     assert.equal(purchase.telegram_user_id, TRUSTED_TELEGRAM_ID);
-    assert.equal(purchase.expires_at, clock + 30 * DAY_MS,
-      'the fulfilled monthly plan must grant exactly 30 server-clock days');
+    assert.equal(purchase.expires_at, null,
+      'payment must freeze the duration without consuming it before activation');
+    const storedLicense = JSON.parse(await env.LICENSES.get(purchase.license_key));
+    assert.equal(storedLicense.subscription_days, 30);
+    assert.equal(storedLicense.subscription_duration_ms, 30 * DAY_MS,
+      'the fulfilled monthly plan must freeze exactly 30 days for first activation');
+    assert.equal(storedLicense.subscription_started_at, null);
+    assert.equal(storedLicense.expires_at, null);
 
     const licenseDeliveries = telegramCalls.filter((call) =>
       String(call.body?.text || '').includes(purchase.license_key));
@@ -651,6 +657,8 @@ try {
       'Telegram delivery must not disclose the separate receipt email address');
     assert.equal(String(licenseDeliveries[0].body.chat_id), TRUSTED_TELEGRAM_ID,
       'delivery must use the first authenticated private from.id exactly');
+    assert.ok(String(licenseDeliveries[0].body.text).includes('начнётся при первой активации'),
+      'Telegram must explain when the frozen paid period begins');
     assert.notEqual(String(licenseDeliveries[0].body.chat_id), OTHER_TELEGRAM_ID);
     assert.ok(sqlite.prepare(
       'SELECT delivered_at FROM delivery_outbox WHERE license_key = ?'

@@ -512,7 +512,8 @@ curl -X POST 'https://smeshapi.site/deactivate' \
 ```
 
 Deactivation is the only supported transfer path. It releases the active slot
-but retains the historical activation ledger for audit and referral integrity.
+but retains the original `activated_at` timestamp. Device transfer therefore
+does not restart a paid subscription period.
 
 ## Support Bot
 
@@ -578,8 +579,11 @@ reuse a test `InvId` in production.
 
 ## Subscriptions
 
-A subscription is a license with a finite `expires_at`. The order endpoint owns
-the catalog and freezes one exact price in integer kopecks before redirecting:
+A paid subscription stores a frozen duration at fulfillment and receives its
+finite `expires_at` on the first successful extension activation. Waiting to
+paste the key does not consume paid time; deactivation and transfer do not
+restart it. The order endpoint owns the catalog and freezes one exact price in
+integer kopecks before redirecting:
 
 ```toml
 MONTHLY_PRICE_RUB       = "149"
@@ -596,6 +600,11 @@ different product.
 `SUBSCRIPTION_DAYS` likewise accepts only a canonical whole number from 1 to
 3650; exponent and whitespace coercions fail readiness instead of silently
 changing the entitlement duration.
+
+The monthly plan is exactly 30 × 24 hours. The school plan is exactly 273 days
+from activation, even when that interval crosses the summer break. Unactivated
+Robokassa keys issued before activation-bound durations were introduced recover
+their purchased duration from the original immutable issue/expiry pair.
 
 The buyer's mental model is exactly the license flow: **pay → receive a code →
 paste it into Settings**. When a subscription lapses, `/verify` returns

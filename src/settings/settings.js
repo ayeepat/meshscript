@@ -5,7 +5,8 @@ import { mdToHtml } from '../common/markdown.js';
 import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 import { DEFAULT_LIMITS, MAX_DAILY_LIMIT, getUsage, getUsageHistory } from '../lib/rate-limit.js';
 import {
-  setLicenseKey, getLicenseStatus, reasonMessage, deactivateCurrentLicense
+  setLicenseKey, getLicenseStatus, reasonMessage, deactivateCurrentLicense,
+  normalizeEnteredLicenseKey
 } from '../lib/license.js';
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
@@ -673,7 +674,7 @@ function settingsDataEqual(left, right) {
 }
 
 function normalizedVisibleLicenseKey() {
-  return document.getElementById('licenseKey').value.trim().toUpperCase();
+  return normalizeEnteredLicenseKey(document.getElementById('licenseKey').value);
 }
 
 function licenseIntentOwnsUi(intent) {

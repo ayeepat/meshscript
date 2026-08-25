@@ -1035,9 +1035,9 @@ async function fulfillAuthorizedRobokassaOrder(env, ctx, order, n, fields) {
   const plan = order.plan_type === 'subscription'
     ? {
         type: 'subscription',
-        expires_at: new Date(Date.now() + Number(order.subscription_days) * 24 * 60 * 60 * 1000).toISOString()
+        subscription_days: Number(order.subscription_days)
       }
-    : { type: 'lifetime', expires_at: null };
+    : { type: 'lifetime', subscription_days: null };
   const isPreorder = !!order.is_preorder;
 
   // Referral: a valid code the buyer entered at checkout (best-effort
@@ -1051,9 +1051,12 @@ async function fulfillAuthorizedRobokassaOrder(env, ctx, order, n, fields) {
     buyerEmail: order.email,
     buyerTelegramId: order.telegram_user_id
   });
-  const expiresAt = (referral.valid && plan.type === 'subscription')
-    ? referrals.withBuyerBonus(env, plan.expires_at)
-    : plan.expires_at;
+  const baseDurationMs = plan.type === 'subscription'
+    ? plan.subscription_days * 24 * 60 * 60 * 1000
+    : null;
+  const subscriptionDurationMs = referral.valid && baseDurationMs != null
+    ? referrals.withBuyerBonusDurationMs(env, baseDurationMs)
+    : baseDurationMs;
 
   const license = await issueLicense(env, {
     gateway: 'robokassa',
@@ -1061,7 +1064,9 @@ async function fulfillAuthorizedRobokassaOrder(env, ctx, order, n, fields) {
     email: order.email,
     telegram_user_id: order.telegram_user_id,
     type: plan.type,
-    expires_at: expiresAt,
+    expires_at: null,
+    subscription_days: plan.subscription_days,
+    subscription_duration_ms: subscriptionDurationMs,
     amount_kopecks: n.amount_kopecks,
     is_preorder: isPreorder,
     referral_code: referral.valid ? referral.ref.code : null
@@ -1382,6 +1387,7 @@ export async function deliverKey(env, license, isPreorder, { force = false, retr
     amount_kopecks: Number.isSafeInteger(license.amount_kopecks)
       ? license.amount_kopecks
       : null,
+    type: license.type,
     expires_at: license.expires_at,
     payment_id: license.payment_id,
     email: license.email
@@ -1390,6 +1396,8 @@ export async function deliverKey(env, license, isPreorder, { force = false, retr
     to: license.email,
     key: license.key,
     isPreorder,
+    type: license.type,
+    expires_at: license.expires_at,
     dedupe: !force
   });
   const skippedOk = (channel) => Promise.resolve({ skipped: false, ok: true, deduped: channel });
@@ -2340,7 +2348,16 @@ async function handleAdminIssue(request, env) {
   if (body.expires_at != null && !normalizeExpiry(body.expires_at)) {
     return error(400, 'bad_expiry');
   }
-  if (type === 'subscription' && body.expires_at == null) return error(400, 'bad_expiry');
+  const subscriptionDays = body.subscription_days == null
+    ? null
+    : Number(body.subscription_days);
+  if (body.subscription_days != null &&
+      (!Number.isSafeInteger(subscriptionDays) || subscriptionDays < 1 || subscriptionDays > 3650)) {
+    return error(400, 'bad_subscription_days');
+  }
+  if (type === 'subscription' && body.expires_at == null && subscriptionDays == null) {
+    return error(400, 'bad_expiry');
+  }
 
   const license = await issueLicense(env, {
     gateway: body.gateway || 'manual',
@@ -2349,6 +2366,7 @@ async function handleAdminIssue(request, env) {
     telegram_user_id: body.telegram_user_id || null,
     type: body.type || 'lifetime',
     expires_at: body.expires_at || null,
+    subscription_days: subscriptionDays,
     amount_rub: body.amount_rub || null,
     is_preorder: !!body.is_preorder,
     note: body.note || null

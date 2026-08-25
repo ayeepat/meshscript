@@ -507,6 +507,19 @@ export function withBuyerBonus(env, expiresAtIso) {
 }
 
 /**
+ * Activation-bound equivalent of withBuyerBonus(). The duration is frozen in
+ * the paid license claim and later added to D1's first activated_at, so waiting
+ * before activation never consumes either the plan or the buyer bonus.
+ */
+export function withBuyerBonusDurationMs(env, durationMs) {
+  const duration = Number(durationMs);
+  const pct = buyerBonusPct(env);
+  if (!Number.isSafeInteger(duration) || duration <= 0 || !pct) return durationMs;
+  const bonused = Math.round(duration * (1 + pct / 100));
+  return Number.isSafeInteger(bonused) && bonused > 0 ? bonused : durationMs;
+}
+
+/**
  * Credit the referrer for a confirmed purchase. D1 records a fixed target and
  * absolute expiry, then a per-code lease sweeps every pending row in order.
  * Retries are therefore idempotent and later purchases self-heal older work.

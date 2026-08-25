@@ -303,9 +303,11 @@ CREATE INDEX IF NOT EXISTS idx_license_devices_device ON license_devices(device_
 -- One authenticated ACTIVE installation per license. `license_devices` above
 -- remains an append-only compatibility/audit index; it is not authorization.
 -- The first installation receives a random bearer capability whose SHA-256
--- digest is stored here. A different installation cannot replace the active
--- row merely by choosing another client-side UUID: the current installation
--- must explicitly deactivate with that capability first.
+-- digest is stored here. activated_at is also the immutable start clock for
+-- activation-bound subscriptions; deactivate/reactivate never resets it. A
+-- different installation cannot replace the active row merely by choosing
+-- another client-side UUID: the current installation must explicitly
+-- deactivate with that capability first.
 CREATE TABLE IF NOT EXISTS license_activations (
   license_key    TEXT    PRIMARY KEY,
   status         TEXT    NOT NULL CHECK (status IN ('active', 'inactive')),

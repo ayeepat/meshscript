@@ -3,7 +3,8 @@ import {
   buyerBonusPct,
   ipDailyLimit,
   paidDays,
-  withBuyerBonus
+  withBuyerBonus,
+  withBuyerBonusDurationMs
 } from '../backend/src/referrals.js';
 
 assert.equal(paidDays({}), 7);
@@ -28,6 +29,15 @@ const future = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
 const bonused = withBuyerBonus({ REFERRAL_BUYER_BONUS_PCT: '10' }, future);
 assert.ok(Date.parse(bonused) > Date.parse(future));
 assert.equal(withBuyerBonus({ REFERRAL_BUYER_BONUS_PCT: '0' }, future), future);
+const monthMs = 30 * 24 * 60 * 60 * 1000;
+assert.equal(
+  withBuyerBonusDurationMs({ REFERRAL_BUYER_BONUS_PCT: '10' }, monthMs),
+  33 * 24 * 60 * 60 * 1000,
+  'buyer bonus must extend the frozen activation-bound duration'
+);
+assert.equal(withBuyerBonusDurationMs({ REFERRAL_BUYER_BONUS_PCT: '0' }, monthMs), monthMs);
+assert.equal(withBuyerBonusDurationMs({ REFERRAL_BUYER_BONUS_PCT: '10' }, Number.MAX_SAFE_INTEGER),
+  Number.MAX_SAFE_INTEGER, 'overflow must retain the original duration');
 
 // This is the maximum representable ECMAScript date. Adding any positive
 // percentage would make toISOString throw; payment processing must retain the

@@ -15,7 +15,7 @@
 import { fetchDelivery } from './http.js';
 
 export async function sendLicenseTelegram(env, {
-  user_id, key, isPreorder, amount_kopecks = null, expires_at = null,
+  user_id, key, isPreorder, amount_kopecks = null, type = null, expires_at = null,
   payment_id = null, email = null
 }) {
   if (!env.TELEGRAM_BOT_TOKEN || !user_id) return { skipped: true };
@@ -31,6 +31,8 @@ export async function sendLicenseTelegram(env, {
   if (expires_at) {
     const expiry = formatExpiry(expires_at);
     if (expiry) paymentLines.push(`Подписка действует до ${expiry}`);
+  } else if (type === 'subscription') {
+    paymentLines.push('Срок подписки начнётся при первой активации ключа');
   }
   if (/^\d+$/.test(String(payment_id || ''))) paymentLines.push(`Заказ №${payment_id}`);
   // Telegram and receipt email may belong to different family members. Do not

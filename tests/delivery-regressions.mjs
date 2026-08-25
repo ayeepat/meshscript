@@ -20,6 +20,7 @@ let fetchImpl = async (url, init) => {
 globalThis.fetch = (...args) => fetchImpl(...args);
 
 const { sendLicenseTelegram } = await import('../backend/src/delivery/telegram.js');
+const { sendLicenseEmail } = await import('../backend/src/delivery/email.js');
 const { processSupportUpdate } = await import('../backend/src/delivery/support.js');
 const { deliverKey } = await import('../backend/src/worker.js');
 
@@ -31,6 +32,20 @@ assert.ok(dm.includes('`' + key + '`'),
   `the code span must contain the raw key; got: ${dm}`);
 assert.ok(!dm.includes('SMESH\\-'),
   'the key must not carry escaped hyphens the buyer would copy');
+
+// A paid period does not have an expiry before the buyer first activates the
+// key. Delivery must explain that instead of inventing an issue-time date.
+calls.length = 0;
+await sendLicenseTelegram({ TELEGRAM_BOT_TOKEN: 't' }, {
+  user_id: 1, key, isPreorder: false, type: 'subscription', expires_at: null
+});
+assert.ok(calls.at(-1).body.text.includes('начнётся при первой активации'));
+await sendLicenseEmail({ RESEND_API_KEY: 'r' }, {
+  to: 'buyer@example.com', key, isPreorder: false, type: 'subscription', expires_at: null
+});
+const pendingEmail = calls.at(-1).body.html;
+assert.ok(pendingEmail.includes('начнётся при первой активации'));
+assert.ok(!pendingEmail.includes('Подписка действует до .'));
 
 // ---- 2. owner-reply routing survives an injected #id ----
 const kvStub = { get: async () => null, put: async () => {} };
