@@ -17,7 +17,7 @@ const PASSWORD2 = 'checkout-result-password-2';
 const TELEGRAM_SECRET = 'checkout-telegram-webhook-secret';
 const RESULT_URL = 'https://api.example/webhook/robokassa';
 const SUCCESS_URL2 = 'https://site.example/checkout/success/';
-const FAIL_URL2 = 'https://site.example/checkout/?payment=cancelled';
+const FAIL_URL2 = 'https://site.example/checkout/';
 const TRUSTED_TELEGRAM_ID = '7001001';
 const OTHER_TELEGRAM_ID = '7002002';
 const CLIENT_SUPPLIED_TELEGRAM_ID = '7999999';

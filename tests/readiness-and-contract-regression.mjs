@@ -299,7 +299,7 @@ for (const table of HEALTH_TABLES) {
     CHECKOUT_TELEGRAM_BOT_USERNAME: 'smeshaibot',
     CHECKOUT_CAPABILITY_SECRET: 'checkout-capability-secret-that-is-at-least-32-bytes',
     ROBOKASSA_SUCCESS_URL2: 'https://site.example/checkout/success/',
-    ROBOKASSA_FAIL_URL2: 'https://site.example/checkout/?payment=cancelled',
+    ROBOKASSA_FAIL_URL2: 'https://site.example/checkout/',
     PAYMENT_ENVIRONMENT: 'production',
     ROBOKASSA_MERCHANT_LOGIN: 'merchant',
     ROBOKASSA_PASSWORD1_PRODUCTION: 'p1',

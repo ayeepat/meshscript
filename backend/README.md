@@ -212,7 +212,7 @@ SCHOOL_YEAR_DAYS = "273"
 CHECKOUT_PROMO_MONTH_PRICE_RUB = "10"
 CHECKOUT_TELEGRAM_BOT_USERNAME = "smeshaibot"
 ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
-ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/?payment=cancelled"
+ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/"
 LEGACY_PAYMENT_ORDER_ENABLED = "false"
 ROBOKASSA_ENFORCE_IP_ALLOWLIST = "true"
 DEVICE_LIMIT = "1"
@@ -392,7 +392,7 @@ Robokassa dashboard → shop → technical settings:
 - **ResultURL**: `https://<your-worker-url>/webhook/robokassa`
 - **ResultURL method**: `POST` recommended. `GET` also works.
 - **SuccessURL**: `https://smeshai.xyz/checkout/success/` (GET).
-- **FailURL**: `https://smeshai.xyz/checkout/?payment=cancelled` (GET).
+- **FailURL**: `https://smeshai.xyz/checkout/` (GET).
 - **Production Password #1/#2/#3**: store them only in the corresponding
   `ROBOKASSA_PASSWORD{1,2,3}_PRODUCTION` secrets.
 - **Hash algorithm**: select `SHA256`, matching `ROBOKASSA_HASH_ALGO`.

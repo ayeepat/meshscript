@@ -88,7 +88,7 @@ function environment(paymentEnvironment = 'production', overrides = {}) {
       SCHOOL_YEAR_PRICE_RUB: '999',
       SCHOOL_YEAR_DAYS: '273',
       ROBOKASSA_SUCCESS_URL2: 'https://site.example/checkout/success/',
-      ROBOKASSA_FAIL_URL2: 'https://site.example/checkout/?payment=cancelled',
+      ROBOKASSA_FAIL_URL2: 'https://site.example/checkout/',
       CHECKOUT_TELEGRAM_BOT_USERNAME: 'smesh_allocator_bot',
       CHECKOUT_CAPABILITY_SECRET: 'allocator-checkout-capability-secret-0123456789',
       TELEGRAM_BOT_TOKEN: 'allocator-telegram-token',

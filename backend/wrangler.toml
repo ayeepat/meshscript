@@ -92,7 +92,7 @@ ROBOKASSA_REFUND_HASH_ALGO = "HS256"
 # Robokassa cabinet; ResultUrl2 uses a different JWS callback format and is not
 # sent to the classic ResultURL handler.
 ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
-ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/?payment=cancelled"
+ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/"
 # The cabinet confirms Robocheki SMZ for this NPD shop. Send itemized receipt
 # data to Robokassa; omit SNO so the confirmed cabinet profile remains the
 # authority. The offer grants a non-exclusive software licence and access is
