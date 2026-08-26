@@ -6,6 +6,29 @@
  * developer toggles between releases.
  */
 
+// Which AI vendor answers is an internal routing detail, not a student-facing
+// choice: the license buys "СМЭШ answers your homework", and naming Groq /
+// OpenRouter / Qwen / DeepSeek in the UI only invites support questions we
+// don't want and pins us to vendors we may swap. Flipping this back to true
+// restores the Settings picker, the BYO key fields, the per-provider limits,
+// the usage chart switcher and the GRQ/OPR/QWN/DSK badge — every code path
+// behind them is intact and still tested.
+//
+// This hides the vendor NAMES from the product surface only. The consent
+// screen still discloses that homework content goes to third-party AI
+// services, and docs/STORE-REVIEW.md plus the site's privacy policy still name
+// them. Hiding a picker must not turn into hiding the actual data recipients,
+// especially when the audience is schoolchildren.
+export const SHOW_PROVIDER_UI = false;
+
+// What actually answers while the picker is hidden. DeepSeek is the cheapest
+// per text solve; askAI() auto-upgrades to Qwen the moment a request carries an
+// image or PDF (both ride the same Model Studio key through the proxy), so
+// screenshots and textbook photos keep full vision quality. Must stay one of
+// the licensed providers — a BYO one would need a key the user can no longer
+// enter.
+export const DEFAULT_PROVIDER = 'deepseek';
+
 // Base URL of the license backend (Cloudflare Worker). Hit `/verify` here.
 // This is a dedicated custom domain bound to the `smesh-licenses` Worker via
 // Cloudflare Custom Domains, registered specifically for this purpose and

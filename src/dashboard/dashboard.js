@@ -10,6 +10,7 @@ import { filesLabel } from '../common/plural.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { PROVIDER_ABBR, PROVIDER_NAME } from '../common/provider-badge.js';
+import { SHOW_PROVIDER_UI } from '../lib/config.js';
 import { isPdfFile } from '../lib/file-kinds.js';
 import { isGdzApiUrl, isGdzHumanUrl } from '../lib/gdz-hosts.js';
 import {
@@ -25,8 +26,11 @@ import { principalBindingMatches } from '../lib/principal-binding.js';
 // dashboard the Авто/Думать toggle — not the Settings provider — decides the
 // model (see the SOLVE payload's `engine`), so the badge is painted from the
 // engine instead of mountProviderBadge's aiProvider setting.
+// Dormant while SHOW_PROVIDER_UI is false — the Авто/Думать toggle stays, only
+// the vendor tag next to it goes away.
 const ENGINE_PROVIDER = { auto: 'deepseek', think: 'qwen' };
 function paintEngineBadge(engine) {
+  if (!SHOW_PROVIDER_UI) return;
   const el = document.getElementById('provBadge');
   const p = ENGINE_PROVIDER[engine];
   el.textContent = PROVIDER_ABBR[p];

@@ -100,10 +100,35 @@ vm.runInNewContext(`${choiceSource}\nthis.parseChoiceIndices = parseChoiceIndice
 assert.deepEqual(Array.from(choiceSandbox.parseChoiceIndices('а и в', 3)), [0, 2],
   'whitespace-delimited Cyrillic «и» must split multi-choice answers');
 
+// The store-review doc has to describe the CURRENT permission set. GDZ moved to
+// the Worker and `declarativeNetRequest` is gone, so the doc must no longer
+// justify a rule that is not there — a reviewer finding a permission described
+// but not requested (or vice versa) is exactly the discrepancy that stalls a
+// listing.
 const review = source('../docs/STORE-REVIEW.md');
-assert.match(review, /updateSessionRules\(\)/);
-assert.match(review, /src\/lib\/gdz-ua-rule\.js/);
+assert.match(review, /POST https:\/\/smeshapi\.site\/gdz\/fetch/,
+  'the doc must point at the proxy route that replaced the DNR rule');
+assert.match(review, /backend\/src\/gdz\.js/);
+assert.doesNotMatch(review, /updateSessionRules\(\)/,
+  'the doc must not describe a DNR rule the extension no longer installs');
+assert.doesNotMatch(review, /src\/lib\/gdz-ua-rule\.js/,
+  'gdz-ua-rule.js was deleted with the permission');
 assert.doesNotMatch(review, /src\/rules\/gdz-ua\.json/);
 assert.doesNotMatch(review, /There is no dynamic rule generation/);
+// The permission table and the manifest must agree in BOTH directions.
+const reviewManifest = JSON.parse(source('../manifest.json'));
+for (const [row] of review.matchAll(/^\| `([a-zA-Z_]+)` \|/gm)) {
+  const permission = row.replace(/[|`\s]/g, '');
+  assert.ok(
+    reviewManifest.permissions.includes(permission),
+    `STORE-REVIEW.md documents a permission the manifest does not request: ${permission}`
+  );
+}
+for (const permission of reviewManifest.permissions) {
+  assert.ok(
+    review.includes(`\`${permission}\``),
+    `manifest requests ${permission} but STORE-REVIEW.md does not justify it`
+  );
+}
 
 console.log('security boundary and text verification regressions passed');

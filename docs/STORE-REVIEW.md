@@ -7,19 +7,36 @@ each point maps to code in this repo.
 ## What the extension does
 
 A personal homework/test assistant for the Moscow school diary **МЭШ**
-(`school.mos.ru`). The user either pastes their **own** API key for an AI
-provider or activates a purchased СМЭШ license (which routes through our own
-proxy); the extension reads the homework on the page they are already looking
-at, optionally sends it to that provider, and shows the answer. It never logs
-into anything on the user's behalf and never submits a test.
+(`school.mos.ru`). New users activate a purchased СМЭШ license, which routes AI
+requests through our proxy. An older installation that already holds the
+user's own provider key may continue to call that provider directly. The
+extension reads the homework on the page the user is already viewing, sends it
+to an AI provider, and shows the answer. It never logs into anything on the
+user's behalf and never submits a test.
+
+**Provider selection is not exposed to the user.** As shipped
+(`SHOW_PROVIDER_UI = false` in `src/lib/config.js`) there is no provider picker
+and no field for a third-party API key. Fresh installations therefore use the
+licensed proxy. The bring-your-own-key adapters (OpenRouter, Groq, Alibaba
+Model Studio) remain in the source and still run for an installation that was
+configured before the flag was introduced and still holds its own key; those
+requests go directly to the selected provider, which is why the corresponding
+host permissions remain below. The vendor names are hidden from the product UI
+only. They are named in full here and in the privacy policy at
+`smeshai.xyz/privacy`, and the consent screen says that homework content may be
+sent either through the СМЭШ proxy or directly with a previously saved key.
 
 ## Consent gate (required before any data leaves the device)
 
 On first run the popup shows a consent screen that states plainly that task
 text, test screenshots and attached files (including audio clips sent for
-transcription) go to the chosen AI provider — OpenRouter, Groq, Qwen (Alibaba)
-or DeepSeek, the latter two via our proxy `ai.smeshapi.site` on the license
-path. No AI request of any kind (solving, transcription) is made until the
+transcription) leave the device and go to third-party AI services. Licensed AI
+requests use our proxy at `ai.smeshapi.site`; a pre-existing bring-your-own-key
+setup may call its provider directly. Those services are OpenRouter, Groq,
+Qwen (Alibaba) and DeepSeek; they are named in the linked privacy policy rather
+than in the checkbox text, which keeps the in-product disclosure readable for
+a schoolchild while the full list stays one click away. No AI request of any
+kind (solving, transcription) is made until the
 user accepts (`src/lib/consent.js`; every outbound handler in
 `src/background/service-worker.js` re-checks it). The shared provider and
 transcription network boundaries perform one final storage-backed check
@@ -35,35 +52,51 @@ when consent is withdrawn. Consent is reviewable and revocable in Settings →
 | `activeTab` | On an explicit user click, screenshot the visible test page and read its text to solve it. |
 | `scripting` | Inject the content script that reads the user's homework cards and fills test answers into the form fields on the Mesh page. |
 | `alarms` | A periodic local-data retention sweep (history 7 d, week scan 24 h, pending file handoffs 1 h). No network involved. |
-| `declarativeNetRequest` | Installs one narrowly scoped **session rule** for GDZ requests (`buildGdzUaRule` / `ensureUaRule`): see below. |
 
 ## Host permissions
 
 | Host | Why |
 |---|---|
 | `https://school.mos.ru/*`, `https://uchebnik.mos.ru/*` | Read the user's **own** diary/homework/test player and download attachments from the two exact Mesh origins, inside the user's already-authenticated session. Scripted child-frame capture additionally requires a positively identified test-player document; unrelated MOS frames are excluded. |
-| `https://openrouter.ai/*`, `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*` | The BYO-key AI providers that generate answers (OpenRouter, Groq, and Alibaba Model Studio for power users' own Qwen/DeepSeek keys). |
+| `https://openrouter.ai/*`, `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*` | The BYO-key AI providers (OpenRouter, Groq, and Alibaba Model Studio for power users' own Qwen/DeepSeek keys). Not reachable from the shipped UI — see "Provider selection is not exposed" above — but still used by pre-existing installs that hold their own key, and by Groq Whisper for audio transcription. |
 | `https://ai.smeshapi.site/*` | Our AI proxy for licensed users: Qwen/DeepSeek requests require the license, anonymous device id and the random one-device activation bearer; the key and public UUID alone are insufficient. Receives the same consent-gated task content as a direct provider call. |
-| `https://gdz-ru.com/*`, `https://*.gdz-ru.com/*`, `https://gdz.ru/*` | Fetch ready textbook answers (GDZ) when the user pins a textbook, so common exercises don't need an AI call. |
 | `https://*.smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. |
-| `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body) and, **only if the user opts in**, anonymous usage statistics (see below). |
+| `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body), the GDZ proxy (`POST /gdz/fetch`, see below) and, **only if the user opts in**, anonymous usage statistics (see below). |
 
-## The declarativeNetRequest rule (the part reviewers ask about)
+## GDZ textbook answers (no host permission, no declarativeNetRequest)
 
-Before its first GDZ API/image request in each service-worker lifetime,
-`src/lib/gdz-api.js` calls `chrome.declarativeNetRequest.updateSessionRules()`
-with the single rule built by `src/lib/gdz-ua-rule.js`. Session rules disappear
-when the browser session ends, so the worker recreates it when needed; there is
-no static rule resource in the manifest.
+When the user pins a textbook, common exercises are answered from published
+"ГДЗ" solution scans instead of an AI call. **The extension does not contact
+either GDZ host.** It sends the URL it wants to our own Worker
+(`POST https://smeshapi.site/gdz/fetch`, `backend/src/gdz.js`), which fetches
+it and returns the JSON or the image.
 
-The rule rewrites the `User-Agent` header to `okhttp/4.9.1` only when both
-conditions hold: the request targets `gdz-ru.com` (including subdomains), and
-the initiator is this extension's own runtime ID. It is limited to the resource
-types used by extension fetches and GDZ media. The GDZ mobile API sits behind
-DDoS-Guard, which returns data only to the mobile app's User-Agent; MV3
-`fetch()` cannot set `User-Agent` directly, hence the rule. It does not block,
-redirect, or read requests, and it cannot modify page-initiated traffic or
-traffic to another host.
+That indirection exists because the GDZ mobile API sits behind DDoS-Guard,
+which returns data only to the mobile app's `okhttp` User-Agent and 403s a
+browser one. MV3 `fetch()` cannot set `User-Agent`; a Worker can. Earlier
+versions of this extension therefore used a `declarativeNetRequest` session
+rule to rewrite that single header. **That permission has been removed**, along
+with the three GDZ host permissions, and `tests/gdz-proxy-regression.mjs` fails
+the build if any of them — or a call to `chrome.declarativeNetRequest` — comes
+back.
+
+The proxy route is not an open relay:
+
+- a valid, active license is required and re-verified server-side per request,
+  including the one-active-device activation lease (the same gate as the AI
+  proxy);
+- a per-license daily request cap (`GDZ_DAILY_LIMIT`), bucketed by a SHA-256 of
+  the key so no license key is stored in the counter table;
+- a server-side host allowlist (HTTPS only, exact host or a real subdomain
+  label, no credentials, no non-default port) that is deliberately a separate
+  copy from the extension's — the client's check is advisory, this one is the
+  boundary;
+- byte ceilings and a timeout on every upstream read, with redirects followed
+  manually and re-validated at each hop.
+
+No homework content is sent to the proxy: the request body contains the
+license/device activation credentials, a request kind and a public GDZ URL.
+Homework text never enters this path.
 
 ## Data handling
 

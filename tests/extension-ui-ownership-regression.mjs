@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { readFileSync } from 'node:fs';
+import { SHOW_PROVIDER_UI, DEFAULT_PROVIDER } from '../src/lib/config.js';
 
 const answerPanelSource = readFileSync(
   new URL('../src/content/answer-panel.js', import.meta.url),
@@ -151,10 +152,17 @@ assert.match(
     'async function ensureUsageDashboard('
   );
   const credits = [deferred(), deferred()];
-  const usages = [
-    { openrouter: { used: 1, limit: 10 } },
-    { openrouter: { used: 2, limit: 20 } },
-  ];
+  // Carry every provider so the fixture matches whichever series
+  // refreshUsageDashboard reads for the "Сегодня" tile — that depends on
+  // config.SHOW_PROVIDER_UI, and this test is about the generation race, not
+  // about which provider is on screen.
+  const usageFrame = (used, limit) => ({
+    openrouter: { used, limit },
+    groq: { used, limit },
+    qwen: { used, limit },
+    deepseek: { used, limit },
+  });
+  const usages = [usageFrame(1, 10), usageFrame(2, 20)];
   const histories = [
     [{ day: 'old', openrouter: 1 }],
     [{ day: 'new', openrouter: 2 }],
@@ -166,6 +174,8 @@ assert.match(
   const paints = [];
   const context = {
     Promise,
+    SHOW_PROVIDER_UI,
+    DEFAULT_PROVIDER,
     getUsage: () => Promise.resolve(usages[usageCall++]),
     getUsageHistory: () => Promise.resolve(histories[historyCall++]),
     fetchCredits: () => credits[creditsCall++].promise,

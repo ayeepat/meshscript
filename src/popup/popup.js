@@ -15,7 +15,7 @@ import {
   getLicenseStatus, setLicenseKey, reasonMessage, validateEnteredLicenseKey
 } from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
-import { SUPPORT_BOT_URL } from '../lib/config.js';
+import { DEFAULT_PROVIDER, SHOW_PROVIDER_UI, SUPPORT_BOT_URL } from '../lib/config.js';
 import { assertUploadAllowed } from '../lib/upload-limits.js';
 import { filesLabel, pluralRu } from '../common/plural.js';
 import { awaitStablePendingRead } from '../lib/pending-read.js';
@@ -851,6 +851,9 @@ async function capturePage(tab) {
  * @returns {Promise<{ok:boolean, answer?:string, questions?:object[], error?:string}>}
  */
 function timeoutMessage(provider) {
+  if (!SHOW_PROVIDER_UI) {
+    return 'Не удалось получить ответ за 2 минуты. Проверьте интернет и попробуйте ещё раз.';
+  }
   const name = {
     openrouter: 'OpenRouter',
     groq: 'Groq',
@@ -1168,10 +1171,14 @@ const PROVIDER_KEY_LINK = {
   qwen: LICENSE_LINK,
   deepseek: LICENSE_LINK
 };
-let obProvider = 'groq';
+let obProvider = DEFAULT_PROVIDER;
 
 function setObProvider(p) {
-  obProvider = OB_PROVIDERS.includes(p) ? p : 'groq';
+  // With the picker hidden the only credential onboarding can collect is the
+  // СМЭШ license, so a stored BYO value must not put a "paste your API key"
+  // step in front of a paying student. Pin to the licensed default instead.
+  const requested = OB_PROVIDERS.includes(p) ? p : DEFAULT_PROVIDER;
+  obProvider = SHOW_PROVIDER_UI ? requested : DEFAULT_PROVIDER;
   const meta = PROVIDER_KEY_LINK[obProvider];
   for (const b of document.querySelectorAll('#obProvider button')) {
     b.classList.toggle('active', b.dataset.p === obProvider);
@@ -1272,10 +1279,14 @@ async function finishOnboarding() {
 }
 
 function wireOnboarding() {
-  document.getElementById('obProvider').addEventListener('click', (e) => {
-    const b = e.target.closest('button');
-    if (b) setObProvider(b.dataset.p);
-  });
+  if (SHOW_PROVIDER_UI) {
+    // Ships hidden in the markup so no vendor name flashes before this runs.
+    document.getElementById('obProvider').hidden = false;
+    document.getElementById('obProvider').addEventListener('click', (e) => {
+      const b = e.target.closest('button');
+      if (b) setObProvider(b.dataset.p);
+    });
+  }
   document.getElementById('obStart').onclick = finishOnboarding;
   document.getElementById('obSettings').onclick = () => chrome.runtime.openOptionsPage();
 }
@@ -1289,7 +1300,13 @@ async function isReadyToSolve() {
   const stored = await chrome.storage.local.get(
     ['aiProvider', 'licenseStatus', 'qwenApiKey', ...Object.values(PROVIDER_KEY_FIELD)]
   );
-  const provider = stored.aiProvider || 'openrouter';
+  // Same grandfathering rule as ai.resolveStoredProvider: a BYO value with no
+  // stored key can't answer and can't be fixed, so it counts as the licensed
+  // default and the license gate below decides readiness.
+  const byoField = PROVIDER_KEY_FIELD[stored.aiProvider];
+  const provider = (!SHOW_PROVIDER_UI && byoField && !stored[byoField])
+    ? DEFAULT_PROVIDER
+    : (stored.aiProvider || DEFAULT_PROVIDER);
   if (provider === 'qwen' || provider === 'deepseek') {
     // Hidden BYO Model Studio key bypasses the license entirely.
     if (stored.qwenApiKey) return true;
@@ -1353,7 +1370,7 @@ async function init() {
     scanHomework();
   } else {
     const { aiProvider } = await chrome.storage.local.get('aiProvider');
-    setObProvider(aiProvider || 'groq'); // prefer free Groq for brand-new users
+    setObProvider(aiProvider || DEFAULT_PROVIDER);
     showOnboarding(true);
   }
 }

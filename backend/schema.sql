@@ -434,13 +434,23 @@ CREATE TABLE IF NOT EXISTS device_tombstones (
   deleted_at INTEGER NOT NULL             -- ms epoch
 );
 
--- Atomic abuse budgets shared by telemetry, admin-auth failures, and failed
--- license lookups. KV read-modify-write counters lose increments under
--- concurrency; this table keeps each budget authoritative. Rows from old days
--- can be pruned.
+-- Atomic abuse budgets shared by telemetry, admin-auth failures, failed
+-- license lookups, and the GDZ proxy. KV read-modify-write counters lose
+-- increments under concurrency; this table keeps each budget authoritative.
+-- Rows from old days can be pruned.
+--
+-- `scope` values: ip | device | admin_fail | verify_fail | gdz | gdz_cover.
+-- The two GDZ scopes bucket by a SHA-256 of the license key, never the key
+-- itself (src/gdz.js); covers are metered separately from answer lookups so
+-- browsing the textbook picker cannot eat the day's answer allowance.
+--
+-- NOTE: keep prose OUTSIDE the CREATE TABLE body. /admin/health fingerprints
+-- each table against `sqlite_master.sql`, which stores the statement text
+-- verbatim — a comment added between the parentheses changes that fingerprint
+-- and reports the deployed table as an invalid shape.
 CREATE TABLE IF NOT EXISTS telemetry_budget (
   day        TEXT    NOT NULL,
-  scope      TEXT    NOT NULL,          -- ip | device | admin_fail | verify_fail
+  scope      TEXT    NOT NULL,
   budget_key TEXT    NOT NULL,
   count      INTEGER NOT NULL DEFAULT 0,
   PRIMARY KEY (day, scope, budget_key)

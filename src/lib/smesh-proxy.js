@@ -407,7 +407,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   const status = await getLicenseStatus();
   if (!status?.key) {
     throw new Error(
-      'Qwen и DeepSeek работают по лицензии СМЭШ — API-ключи не нужны. ' +
+      'Расширение работает по лицензии СМЭШ. ' +
       'Введите ключ доступа (SMESH-…) в настройках расширения.'
     );
   }

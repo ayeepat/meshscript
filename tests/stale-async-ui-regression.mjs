@@ -45,6 +45,11 @@ function deferred() {
   const badge = { textContent: '', title: '', hidden: true };
   const context = {
     Promise,
+    // The badge is switched off in production (config.SHOW_PROVIDER_UI), but the
+    // code stays for when the flag is flipped back — so pin it on here and keep
+    // covering the race it was written for.
+    SHOW_PROVIDER_UI: true,
+    DEFAULT_PROVIDER: 'deepseek',
     document: { getElementById: () => badge },
     chrome: {
       storage: {
@@ -54,7 +59,7 @@ function deferred() {
     }
   };
   vm.runInNewContext(
-    `${providerBadgeSource.replace(/\bexport\s+/g, '')}\n` +
+    `${providerBadgeSource.replace(/^import .*$/gm, '').replace(/\bexport\s+/g, '')}\n` +
     'globalThis.__mountProviderBadge = mountProviderBadge;',
     context,
     { filename: 'provider-badge.js' }

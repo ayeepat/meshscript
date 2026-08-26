@@ -4,6 +4,27 @@ import vm from 'node:vm';
 
 const pillSource = readFileSync(new URL('../src/content/test-pill.js', import.meta.url), 'utf8');
 
+// The pill inlines SHOW_PROVIDER_UI (a content script can't import config.js).
+// ai-provider-regression asserts the two stay in sync; here it decides whether
+// the vendor tag should be painted at all.
+const PILL_SHOWS_PROVIDER = pillSource.includes('const SHOW_PROVIDER_UI = true;');
+
+/**
+ * The pill tracks the active provider whether or not it paints one. When the
+ * tag is on, assert the rendered abbreviation; when it's off, assert nothing
+ * leaked into the shadow root — the tracked value is checked via the solve
+ * payload instead.
+ */
+function assertPillProvider(host, expectedAbbr) {
+  assert.equal(
+    host.shadow.nodes.provider.textContent,
+    PILL_SHOWS_PROVIDER ? expectedAbbr : '',
+    PILL_SHOWS_PROVIDER
+      ? `pill must show ${expectedAbbr}`
+      : 'the pill must not paint a vendor tag onto the Mesh page'
+  );
+}
+
 // The closed shadow root hides its controls, but the page still owns the
 // anonymous host's computed style. Keep the security-critical host geometry
 // authoritative so page CSS cannot invisibly move a paid action over a decoy.
@@ -276,7 +297,7 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
   assert.equal(host.shadow.nodes.pill.style.left, '88px');
   assert.equal(host.shadow.nodes.pill.style.top, '66px');
   assert.equal(host.shadow.nodes.pill.dataset.theme, 'dark');
-  assert.equal(host.shadow.nodes.provider.textContent, 'GRQ');
+  assertPillProvider(host, 'GRQ');
 
   // Resolving the abandoned generation last must neither repaint state nor run
   // its stale build continuation against the newer host.
@@ -287,7 +308,15 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
   assert.equal(host.shadow.renderCount, 1, 'an abandoned build must not render into the new lifecycle');
   assert.equal(host.shadow.nodes.pill.style.left, '88px');
   assert.equal(host.shadow.nodes.pill.dataset.theme, 'dark');
-  assert.equal(host.shadow.nodes.provider.textContent, 'GRQ');
+  assertPillProvider(host, 'GRQ');
+
+  // The provider the pill settled on is what rides the solve request, so a
+  // stale snapshot winning here would send the worker to the wrong backend.
+  host.shadow.nodes.pageButton.__listener('click')({ isTrusted: true });
+  await flushMicrotasks();
+  const solve = h.pendingSolves.find((e) => e.message.type === 'PILL_SOLVE_PAGE');
+  assert.equal(solve?.message.payload.provider, 'groq',
+    'the solve payload must carry the event-provided provider, not the stale read');
 }
 
 // A route change owns the UI immediately, even while a privileged solve message

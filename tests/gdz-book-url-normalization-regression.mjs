@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 const store = {};
 globalThis.chrome = {
   runtime: { id: 'abcdefghijklmnopabcdefghijklmnop' },
-  declarativeNetRequest: { async updateSessionRules() {} },
   storage: {
     local: {
       async get(keys) {
@@ -18,56 +17,49 @@ globalThis.chrome = {
   }
 };
 
-const requestedUrls = [];
-function jsonResponse(value) {
-  const text = JSON.stringify(value);
-  return new Response(text, {
-    status: 200,
-    headers: {
-      'content-type': 'application/json',
-      'content-length': String(Buffer.byteLength(text))
+// GDZ fetching runs on the Worker now, so the only real request is one POST to
+// the proxy. The stub unwraps it and dispatches on the upstream URL, which is
+// what every assertion below is actually about.
+const { installGdzProxyStub } = await import('./helpers/gdz-proxy-stub.mjs');
+const proxyRequests = installGdzProxyStub({
+  store,
+  upstream(kind, url) {
+    if (kind === 'human') return { ref: { base: url, suffix: null } };
+    if (url === 'https://gdz-ru.com/full-book-list?country_id=1') {
+      return {
+        data: {
+          success: true,
+          subjects: [],
+          classes: [],
+          books: [{
+            id: 1,
+            subject_id: 4,
+            title: 'Алгебра',
+            subtype: 'Учебник',
+            classes: [7],
+            url: '/po-algebre/7-klass/makarychev/'
+          }]
+        }
+      };
     }
-  });
-}
-
-globalThis.fetch = async (url) => {
-  requestedUrls.push(url);
-  if (url === 'https://gdz-ru.com/full-book-list?country_id=1') {
-    return jsonResponse({
-      success: true,
-      subjects: [],
-      classes: [],
-      books: [{
-        id: 1,
-        subject_id: 4,
-        title: 'Алгебра',
-        subtype: 'Учебник',
-        classes: [7],
-        url: '/po-algebre/7-klass/makarychev/'
-      }]
-    });
+    if (url === 'https://gdz-ru.com/po-algebre/7-klass/makarychev/') {
+      return {
+        data: {
+          structure: [{
+            title: 'Упражнения',
+            tasks: [{ title: '25', url: '/task/25/' }]
+          }]
+        }
+      };
+    }
+    if (url === 'https://gdz-ru.com/task/25/') {
+      return { data: { editions: [{ images: [{ url: 'https://img.gdz-ru.com/answer-25.png' }] }] } };
+    }
+    throw new Error(`unexpected upstream ${url}`);
   }
-  if (url === 'https://gdz-ru.com/po-algebre/7-klass/makarychev/') {
-    return jsonResponse({
-      structure: [{
-        title: 'Упражнения',
-        tasks: [{ title: '25', url: '/task/25/' }]
-      }]
-    });
-  }
-  if (url === 'https://gdz-ru.com/task/25/') {
-    return jsonResponse({
-      editions: [{ images: [{ url: 'https://img.gdz-ru.com/answer-25.png' }] }]
-    });
-  }
-  if (url === 'https://gdz.ru/po-algebre/7-klass/makarychev/') {
-    return new Response('<html></html>', {
-      status: 200,
-      headers: { 'content-type': 'text/html' }
-    });
-  }
-  throw new Error(`unexpected fetch ${url}`);
-};
+});
+// The URL the extension ASKED the proxy for is what these assertions are about.
+const upstreamUrls = () => proxyRequests.map((request) => request.url);
 
 const {
   getCatalog,
@@ -124,7 +116,7 @@ assert.deepEqual(relativeTasks, absoluteTasks,
   'relative and absolute stored book URLs must share one task-list cache identity');
 assert.equal(relativeTasks[0].url, 'https://gdz-ru.com/task/25/');
 assert.equal(
-  requestedUrls.filter((url) => url === bookUrl).length,
+  upstreamUrls().filter((url) => url === bookUrl).length,
   1,
   'relative and absolute forms must resolve with one canonical book request'
 );
@@ -133,16 +125,16 @@ const resolved = await resolveTask(bookUrl, '25');
 assert.equal(resolved.taskUrl, 'https://gdz-ru.com/task/25/');
 assert.equal(resolved.images[0], 'https://img.gdz-ru.com/answer-25.png');
 assert.equal(
-  requestedUrls.some((url) => url.includes('https://gdz-ru.comhttps://')),
+  upstreamUrls().some((url) => url.includes('https://gdz-ru.comhttps://')),
   false,
   'resolution must never concatenate BASE onto an absolute URL'
 );
 
-const requestCount = requestedUrls.length;
+const requestCount = proxyRequests.length;
 const resolvedLegacy = await resolveTask(bookPath, '25');
 assert.deepEqual(resolvedLegacy, resolved,
   'relative and absolute book forms must share the resolved-task cache identity');
-assert.equal(requestedUrls.length, requestCount);
+assert.equal(proxyRequests.length, requestCount);
 
 store.gdzTaskCache[`v2|${bookPath}|page|25`] = {
   v: {
@@ -156,7 +148,7 @@ store.gdzTaskCache[`v2|${bookPath}|page|25`] = {
 const migratedCacheHit = await resolveTask(bookUrl, '25', { mode: 'page' });
 assert.equal(migratedCacheHit.taskUrl, 'https://gdz-ru.com/task/25/',
   'legacy relative resolved-task cache entries must remain readable and return canonical URLs');
-assert.equal(requestedUrls.length, requestCount,
+assert.equal(proxyRequests.length, requestCount,
   'reading a compatible legacy cache entry must not trigger a network request');
 
 await assert.rejects(

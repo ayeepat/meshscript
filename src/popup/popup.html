@@ -25,25 +25,30 @@
 
   <section id="onboardView" class="onboard" hidden>
     <h2 class="ob-title">Добро пожаловать в СМЭШ AI</h2>
-    <p class="ob-lede">Решаю домашку и тесты из электронного дневника МЭШ. Нужен один бесплатный ключ ИИ — и можно начинать.</p>
+    <p class="ob-lede">Решаю домашку и тесты из электронного дневника МЭШ. Активируйте ключ доступа — и можно начинать.</p>
 
     <div class="ob-step">
-      <div class="ob-h">1 · Подключите ИИ</div>
-      <div class="seg" id="obProvider" role="group" aria-label="Сервис ИИ">
+      <div class="ob-h">1 · Ключ доступа</div>
+      <!-- Provider picker: hidden while config.SHOW_PROVIDER_UI is false. The
+           license key is the only credential a student ever enters. -->
+      <div class="seg" id="obProvider" role="group" aria-label="Сервис ИИ" hidden>
         <button data-p="groq" class="active" type="button">Groq</button>
         <button data-p="openrouter" type="button">OpenRouter</button>
         <button data-p="qwen" type="button">Qwen</button>
         <button data-p="deepseek" type="button">DeepSeek</button>
       </div>
-      <a id="obKeyLink" class="ob-link" href="https://console.groq.com/keys" target="_blank" rel="noopener noreferrer">Получить бесплатный ключ →</a>
-      <input id="obKey" class="ob-input" type="text" placeholder="gsk_…" autocomplete="off" spellcheck="false" />
+      <a id="obKeyLink" class="ob-link" href="https://www.smeshai.xyz/" target="_blank" rel="noopener noreferrer">Купить лицензию СМЭШ →</a>
+      <input id="obKey" class="ob-input" type="text" placeholder="SMESH-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" />
     </div>
 
     <div class="ob-step">
       <div class="ob-h">2 · Согласие</div>
       <label class="ob-consent">
         <input id="obConsent" type="checkbox" />
-        <span>Понимаю, что текст заданий, скриншоты и прикреплённые файлы (включая аудио для расшифровки) отправляются выбранному ИИ-сервису — OpenRouter, Groq, Qwen или DeepSeek (по лицензии — через сервер СМЭШ) — для получения ответа. Принимаю
+        <!-- Deliberately still says the data leaves the device and goes to
+             third-party AI services. Only the vendor names moved to the
+             privacy policy linked right here. -->
+        <span>Понимаю, что текст заданий, скриншоты и прикреплённые файлы (включая аудио для расшифровки) отправляются сторонним ИИ-сервисам — через сервер СМЭШ или напрямую, если в расширении сохранён мой ключ такого сервиса. Их список указан в политике конфиденциальности. Принимаю
           <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a> и
           <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия</a>.</span>
       </label>

@@ -9,6 +9,8 @@
  *  - SSE STREAMING (postStream) so answers can be revealed token-by-token.
  */
 
+import { SHOW_PROVIDER_UI } from './config.js';
+
 const DEFAULT_TIMEOUT_MS = 60000;
 const MAX_STREAM_CHARS = 2 * 1024 * 1024;
 const MAX_RESPONSE_TEXT_BYTES = 64 * 1024;
@@ -33,22 +35,35 @@ function extractError(text) {
  * student can act on. Falls back to the raw provider message for anything we
  * don't have a friendly phrasing for.
  */
-function friendlyMessage(label, status, providerMsg) {
+function friendlyMessage(rawLabel, status, providerMsg) {
+  // `rawLabel` is the vendor name. It stays in logs and in the raw-error tail,
+  // but while the provider UI is hidden it must not reach the student — and
+  // neither may advice like "switch to Groq", which points at a control that
+  // is no longer there.
+  const label = SHOW_PROVIDER_UI ? rawLabel : 'ИИ-сервис';
   const m = (providerMsg || '').toLowerCase();
   const credit = /insufficient|credit|balance|quota|exceeded your|payment|402/.test(m);
   if (status === 401 || status === 403) {
-    return `Неверный API-ключ ${label}. Проверьте ключ в настройках расширения.`;
+    return SHOW_PROVIDER_UI
+      ? `Неверный API-ключ ${label}. Проверьте ключ в настройках расширения.`
+      : 'ИИ-сервис отклонил запрос. Проверьте ключ доступа в настройках расширения.';
   }
   if (status === 402 || (status === 400 && credit)) {
-    return `На счёте ${label} закончились средства. Пополните баланс или переключитесь на Groq (бесплатно) в настройках.`;
+    return SHOW_PROVIDER_UI
+      ? `На счёте ${label} закончились средства. Пополните баланс или переключитесь на Groq (бесплатно) в настройках.`
+      : 'Лимит запросов по лицензии исчерпан. Попробуйте позже или напишите в поддержку.';
   }
   if (status === 429) {
-    return `${label}: слишком много запросов, лимит исчерпан. Подождите минуту и попробуйте снова (или переключитесь на Groq в настройках).`;
+    return SHOW_PROVIDER_UI
+      ? `${label}: слишком много запросов, лимит исчерпан. Подождите минуту и попробуйте снова (или переключитесь на Groq в настройках).`
+      : `${label}: слишком много запросов подряд. Подождите минуту и попробуйте снова.`;
   }
   if (status >= 500) {
     return `${label}: сервер временно недоступен. Попробуйте ещё раз через минуту.`;
   }
-  return `${label} ${status}: ${providerMsg}`;
+  return SHOW_PROVIDER_UI
+    ? `${label} ${status}: ${providerMsg}`
+    : `ИИ-сервис вернул ошибку ${status}. Попробуйте ещё раз.`;
 }
 
 /** Build the friendly Error for a non-OK response (shared by both helpers). */

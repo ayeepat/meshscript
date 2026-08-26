@@ -4,16 +4,13 @@
   "name": "СМЭШ AI",
   "version": "0.5.2",
   "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).",
-  "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "declarativeNetRequest", "alarms"],
+  "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "alarms"],
   "host_permissions": [
     "https://school.mos.ru/*",
     "https://uchebnik.mos.ru/*",
     "https://api.groq.com/*",
     "https://openrouter.ai/*",
     "https://dashscope-intl.aliyuncs.com/*",
-    "https://gdz-ru.com/*",
-    "https://*.gdz-ru.com/*",
-    "https://gdz.ru/*",
     "https://*.smeshai.xyz/*",
     "https://smeshapi.site/*",
     "https://ai.smeshapi.site/*"

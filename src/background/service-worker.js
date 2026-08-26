@@ -3,7 +3,7 @@
  * Orchestrates the AI provider call and local solve-history persistence.
  * All API keys live here / in storage, never in content scripts.
  */
-import { askAI, normalizeAIProvider } from '../lib/ai.js';
+import { askAI, normalizeAIProvider, resolveStoredProvider } from '../lib/ai.js';
 import { getByoKey } from '../lib/qwen.js';
 import { fetchOpenRouterCredits, getSpendHistory, verifyOpenRouterKey } from '../lib/openrouter.js';
 import { verifyGroqKey } from '../lib/groq.js';
@@ -30,8 +30,10 @@ import {
   searchBooks,
   resolveForTask,
   fetchTaskImage,
+  fetchCoverImage,
   normalizeGdzApiUrl,
 } from '../lib/gdz-api.js';
+import { isGdzCoverUrl } from '../lib/gdz-hosts.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
 import { transcribeAudioFiles } from '../lib/transcribe.js';
@@ -368,9 +370,8 @@ async function openDashboard(payload) {
  * actual file/page) will otherwise invent plausible-but-wrong answers and even
  * claim it "read" material it never got.
  *
- *  - audio: this tool can NEVER process sound. If the task needs listening and
- *    no readable text/file is attached (a transcript can't arrive as audio),
- *    refuse the audio outright.
+ *  - audio: automatic transcription is available only to a grandfathered BYO
+ *    install with its stored transcription key. Otherwise ask for text.
  *  - attachment: task points at a file/variant/worksheet but nothing readable
  *    is attached -> ask for it (Office files like .docx don't count: unreadable).
  *  - textbook ref: bare «Упр. 25 / §3» with no page photo -> ask for the photo.
@@ -378,7 +379,7 @@ async function openDashboard(payload) {
  * "Readable" = image, PDF or plain text (see file-kinds). An attached .docx or
  * an empty file does not satisfy the requirement.
  */
-function missingInputGate(category, task, files) {
+function missingInputGate(category, task, files, { canTranscribe = false } = {}) {
   const hasReadable = files.some(isReadableFile);
   const cls = classifyTask(task);
   const audio = needsAudio(task);
@@ -389,24 +390,33 @@ function missingInputGate(category, task, files) {
   // nothing. Point at the likely cause instead of telling the user to attach a
   // file they already attached.
   if (files.some(isAudioFile) && !hasReadable) {
-    return 'Не удалось расшифровать аудиозапись. Проверьте, что в настройках указан ключ Groq ' +
-      '(бесплатный — он нужен для распознавания речи) и не исчерпан его дневной лимит, ' +
-      'затем попробуйте ещё раз. Либо пришлите готовую расшифровку (текст) записи.';
+    // NOTE: transcription runs on a BYO Groq key only (lib/transcribe.js). With
+    // the provider UI hidden there is no licensed Whisper path, so a licensed
+    // user cannot fix this — don't send them hunting for a setting that isn't
+    // there. Say what to do instead.
+    return 'Не удалось расшифровать аудиозапись. Пришлите готовую расшифровку (текст) записи ' +
+      'или скриншот задания с текстом — и я всё решу.';
   }
 
   if (cls.kind === 'attachment' && !hasReadable) {
     let msg = 'Не могу решить это задание без самого материала. ' +
       'Пришлите файл варианта/задания (PDF, фото или скриншот страницы), и я всё решу.';
     if (audio) {
-      msg += '\n\nДля аудирования прикрепите сам аудиофайл (mp3, m4a, wav…) — я его ' +
-        'расшифрую и решу эту часть. Либо пришлите готовую расшифровку (текст) записи.';
+      msg += canTranscribe
+        ? '\n\nДля аудирования прикрепите сам аудиофайл (mp3, m4a, wav…) — я его ' +
+          'расшифрую и решу эту часть. Либо пришлите готовую расшифровку (текст) записи.'
+        : '\n\nДля аудирования пришлите готовую расшифровку записи (текст) или ' +
+          'скриншот задания с текстом.';
     }
     return msg;
   }
 
   if (audio && !hasReadable) {
-    return 'В этом задании нужно аудирование. Прикрепите аудиофайл записи (mp3, m4a, wav…) — ' +
-      'я расшифрую его и решу. Либо пришлите готовую расшифровку (текст) или фото/скан заданий.';
+    return canTranscribe
+      ? 'В этом задании нужно аудирование. Прикрепите аудиофайл записи (mp3, m4a, wav…) — ' +
+        'я расшифрую его и решу. Либо пришлите готовую расшифровку (текст) или фото/скан заданий.'
+      : 'В этом задании нужно аудирование. Пришлите готовую расшифровку записи (текст) ' +
+        'или фото/скан задания с текстом.';
   }
 
   if ((category === PROMPT_CATEGORIES.RUSSIAN_FULL || cls.kind === 'textbook') &&
@@ -515,7 +525,10 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   // way (a reshebnik has no listening answers), so we skip GDZ for those.
   let gdzAttached = 0;
   if (history.length === 0) {
-    const gate = missingInputGate(category, task, files);
+    const { groqApiKey } = needsAudio(task)
+      ? await chrome.storage.local.get('groqApiKey')
+      : { groqApiKey: '' };
+    const gate = missingInputGate(category, task, files, { canTranscribe: !!groqApiKey });
     if (gate) {
       const audioGap = needsAudio(task) && !files.some(isReadableFile);
       const gdzFiles = audioGap ? [] : await fetchGdzMaterial(subject, task);
@@ -570,19 +583,21 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   const requestHasPdf = hasPdf(files) || history.some((m) => m?.files?.some(isPdfFile));
   if (requestHasPdf) {
     const { aiProvider } = await chrome.storage.local.get('aiProvider');
-    const chosen = engineProvider || normalizeAIProvider(aiProvider);
+    // resolveStoredProvider, not a bare normalize: a legacy install still
+    // pointing at a BYO provider it has no key for resolves to the licensed
+    // default, whose proxy reads PDFs. Otherwise those users would be sent to
+    // OpenRouter and dead-end below on a key they can no longer enter.
+    const chosen = engineProvider || await resolveStoredProvider(aiProvider);
     const proxyReadsPdf = (chosen === 'qwen' || chosen === 'deepseek') && !(await getByoKey());
     if (!proxyReadsPdf) {
       provider = 'openrouter';
-      // Explain WHY a key is suddenly needed (the user may have deliberately
-      // picked free Groq, which can't read PDFs) instead of a bare "key not
-      // set" error — and point at the keyless licensed path first.
+      // Only reachable for a grandfathered BYO install (see above). Explain WHY
+      // a key is suddenly needed instead of a bare "key not set" error.
       const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
       if (!openrouterApiKey) {
         return {
-          answer: 'В задании есть PDF. Его умеют читать Qwen и DeepSeek (по лицензии СМЭШ, ключи не нужны) — ' +
-            'переключитесь на один из них в настройках расширения. Либо добавьте ключ OpenRouter (модель Gemini), ' +
-            'либо пришлите это задание фотографиями страниц / текстом.',
+          answer: 'В задании есть PDF, а он читается только по лицензии СМЭШ. Активируйте ключ доступа ' +
+            'в настройках расширения — либо пришлите это задание фотографиями страниц или текстом.',
           sessionId
         };
       }
@@ -2285,7 +2300,7 @@ const SENDER_MESSAGE_TYPES = {
     'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG',
     'GET_DEVICE_ID', 'SET_LICENSE_KEY', 'DEACTIVATE_LICENSE', 'SYNC_REFERRAL_POINTER', 'DELETE_LOCAL_DATA',
     'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES',
-    'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
+    'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_COVER', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
     'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY'
   ])
 };
@@ -2450,7 +2465,11 @@ const MESSAGE_SCHEMAS = {
   GDZ_BOOK_REMOVE: (msg) => payloadRecord(msg, ['subjectId', 'url']) &&
     isGdzSubjectId(msg.payload.subjectId) &&
     isString(msg.payload.url, MAX_URL_CHARS) &&
-    !!normalizeGdzApiUrl(msg.payload.url)
+    !!normalizeGdzApiUrl(msg.payload.url),
+  // Book covers live on either GDZ host, so this one accepts the wider cover
+  // allowlist rather than the API-only one the other GDZ messages use.
+  GDZ_COVER: (msg) => payloadRecord(msg, ['url']) &&
+    isString(msg.payload.url, MAX_URL_CHARS) && isGdzCoverUrl(msg.payload.url)
 };
 
 function isMeshContentUrl(url) {
@@ -2840,6 +2859,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               url: normalizeGdzApiUrl(msg.payload.book.url),
             }),
           });
+          break;
+        // Settings renders book covers. They used to be direct <img src> loads,
+        // which only worked because the DNR rule rewrote the User-Agent on the
+        // page's own image requests; with the permission gone they have to come
+        // through the proxy like every other GDZ byte.
+        case 'GDZ_COVER':
+          sendResponse({ ok: true, image: await fetchCoverImage(msg.payload.url) });
           break;
         case 'GDZ_BOOK_REMOVE':
           sendResponse({

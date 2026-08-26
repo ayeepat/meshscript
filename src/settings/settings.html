@@ -14,7 +14,9 @@
         <img class="brandmark" src="../../assets/icons/logo-mark.png" alt="СМЭШ AI" />
         <div class="brandtext">
           <h1>СМЭШ AI</h1>
-          <span>Настройки · v0.5.0</span>
+          <!-- Filled from the manifest in settings.js — a hardcoded number here
+               went stale two releases running. -->
+          <span id="brandVersion">Настройки</span>
         </div>
       </div>
 
@@ -55,7 +57,7 @@
         <div class="page-head">
           <div>
             <p class="eyebrow">Основное</p>
-            <h2>Вход, согласие и провайдер</h2>
+            <h2>Вход и согласие</h2>
           </div>
           <span class="licstatus" id="consentStatus" data-state="idle">…</span>
         </div>
@@ -65,7 +67,10 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
             <div>
               <h3>Конфиденциальность и данные</h3>
-              <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы выбранному ИИ-сервису: OpenRouter, Groq, Qwen (Alibaba) или DeepSeek — для лицензии последние два работают через сервер СМЭШ (ai.smeshapi.site). Туда же уходят задания для определения типа (нужен ли файл) и аудиофайлы для расшифровки. История хранится только локально и не дольше 7 дней.</p>
+              <!-- Neutral about which vendor, explicit that data leaves the
+                   device and reaches third parties. The named list lives in the
+                   linked privacy policy. -->
+              <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы (включая аудио для расшифровки) сторонним ИИ-сервисам. Запрос идёт через сервер СМЭШ (ai.smeshapi.site) или напрямую, если в расширении сохранился ваш ключ такого сервиса. Полный список получателей — в <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политике конфиденциальности</a>. История хранится только локально и не дольше 7 дней.</p>
             </div>
           </div>
           <label class="consent-row">
@@ -152,7 +157,11 @@
           <p class="ref-hint">Код действует бесплатно и бессрочно. Бонусные дни начисляются автоматически после оплаты друга.</p>
         </section>
 
-        <section class="panel">
+        <!-- Provider picker + BYO key fields. Hidden while
+             config.SHOW_PROVIDER_UI is false (settings.js applyProviderVisibility);
+             the inputs stay in the DOM so the save/hydrate transaction is
+             unchanged and flipping the flag brings the panel straight back. -->
+        <section class="panel" id="providerPanel" hidden>
           <div class="panel-head">
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg></span>
             <div>
@@ -211,23 +220,25 @@
           <div>
             <p class="eyebrow">Аналитика</p>
             <h2>Расход и статистика</h2>
-            <p>Сколько запросов и денег уходит. Баланс OpenRouter подтягивается при открытии этой страницы.</p>
+            <p id="usageLede">Сколько запросов уходит. Счётчики считаются локально и никуда не отправляются.</p>
           </div>
           <button id="usageReload" class="ghostbtn" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Обновить</button>
         </div>
 
         <section class="panel">
           <div class="spendgrid">
-            <div class="spendtile">
+            <!-- The two balance tiles read an OpenRouter account and are hidden
+                 with the rest of the BYO surface (settings.js). -->
+            <div class="spendtile" data-byo-only hidden>
               <span class="spendlabel">Потрачено · OpenRouter</span>
               <span class="spendval" id="orSpent">—</span>
             </div>
-            <div class="spendtile">
+            <div class="spendtile" data-byo-only hidden>
               <span class="spendlabel">Остаток на балансе</span>
               <span class="spendval accent" id="orRemain">—</span>
             </div>
             <div class="spendtile">
-              <span class="spendlabel">Сегодня · OpenRouter</span>
+              <span class="spendlabel" id="todayLabel">Сегодня</span>
               <span class="spendval" id="orToday">—</span>
               <span class="spendsub">запросов из лимита</span>
             </div>
@@ -238,7 +249,9 @@
 
           <div class="charthead">
             <span class="charttitle">Последние 14 дней</span>
-            <div class="seg small" id="chartMode" role="group" aria-label="Метрика графика">
+            <!-- Per-vendor series switcher: hidden with the rest of the provider
+                 surface, leaving one neutral "запросов в день" series. -->
+            <div class="seg small" id="chartMode" role="group" aria-label="Метрика графика" hidden>
               <button data-mode="openrouter" class="active" type="button" title="OpenRouter — запросов в день">OPR</button>
               <button data-mode="groq" type="button" title="Groq — запросов в день">GRQ</button>
               <button data-mode="qwen" type="button" title="Qwen — запросов в день">QWN</button>
@@ -250,7 +263,11 @@
           <div class="chartlegend" id="chartLegend"></div>
         </section>
 
-        <section class="panel">
+        <!-- Per-vendor daily caps. Hidden while SHOW_PROVIDER_UI is false — the
+             caps still enforce from DEFAULT_LIMITS (lib/rate-limit.js), they
+             just stop being user-editable, since editing them meant picking a
+             vendor. -->
+        <section class="panel" id="limitsPanel" hidden>
           <div class="panel-head">
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8v4l3 2"/><circle cx="12" cy="12" r="10"/></svg></span>
             <div>

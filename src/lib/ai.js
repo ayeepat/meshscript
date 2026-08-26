@@ -1,6 +1,12 @@
 /**
  * Provider dispatcher. Chooses the AI backend based on the 'aiProvider'
- * setting in chrome.storage.local. Defaults to OpenRouter (Gemini 2.5 Flash).
+ * setting in chrome.storage.local, falling back to config.DEFAULT_PROVIDER.
+ *
+ * The picker that writes that setting is hidden from students
+ * (config.SHOW_PROVIDER_UI), so in practice fresh installs never set it and
+ * land on the licensed default. An install that still carries a BYO value from
+ * an earlier build keeps working as long as its key is there — see
+ * resolveStoredProvider below.
  *
  * Four providers: OpenRouter (BYO key, main solver, reads PDFs natively),
  * Groq (BYO free key, vision + text, also transcribes listening audio — see
@@ -18,11 +24,32 @@ import { askDeepseek } from './deepseek.js';
 import { isImageFile, isPdfFile } from './file-kinds.js';
 import { SECURITY_GUARD } from './security-prompt.js';
 import { consentNetworkSignal } from './consent.js';
+import { DEFAULT_PROVIDER, SHOW_PROVIDER_UI } from './config.js';
 
 export const AI_PROVIDERS = ['openrouter', 'groq', 'qwen', 'deepseek'];
 
-export function normalizeAIProvider(provider, fallback = 'openrouter') {
+// Which stored providers need a key the user pasted themselves.
+const BYO_KEY_FIELD = { openrouter: 'openrouterApiKey', groq: 'groqApiKey' };
+
+export function normalizeAIProvider(provider, fallback = DEFAULT_PROVIDER) {
   return AI_PROVIDERS.includes(provider) ? provider : fallback;
+}
+
+/**
+ * Resolve the stored `aiProvider` into one that can actually answer.
+ *
+ * With the picker hidden there is no longer any way to paste an OpenRouter or
+ * Groq key, so an install left pointing at one of those without a stored key
+ * would dead-end on every «Решить». Grandfather the ones that DO have a key —
+ * an existing user who set this up in an earlier build keeps their setup — and
+ * route everyone else to the licensed default.
+ */
+export async function resolveStoredProvider(stored) {
+  const chosen = normalizeAIProvider(stored);
+  const field = BYO_KEY_FIELD[chosen];
+  if (!field || SHOW_PROVIDER_UI) return chosen;
+  const { [field]: key } = await chrome.storage.local.get(field);
+  return key ? chosen : DEFAULT_PROVIDER;
 }
 
 export async function askAI(systemPrompt, userText, files = [], history = [], opts = {}) {
@@ -31,11 +58,13 @@ export async function askAI(systemPrompt, userText, files = [], history = [], op
   // stays in user-role task data and history.
   const hardenedSystemPrompt = `${SECURITY_GUARD}\n\n${systemPrompt}`;
   const { aiProvider } = await chrome.storage.local.get('aiProvider');
-  // opts.provider forces a backend regardless of the setting. The solver uses
-  // it to route PDF solves to OpenRouter when the СМЭШ proxy can't take them
-  // (Groq / BYO-key paths don't read PDFs and would otherwise hallucinate an
-  // answer to a file they never saw; the proxy re-routes PDFs to Gemini itself).
-  let chosen = normalizeAIProvider(opts.provider, normalizeAIProvider(aiProvider));
+  // opts.provider takes precedence over the stored setting. It still passes
+  // through the same availability resolver: the popup and in-page test pill
+  // can carry a legacy BYO value, and while the picker is hidden a missing key
+  // must fall back to the licensed default instead of dead-ending.
+  let chosen = await resolveStoredProvider(
+    AI_PROVIDERS.includes(opts.provider) ? opts.provider : aiProvider
+  );
   // DeepSeek V4 has no vision at all — a test screenshot or photo sent there
   // would come back as a guess about an image the model never saw. Requests
   // that carry an image (in this turn OR replayed history) auto-upgrade to

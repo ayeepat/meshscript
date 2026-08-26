@@ -4,9 +4,15 @@
  *
  * The host is the gdz.ru mobile-app backend (NOT the public gdz.ru website,
  * which sits behind a JS challenge). DDoS-Guard allowlists the User-Agent:
- * only an okhttp UA returns 200; a browser UA gets 403. MV3 fetch() cannot
- * set User-Agent, so a session declarativeNetRequest rule scoped to this
- * extension rewrites the UA on its own gdz-ru.com requests.
+ * only an okhttp UA returns 200; a browser UA gets 403.
+ *
+ * The extension no longer talks to either GDZ host. MV3 fetch() cannot set
+ * User-Agent, which used to force a `declarativeNetRequest` session rule — the
+ * single most questioned permission in Chrome Web Store review, present for
+ * exactly one header. Every GDZ request now goes through the licensed СМЭШ
+ * proxy (lib/gdz-proxy.js → backend/src/gdz.js), which sets the header freely.
+ * So this file kept all of its parsing, ranking and caching and lost only the
+ * network hop.
  *
  * Public surface:
  *   - getCatalog()           : trimmed { books, subjects, classes } (cached)
@@ -19,9 +25,8 @@
  */
 
 import { parseRefs } from './gdz-match.js';
-import { fetchBounded } from './bounded-fetch.js';
-import { buildGdzUaRule, GDZ_UA_RULE_ID } from './gdz-ua-rule.js';
-import { isGdzApiUrl, isGdzHumanUrl } from './gdz-hosts.js';
+import { gdzProxyFetch } from './gdz-proxy.js';
+import { isGdzApiUrl, isGdzHumanUrl, isGdzCoverUrl } from './gdz-hosts.js';
 import { MAX_STANDARD_UPLOAD_BYTES } from './upload-limits.js';
 import { imageDimensions } from './image-compress.js';
 
@@ -114,15 +119,9 @@ const TASK_LIST_TTL_MS = 30 * 60 * 1000;
 
 /* ---------- HTTP ---------- */
 
-// gdz-ru.com sits behind DDoS-Guard and can stall a connection open without
-// ever responding. A bare fetch() then hangs forever — and because the GDZ
-// lookup gates the dashboard's AI solve, that hang would strand the user on a
-// blank chat. Abort every GDZ request after a fixed ceiling so a wedged
-// connection surfaces as a throw (caller falls back to the AI / skips the image).
-const FETCH_TIMEOUT_MS = 15000;
-const JSON_MAX_BYTES = 4 * 1024 * 1024;
-const CATALOG_MAX_BYTES = 24 * 1024 * 1024;
-const HUMAN_PAGE_MAX_BYTES = 3 * 1024 * 1024;
+// Byte ceilings and the upstream timeout now live on the proxy (backend
+// gdz.js), which is the side that actually talks to gdz-ru.com. The client
+// keeps only the limits it enforces on what comes BACK.
 export const GDZ_IMAGE_MAX_PIXELS = 25_000_000;
 const GDZ_IMAGE_MAX_SIDE = 12_000;
 
@@ -133,42 +132,19 @@ const GDZ_IMAGE_MAX_SIDE = 12_000;
  */
 export const MAX_ANSWER_IMAGES = 8;
 
-// Session rules vanish on browser restart. This promise is memoized only for
-// the current service-worker lifetime, so every new worker registers it again.
-let uaRulePromise = null;
-function ensureUaRule() {
-  if (!uaRulePromise) {
-    uaRulePromise = chrome.declarativeNetRequest.updateSessionRules({
-      removeRuleIds: [GDZ_UA_RULE_ID],
-      addRules: [buildGdzUaRule(chrome.runtime.id)]
-    }).catch((error) => {
-      uaRulePromise = null;
-      throw error;
-    });
-  }
-  return uaRulePromise;
-}
-
-// API requests rely on the DNR rule to rewrite User-Agent. We don't set it
-// directly (and can't — it's a forbidden header).
-async function getJson(url, { maxBytes = JSON_MAX_BYTES } = {}) {
-  await ensureUaRule();
-  const { res, bytes } = await fetchBounded(url, {
-    maxBytes,
-    timeoutMs: FETCH_TIMEOUT_MS,
-    allowedUrl: isGdzApiUrl,
-    maxRedirects: 3,
-    credentials: 'omit',
-    cache: 'no-store'
-  });
-  if (!res.ok) throw new Error(`GDZ ${res.status} ${url}`);
-  try {
-    return JSON.parse(new TextDecoder().decode(bytes));
-  } catch {
-    // A 200 with a non-JSON (HTML) body means DDoS-Guard served a challenge
-    // page instead of data — almost always the UA-rewrite rule didn't apply.
-    throw new Error('GDZ: ответ не JSON — правило подмены User-Agent не сработало.');
-  }
+/**
+ * Fetch one mobile-API document through the licensed proxy.
+ *
+ * The allowlist check stays here even though the proxy repeats it: this one
+ * catches a bad URL before a pointless round trip, and it keeps the same fail-
+ * closed contract callers already relied on. The proxy's copy is the security
+ * boundary — a client check can always be bypassed.
+ */
+async function getJson(url) {
+  if (!isGdzApiUrl(url)) throw new Error('GDZ: invalid API URL');
+  const { data } = await gdzProxyFetch('json', url);
+  if (data === null || typeof data !== 'object') throw new Error('GDZ: некорректный ответ сервера.');
+  return data;
 }
 
 function nameFromUrl(url) {
@@ -176,68 +152,69 @@ function nameFromUrl(url) {
   catch { return 'gdz-answer.jpg'; }
 }
 
-async function getBlobAsBase64(url) {
-  await ensureUaRule();
-  // Name the host on failure. Answer images may be served from a different
-  // gdz-ru.com host than the API; if that host is missing from host_permissions
-  // (network fail) or from the DNR UA rule (403), the error must say WHICH host
-  // so GDZ_SELFTEST points right at the manifest/rule fix instead of failing
-  // silently.
-  let host = url;
-  try { host = new URL(url).host; } catch { /* keep raw url */ }
-  if (!isGdzApiUrl(url)) throw new Error(`GDZ image: bad host ${host}`);
-  let res, bytes;
-  try {
-    ({ res, bytes } = await fetchBounded(url, {
-      maxBytes: MAX_STANDARD_UPLOAD_BYTES,
-      timeoutMs: FETCH_TIMEOUT_MS,
-      allowedUrl: isGdzApiUrl,
-      maxRedirects: 3,
-      credentials: 'omit',
-      cache: 'no-store',
-      redirect: 'manual'
-    }));
-  } catch (e) {
-    throw new Error(`GDZ image: network fail for ${host} (missing host permission or UA rule?) — ${e}`);
-  }
-  if (!res.ok) throw new Error(`GDZ image ${res.status} ${host}`);
-  let finalHost = res.url;
-  try { finalHost = new URL(res.url).host; } catch { /* error names the raw final URL */ }
-  if (!isGdzApiUrl(res.url)) throw new Error(`GDZ image: redirect left allowlist for ${finalHost}`);
-  const mimeType = (res.headers.get('content-type') || '').split(';', 1)[0].trim().toLowerCase();
-  // DDoS-Guard and off-origin redirects can still return 200 HTML. Only real
-  // images may cross into the dashboard as inline attachments.
+// Chunked atob: a one-shot charCodeAt map over a multi-megabyte base64 string
+// is slower and peaks higher than filling a preallocated buffer.
+function base64ToBytes(dataBase64) {
+  const binary = atob(dataBase64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+/**
+ * Validate one image returned by the proxy before this extension process can
+ * decode, render or forward it. Answer scans and covers have different URL
+ * allowlists, but the returned bytes share one safety contract.
+ */
+function validatedProxyImage(image, sourceUrl) {
+  let host = sourceUrl;
+  try { host = new URL(sourceUrl).host; } catch { /* keep raw url */ }
+
+  const mimeType = String(image?.mimeType || '').toLowerCase();
   if (!['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(mimeType)) {
-    throw new Error(`GDZ image: unsupported content type from ${finalHost}`);
+    throw new Error(`GDZ image: unsupported content type from ${host}`);
   }
-  // Unlike the general upload compressor (which is fail-open), GDZ is a remote
-  // trust boundary. Require parseable container dimensions and reject before
-  // any decoder/model sees a decompression bomb.
+  if (typeof image.dataBase64 !== 'string' || !image.dataBase64) {
+    throw new Error(`GDZ image: empty body from ${host}`);
+  }
+
+  let bytes;
+  try { bytes = base64ToBytes(image.dataBase64); }
+  catch { throw new Error(`GDZ image: malformed body from ${host}`); }
+  if (bytes.byteLength > MAX_STANDARD_UPLOAD_BYTES) {
+    throw new Error(`GDZ image: oversized body from ${host}`);
+  }
+
   const dimensions = imageDimensions(bytes);
   if (!dimensions || dimensions.w < 1 || dimensions.h < 1 ||
       dimensions.w * dimensions.h > GDZ_IMAGE_MAX_PIXELS ||
       Math.max(dimensions.w, dimensions.h) > GDZ_IMAGE_MAX_SIDE) {
-    throw new Error(`GDZ image: unsafe dimensions from ${finalHost}`);
+    throw new Error(`GDZ image: unsafe dimensions from ${host}`);
   }
-  // Shape matches the rest of the codebase's inline-file objects {mimeType,
-  // dataBase64, name} so a resolved answer can be attached like any upload.
-  return {
-    mimeType,
-    dataBase64: abToBase64(bytes),
-    name: nameFromUrl(res.url)
-  };
+
+  return { mimeType, dataBase64: image.dataBase64, name: nameFromUrl(sourceUrl) };
 }
 
-// Chunked btoa: a one-shot String.fromCharCode on a multi-megabyte JPEG
-// blows the JS stack.
-function abToBase64(buf) {
-  const bytes = buf instanceof Uint8Array ? buf : new Uint8Array(buf);
-  let bin = '';
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    bin += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(bin);
+/**
+ * Fetch one answer image through the licensed proxy.
+ *
+ * The proxy already rejects a non-image content type, but the size and
+ * dimension gates stay HERE on purpose: this process is the one that decodes
+ * the image and hands it to a model, so it must not outsource the check that
+ * protects its own decoder from a decompression bomb. Two independent gates,
+ * and the client's does not depend on the server having been correct.
+ */
+async function getBlobAsBase64(url) {
+  let host = url;
+  try { host = new URL(url).host; } catch { /* keep raw url */ }
+  if (!isGdzApiUrl(url)) throw new Error(`GDZ image: bad host ${host}`);
+
+  const { image } = await gdzProxyFetch('image', url);
+  // Shape matches the rest of the codebase's inline-file objects {mimeType,
+  // dataBase64, name} so a resolved answer can be attached like any upload.
+  // Name from the URL we asked for: the proxy reports the post-redirect URL it
+  // landed on, but that is its claim, and the filename is cosmetic.
+  return validatedProxyImage(image, url);
 }
 
 /* ---------- Catalog ---------- */
@@ -297,7 +274,7 @@ export async function getCatalog({ force = false } = {}) {
   }
   if (catalogInFlight) return catalogInFlight; // a load is already running — join it
   catalogInFlight = (async () => {
-    const raw = await getJson(BASE + CATALOG_PATH, { maxBytes: CATALOG_MAX_BYTES });
+    const raw = await getJson(BASE + CATALOG_PATH);
     if (!raw || raw.success === false) throw new Error('GDZ catalog: bad payload');
     const trimmed = trimCatalog(raw);
     await chrome.storage.local.set({ [CATALOG_KEY]: trimmed });
@@ -393,8 +370,6 @@ export async function listTasks(bookUrl) {
   return tasks;
 }
 
-function escapeRe(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-
 // Serialise resolved-task cache writes. The cache is a single storage.local
 // object; two concurrent resolves doing read-modify-write would clobber each
 // other's entries. Chain every write behind the previous one and re-read the
@@ -423,8 +398,10 @@ function updateTaskCache(cacheKey, result) {
  * link suffix (= the book's main numbered exercises), and cache the pair so
  * every exercise link is then a string concat.
  *
- * gdz.ru keeps the real browser UA (the DNR rule rewrites only gdz-ru.com),
- * which is what passes DDoS-Guard for these SEO pages.
+ * The page fetch and the link tally both run on the proxy: shipping 3 MB of
+ * SEO HTML to the client to run one regex over it would cost far more than the
+ * ~20-byte answer. gdz.ru wants a plausible browser UA (not the mobile API's
+ * okhttp), which the proxy sets per kind.
  *
  * @returns {Promise<{base:string|null, suffix:string|null}>} base may be set
  *   without a suffix (link to the book); both null on network/challenge failure.
@@ -442,30 +419,25 @@ async function resolveHumanRef(bookUrl) {
   }
 
   const ref = { base: null, suffix: null };
+  // A THROW means the request never produced a verdict — no license yet, the
+  // proxy is down, the daily cap is spent. An ANSWER of "no suffix found" is a
+  // real verdict about the book and is worth caching for the week. Caching the
+  // first as if it were the second would keep the exact-exercise link missing
+  // for seven days after the user fixes their license, so only a real answer
+  // reaches the cache.
+  let answered = false;
   try {
-    const { res, bytes } = await fetchBounded(new URL(legacyBookPath, HUMAN).href, {
-      maxBytes: HUMAN_PAGE_MAX_BYTES,
-      timeoutMs: FETCH_TIMEOUT_MS,
-      allowedUrl: isGdzHumanUrl,
-      maxRedirects: 3,
-      credentials: 'omit',
-      redirect: 'manual'
-    });
-    if (res.ok && isGdzHumanUrl(res.url)) {
-      ref.base = res.url.endsWith('/') ? res.url : res.url + '/';   // canonical book page
-      const relUrl = new URL(ref.base);
-      const rel = `${relUrl.pathname}${relUrl.search}`;
-      const html = new TextDecoder().decode(bytes);
-      // Tally `{base}{digits}-{letters}/` links; the most common suffix is the
-      // book's main exercise numbering (Виленкин "-nom", Макарычев "-task"…).
-      const re = new RegExp('href="' + escapeRe(rel) + '(\\d+)-([a-z]+)/"', 'gi');
-      const counts = new Map();
-      let m;
-      while ((m = re.exec(html))) counts.set(m[2], (counts.get(m[2]) || 0) + 1);
-      let best = 0;
-      for (const [s, c] of counts) if (c > best) { best = c; ref.suffix = s; }
+    const { ref: resolved } = await gdzProxyFetch('human', new URL(legacyBookPath, HUMAN).href);
+    answered = true;
+    // The base is a link the student can click, so re-validate it here rather
+    // than trusting the proxy's echo: everything else in this file treats a
+    // gdz.ru URL as untrusted until isGdzHumanUrl says otherwise.
+    if (resolved && isGdzHumanUrl(resolved.base)) {
+      ref.base = resolved.base.endsWith('/') ? resolved.base : `${resolved.base}/`;
+      ref.suffix = /^[a-z]+$/i.test(resolved.suffix || '') ? resolved.suffix : null;
     }
-  } catch { /* network down or DDoS-Guard challenge — leave nulls, link to book */ }
+  } catch { /* no verdict — fall through uncached, link to the book this time */ }
+  if (!answered) return ref;
 
   humanRefCache.set(canonicalBookUrl, ref);
   // This is the one cache no retention sweep touches (it is public book
@@ -600,4 +572,25 @@ export async function resolveForTask(book, taskText) {
  *  it directly without a network round-trip from the renderer process. */
 export async function fetchTaskImage(imageUrl) {
   return getBlobAsBase64(imageUrl);
+}
+
+/**
+ * Download a book cover as inline base64 for the Settings picker.
+ *
+ * Separate from fetchTaskImage because a cover may live on EITHER GDZ host
+ * (the catalog serves some from the public site) while an answer image only
+ * ever comes from the mobile API host — and widening the answer path to match
+ * would loosen a boundary for the sake of decoration.
+ *
+ * @returns {Promise<{mimeType:string,dataBase64:string,name:string}|null>}
+ *   null on any failure: a missing cover just leaves the framed placeholder.
+ */
+export async function fetchCoverImage(coverUrl) {
+  if (!isGdzCoverUrl(coverUrl)) return null;
+  try {
+    const { image } = await gdzProxyFetch('cover', coverUrl);
+    return validatedProxyImage(image, coverUrl);
+  } catch {
+    return null;
+  }
 }

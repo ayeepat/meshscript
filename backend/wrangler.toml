@@ -152,6 +152,20 @@ REFERRAL_IP_DAILY_LIMIT = "30"
 # privacy boundary to 30..365 days; user-triggered /t/delete remains immediate.
 ANALYTICS_RETENTION_DAYS = "90"
 
+# ── GDZ proxy (gdz.js) ───────────────────────────────────────────────────────
+# The extension has no GDZ host permissions and no declarativeNetRequest rule:
+# it asks this Worker to fetch, because gdz-ru.com's DDoS-Guard only answers the
+# mobile app's okhttp User-Agent and MV3 fetch() cannot set that header.
+# Per-license daily request cap so a leaked key can't turn the route into a
+# scraper. One pinned textbook costs a handful of requests per solve; the
+# 6.5 MB catalog is served from a per-data-center edge cache.
+GDZ_DAILY_LIMIT = "600"
+# Book covers in the Settings picker are metered separately: a student browsing
+# the catalog renders dozens of thumbnails per search, and on a shared counter
+# that browsing would eat the answer allowance above. Covers are also cached at
+# the edge, so this mostly bounds a cold cache.
+GDZ_COVER_DAILY_LIMIT = "2000"
+
 # ── AI proxy (ai-proxy.js): Qwen/DeepSeek for licensed users, no user keys ───
 # The production extension uses the VPS proxy, which is the sole quota
 # authority. Keep the legacy Worker route retired unless an operator is

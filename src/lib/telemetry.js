@@ -21,7 +21,7 @@
  * Runs ONLY in the background service worker.
  */
 
-import { BACKEND_URL } from './config.js';
+import { BACKEND_URL, DEFAULT_PROVIDER } from './config.js';
 import { getDeviceId } from './history.js';
 import { hasConsent } from './consent.js';
 
@@ -116,7 +116,7 @@ async function flush() {
   try {
     // Double opt-in gate: the general data-processing consent AND the separate
     // statistics toggle (Settings → «Анонимная статистика», default OFF).
-    const { telemetryEnabled, aiProvider = 'openrouter', licenseStatus } =
+    const { telemetryEnabled, aiProvider = DEFAULT_PROVIDER, licenseStatus } =
       await chrome.storage.local.get(['telemetryEnabled', 'aiProvider', 'licenseStatus']);
     const telemetryToken = typeof licenseStatus?.telemetry_token === 'string'
       ? licenseStatus.telemetry_token

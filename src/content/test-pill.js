@@ -114,11 +114,13 @@
   let activeDragCleanup = null;
 
   let themePref = 'system';
-  // Active AI provider, shown as a tiny GRQ/OPR/QWN/DSK tag on the pill so the
-  // user sees which service will answer before pressing «Решить». Mirrors
-  // common/provider-badge.js (can't import an ES module into a content script).
-  let providerId = 'openrouter';
-  let providerAbbr = 'OPR';
+  // Active AI provider. The tiny GRQ/OPR/QWN/DSK tag it used to paint on the
+  // pill is switched off — SHOW_PROVIDER_UI mirrors lib/config.js, which a
+  // classic content script can't import; keep the two in sync. providerId is
+  // still tracked either way: it rides the SOLVE payload as `provider`.
+  const SHOW_PROVIDER_UI = false;
+  let providerId = 'deepseek'; // mirrors config.DEFAULT_PROVIDER
+  let providerAbbr = 'DSK';
   // Initial storage reads race live storage.onChanged delivery (and a completed
   // drag can race a route-triggered rebuild). Each revision makes the newest
   // local/event state authoritative over an older callback snapshot.
@@ -127,7 +129,7 @@
   let providerRevision = 0;
   const PROV_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
   function setProvider(p) {
-    providerId = PROV_ABBR[p] ? p : 'openrouter';
+    providerId = PROV_ABBR[p] ? p : 'deepseek';
     providerAbbr = PROV_ABBR[providerId];
   }
   const darkMedia = window.matchMedia('(prefers-color-scheme: dark)');
@@ -515,7 +517,7 @@
             <span>все страницы</span>
           </button>
         </div>
-        <span class="prov" title="Активный ИИ-сервис">${providerAbbr}</span>
+        ${SHOW_PROVIDER_UI ? `<span class="prov" title="Активный ИИ-сервис">${providerAbbr}</span>` : ''}
         <div class="status" aria-live="polite">
           <span class="spinner" aria-hidden="true"></span>
           <span class="stext"></span>

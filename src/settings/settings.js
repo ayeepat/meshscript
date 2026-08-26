@@ -1,4 +1,13 @@
-/** Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks, 7-day history. */
+/**
+ * Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks,
+ * 7-day history.
+ *
+ * The provider picker, the BYO key fields, the per-vendor daily limits and the
+ * usage chart's series switcher are all hidden behind config.SHOW_PROVIDER_UI
+ * (see applyProviderVisibility). They are hidden, not removed — the save and
+ * hydrate paths still read them, so flipping that one flag brings the whole
+ * surface back.
+ */
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
 import { mdToHtml } from '../common/markdown.js';
@@ -11,7 +20,9 @@ import {
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
 import { getDeviceId, deleteAllLocalData } from '../lib/history.js';
-import { SUPPORT_BOT_URL, BACKEND_URL } from '../lib/config.js';
+import {
+  SUPPORT_BOT_URL, BACKEND_URL, SHOW_PROVIDER_UI, DEFAULT_PROVIDER
+} from '../lib/config.js';
 import { isGdzCoverUrl } from '../lib/gdz-hosts.js';
 import { normalizeGdzApiUrl } from '../lib/gdz-api.js';
 import { fetchTextBounded } from '../lib/http.js';
@@ -22,6 +33,10 @@ initTheme();
 // Point the «Поддержка» card at the support bot (single source of truth in config.js).
 const supportLink = document.getElementById('supportLink');
 if (supportLink) supportLink.href = SUPPORT_BOT_URL;
+
+// The sidebar version comes from the manifest so it can't drift from the build.
+const brandVersion = document.getElementById('brandVersion');
+if (brandVersion) brandVersion.textContent = `Настройки · v${chrome.runtime.getManifest().version}`;
 
 // No qwenApiKey here: Qwen/DeepSeek run through the СМЭШ proxy on the license
 // key (see lib/smesh-proxy.js) — students never handle an Alibaba key. A BYO
@@ -128,10 +143,30 @@ function syncProviderKeys() {
   document.getElementById('licenseKeyNote').hidden = usesOwnKey;
 }
 
+/**
+ * Reveal the vendor-named controls, but only when SHOW_PROVIDER_UI is on.
+ *
+ * The markup ships `hidden` so a vendor name can never flash before this runs —
+ * which also means the shipped HTML is honest about what a student sees. The
+ * inputs stay in the DOM either way, so readSettingsFormData /
+ * hydrateSettingsForm and the whole save transaction are untouched, and
+ * flipping the flag in config.js restores the full UI with no other edit.
+ */
+function applyProviderVisibility() {
+  if (!SHOW_PROVIDER_UI) return;
+  for (const id of ['providerPanel', 'limitsPanel', 'chartMode']) {
+    document.getElementById(id).hidden = false;
+  }
+  for (const tile of document.querySelectorAll('[data-byo-only]')) tile.hidden = false;
+  document.getElementById('todayLabel').textContent = 'Сегодня · OpenRouter';
+  document.getElementById('usageLede').textContent =
+    'Сколько запросов и денег уходит. Баланс OpenRouter подтягивается при открытии этой страницы.';
+}
+
 async function hydrateSettingsForm() {
   const stored = await chrome.storage.local.get([...KEY_FIELDS, 'aiProvider', 'rateLimits']);
   for (const f of KEY_FIELDS) setFieldUnlessTouched(f, stored[f] || '');
-  setFieldUnlessTouched('aiProvider', PROVIDER_OPTIONS.has(stored.aiProvider) ? stored.aiProvider : 'openrouter');
+  setFieldUnlessTouched('aiProvider', PROVIDER_OPTIONS.has(stored.aiProvider) ? stored.aiProvider : DEFAULT_PROVIDER);
   syncProviderKeys();
   const limits = stored.rateLimits || {};
   setFieldUnlessTouched('limitOpenrouter', limits.openrouter ?? DEFAULT_LIMITS.openrouter);
@@ -487,7 +522,9 @@ let usageDashboardGeneration = 0;
 // The chart shows ONE series at a time, picked by the #chartMode switcher, so
 // the providers never clog one cramped column. A provider mode = that
 // provider's daily request count; 'usd' = OpenRouter spend. Default: OpenRouter.
-let chartMode = 'openrouter'; // 'openrouter' | 'groq' | 'qwen' | 'deepseek' | 'usd'
+// With the switcher hidden there is only ever one series to draw, and it has to
+// be the provider that actually answers.
+let chartMode = SHOW_PROVIDER_UI ? 'openrouter' : DEFAULT_PROVIDER;
 
 // Per-provider chart metadata: which reqHistory field to read, the legend label,
 // and the bar/swatch CSS classes (colours defined in settings.css).
@@ -506,12 +543,19 @@ const shortDay = (iso) => { const [, m, d] = iso.split('-'); return `${Number(d)
 // OpenRouter balance via the service worker (keeps the network call + key in the
 // worker, and records the daily spend snapshot as a side effect).
 function fetchCredits() {
+  // Purely a BYO-OpenRouter account lookup. With that surface hidden there is
+  // no key to query and nowhere to show the answer — skip the request entirely
+  // rather than firing it and discarding the result.
+  if (!SHOW_PROVIDER_UI) return Promise.resolve(null);
   return new Promise((resolve) => {
     chrome.runtime.sendMessage({ type: 'OPENROUTER_CREDITS' }, (r) => resolve(chrome.runtime.lastError ? null : r));
   });
 }
 
 function renderSpend(c) {
+  // Tiles and note are hidden with the BYO surface; writing "add an OpenRouter
+  // key above" into a hidden note would only wait to reappear if the flag flips.
+  if (!SHOW_PROVIDER_UI) return;
   const spent = document.getElementById('orSpent');
   const remain = document.getElementById('orRemain');
   const bar = document.getElementById('balanceBar');
@@ -564,7 +608,9 @@ function chartSvg(mode) {
     } else {
       const v = reqHistory[i][prov.key] || 0;
       const h = (v / max) * plotH;
-      bars.push(`<rect class="bar ${prov.cls}" x="${x}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${prov.name} ${v}</title></rect>`);
+      // The hover title is user-visible — drop the vendor name with the rest.
+      const tip = SHOW_PROVIDER_UI ? `${prov.name} ${v}` : `${v}`;
+      bars.push(`<rect class="bar ${prov.cls}" x="${x}" y="${(baselineY - h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" rx="2"><title>${shortDay(days[i])}: ${tip}</title></rect>`);
     }
   }
 
@@ -584,7 +630,8 @@ function renderLegend(mode) {
     legend.innerHTML = '<span class="lg"><i class="sw or"></i>Точные траты через расширение, $/день</span>';
   } else {
     const m = PROVIDER_CHART[mode] || PROVIDER_CHART.openrouter;
-    legend.innerHTML = `<span class="lg"><i class="sw ${m.sw}"></i>${m.label} · запросов в день</span>`;
+    const label = SHOW_PROVIDER_UI ? `${m.label} · запросов в день` : 'Запросов в день';
+    legend.innerHTML = `<span class="lg"><i class="sw ${m.sw}"></i>${label}</span>`;
   }
 }
 
@@ -615,7 +662,10 @@ async function refreshUsageDashboard() {
     // before the credits await let two refreshes produce a mixed-generation UI.
     reqHistory = hist;
     spendHistory = (credits && credits.spendHistory) || [];
-    document.getElementById('orToday').textContent = `${usage.openrouter.used} / ${usage.openrouter.limit}`;
+    // Follow the series the chart is actually drawing, so the tile and the bars
+    // can't disagree about which budget "Сегодня" refers to.
+    const todayUsage = usage[SHOW_PROVIDER_UI ? 'openrouter' : DEFAULT_PROVIDER] || usage.openrouter;
+    document.getElementById('orToday').textContent = `${todayUsage.used} / ${todayUsage.limit}`;
     renderSpend(credits);
     renderChart(chartMode);
     return true;
@@ -655,7 +705,7 @@ function readSettingsFormData() {
   const data = {};
   for (const f of KEY_FIELDS) data[f] = document.getElementById(f).value.trim();
   const selectedProvider = document.getElementById('aiProvider').value;
-  data.aiProvider = PROVIDER_OPTIONS.has(selectedProvider) ? selectedProvider : 'openrouter';
+  data.aiProvider = PROVIDER_OPTIONS.has(selectedProvider) ? selectedProvider : DEFAULT_PROVIDER;
   const boundedLimit = (id, fallback) => Math.min(
     MAX_DAILY_LIMIT,
     Math.max(1, parseInt(document.getElementById(id).value, 10) || fallback)
@@ -1098,13 +1148,58 @@ function classesLabel(classes) {
   const contiguous = c.every((v, i) => i === 0 || v === c[i - 1] + 1);
   return (c.length === 1 ? `${c[0]}` : contiguous ? `${c[0]}–${c[c.length - 1]}` : c.join(', ')) + ' класс';
 }
-// No inline onerror handler — MV3's page CSP blocks inline JS. A missing cover
-// just shows the empty framed box, which is fine. Also only render remote
-// covers from the known GDZ hosts — storage is user-writable, so a tampered
-// book record must not turn Settings into a blind third-party image embedder.
+// Covers used to be plain <img src="https://gdz-ru.com/…">, which worked only
+// because the declarativeNetRequest rule rewrote the User-Agent on the page's
+// own image loads too. With that permission gone the browser can no longer
+// reach GDZ at all, so a cover is rendered as a placeholder and hydrated from
+// the licensed proxy (hydrateCovers below).
+//
+// Still gated on isGdzCoverUrl: storage is user-writable, and a tampered book
+// record must not turn Settings into a blind third-party image fetcher.
 const coverHtml = (url, cls) => (isGdzCoverUrl(url)
-  ? `<img class="cover ${cls}" src="${esc(url)}" alt="" loading="lazy">`
+  ? `<span class="cover ${cls} ph" data-cover="${esc(url)}">${iconSvg('book', 16)}</span>`
   : `<span class="cover ${cls} ph">${iconSvg('book', 16)}</span>`);
+
+// One entry per cover URL, shared by both lists and kept for the page's
+// lifetime: the search results repaint on every keystroke, and re-fetching the
+// same dozen covers through the proxy on each one would be pointless traffic.
+// A failed cover caches `null` so a dead URL is not retried on every repaint.
+const coverCache = new Map();
+
+function loadCover(url) {
+  if (!coverCache.has(url)) {
+    coverCache.set(url, gdzSend('GDZ_COVER', { url }).then(
+      (resp) => (resp?.ok && resp.image?.dataBase64
+        ? `data:${resp.image.mimeType};base64,${resp.image.dataBase64}`
+        : null),
+      () => null
+    ));
+  }
+  return coverCache.get(url);
+}
+
+/**
+ * Swap every cover placeholder under `root` for the real image.
+ *
+ * Deliberately fire-and-forget and failure-tolerant: a cover is decoration, and
+ * the framed placeholder it replaces is already an acceptable final state. The
+ * element is re-checked after the await because a repaint may have replaced the
+ * row while the proxy request was in flight.
+ */
+function hydrateCovers(root) {
+  for (const placeholder of root.querySelectorAll('[data-cover]')) {
+    const url = placeholder.dataset.cover;
+    void loadCover(url).then((dataUrl) => {
+      if (!dataUrl || !placeholder.isConnected) return;
+      const img = document.createElement('img');
+      img.className = placeholder.className.replace(/\bph\b/, '').trim();
+      img.alt = '';
+      img.loading = 'lazy';
+      img.src = dataUrl;
+      placeholder.replaceWith(img);
+    });
+  }
+}
 
 function gdzSend(type, payload) {
   return new Promise((resolve) => {
@@ -1145,6 +1240,7 @@ function renderBooks() {
        </div>`;
     box.appendChild(row);
   }
+  hydrateCovers(box);
   box.querySelectorAll('[data-del-url]').forEach((btn) => {
     btn.onclick = () => removeBook(btn.dataset.delSid, btn.dataset.delUrl);
   });
@@ -1183,7 +1279,14 @@ async function runBookSearch() {
   if (generation !== bookSearchGeneration) return;
   if (!resp?.ok) {
     count.textContent = '';
-    results.innerHTML = `<div class="empty">${iconSvg('alert', 15)}<span>Не удалось загрузить каталог ГДЗ.</span></div>`;
+    // The catalog now comes through the licensed proxy, so the most likely
+    // failure is a missing or expired key — and the proxy already phrases that
+    // for a student. A bare "не удалось загрузить" would send them looking for
+    // a network problem they don't have.
+    const reason = typeof resp?.error === 'string' && resp.error.trim()
+      ? resp.error
+      : 'Не удалось загрузить каталог ГДЗ.';
+    results.innerHTML = `<div class="empty">${iconSvg('alert', 15)}<span>${esc(reason)}</span></div>`;
     return;
   }
   // Only surface subjects the extension can map back from a Mesh lesson — pinning
@@ -1241,6 +1344,7 @@ function paintResultRow(el, b) {
     (added
       ? `<span class="tag added">${iconSvg('check', 12)}добавлено</span>`
       : `<span class="tag">${iconSvg('plus', 12)}добавить</span>`);
+  hydrateCovers(el);
   el.onclick = () => (isAdded(b) ? removeBook(String(b.subject_id), b.url) : addBook(b));
   el.onkeydown = (e) => {
     if (e.key !== 'Enter' && e.key !== ' ') return;
@@ -1375,6 +1479,7 @@ function wireTabs() {
 
 /* ---------- Init ---------- */
 
+applyProviderVisibility(); // before anything paints, so no vendor name flashes
 wireReveals();
 wireTabs();
 applyConsentGate(false);

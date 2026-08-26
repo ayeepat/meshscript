@@ -5,6 +5,8 @@
  *   POST/GET /webhook/robokassa  Robokassa ResultURL notification, auto-issues a license
  *   POST /verify             Extension calls this; returns active|expired|...
  *   POST /ai/chat            Disabled legacy proxy; production AI runs on the VPS
+ *   POST /gdz/fetch          License-gated GDZ proxy (see gdz.js): the extension
+ *                            has no GDZ host permissions and no DNR rule
  *   POST /referral/code      Get/create this device's referral code
  *   GET  /referral/check     Validate a code at checkout (before charging)
  *   POST /referral/status    Referral stats + reward key (device capability required)
@@ -31,6 +33,7 @@ import {
   deviceLimitConfigValid
 } from './licenses.js';
 import { handleAiChat } from './ai-proxy.js';
+import { handleGdzFetch } from './gdz.js';
 import * as referrals from './referrals.js';
 import * as analytics from './analytics.js';
 import * as robokassa from './gateways/robokassa.js';
@@ -85,7 +88,8 @@ function statsCors(request, env) {
 const isStatsPath = (path) => path.startsWith('/admin/stats/');
 
 const isPublicExtensionPath = (path) =>
-  path === '/verify' || path === '/deactivate' || path === '/ai/chat' || path.startsWith('/referral/') ||
+  path === '/verify' || path === '/deactivate' || path === '/ai/chat' || path === '/gdz/fetch' ||
+  path.startsWith('/referral/') ||
   path === '/payments/robokassa/order' || path.startsWith('/checkout/') ||
   path === '/t' || path === '/t/ai' || path === '/t/delete';
 
@@ -195,6 +199,7 @@ export default {
         if (!legacyAiProxyEnabled(env)) return error(410, 'legacy_ai_proxy_disabled', VERIFY_CORS);
         return await handleAiChat(request, env);
       }
+      if (path === '/gdz/fetch' && method === 'POST') return await handleGdzFetch(request, env, ctx);
       if (path === '/webhook/robokassa' && (method === 'POST' || method === 'GET')) {
         return await handleRobokassa(request, env, ctx);
       }

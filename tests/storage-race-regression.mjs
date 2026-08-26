@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { SHOW_PROVIDER_UI } from '../src/lib/config.js';
 
 const store = {};
 const sessionStore = {};
@@ -104,7 +105,10 @@ const livePastStorageTtl = await reserveOne('deepseek');
 delete store.rateReservations[livePastStorageTtl];
 await assert.rejects(
   reserveOne('deepseek'),
-  /Дневной лимит DeepSeek исчерпан/,
+  // The cap is named after the vendor only while the provider UI is visible;
+  // otherwise it's described without one. Either way it must still REJECT —
+  // that's what this case is about.
+  SHOW_PROVIDER_UI ? /Дневной лимит DeepSeek исчерпан/ : /Дневной лимит запросов исчерпан/,
   'a still-live worker reservation must continue occupying budget after storage pruning'
 );
 await cancelOne(livePastStorageTtl);

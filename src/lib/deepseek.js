@@ -60,7 +60,9 @@ function fileToContentPart(f, allowPdf) {
   }
   return {
     type: 'text',
-    text: `[Приложен файл ${f.name || ''} (${f.mimeType}), который DeepSeek не читает (нет ни изображений, ни PDF — только текст). ` +
+    // Model-facing, but a model can echo a vendor name straight into the
+    // answer the student reads — keep it anonymous.
+    text: `[Приложен файл ${f.name || ''} (${f.mimeType}), который эта модель не читает (нет ни изображений, ни PDF — только текст). ` +
       `Попросите текст, если нужно содержимое. Не выдумывай его содержимое.]`
   };
 }

@@ -169,6 +169,23 @@ assert.equal(localStore.runtimeConfig, undefined, 'unsigned legacy cache must be
   const declared = [...senderTypes.matchAll(/'([A-Z][A-Z_]+)'/g)].map((match) => match[1]);
   assert.ok(declared.length > 10, 'the accepted message types must be extractable');
 
+  // Exhaustiveness works both ways: a schema/handler omitted from the sender
+  // sets is dead code. The caller receives "action unavailable" before its
+  // validated switch case can run, which is exactly how GDZ_COVER originally
+  // shipped as a permanent placeholder.
+  const schemaSource = workerSource.slice(
+    workerSource.indexOf('const MESSAGE_SCHEMAS = {'),
+    workerSource.indexOf('function isMeshContentUrl(')
+  );
+  const schemaTypes = [...schemaSource.matchAll(/^  ([A-Z][A-Z_]+):/gm)]
+    .map((match) => match[1]);
+  assert.ok(schemaTypes.length > 10, 'the message schemas must be extractable');
+  assert.deepEqual(
+    [...new Set(declared)].sort(),
+    [...new Set(schemaTypes)].sort(),
+    'sender allowlists and message schemas must name the same exhaustive surface'
+  );
+
   const callerSources = [
     '../src/popup/popup.js', '../src/dashboard/dashboard.js', '../src/settings/settings.js',
     '../src/content/scraper.js', '../src/content/test-pill.js', '../src/content/answer-panel.js',

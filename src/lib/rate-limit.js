@@ -1,7 +1,10 @@
 /**
  * Per-provider daily request cap, persisted in chrome.storage.local.
- * Keeps a runaway loop or curious user from torching a paid balance, and
- * lets the user raise/lower the caps in Settings.
+ * Keeps a runaway loop or curious user from torching a paid balance.
+ *
+ * While config.SHOW_PROVIDER_UI is false the caps are no longer user-editable —
+ * the Settings panel is hidden and DEFAULT_LIMITS applies — but every cap still
+ * enforces, so a runaway loop is still bounded.
  *
  * Storage:
  *   rateLimits:  { openrouter: number, groq: number, ... }   // user-set caps
@@ -15,11 +18,15 @@
  * trail so Settings can chart successful requests/day; it's pruned on write.
  */
 
+import { SHOW_PROVIDER_UI } from './config.js';
+
 export const DEFAULT_LIMITS = { openrouter: 80, groq: 300, qwen: 80, deepseek: 150 };
 // Single source of truth for the ceiling advertised in Settings; also clamps hand-edited storage values.
 export const MAX_DAILY_LIMIT = 10000;
 
-// Human-readable provider names for the over-limit error message.
+// Human-readable provider names for the over-limit error message. Only used
+// while the provider UI is visible; otherwise the cap is described without
+// naming a vendor (and without pointing at a settings field that's hidden).
 const PROVIDER_NAMES = { openrouter: 'OpenRouter', groq: 'Groq', qwen: 'Qwen', deepseek: 'DeepSeek' };
 const HISTORY_DAYS = 14;
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
@@ -114,10 +121,11 @@ async function reserveOneInner(provider) {
   }
   if (used + pending >= limit) {
     const name = PROVIDER_NAMES[provider] || provider;
-    throw new Error(
-      `Дневной лимит ${name} исчерпан (${used + pending}/${limit}). ` +
-      `Изменить лимит можно в настройках расширения, либо дождитесь завтра — счётчик сбросится.`
-    );
+    throw new Error(SHOW_PROVIDER_UI
+      ? `Дневной лимит ${name} исчерпан (${used + pending}/${limit}). ` +
+        `Изменить лимит можно в настройках расширения, либо дождитесь завтра — счётчик сбросится.`
+      : `Дневной лимит запросов исчерпан (${used + pending}/${limit}). ` +
+        `Счётчик сбросится завтра.`);
   }
   const attempts = currentCount(rateAttempts[provider], day);
   if (attempts >= limit * 3) {

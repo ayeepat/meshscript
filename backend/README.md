@@ -26,6 +26,7 @@ are set, both fire and the buyer gets the key in both places.
 | `POST /verify`            | key on first activation; activation bearer thereafter | Activate or verify the one authorized installation. |
 | `POST /deactivate`        | key + device id + activation bearer         | Explicitly release device number 1 for another device. |
 | `POST /ai/chat`           | disabled by default (`410 Gone`)            | Retired Worker proxy; production AI goes through the VPS. |
+| `POST /gdz/fetch`         | key + device id + activation bearer; per-license daily cap | Fetch a GDZ catalog/book/task/image/cover on the extension's behalf. Exists so the extension needs no GDZ host permission and no `declarativeNetRequest` rule — see `backend/src/gdz.js`. |
 | `POST /checkout/session`  | none (CORS open; per-IP budget)     | Freeze a plan/promo and return a short-lived Telegram capability. |
 | `POST /checkout/status`   | checkout capability                     | Poll Telegram, payment, fulfillment and delivery state without exposing PII/key. |
 | `POST /checkout/payment`  | checkout capability + verified Telegram binding | Freeze email/consent and return signed hosted-payment fields. |

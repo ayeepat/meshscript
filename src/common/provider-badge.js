@@ -7,13 +7,17 @@
  *
  * The in-page test pill (a classic content script that can't import ES modules)
  * carries its own inlined copy of this — keep PROVIDER_ABBR in sync there.
+ *
+ * Dormant while config.SHOW_PROVIDER_UI is false: mountProviderBadge leaves the
+ * element hidden so no vendor name reaches the student.
  */
+import { DEFAULT_PROVIDER, SHOW_PROVIDER_UI } from '../lib/config.js';
 
 export const PROVIDER_ABBR = { groq: 'GRQ', openrouter: 'OPR', qwen: 'QWN', deepseek: 'DSK' };
 export const PROVIDER_NAME = { groq: 'Groq', openrouter: 'OpenRouter', qwen: 'Qwen', deepseek: 'DeepSeek' };
 
 function pick(provider) {
-  const p = PROVIDER_ABBR[provider] ? provider : 'openrouter';
+  const p = PROVIDER_ABBR[provider] ? provider : DEFAULT_PROVIDER;
   return { abbr: PROVIDER_ABBR[p], name: PROVIDER_NAME[p] };
 }
 
@@ -24,6 +28,7 @@ function pick(provider) {
  * @param {HTMLElement|string} elOrId element or its id
  */
 export async function mountProviderBadge(elOrId) {
+  if (!SHOW_PROVIDER_UI) return;
   const el = typeof elOrId === 'string' ? document.getElementById(elOrId) : elOrId;
   if (!el) return;
   const paint = ({ abbr, name }) => {
@@ -39,10 +44,10 @@ export async function mountProviderBadge(elOrId) {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.aiProvider) {
       generation++;
-      paint(pick(changes.aiProvider.newValue || 'openrouter'));
+      paint(pick(changes.aiProvider.newValue || DEFAULT_PROVIDER));
     }
   });
   const readGeneration = generation;
-  const { aiProvider = 'openrouter' } = await chrome.storage.local.get('aiProvider');
+  const { aiProvider = DEFAULT_PROVIDER } = await chrome.storage.local.get('aiProvider');
   if (generation === readGeneration) paint(pick(aiProvider));
 }

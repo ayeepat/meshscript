@@ -26,7 +26,6 @@ const store = {
 
 globalThis.chrome = {
   runtime: { id: 'abcdefghijklmnopabcdefghijklmnop' },
-  declarativeNetRequest: { async updateSessionRules() {} },
   storage: {
     local: {
       async get(key) {
@@ -47,54 +46,48 @@ globalThis.chrome = {
   },
 };
 
-function response(body, url, contentType) {
-  const value = typeof body === 'string' ? body : JSON.stringify(body);
-  const result = new Response(value, {
-    status: 200,
-    headers: {
-      'content-type': contentType,
-      'content-length': String(Buffer.byteLength(value)),
-    },
-  });
-  Object.defineProperty(result, 'url', { value: url });
-  return result;
-}
-
 let releaseHumanRequests;
 const bothHumanRequestsStarted = new Promise((resolve) => { releaseHumanRequests = resolve; });
 let humanRequestCount = 0;
 
-globalThis.fetch = async (input) => {
-  const url = new URL(input);
-  if (url.origin === 'https://gdz-ru.com' && /^\/parallel-[a-d]\/$/.test(url.pathname)) {
-    const id = url.pathname.match(/parallel-([a-d])/)[1];
-    return response({
-      structure: [{
-        title: 'Упражнения',
-        tasks: [{ title: '1', url: `https://gdz-ru.com/task-${id}/` }],
-      }],
-    }, url.href, 'application/json');
-  }
-  if (url.origin === 'https://gdz-ru.com' && /^\/task-[a-d]\/$/.test(url.pathname)) {
-    const id = url.pathname.match(/task-([a-d])/)[1];
-    return response({
-      editions: [{ images: [{ url: `https://img.gdz-ru.com/answer-${id}.png` }] }],
-    }, url.href, 'application/json');
-  }
-  if (url.origin === 'https://gdz.ru' && /^\/parallel-[a-d]\/$/.test(url.pathname)) {
-    humanRequestCount += 1;
-    if (/^\/parallel-[ab]\/$/.test(url.pathname)) {
-      if (humanRequestCount === bookUrls.length) releaseHumanRequests();
-      await bothHumanRequestsStarted;
+// The link-suffix tally now runs on the Worker (it used to fetch 3 MB of SEO
+// HTML to the client for one regex), so the fixture returns the derived ref
+// instead of a page. What this regression is actually about — two overlapping
+// uncached lookups sharing one serialized storage.local cache — is unchanged
+// and still entirely client-side.
+const { installGdzProxyStub } = await import('./helpers/gdz-proxy-stub.mjs');
+installGdzProxyStub({
+  store,
+  async upstream(kind, input) {
+    const url = new URL(input);
+    if (kind === 'human' && /^\/parallel-[a-d]\/$/.test(url.pathname)) {
+      humanRequestCount += 1;
+      // Hold both parallel lookups open until each has started, so their cache
+      // writes genuinely overlap rather than serializing by luck.
+      if (/^\/parallel-[ab]\/$/.test(url.pathname)) {
+        if (humanRequestCount === bookUrls.length) releaseHumanRequests();
+        await bothHumanRequestsStarted;
+      }
+      return { ref: { base: url.href, suffix: 'task' } };
     }
-    return response(
-      `<a href="${url.pathname}1-task/">answer</a>`,
-      url.href,
-      'text/html',
-    );
-  }
-  throw new Error(`unexpected fetch ${url.href}`);
-};
+    if (/^\/parallel-[a-d]\/$/.test(url.pathname)) {
+      const id = url.pathname.match(/parallel-([a-d])/)[1];
+      return {
+        data: {
+          structure: [{
+            title: 'Упражнения',
+            tasks: [{ title: '1', url: `https://gdz-ru.com/task-${id}/` }],
+          }],
+        },
+      };
+    }
+    if (/^\/task-[a-d]\/$/.test(url.pathname)) {
+      const id = url.pathname.match(/task-([a-d])/)[1];
+      return { data: { editions: [{ images: [{ url: `https://img.gdz-ru.com/answer-${id}.png` }] }] } };
+    }
+    throw new Error(`unexpected upstream ${url.href}`);
+  },
+});
 
 const { resolveTask } = await import('../src/lib/gdz-api.js');
 
