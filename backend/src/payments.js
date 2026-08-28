@@ -164,9 +164,27 @@ function checkoutCapabilitySecret(env) {
     : '';
 }
 
-function checkoutPromoCode(env) {
-  const code = String(env.CHECKOUT_PROMO_CODE || '').trim().toUpperCase();
+// Private discount codes. Each slot pairs its own Worker secret with a
+// server-owned monthly price, so a second concurrent sale needs no client
+// change and never puts a code into tracked configuration. An unset or
+// malformed slot is simply absent from the catalog.
+const CHECKOUT_PROMO_SLOTS = [
+  { code: 'CHECKOUT_PROMO_CODE', price: 'CHECKOUT_PROMO_MONTH_PRICE_RUB' },
+  { code: 'CHECKOUT_PROMO2_CODE', price: 'CHECKOUT_PROMO2_MONTH_PRICE_RUB' }
+];
+
+function checkoutPromoCode(env, slot) {
+  const code = String(env[slot.code] || '').trim().toUpperCase();
   return /^[A-Z0-9_-]{4,32}$/.test(code) ? code : '';
+}
+
+function checkoutPromos(env) {
+  return CHECKOUT_PROMO_SLOTS
+    .map((slot) => ({
+      code: checkoutPromoCode(env, slot),
+      amount_kopecks: rublesToKopecks(env[slot.price])
+    }))
+    .filter((promo) => promo.code);
 }
 
 function requestedPromoCode(value) {
@@ -192,9 +210,9 @@ function checkoutCatalogPlan(env, requestedPlan, requestedPromo = '') {
     let amountKopecks = monthlyPrice;
     let promoApplied = false;
     if (promo) {
-      const configuredCode = checkoutPromoCode(env);
-      if (!configuredCode || promo !== configuredCode) return { ok: false, reason: 'bad_promo' };
-      amountKopecks = rublesToKopecks(env.CHECKOUT_PROMO_MONTH_PRICE_RUB);
+      const configured = checkoutPromos(env).find((entry) => entry.code === promo);
+      if (!configured) return { ok: false, reason: 'bad_promo' };
+      amountKopecks = configured.amount_kopecks;
       if (!amountKopecks) return { ok: false, reason: 'promo_unavailable' };
       promoApplied = true;
     }
@@ -233,13 +251,14 @@ export function checkoutConfigValid(env) {
   if (!paymentConfigValid(env)) return false;
   const month = checkoutCatalogPlan(env, 'month');
   const school = checkoutCatalogPlan(env, 'school');
-  const promoCode = checkoutPromoCode(env);
-  const promoPrice = rublesToKopecks(env.CHECKOUT_PROMO_MONTH_PRICE_RUB);
+  // A live code whose price is missing or malformed would otherwise reach the
+  // catalog as 'promo_unavailable' at the moment a buyer types it.
+  const promosPriced = checkoutPromos(env).every((promo) => !!promo.amount_kopecks);
   return !!(
     month.ok && school.ok && checkoutBotUsername(env) &&
     String(env.TELEGRAM_BOT_TOKEN || '') && telegramWebhookSecretValid(env) &&
     checkoutCapabilitySecretValid(env) &&
-    (!promoCode || promoPrice)
+    promosPriced
   );
 }
 
@@ -490,12 +509,14 @@ function checkoutPlanFromOrder(env, order) {
   const days = Number(order?.subscription_days);
   const amount = Number(order?.amount_kopecks);
   const month = checkoutCatalogPlan(env, 'month');
-  const promo = checkoutPromoCode(env)
-    ? checkoutCatalogPlan(env, 'month', checkoutPromoCode(env))
-    : null;
+  const promos = checkoutPromos(env)
+    .map((promo) => checkoutCatalogPlan(env, 'month', promo.code));
   const school = checkoutCatalogPlan(env, 'school');
   if (school.ok && days === school.duration_days && amount === school.amount_kopecks) return school;
-  if (promo?.ok && days === promo.duration_days && amount === promo.amount_kopecks) return promo;
+  const promo = promos.find(
+    (plan) => plan.ok && days === plan.duration_days && amount === plan.amount_kopecks
+  );
+  if (promo) return promo;
   if (month.ok && days === month.duration_days && amount === month.amount_kopecks) return month;
   return {
     ok: true,

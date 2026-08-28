@@ -296,6 +296,8 @@ for (const table of HEALTH_TABLES) {
     SCHOOL_YEAR_DAYS: '273',
     CHECKOUT_PROMO_CODE: 'TEST654',
     CHECKOUT_PROMO_MONTH_PRICE_RUB: '10',
+    CHECKOUT_PROMO2_CODE: 'TEST639',
+    CHECKOUT_PROMO2_MONTH_PRICE_RUB: '69',
     CHECKOUT_TELEGRAM_BOT_USERNAME: 'smeshaibot',
     CHECKOUT_CAPABILITY_SECRET: 'checkout-capability-secret-that-is-at-least-32-bytes',
     ROBOKASSA_SUCCESS_URL2: 'https://site.example/checkout/success/',

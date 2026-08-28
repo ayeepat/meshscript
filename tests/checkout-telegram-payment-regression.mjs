@@ -95,6 +95,8 @@ function environment(overrides = {}) {
       SCHOOL_YEAR_DAYS: '273',
       CHECKOUT_PROMO_CODE: 'TEST654',
       CHECKOUT_PROMO_MONTH_PRICE_RUB: '10',
+      CHECKOUT_PROMO2_CODE: 'TEST639',
+      CHECKOUT_PROMO2_MONTH_PRICE_RUB: '69',
       CHECKOUT_TELEGRAM_BOT_USERNAME: 'smesh_checkout_bot',
       CHECKOUT_CAPABILITY_SECRET: 'checkout-capability-secret-that-is-at-least-32-bytes',
       TELEGRAM_BOT_TOKEN: 'checkout-bot-token',
@@ -291,7 +293,8 @@ try {
       {},
       { plan: 'lifetime' },
       { plan: 'month', promo_code: 'NOT-TEST654' },
-      { plan: 'school', promo_code: 'TEST654' }
+      { plan: 'school', promo_code: 'TEST654' },
+      { plan: 'school', promo_code: 'TEST639' }
     ]) {
       assertClientRejected(await postJson(env, '/checkout/session', body),
         `invalid checkout ${JSON.stringify(body)}`);
@@ -338,6 +341,36 @@ try {
       code: 'month', name: '30 дней', price_kopecks: 1_000,
       duration_days: 30, promo_applied: true
     });
+
+    // Each promo slot prices independently: a second live sale must neither
+    // borrow the first slot's discount nor be reachable by its code.
+    const secondPromo = await createSession(env, {
+      plan: 'month', promo_code: 'test639', amount: '0.01', price_kopecks: 1
+    });
+    assert.deepEqual(secondPromo.plan, {
+      code: 'month', name: '30 дней', price_kopecks: 6_900,
+      duration_days: 30, promo_applied: true
+    });
+    const secondPromoStatus = await postJson(env, '/checkout/status', {
+      token: secondPromo.token
+    });
+    assert.equal(secondPromoStatus.response.status, 200, secondPromoStatus.text);
+    assert.deepEqual(secondPromoStatus.data.plan, secondPromo.plan,
+      'the stored order must resolve back to the slot that priced it');
+    assertStatusContainsNoSecrets(secondPromoStatus.data, ['TEST639', 'TEST654']);
+
+    const retiredSlot = await postJson({
+      ...env, CHECKOUT_PROMO2_CODE: undefined
+    }, '/checkout/session', { plan: 'month', promo_code: 'TEST639' });
+    assert.equal(retiredSlot.response.status, 400,
+      'unsetting the secret must retire that code without touching the other slot');
+    assert.equal(retiredSlot.data.reason, 'bad_promo');
+    const unpricedSlot = await postJson({
+      ...env, CHECKOUT_PROMO2_MONTH_PRICE_RUB: undefined
+    }, '/checkout/session', { plan: 'month' });
+    assert.equal(unpricedSlot.response.status, 503,
+      'a live code without a price must fail readiness, not surface at the buyer');
+    assert.equal(unpricedSlot.data.reason, 'checkout_config');
 
     const sharedIp = '198.51.100.77';
     const day = new Date(clock + 3 * 60 * 60 * 1000).toISOString().slice(0, 10);

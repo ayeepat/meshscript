@@ -134,7 +134,7 @@ function safeErrorText(errorValue, env = {}) {
     'ROBOKASSA_PASSWORD1_TEST', 'ROBOKASSA_PASSWORD2_TEST',
     'ROBOKASSA_PASSWORD3_PRODUCTION', 'ROBOKASSA_PASSWORD3_TEST', 'RESEND_API_KEY',
     'AI_PROXY_API_KEY', 'INGEST_KEY', 'CHECKOUT_CAPABILITY_SECRET',
-    'CHECKOUT_PROMO_CODE', 'OWNER_LICENSE_KEY'
+    'CHECKOUT_PROMO_CODE', 'CHECKOUT_PROMO2_CODE', 'OWNER_LICENSE_KEY'
   ]) {
     const secret = String(env[name] || '');
     if (secret.length >= 4) text = text.split(secret).join('[REDACTED]');

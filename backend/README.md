@@ -214,6 +214,7 @@ MONTHLY_DAYS = "30"
 SCHOOL_YEAR_PRICE_RUB = "999"
 SCHOOL_YEAR_DAYS = "273"
 CHECKOUT_PROMO_MONTH_PRICE_RUB = "10"
+CHECKOUT_PROMO2_MONTH_PRICE_RUB = "69"
 CHECKOUT_TELEGRAM_BOT_USERNAME = "smeshaibot"
 ROBOKASSA_SUCCESS_URL2 = "https://smeshai.xyz/checkout/success/"
 ROBOKASSA_FAIL_URL2 = "https://smeshai.xyz/checkout/"
@@ -224,11 +225,15 @@ AI_PROXY_LEGACY_ENABLED = "false"
 EMAIL_FROM = "СМЭШ AI <license@smesh.app>"
 ```
 
-Keep the optional promo code out of tracked configuration and set it as a
-Worker secret only while it should be accepted:
+Keep the optional promo codes out of tracked configuration and set each as a
+Worker secret only while it should be accepted. Two independent slots exist;
+each one discounts the 30-day plan to its own `*_MONTH_PRICE_RUB` above and is
+otherwise identical to a full-price monthly order (same duration, same Telegram
+binding, same delivery). Unsetting the secret retires that code immediately.
 
 ```bash
 npx wrangler secret put CHECKOUT_PROMO_CODE
+npx wrangler secret put CHECKOUT_PROMO2_CODE
 ```
 
 `ROBOKASSA_HASH_ALGO` must match the algorithm selected in Robokassa technical
