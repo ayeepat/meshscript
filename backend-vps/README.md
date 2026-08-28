@@ -59,8 +59,9 @@ ten minutes, so duplicates and slow drips cannot pin memory indefinitely.
 
 ## Files
 - `server.js` — the proxy (Node 24 LTS, **zero npm deps**). License verified via
-  the CF worker `/verify` per request with its activation bearer; per-license + global daily quotas
-  are atomically persisted before a job is accepted
+  the CF worker `/verify` per request with its activation bearer; per-minute
+  bursts are held in memory, while per-license and global daily quotas are
+  atomically persisted before a job is accepted
   (`/var/lib/smesh-proxy/quota.json`); poll jobs buffered in
   memory (bounded: max 24 active and 64 total retained, abandoned jobs aborted
   after 90s, done jobs GC'd after 5 min). Long polls are admitted at most two
@@ -158,12 +159,18 @@ The owner dashboard calls `GET/PUT /admin/model-config` with
 - Auto and Think text/vision chains (any valid model id accepted by 302.AI's
   OpenAI-compatible `/v1/chat/completions` endpoint);
 - the standard text/vision chain and isolated PDF chain;
-- the combined frontier allowance per licence, standard allowance, global
-  breaker, and emergency `force_standard` switch;
+- the shared starts-per-minute cap, combined frontier allowance per licence,
+  standard allowance, global breaker, and emergency `force_standard` switch;
 - exact per-model prices used by owner analytics.
 
 After the combined frontier allowance is exhausted, the request is admitted on
-the standard chain instead of returning a frontier-limit error. Config writes
+the standard chain instead of returning a frontier-limit error. The defaults
+are 5 starts per rolling minute, 15 combined Auto + Think requests, then 70
+standard requests per Moscow day (85 total). Exact idempotent `/ai/start`
+retries reuse their original job and do not count again; a minute-limit
+rejection happens before daily quota is charged. Minute counters are held in
+memory and begin with an empty window after a service restart, while daily
+counters remain durable. Config writes
 are bounded, validated, fsynced and atomically renamed. The API rejects stale
 dashboard revisions with HTTP 409 and retains ten rollback snapshots. A corrupt
 or unwriteable config fails AI admission closed until a valid dashboard save or

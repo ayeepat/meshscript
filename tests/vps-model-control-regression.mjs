@@ -116,8 +116,12 @@ try {
   const initialState = await initial.json();
   assert.equal(initialState.revision, 0);
   assert.equal(initialState.config.routes.standard.text[0], 'glm-5.3-flash');
+  assert.equal(initialState.config.limits.requests_per_minute, 5);
+  assert.equal(initialState.config.limits.frontier_per_license, 15);
+  assert.equal(initialState.config.limits.standard_per_license, 70);
 
   const nextConfig = structuredClone(initialState.config);
+  delete nextConfig.limits.requests_per_minute;
   nextConfig.limits.frontier_per_license = 1;
   nextConfig.limits.standard_per_license = 3;
   nextConfig.routes.deepseek.text = ['frontier-test-model'];
@@ -128,7 +132,10 @@ try {
     body: JSON.stringify({ expected_revision: 0, reason: 'regression setup', config: nextConfig })
   });
   if (saved.status !== 200) throw new Error(`save failed: ${saved.status} ${await saved.text()}`);
-  assert.equal((await saved.json()).revision, 1);
+  const savedState = await saved.json();
+  assert.equal(savedState.revision, 1);
+  assert.equal(savedState.config.limits.requests_per_minute, 5,
+    'a revision-1 config without the new field must migrate to the safe default');
 
   const stale = await fetch(`${base}/admin/model-config`, {
     method: 'PUT', headers: adminHeaders,
@@ -136,28 +143,36 @@ try {
   });
   assert.equal(stale.status, 409);
 
-  const requestBody = (provider, nonce) => ({
+  const requestBody = (provider, nonce, identity = {}) => ({
     provider,
-    license_key: 'SMESH-MODEL-CONTROL-TEST',
-    device_id: '123e4567-e89b-42d3-a456-426614174000',
+    license_key: identity.licenseKey || 'SMESH-MODEL-CONTROL-TEST',
+    device_id: identity.deviceId || '123e4567-e89b-42d3-a456-426614174000',
     activation_token: 'a'.repeat(43),
     messages: [{ role: 'user', content: `hello ${nonce}` }],
-    idempotency_key: `123e4567-e89b-42d3-a456-42661417400${nonce}`
+    idempotency_key: `model-control-${nonce}`
   });
-  const start = async (provider, nonce) => {
+  const start = async (provider, nonce, identity) => {
+    const expectedCalls = calls.length + 1;
     const response = await fetch(`${base}/ai/start`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody(provider, nonce))
+      body: JSON.stringify(requestBody(provider, nonce, identity))
     });
     if (response.status !== 200) throw new Error(`start failed: ${response.status} ${await response.text()}`);
-    await response.json();
-    const expectedCalls = Number(nonce);
+    const payload = await response.json();
     for (let i = 0; i < 100 && calls.length < expectedCalls; i++) {
       await new Promise((resolve) => setTimeout(resolve, 20));
     }
+    return payload;
   };
 
-  await start('deepseek', '1');
+  const firstJob = await start('deepseek', '1');
+  const replay = await fetch(`${base}/ai/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody('deepseek', '1'))
+  });
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).job_id, firstJob.job_id);
+  assert.equal(calls.length, 1, 'an exact /ai/start replay must not start or count another request');
   await start('qwen', '2');
   assert.deepEqual(calls, ['frontier-test-model', 'glm-5.3-flash'],
     'the combined frontier allowance must spill the second route into the standard chain');
@@ -201,10 +216,50 @@ try {
   ]);
   assert.equal(quota.counts['*|all'], 4);
 
+  const beforeMinuteSave = await (await fetch(
+    `${base}/admin/model-config`, { headers: adminHeaders }
+  )).json();
+  const minuteConfig = structuredClone(beforeMinuteSave.config);
+  minuteConfig.limits.requests_per_minute = 5;
+  minuteConfig.limits.standard_per_license = 70;
+  const minuteSaved = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: beforeMinuteSave.revision,
+      reason: 'minute limit regression',
+      config: minuteConfig
+    })
+  });
+  if (minuteSaved.status !== 200) {
+    throw new Error(`minute save failed: ${minuteSaved.status} ${await minuteSaved.text()}`);
+  }
+  assert.equal((await minuteSaved.json()).revision, 4);
+
+  const minuteIdentity = {
+    licenseKey: 'SMESH-MINUTE-CONTROL-TEST',
+    deviceId: '123e4567-e89b-42d3-a456-426614174001'
+  };
+  for (const nonce of ['5', '6', '7', '8', '9']) {
+    await start(nonce === '6' ? 'qwen' : 'deepseek', nonce, minuteIdentity);
+  }
+  const globalBeforeRejectedBurst = JSON.parse(await readFile(quotaFile, 'utf8')).counts['*|all'];
+  const rejectedBurst = await fetch(`${base}/ai/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(requestBody('deepseek', '10', minuteIdentity))
+  });
+  assert.equal(rejectedBurst.status, 429, 'the sixth request in one minute must be rejected at a cap of five');
+  assert.match((await rejectedBurst.json()).error.message, /на лицензию: 5/);
+  assert.equal(calls.length, 9, 'a minute-limited request must never reach the paid upstream');
+  const quotaAfterRejectedBurst = JSON.parse(await readFile(quotaFile, 'utf8'));
+  assert.equal(quotaAfterRejectedBurst.counts['*|all'], globalBeforeRejectedBurst,
+    'a minute-limited request must not consume durable daily quota');
+
   const persisted = JSON.parse(await readFile(modelFile, 'utf8'));
-  assert.equal(persisted.revision, 3);
+  assert.equal(persisted.revision, 4);
+  assert.equal(persisted.config.limits.requests_per_minute, 5);
+  assert.equal(persisted.config.limits.standard_per_license, 70);
   assert.equal(persisted.config.routes.standard.text[0], 'glm-5.3-flash');
-  assert.equal(persisted.history[0].revision, 2);
+  assert.equal(persisted.history[0].revision, 3);
 } finally {
   proxy.kill('SIGTERM');
   upstream.close();

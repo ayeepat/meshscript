@@ -251,11 +251,14 @@ function bootstrapModelConfig() {
   ].filter(Boolean).join(','));
   return {
     limits: {
+      requests_per_minute: boundedQuotaVar(
+        'PROXY_REQUESTS_PER_MINUTE', env.PROXY_REQUESTS_PER_MINUTE, 5, 1, 60
+      ),
       frontier_per_license: boundedQuotaVar(
         'PROXY_FRONTIER_DAILY', env.PROXY_FRONTIER_DAILY, 15, 0, 5000
       ),
       standard_per_license: boundedQuotaVar(
-        'PROXY_STANDARD_DAILY', env.PROXY_STANDARD_DAILY, 150, 1, 10000
+        'PROXY_STANDARD_DAILY', env.PROXY_STANDARD_DAILY, 70, 1, 10000
       ),
       global_daily: GLOBAL_DAILY,
       force_standard: false
@@ -317,12 +320,19 @@ function validLimit(value, name, min, max) {
 function validateModelConfig(input) {
   exactKeys(input, ['limits', 'routes', 'rates'], 'config');
   exactKeys(input.limits, [
-    'frontier_per_license', 'standard_per_license', 'global_daily', 'force_standard'
+    'requests_per_minute', 'frontier_per_license', 'standard_per_license',
+    'global_daily', 'force_standard'
   ], 'config.limits');
   if (typeof input.limits.force_standard !== 'boolean') {
     throw new Error('config.limits.force_standard must be boolean');
   }
   const limits = {
+    // Revision-1 config files and an older dashboard do not have this field.
+    // Normalize them to the safe production default instead of disabling all
+    // AI admission during the mixed-version rollout.
+    requests_per_minute: Object.prototype.hasOwnProperty.call(input.limits, 'requests_per_minute')
+      ? validLimit(input.limits.requests_per_minute, 'requests_per_minute', 1, 60)
+      : 5,
     frontier_per_license: validLimit(
       input.limits.frontier_per_license, 'frontier_per_license', 0, 5000
     ),
@@ -537,9 +547,9 @@ const MAX_RETAINED_JOBS = 64;
 const MAX_JOBS_PER_LICENSE = 2;
 const MAX_JOBS_PER_DEVICE = 2;
 const MAX_JOBS_PER_IP = 4;
-const JOB_START_RATE_LIMIT = 20;
 const JOB_START_IP_RATE_LIMIT = 60;
-const JOB_START_RATE_WINDOW_MS = 10 * 60 * 1000;
+const JOB_START_RATE_WINDOW_MS = 60 * 1000;
+const JOB_START_IP_RATE_WINDOW_MS = 10 * 60 * 1000;
 // Anonymous requests reach the Worker license verifier before they can prove a
 // license. Bound that pre-authentication work separately so random credentials
 // cannot occupy every outbound socket or consume the Worker request quota.
@@ -2578,11 +2588,19 @@ function admitJobStart(reservation, prep) {
   }
 
   const now = Date.now();
+  const requestLimit = modelState.config.limits.requests_per_minute;
   const licenseStarts = recentStarts(startsByLicense, prep.licenseKey, now);
   const deviceStarts = recentStarts(startsByDevice, prep.deviceId, now);
-  const ipStarts = recentStarts(startsByIp, reservation.ip, now);
-  if (licenseStarts.length >= JOB_START_RATE_LIMIT || deviceStarts.length >= JOB_START_RATE_LIMIT) {
-    return { err: { status: 429, message: 'Слишком много запросов за короткое время. Подождите несколько минут и попробуйте снова.' } };
+  const ipStarts = recentStarts(
+    startsByIp, reservation.ip, now, JOB_START_IP_RATE_WINDOW_MS
+  );
+  if (licenseStarts.length >= requestLimit || deviceStarts.length >= requestLimit) {
+    return {
+      err: {
+        status: 429,
+        message: `Лимит запросов в минуту на лицензию: ${requestLimit}. Подождите минуту и попробуйте снова.`
+      }
+    };
   }
   if (ipStarts.length >= JOB_START_IP_RATE_LIMIT) {
     return { err: { status: 429, message: 'Слишком много запросов с этого адреса. Подождите несколько минут и попробуйте снова.' } };
@@ -2666,11 +2684,13 @@ setInterval(() => {
       else deleteUploadTicket(token);
     }
   }
-  // Sliding windows only need their last ten minutes; pruning here bounds the
-  // attacker-controlled license/device keyspace even when traffic goes quiet.
+  // Licence/device bursts keep one configured minute; the shared-IP abuse
+  // guard keeps ten. Pruning bounds attacker-controlled keyspace at rest.
   for (const [key] of startsByLicense) recentStarts(startsByLicense, key, now);
   for (const [key] of startsByDevice) recentStarts(startsByDevice, key, now);
-  for (const [key] of startsByIp) recentStarts(startsByIp, key, now);
+  for (const [key] of startsByIp) {
+    recentStarts(startsByIp, key, now, JOB_START_IP_RATE_WINDOW_MS);
+  }
   for (const [key] of uploadTicketStartsByLicense) {
     recentStarts(uploadTicketStartsByLicense, key, now, UPLOAD_TICKET_RATE_WINDOW_MS);
   }
