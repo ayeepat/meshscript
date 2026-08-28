@@ -1,5 +1,5 @@
 /**
- * The per-license daily cap must apply to EVERY admitted job.
+ * The per-license frontier + standard caps must apply to EVERY admitted job.
  *
  * `PROVIDERS[body.provider]` also resolved Object.prototype members, so
  * `provider:"constructor"` passed the unknown-provider gate with an object that
@@ -16,12 +16,13 @@
 import assert from 'node:assert/strict';
 import http from 'node:http';
 import { once } from 'node:events';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
 const LICENSE = 'SMESH-CAPS-TEST-0001';
+const AMBIGUOUS_LICENSE = 'SMESH-CAPS-TEST-0002';
 const DEVICE = '00000000-0000-4000-8000-0000000000aa';
 const ACTIVATION_TOKEN = 'A'.repeat(43);
 // A one-request cap makes "the cap is enforced at all" unambiguous.
@@ -99,7 +100,12 @@ function pdfMessages() {
 }
 
 const mockPort = await listen(mock);
-const proxyPort = 20000 + Math.floor(Math.random() * 20000);
+const proxyPort = await (async () => {
+  const probe = http.createServer();
+  return listen(probe).then((port) => new Promise((resolve, reject) => {
+    probe.close((error) => error ? reject(error) : resolve(port));
+  }));
+})();
 const temp = await mkdtemp(path.join(os.tmpdir(), 'smesh-cap-test-'));
 const quotaFile = path.join(temp, 'quota.json');
 const base = `http://127.0.0.1:${proxyPort}`;
@@ -112,8 +118,8 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
     AI_PROXY_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
     AI_PROXY_API_KEY: 'test-key',
-    PROXY_QWEN_DAILY: String(PER_LICENSE_CAP),
-    PROXY_DEEPSEEK_DAILY: String(PER_LICENSE_CAP),
+    PROXY_FRONTIER_DAILY: String(PER_LICENSE_CAP),
+    PROXY_STANDARD_DAILY: String(PER_LICENSE_CAP),
     QUOTA_FILE: quotaFile
   },
   stdio: 'pipe'
@@ -165,7 +171,7 @@ try {
       `provider="${provider}" must not consume the global daily breaker`);
   }
 
-  /* ------- the real provider is capped, and the cap actually bites ------- */
+  /* --- frontier spills into standard, then the standard cap actually bites --- */
   const first = await post(`${base}/ai/start`, {
     provider: 'qwen', license_key: LICENSE, device_id: DEVICE,
     messages: [{ role: 'user', content: 'hi' }]
@@ -179,22 +185,29 @@ try {
   assert.equal(globalCount(await quotaCounts()), 1,
     'a job that really streamed an answer must keep its reservation');
 
-  const overCap = await post(`${base}/ai/start`, {
+  const standard = await post(`${base}/ai/start`, {
     provider: 'qwen', license_key: LICENSE, device_id: DEVICE,
     messages: [{ role: 'user', content: 'again' }]
   });
-  assert.equal(overCap.status, 429, 'the per-license daily cap must reject the next job');
+  assert.equal(standard.status, 200, 'an exhausted frontier allowance must spill into standard');
+  await drain(await standard.json());
+
+  const overCap = await post(`${base}/ai/start`, {
+    provider: 'qwen', license_key: LICENSE, device_id: DEVICE,
+    messages: [{ role: 'user', content: 'third' }]
+  });
+  assert.equal(overCap.status, 429, 'the standard per-license cap must reject the next job');
   assert.match((await overCap.json()).error.message, /Дневной лимит/);
 
   /* ------ an AMBIGUOUS upstream failure keeps its reservation ------- */
-  // Same license, a different provider so the qwen cap is not what rejects it.
+  // A second license starts with an unused combined frontier allowance.
   // "No stream opened" is NOT proof of zero spend: the request body reached the
   // provider, so a bare 5xx may follow completed paid work. Refunding it let a
   // caller buy unbounded ambiguous work under a cap of one.
   upstreamMode = 'ambiguous';
   const beforeAmbiguous = globalCount(await quotaCounts());
   const ambiguous = await post(`${base}/ai/start`, {
-    provider: 'deepseek', license_key: LICENSE, device_id: DEVICE,
+    provider: 'deepseek', license_key: AMBIGUOUS_LICENSE, device_id: DEVICE,
     messages: [{ role: 'user', content: 'upstream will fail' }]
   });
   assert.equal(ambiguous.status, 200, 'the job is admitted; the failure happens in the runner');
@@ -202,18 +215,26 @@ try {
   assert.equal(globalCount(await quotaCounts()), beforeAmbiguous + 1,
     'an ambiguous upstream failure must keep consuming the daily allowance');
 
-  // And the cap therefore actually bites: the deepseek allowance is spent.
-  const overCapAfterAmbiguous = await post(`${base}/ai/start`, {
-    provider: 'deepseek', license_key: LICENSE, device_id: DEVICE,
+  // The retained frontier reservation moves the next request to standard.
+  upstreamMode = 'ok';
+  const afterAmbiguous = await post(`${base}/ai/start`, {
+    provider: 'deepseek', license_key: AMBIGUOUS_LICENSE, device_id: DEVICE,
     messages: [{ role: 'user', content: 'again' }]
   });
+  assert.equal(afterAmbiguous.status, 200,
+    'a spent frontier allowance must continue on the standard chain');
+  await drain(await afterAmbiguous.json());
+
+  const overCapAfterAmbiguous = await post(`${base}/ai/start`, {
+    provider: 'deepseek', license_key: AMBIGUOUS_LICENSE, device_id: DEVICE,
+    messages: [{ role: 'user', content: 'third' }]
+  });
   assert.equal(overCapAfterAmbiguous.status, 429,
-    'ambiguous provider work must still exhaust the per-license cap');
+    'ambiguous provider work must still count toward the two-tier per-license cap');
 
   console.log('vps provider cap bypass regression passed');
 } finally {
   proc.kill('SIGTERM');
   await Promise.race([once(proc, 'exit'), new Promise((resolve) => setTimeout(resolve, 1000))]);
   mock.close();
-  await rm(temp, { recursive: true, force: true });
 }

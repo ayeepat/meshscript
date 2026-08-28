@@ -282,7 +282,7 @@ try {
   }, 'liveness must stay available for process supervision');
   assert.deepEqual(await json(await fetch(`${missingKey.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: false, quota_config: true, quota_store: true } }
+    body: { ok: false, checks: { upstream_key: false, quota_config: true, quota_store: true, model_config: true } }
   }, 'readiness must reject an instance without its paid-provider key');
   await stopProxy(missingKey.proc);
   processes.delete(missingKey.proc);
@@ -296,20 +296,20 @@ try {
   processes.add(healthy.proc);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true } }
+    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
   });
   await assert.rejects(access(healthyPath), { code: 'ENOENT' },
     'a readiness probe must not create authoritative quota state before admission');
   await mkdir(healthyPath);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false } }
+    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false, model_config: true } }
   }, 'readiness must detect post-start loss of the exact quota target before admission');
   const healthyBlocker = path.join(temp, 'healthy-target-blocker');
   await rename(healthyPath, healthyBlocker);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true } }
+    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
   }, 'an unused quota store may recover without inventing authoritative state');
   await assert.rejects(access(healthyPath), { code: 'ENOENT' });
   await stopProxy(healthy.proc);
@@ -325,7 +325,7 @@ try {
   processes.add(corrupt.proc);
   assert.deepEqual(await json(await fetch(`${corrupt.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false } }
+    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false, model_config: true } }
   }, 'corrupt persisted accounting must never be replaced with empty counters');
   const callsBeforeBlockedStart = upstreamCalls;
   const blockedStart = await startSolve(corrupt.base, 'CORRUPT');
@@ -338,7 +338,7 @@ try {
   await writeFile(corruptPath, JSON.stringify({ day: '2026-07-26', counts: {} }), { mode: 0o600 });
   assert.deepEqual(await json(await fetch(`${corrupt.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true } }
+    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
   }, 'readiness should recover only after a valid durable quota store is restored');
   const recoveredStart = await startSolve(corrupt.base, 'RECOVERED');
   assert.equal(recoveredStart.status, 200, await recoveredStart.clone().text());

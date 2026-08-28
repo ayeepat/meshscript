@@ -14,7 +14,7 @@ The fix is a **polling pseudo-stream**: every RU-facing request is short.
 ```
 Extension ──POST /ai/start───▶  ai.smeshapi.site (this box, DNS-only / grey-cloud)
           ◀─{ job_id }───────       │ POST /verify ──▶ smeshapi.site (CF worker, licenses)
-Extension ──GET /ai/poll──┐         └─ POST (SSE) ──▶ api.302.ai (Qwen / DeepSeek,
+Extension ──GET /ai/poll──┐         └─ POST (SSE) ──▶ api.302.ai (live model chain,
           ◀─{chunk,done}──┘ ~0.6s        buffered in memory per job — this leg
    … repeat until done …                 never touches Russia)
 Extension ──POST /ai/cancel──▶  (abort: stop paying 302.AI)
@@ -66,8 +66,9 @@ ten minutes, so duplicates and slow drips cannot pin memory indefinitely.
   after 90s, done jobs GC'd after 5 min). Long polls are admitted at most two
   per job/token, six per client IP, and 32 process-wide, leaving listener
   capacity for health checks and unrelated users. PDFs: a `{type:'file'}` data-URI part re-routes the
-  job to the Gemini chain (`PROXY_PDF_MODEL`, default `gemini-2.5-flash` —
-  verified reading PDFs on 302.AI), since neither Qwen nor DeepSeek can.
+  job to the configured PDF chain (bootstrapped from `PROXY_PDF_MODEL`, default
+  `gemini-2.5-flash`). Model chains, limits and pricing estimates hot-reload
+  from `/var/lib/smesh-proxy/model-config.json`.
 - `setup.sh` — one-shot installer for Ubuntu 22.04/24.04. Installs Node +
   Caddy, drops `server.js`, a systemd unit, and a Caddyfile, and starts it.
   **Embeds a generated copy of `server.js`** — after editing `server.js`, run
@@ -96,9 +97,15 @@ the operator's shell.
 3. Cloudflare DNS: point `ai.smeshapi.site` → static IP, **DNS only (grey cloud)**.
 4. `gcloud --project "$GCP_PROJECT" compute scp setup.sh "$GCP_INSTANCE:/tmp/" --zone="$GCP_ZONE"`, then
    `gcloud --project "$GCP_PROJECT" compute ssh "$GCP_INSTANCE" --zone="$GCP_ZONE" --command="bash /tmp/setup.sh"`.
-5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key AND `INGEST_KEY` (same value as the worker secret `npx wrangler secret put INGEST_KEY`; enables opt-in server-observed usage reporting to POST /t/ai for the owner dashboard). Set `PROXY_QWEN_DAILY` and `PROXY_DEEPSEEK_DAILY` within `1..5000`, and `PROXY_GLOBAL_DAILY` within `1..100000` and no lower than either provider cap. Then run `sudo systemctl restart smesh-proxy`.
+5. `sudo nano /etc/smesh-proxy.env` → paste the 302.AI key and `INGEST_KEY`
+   (same value as the worker secret `npx wrangler secret put INGEST_KEY`; this
+   enables opt-in server-observed usage reporting to `POST /t/ai`). Generate a
+   separate model-control key with `openssl rand -hex 32` and save it as
+   `MODEL_ADMIN_KEY`. The default dashboard origin is
+   `https://ayeepat.github.io`; override `MODEL_DASHBOARD_ORIGIN` only when the
+   dashboard moves. Then run `sudo systemctl restart smesh-proxy`.
 6. Verify readiness: `curl -fsS https://ai.smeshapi.site/ready` must return
-   `{"ok":true,"checks":{"upstream_key":true,"quota_config":true,"quota_store":true}}`.
+   `{"ok":true,"checks":{"upstream_key":true,"quota_config":true,"quota_store":true,"model_config":true}}`.
    Invalid or out-of-range quota configuration fails readiness and AI admission
    closed rather than silently increasing spend.
    `/health` is intentionally liveness-only and can remain 200 while required
@@ -136,6 +143,37 @@ the operator's shell.
 - `src/lib/smesh-proxy.js` — start → poll → cancel client (the only caller).
 - `src/lib/config.js` — `AI_BACKEND_URL = 'https://ai.smeshapi.site'`.
 - `manifest.json` — `https://ai.smeshapi.site/*` in `host_permissions`.
+
+## Live model control (no extension release)
+
+The extension sends only the stable internal routes `deepseek` (Auto) and
+`qwen` (Think). The VPS resolves those names to the currently saved 302.AI
+model chains. A dashboard save affects every **new** request immediately; an
+in-flight job keeps the route snapshot it started with.
+
+The owner dashboard calls `GET/PUT /admin/model-config` with
+`X-Model-Admin-Key`. This key is separate from `ADMIN_KEY`, `STATS_SECRET`,
+`INGEST_KEY` and `AI_PROXY_API_KEY`. It can change only:
+
+- Auto and Think text/vision chains (any valid model id accepted by 302.AI's
+  OpenAI-compatible `/v1/chat/completions` endpoint);
+- the standard text/vision chain and isolated PDF chain;
+- the combined frontier allowance per licence, standard allowance, global
+  breaker, and emergency `force_standard` switch;
+- exact per-model prices used by owner analytics.
+
+After the combined frontier allowance is exhausted, the request is admitted on
+the standard chain instead of returning a frontier-limit error. Config writes
+are bounded, validated, fsynced and atomically renamed. The API rejects stale
+dashboard revisions with HTTP 409 and retains ten rollback snapshots. A corrupt
+or unwriteable config fails AI admission closed until a valid dashboard save or
+operator repair succeeds.
+
+Browser access is restricted to the exact `MODEL_DASHBOARD_ORIGIN`. The key
+must contain at least 32 bytes, failed attempts are rate-limited, and neither
+the 302.AI key nor task content is returned by the control API. For local
+dashboard work, set `MODEL_DASHBOARD_ORIGIN=http://127.0.0.1:4599` temporarily
+and restart the service; restore the production origin before deployment.
 
 ## Incident 2026-07-14: every solve failed with «ИИ-сервис временно недоступен»
 

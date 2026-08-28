@@ -193,6 +193,23 @@ const UPSTREAM_BASE_URL = parseServiceUrl(
 );
 const UPSTREAM_KEY = process.env.AI_PROXY_API_KEY || '';
 const ADMIN_KEY = process.env.ADMIN_KEY || '';
+// A separate, narrowly-scoped credential for live model routing. Unlike
+// ADMIN_KEY it cannot invoke diagnostic completions; unlike the 302.AI key it
+// cannot be used at the provider. It is safe to type into the owner dashboard
+// for one browser session, but must still be a high-entropy secret.
+const MODEL_ADMIN_KEY = process.env.MODEL_ADMIN_KEY || '';
+function parseDashboardOrigin(value) {
+  const raw = String(value || 'https://ayeepat.github.io').replace(/\/+$/, '');
+  let url;
+  try { url = new URL(raw); } catch { return ''; }
+  const loopbackHttp = url.protocol === 'http:' && LOOPBACK_HOSTS.has(url.hostname.toLowerCase());
+  if ((url.protocol !== 'https:' && !loopbackHttp) || url.origin !== raw ||
+      url.username || url.password || url.search || url.hash) return '';
+  return raw;
+}
+const MODEL_DASHBOARD_ORIGIN = parseDashboardOrigin(process.env.MODEL_DASHBOARD_ORIGIN);
+const MODEL_ADMIN_KEY_VALID = Buffer.byteLength(MODEL_ADMIN_KEY) >= 32 &&
+  Buffer.byteLength(MODEL_ADMIN_KEY) <= 256;
 
 // Opt-in server-side usage reporting → the license worker's POST /t/ai (see
 // backend/src/analytics.js handleServerIngest). Off unless INGEST_KEY is set
@@ -217,6 +234,7 @@ const ACTIVATION_TOKEN = /^[A-Za-z0-9_-]{43}$/;
 // Where the daily quota counters persist. Admission is fail-closed unless the
 // updated counters have been atomically written and fsynced.
 const QUOTA_FILE = process.env.QUOTA_FILE || '/var/lib/smesh-proxy/quota.json';
+const MODEL_CONFIG_FILE = process.env.MODEL_CONFIG_FILE || '/var/lib/smesh-proxy/model-config.json';
 // Deep readiness probes exercise create/fsync/rename, but /ready is public and
 // must not turn every monitoring request into synchronous disk writes. Actual
 // admissions also refresh this proof when they durably reserve quota.
@@ -248,7 +266,6 @@ const PROVIDERS = {
     model: (env.PROXY_QWEN_MODEL || 'qwen3.7-plus').trim(),
     fallbacks: (env.PROXY_QWEN_FALLBACK_MODELS || 'qwen-vl-plus,qwen-plus'),
     visionFallbacks: (env.PROXY_QWEN_VISION_FALLBACK_MODELS || 'qwen-vl-plus'),
-    cap: boundedQuotaVar('PROXY_QWEN_DAILY', env.PROXY_QWEN_DAILY, 80, 1, 5000),
     reasoningEffort: false
   },
   deepseek: {
@@ -256,14 +273,10 @@ const PROVIDERS = {
     model: (env.PROXY_DEEPSEEK_MODEL || 'deepseek-v4-flash').trim(),
     fallbacks: '',
     visionFallbacks: '',
-    cap: boundedQuotaVar('PROXY_DEEPSEEK_DAILY', env.PROXY_DEEPSEEK_DAILY, 150, 1, 5000),
     reasoningEffort: true
   }
 };
 const GLOBAL_DAILY = boundedQuotaVar('PROXY_GLOBAL_DAILY', env.PROXY_GLOBAL_DAILY, 3000, 1, 100000);
-if (GLOBAL_DAILY < Math.max(...Object.values(PROVIDERS).map((provider) => provider.cap))) {
-  quotaConfigErrors.push('PROXY_GLOBAL_DAILY must not be lower than a per-license provider cap');
-}
 const QUOTA_CONFIG_VALID = quotaConfigErrors.length === 0;
 if (!QUOTA_CONFIG_VALID) console.error('invalid quota configuration; admissions disabled');
 
@@ -286,6 +299,294 @@ const PDF_MODEL = (env.PROXY_PDF_MODEL || 'gemini-2.5-flash').trim();
 // gemini-2.0-flash is gone from 302.AI (returns -10003 parameter error,
 // checked 2026-07-11); -lite verified live same day: reads a PDF file part.
 const PDF_FALLBACK_MODELS = env.PROXY_PDF_FALLBACK_MODELS || 'gemini-2.5-flash-lite';
+
+/* ------------------------- live model routing ------------------------ */
+
+const MODEL_CONFIG_VERSION = 1;
+const MAX_MODEL_CONFIG_BYTES = 64 * 1024;
+const MAX_MODEL_HISTORY = 10;
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const MODEL_ROUTE_IDS = ['qwen', 'deepseek', 'standard'];
+
+function commaModels(value) {
+  const seen = new Set();
+  const models = [];
+  for (const candidate of String(value || '').split(',')) {
+    const model = candidate.trim();
+    if (model && !seen.has(model)) { seen.add(model); models.push(model); }
+  }
+  return models;
+}
+
+function bootstrapModelConfig() {
+  const qwenText = commaModels([
+    PROVIDERS.qwen.model, PROVIDERS.qwen.fallbacks
+  ].filter(Boolean).join(','));
+  const qwenVision = commaModels([
+    PROVIDERS.qwen.model, PROVIDERS.qwen.visionFallbacks, PROVIDERS.qwen.fallbacks
+  ].filter(Boolean).join(','));
+  const deepseekText = commaModels([
+    PROVIDERS.deepseek.model, PROVIDERS.deepseek.fallbacks
+  ].filter(Boolean).join(','));
+  const deepseekVision = commaModels([
+    PROVIDERS.deepseek.model, PROVIDERS.deepseek.visionFallbacks, PROVIDERS.deepseek.fallbacks
+  ].filter(Boolean).join(','));
+  return {
+    limits: {
+      frontier_per_license: boundedQuotaVar(
+        'PROXY_FRONTIER_DAILY', env.PROXY_FRONTIER_DAILY, 15, 0, 5000
+      ),
+      standard_per_license: boundedQuotaVar(
+        'PROXY_STANDARD_DAILY', env.PROXY_STANDARD_DAILY, 150, 1, 10000
+      ),
+      global_daily: GLOBAL_DAILY,
+      force_standard: false
+    },
+    routes: {
+      qwen: {
+        label: 'Think', text: qwenText, vision: qwenVision,
+        reasoning_effort: PROVIDERS.qwen.reasoningEffort
+      },
+      deepseek: {
+        label: 'Auto', text: deepseekText, vision: deepseekVision,
+        reasoning_effort: PROVIDERS.deepseek.reasoningEffort
+      },
+      standard: {
+        label: 'Standard', text: ['glm-5.3-flash'], vision: ['glm-4.6v-flash'],
+        reasoning_effort: false
+      },
+      pdf: {
+        label: 'PDF', models: commaModels(`${PDF_MODEL},${PDF_FALLBACK_MODELS}`)
+      }
+    },
+    rates: {
+      'glm-5.3-flash': { input_usd_per_m: 0.075, output_usd_per_m: 0.25 },
+      'glm-4.6v-flash': { input_usd_per_m: 0, output_usd_per_m: 0 }
+    }
+  };
+}
+
+function exactKeys(value, allowed, name) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${name} must be an object`);
+  }
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) throw new Error(`${name}.${key} is not supported`);
+  }
+}
+
+function validModelChain(value, name) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > 8) {
+    throw new Error(`${name} must contain 1 to 8 model ids`);
+  }
+  const seen = new Set();
+  const out = [];
+  for (const raw of value) {
+    const model = typeof raw === 'string' ? raw.trim() : '';
+    if (!MODEL_ID.test(model)) throw new Error(`${name} contains an invalid model id`);
+    if (!seen.has(model)) { seen.add(model); out.push(model); }
+  }
+  return out;
+}
+
+function validLimit(value, name, min, max) {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
+
+function validateModelConfig(input) {
+  exactKeys(input, ['limits', 'routes', 'rates'], 'config');
+  exactKeys(input.limits, [
+    'frontier_per_license', 'standard_per_license', 'global_daily', 'force_standard'
+  ], 'config.limits');
+  if (typeof input.limits.force_standard !== 'boolean') {
+    throw new Error('config.limits.force_standard must be boolean');
+  }
+  const limits = {
+    frontier_per_license: validLimit(
+      input.limits.frontier_per_license, 'frontier_per_license', 0, 5000
+    ),
+    standard_per_license: validLimit(
+      input.limits.standard_per_license, 'standard_per_license', 1, 10000
+    ),
+    global_daily: validLimit(input.limits.global_daily, 'global_daily', 1, 100000),
+    force_standard: input.limits.force_standard
+  };
+
+  exactKeys(input.routes, ['qwen', 'deepseek', 'standard', 'pdf'], 'config.routes');
+  const routes = {};
+  for (const id of MODEL_ROUTE_IDS) {
+    const route = input.routes[id];
+    exactKeys(route, ['label', 'text', 'vision', 'reasoning_effort'], `config.routes.${id}`);
+    const label = typeof route.label === 'string' ? route.label.trim() : '';
+    if (!label || label.length > 40 || /[\u0000-\u001f\u007f]/.test(label)) {
+      throw new Error(`config.routes.${id}.label is invalid`);
+    }
+    if (typeof route.reasoning_effort !== 'boolean') {
+      throw new Error(`config.routes.${id}.reasoning_effort must be boolean`);
+    }
+    routes[id] = {
+      label,
+      text: validModelChain(route.text, `config.routes.${id}.text`),
+      vision: validModelChain(route.vision, `config.routes.${id}.vision`),
+      reasoning_effort: route.reasoning_effort
+    };
+  }
+  exactKeys(input.routes.pdf, ['label', 'models'], 'config.routes.pdf');
+  const pdfLabel = typeof input.routes.pdf.label === 'string' ? input.routes.pdf.label.trim() : '';
+  if (!pdfLabel || pdfLabel.length > 40 || /[\u0000-\u001f\u007f]/.test(pdfLabel)) {
+    throw new Error('config.routes.pdf.label is invalid');
+  }
+  routes.pdf = {
+    label: pdfLabel,
+    models: validModelChain(input.routes.pdf.models, 'config.routes.pdf.models')
+  };
+
+  exactKeys(input.rates, Object.keys(input.rates), 'config.rates');
+  const rates = {};
+  if (Object.keys(input.rates).length > 64) throw new Error('config.rates has too many models');
+  for (const [model, rate] of Object.entries(input.rates)) {
+    if (!MODEL_ID.test(model)) throw new Error('config.rates contains an invalid model id');
+    exactKeys(rate, ['input_usd_per_m', 'output_usd_per_m'], `config.rates.${model}`);
+    const inputRate = Number(rate.input_usd_per_m);
+    const outputRate = Number(rate.output_usd_per_m);
+    if (!Number.isFinite(inputRate) || inputRate < 0 || inputRate > 10000 ||
+        !Number.isFinite(outputRate) || outputRate < 0 || outputRate > 10000) {
+      throw new Error(`config.rates.${model} prices must be from 0 to 10000 USD per 1M tokens`);
+    }
+    rates[model] = { input_usd_per_m: inputRate, output_usd_per_m: outputRate };
+  }
+  return { limits, routes, rates };
+}
+
+function validateModelState(input) {
+  exactKeys(input, ['version', 'revision', 'updated_at', 'reason', 'config', 'history'], 'state');
+  if (input.version !== MODEL_CONFIG_VERSION) throw new Error('unsupported model config version');
+  const revision = validLimit(input.revision, 'revision', 1, Number.MAX_SAFE_INTEGER);
+  const updatedAt = typeof input.updated_at === 'string' ? input.updated_at : '';
+  if (!updatedAt || Number.isNaN(Date.parse(updatedAt))) throw new Error('invalid updated_at');
+  const reason = typeof input.reason === 'string' ? input.reason : '';
+  if (reason.length > 200 || /[\u0000-\u001f\u007f]/.test(reason)) throw new Error('invalid reason');
+  if (!Array.isArray(input.history) || input.history.length > MAX_MODEL_HISTORY) {
+    throw new Error('invalid model config history');
+  }
+  const history = input.history.map((entry) => {
+    exactKeys(entry, ['revision', 'updated_at', 'reason', 'config'], 'history entry');
+    const entryRevision = validLimit(entry.revision, 'history revision', 0, revision - 1);
+    const entryUpdatedAt = typeof entry.updated_at === 'string' ? entry.updated_at : '';
+    if (entryUpdatedAt && Number.isNaN(Date.parse(entryUpdatedAt))) throw new Error('invalid history timestamp');
+    const entryReason = typeof entry.reason === 'string' ? entry.reason : '';
+    if (entryReason.length > 200 || /[\u0000-\u001f\u007f]/.test(entryReason)) {
+      throw new Error('invalid history reason');
+    }
+    return {
+      revision: entryRevision, updated_at: entryUpdatedAt, reason: entryReason,
+      config: validateModelConfig(entry.config)
+    };
+  });
+  return {
+    version: MODEL_CONFIG_VERSION, revision, updated_at: updatedAt, reason,
+    config: validateModelConfig(input.config), history
+  };
+}
+
+let modelState = {
+  version: MODEL_CONFIG_VERSION,
+  revision: 0,
+  updated_at: '',
+  reason: 'environment defaults',
+  config: validateModelConfig(bootstrapModelConfig()),
+  history: []
+};
+let modelConfigHealthy = quotaConfigErrors.length === 0;
+let modelConfigFileLoaded = false;
+
+function readModelState() {
+  let fd;
+  try {
+    fd = fs.openSync(MODEL_CONFIG_FILE, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    const before = fs.fstatSync(fd);
+    if (!before.isFile() || before.size < 1 || before.size > MAX_MODEL_CONFIG_BYTES) {
+      throw new Error('invalid model config file size');
+    }
+    // Read through the checked descriptor into a fixed-size buffer. A local
+    // writer growing the inode after fstat must not turn this small config
+    // read into an unbounded allocation.
+    const bytes = Buffer.allocUnsafe(before.size + 1);
+    let total = 0;
+    while (total < bytes.length) {
+      const count = fs.readSync(fd, bytes, total, bytes.length - total, null);
+      if (count === 0) break;
+      total += count;
+    }
+    if (total !== before.size) throw new Error('model config changed while reading');
+    const after = fs.fstatSync(fd);
+    if (after.size !== before.size || after.mtimeMs !== before.mtimeMs || after.ino !== before.ino) {
+      throw new Error('model config changed while reading');
+    }
+    const raw = bytes.subarray(0, total).toString('utf8');
+    return validateModelState(JSON.parse(raw));
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+try {
+  modelState = readModelState();
+  modelConfigFileLoaded = true;
+  modelConfigHealthy = true;
+} catch (error) {
+  if (error?.code !== 'ENOENT') {
+    modelConfigHealthy = false;
+    console.error('model config load failed; admissions disabled', String(error?.code || error?.name || 'unknown'));
+  }
+}
+
+function persistModelState(nextState) {
+  let temporary = '';
+  try {
+    const validated = validateModelState(nextState);
+    const serialized = JSON.stringify(validated);
+    if (Buffer.byteLength(serialized) > MAX_MODEL_CONFIG_BYTES) throw new Error('model config too large');
+    const directory = path.dirname(MODEL_CONFIG_FILE);
+    fs.mkdirSync(directory, { recursive: true });
+    temporary = path.join(directory, `.${path.basename(MODEL_CONFIG_FILE)}.${process.pid}.${crypto.randomUUID()}.tmp`);
+    const fd = fs.openSync(temporary, 'wx', 0o600);
+    try { fs.writeFileSync(fd, serialized); fs.fsyncSync(fd); }
+    finally { fs.closeSync(fd); }
+    fs.renameSync(temporary, MODEL_CONFIG_FILE);
+    temporary = '';
+    let dirFd;
+    try { dirFd = fs.openSync(directory, 'r'); fs.fsyncSync(dirFd); }
+    finally { if (dirFd !== undefined) fs.closeSync(dirFd); }
+    const committed = readModelState();
+    if (JSON.stringify(committed) !== serialized) throw new Error('model config commit mismatch');
+    modelState = committed;
+    modelConfigHealthy = true;
+    modelConfigFileLoaded = true;
+    return true;
+  } catch (error) {
+    if (temporary) { try { fs.unlinkSync(temporary); } catch { /* best effort */ } }
+    modelConfigHealthy = false;
+    console.error('model config persist failed; admissions disabled', String(error?.code || error?.name || 'unknown'));
+    return false;
+  }
+}
+
+function routeForRequest(providerId, tier, hasImages, hasPdfs, state = modelState) {
+  const config = state.config;
+  if (hasPdfs) {
+    return { name: config.routes.pdf.label, models: [...config.routes.pdf.models], reasoningEffort: false };
+  }
+  const route = tier === 'standard' ? config.routes.standard : config.routes[providerId];
+  return {
+    name: route.label,
+    models: [...(hasImages ? route.vision : route.text)],
+    reasoningEffort: route.reasoning_effort
+  };
+}
 
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
@@ -405,13 +706,13 @@ const UPLOAD_TICKET_RATE_PER_IP = 30;
 
 // Student-facing copy — identical wording to ai-proxy.js. Never mentions keys.
 const UNAVAILABLE = 'ИИ-сервис временно недоступен. Попробуйте позже или переключитесь на другой провайдер в настройках.';
-const NEED_LICENSE = 'Qwen и DeepSeek работают по лицензии СМЭШ. Введите ключ доступа (SMESH-…) в настройках расширения.';
+const NEED_LICENSE = 'ИИ СМЭШ работает по лицензии. Введите ключ доступа (SMESH-…) в настройках расширения.';
 const NEED_DEVICE_ID = 'Не удалось подтвердить устройство. Обновите расширение СМЭШ AI до последней версии и попробуйте снова.';
 const OVERLOADED = 'Сервер СМЭШ сейчас перегружен. Попробуйте позже или переключитесь на другой провайдер в настройках.';
 const JOB_NOT_FOUND = 'Сессия ответа не найдена или устарела. Задайте вопрос ещё раз.';
 const LICENSE_ERRORS = {
   not_found: 'Ключ лицензии не найден. Проверьте его в настройках расширения.',
-  expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться Qwen и DeepSeek.',
+  expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться ИИ СМЭШ.',
   revoked: 'Эта лицензия была отозвана. Напишите в поддержку.',
   device_in_use: 'Этот ключ уже используется на устройстве №1. Сначала деактивируйте его там.',
   device_limit: 'Достигнут лимит устройств для этой лицензии.',
@@ -498,27 +799,168 @@ function isAdmin(req) {
   return safeEqualSecret(ADMIN_KEY, readHeader(req, 'x-admin-key'));
 }
 
+const modelAdminFailures = new Map();
+const MODEL_ADMIN_FAILURE_WINDOW_MS = 10 * 60 * 1000;
+const MODEL_ADMIN_FAILURE_LIMIT = 20;
+const MAX_MODEL_ADMIN_FAILURE_IPS = 4096;
+
+function modelAdminCors(req) {
+  const origin = readHeader(req, 'origin').replace(/\/+$/, '');
+  if (origin && origin !== MODEL_DASHBOARD_ORIGIN) return null;
+  return origin ? {
+    'Access-Control-Allow-Origin': MODEL_DASHBOARD_ORIGIN,
+    'Access-Control-Allow-Methods': 'GET, PUT, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-Model-Admin-Key',
+    'Access-Control-Max-Age': '600',
+    'Vary': 'Origin'
+  } : {};
+}
+
+function modelAdminAllowed(req) {
+  const ip = requestIp(req);
+  if (MODEL_ADMIN_KEY_VALID && safeEqualSecret(MODEL_ADMIN_KEY, readHeader(req, 'x-model-admin-key'))) {
+    modelAdminFailures.delete(ip);
+    return { ok: true };
+  }
+  const now = Date.now();
+  const recent = (modelAdminFailures.get(ip) || []).filter(
+    (timestamp) => timestamp > now - MODEL_ADMIN_FAILURE_WINDOW_MS
+  );
+  if (recent.length >= MODEL_ADMIN_FAILURE_LIMIT) {
+    modelAdminFailures.set(ip, recent);
+    return { ok: false, status: 429 };
+  }
+  if (!modelAdminFailures.has(ip) && modelAdminFailures.size >= MAX_MODEL_ADMIN_FAILURE_IPS) {
+    return { ok: false, status: 429 };
+  }
+  recent.push(now);
+  modelAdminFailures.set(ip, recent);
+  return { ok: false, status: MODEL_ADMIN_KEY_VALID ? 401 : 503 };
+}
+
+setInterval(() => {
+  const cutoff = Date.now() - MODEL_ADMIN_FAILURE_WINDOW_MS;
+  for (const [ip, attempts] of modelAdminFailures) {
+    const recent = attempts.filter((timestamp) => timestamp > cutoff);
+    if (recent.length) modelAdminFailures.set(ip, recent);
+    else modelAdminFailures.delete(ip);
+  }
+}, MODEL_ADMIN_FAILURE_WINDOW_MS).unref();
+
+function publicModelState() {
+  return {
+    ok: true,
+    healthy: modelConfigHealthy,
+    source: modelConfigFileLoaded ? 'saved' : 'environment_defaults',
+    version: modelState.version,
+    revision: modelState.revision,
+    updated_at: modelState.updated_at,
+    reason: modelState.reason,
+    config: modelState.config,
+    history: modelState.history
+  };
+}
+
+function handleModelConfigGet(req, res, corsHeaders) {
+  const auth = modelAdminAllowed(req);
+  if (!auth.ok) {
+    return sendJson(res, auth.status, {
+      ok: false,
+      reason: auth.status === 503 ? 'model_admin_key_not_configured' :
+        auth.status === 429 ? 'too_many_attempts' : 'unauthorized'
+    }, corsHeaders);
+  }
+  return sendJson(res, 200, publicModelState(), corsHeaders);
+}
+
+function parseModelAdminBody(rawBody) {
+  if (Buffer.byteLength(rawBody) > MAX_SMALL_BODY_BYTES * 4) {
+    throw Object.assign(new Error('request_too_large'), { status: 413 });
+  }
+  let body;
+  try { body = JSON.parse(rawBody); }
+  catch { throw Object.assign(new Error('bad_json'), { status: 400 }); }
+  exactKeys(body, ['expected_revision', 'reason', 'config', 'rollback_revision'], 'request');
+  if (!Number.isSafeInteger(body.expected_revision) || body.expected_revision < 0) {
+    throw Object.assign(new Error('invalid_expected_revision'), { status: 400 });
+  }
+  const reason = typeof body.reason === 'string' ? body.reason.trim() : '';
+  if (reason.length > 200 || /[\u0000-\u001f\u007f]/.test(reason)) {
+    throw Object.assign(new Error('invalid_reason'), { status: 400 });
+  }
+  const hasConfig = Object.hasOwn(body, 'config');
+  const hasRollback = Object.hasOwn(body, 'rollback_revision');
+  if (hasConfig === hasRollback) {
+    throw Object.assign(new Error('provide_config_or_rollback'), { status: 400 });
+  }
+  return { ...body, reason };
+}
+
+function handleModelConfigPut(res, rawBody, corsHeaders) {
+  let body;
+  try { body = parseModelAdminBody(rawBody); }
+  catch (error) {
+    return sendJson(res, error.status || 400, { ok: false, reason: String(error.message || 'invalid_config') }, corsHeaders);
+  }
+  if (body.expected_revision !== modelState.revision) {
+    return sendJson(res, 409, {
+      ok: false, reason: 'stale_revision', current_revision: modelState.revision
+    }, corsHeaders);
+  }
+
+  let nextConfig;
+  try {
+    if (Object.hasOwn(body, 'rollback_revision')) {
+      if (!Number.isSafeInteger(body.rollback_revision) || body.rollback_revision < 0) {
+        throw new Error('invalid_rollback_revision');
+      }
+      const target = modelState.history.find((entry) => entry.revision === body.rollback_revision);
+      if (!target) throw new Error('rollback_revision_not_found');
+      nextConfig = validateModelConfig(target.config);
+    } else {
+      nextConfig = validateModelConfig(body.config);
+    }
+  } catch (error) {
+    return sendJson(res, 400, { ok: false, reason: String(error.message || 'invalid_config') }, corsHeaders);
+  }
+
+  const now = new Date().toISOString();
+  const previous = {
+    revision: modelState.revision,
+    updated_at: modelState.updated_at,
+    reason: modelState.reason,
+    config: modelState.config
+  };
+  const nextState = {
+    version: MODEL_CONFIG_VERSION,
+    revision: modelState.revision + 1,
+    updated_at: now,
+    reason: body.reason || (Object.hasOwn(body, 'rollback_revision')
+      ? `rollback to revision ${body.rollback_revision}`
+      : 'dashboard update'),
+    config: nextConfig,
+    history: [previous, ...modelState.history].slice(0, MAX_MODEL_HISTORY)
+  };
+  if (!persistModelState(nextState)) {
+    return sendJson(res, 503, { ok: false, reason: 'model_config_persist_failed' }, corsHeaders);
+  }
+  console.log('model config updated', 'revision=' + modelState.revision,
+    'force_standard=' + modelState.config.limits.force_standard,
+    'reason=' + JSON.stringify(modelState.reason));
+  return sendJson(res, 200, publicModelState(), corsHeaders);
+}
+
 function upstreamUrl() {
   return UPSTREAM_BASE_URL.endsWith('/chat/completions')
     ? UPSTREAM_BASE_URL
     : `${UPSTREAM_BASE_URL}/chat/completions`;
 }
 
-function modelChoices(p, hasImages, hasPdfs) {
+function modelChoices(p) {
   const seen = new Set();
   const out = [];
   const add = (m) => { m = String(m || '').trim(); if (m && !seen.has(m)) { seen.add(m); out.push(m); } };
-  // A PDF part overrides the provider's model chain entirely: only the Gemini
-  // chain can read the file, and a PDF sent to qwen/deepseek would 400 (or
-  // worse, be silently dropped and hallucinated about).
-  if (hasPdfs) {
-    add(PDF_MODEL);
-    for (const m of String(PDF_FALLBACK_MODELS || '').split(',')) add(m);
-    return out;
-  }
-  add(p.model);
-  const list = (hasImages && p.visionFallbacks) ? p.visionFallbacks : p.fallbacks;
-  for (const m of String(list || '').split(',')) add(m);
+  for (const model of p?.models || []) add(model);
   return out;
 }
 
@@ -1077,42 +1519,57 @@ if (!quotaLoadBlocked) {
   else probeQuotaStore();
 }
 
-// Returns { ok:true, day } or { ok:false, status, message }.
+// Returns the durable quota bucket plus an immutable routing snapshot. The
+// caller-selected qwen/deepseek id chooses the frontier experience; once the
+// combined frontier allowance is consumed, both experiences continue on the
+// standard chain.
 function chargeQuota(licenseKey, providerId, provider) {
-  if (!QUOTA_CONFIG_VALID) {
+  if (!QUOTA_CONFIG_VALID || !modelConfigHealthy) {
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
   if (!ensureQuotaPersistence()) {
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
-  // Defence in depth behind providerById(): a per-license cap that is not a
-  // real positive integer is not a cap. `mine > undefined` is always false, so
-  // admitting here would silently charge the global breaker with no per-license
-  // limit at all. Refuse the request instead of metering it against nothing.
-  if (!Number.isSafeInteger(provider?.cap) || provider.cap <= 0 ||
-      !/^[a-z0-9_-]{1,32}$/i.test(String(providerId || ''))) {
-    console.error('quota refused: provider has no usable daily cap', String(providerId));
+  if (!provider || !/^(?:qwen|deepseek)$/.test(String(providerId || ''))) {
+    console.error('quota refused: unknown client route', String(providerId));
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
 
+  const routingState = modelState;
+  const limits = routingState.config.limits;
   const today = mskDay();
   const counts = quota.day === today ? quota.counts : {};
-  const providerKey = `${quotaLicenseRef(licenseKey)}|${providerId}`;
+  const licenseRef = quotaLicenseRef(licenseKey);
+  const qwenUsed = sanitizeQuotaCount(counts[`${licenseRef}|qwen`] || 0);
+  const deepseekUsed = sanitizeQuotaCount(counts[`${licenseRef}|deepseek`] || 0);
+  const frontierUsed = qwenUsed > Number.MAX_SAFE_INTEGER - deepseekUsed
+    ? Number.MAX_SAFE_INTEGER
+    : qwenUsed + deepseekUsed;
+  const tier = limits.force_standard || frontierUsed >= limits.frontier_per_license
+    ? 'standard'
+    : 'frontier';
+  const bucket = tier === 'frontier' ? providerId : 'standard';
+  const cap = tier === 'frontier' ? limits.frontier_per_license : limits.standard_per_license;
+  const providerKey = `${licenseRef}|${bucket}`;
   const mine = Math.min(Number.MAX_SAFE_INTEGER, sanitizeQuotaCount(counts[providerKey] || 0) + 1);
-  if (mine > provider.cap) {
+  if (mine > cap) {
     return {
       ok: false,
       status: 429,
-      message: `Дневной лимит ${provider.name} по вашей лицензии исчерпан (${provider.cap} запросов). ` +
-        'Счётчик сбросится завтра; пока можно переключиться на другой провайдер в настройках.'
+      message: tier === 'frontier'
+        ? 'Дневной лимит быстрых ИИ-запросов исчерпан. Запрос будет доступен через стандартный режим.'
+        : `Дневной лимит ИИ по вашей лицензии исчерпан (${cap} запросов). Счётчик сбросится завтра.`
     };
   }
 
   const total = Math.min(Number.MAX_SAFE_INTEGER, sanitizeQuotaCount(counts['*|all'] || 0) + 1);
-  if (total > GLOBAL_DAILY) {
-    console.error('GLOBAL DAILY BREAKER TRIPPED', total, '>', GLOBAL_DAILY);
+  if (total > limits.global_daily) {
+    console.error('GLOBAL DAILY BREAKER TRIPPED', total, '>', limits.global_daily);
     return { ok: false, status: 429, message: OVERLOADED };
   }
+
+  const route = routeForRequest(providerId, tier, false, false, routingState);
+  if (!route.models.length) return { ok: false, status: 503, message: UNAVAILABLE };
 
   const previousQuota = quota;
   quota = {
@@ -1129,7 +1586,14 @@ function chargeQuota(licenseKey, providerId, provider) {
     }
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
-  return { ok: true, day: today };
+  return {
+    ok: true,
+    day: today,
+    bucket,
+    tier,
+    revision: routingState.revision,
+    routingState
+  };
 }
 
 // Give a reservation back when the request provably bought nothing: the job
@@ -1138,9 +1602,9 @@ function chargeQuota(licenseKey, providerId, provider) {
 // released together. A refund is best effort — a failed one over-counts, which
 // fails closed. It never runs across a day boundary (the new day's counters
 // belong to other requests) and never drives a counter below zero.
-function refundQuota(day, licenseKey, providerId) {
-  if (!day || quota.day !== day || !licenseKey || !providerId) return false;
-  const providerKey = `${quotaLicenseRef(licenseKey)}|${providerId}`;
+function refundQuota(day, licenseKey, bucket) {
+  if (!day || quota.day !== day || !licenseKey || !bucket) return false;
+  const providerKey = `${quotaLicenseRef(licenseKey)}|${bucket}`;
   const counts = quota.counts;
   const mine = Number(counts[providerKey] || 0);
   const total = Number(counts['*|all'] || 0);
@@ -2003,7 +2467,7 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
   // ambiguous transport failure means it may have. A connect-level refusal is
   // positively pre-dispatch and remains refundable even after fetch() began.
   let providerMayHaveRun = false;
-  for (const model of modelChoices(provider, hasImages, hasPdfs)) {
+  for (const model of modelChoices(provider)) {
     usedModel = model;
     const upstreamBody = {
       model, messages, temperature: 0.3, max_tokens: MAX_TOKENS_OUT,
@@ -2211,13 +2675,24 @@ function admitJobStart(reservation, prep) {
   // so a rejected burst neither slips through nor consumes extra daily quota.
   const q = chargeQuota(prep.licenseKey, prep.providerId, prep.provider);
   if (!q.ok) return { err: { status: q.status || 503, message: q.message } };
+  const route = routeForRequest(
+    prep.providerId, q.tier, prep.hasImages, prep.hasPdfs, q.routingState
+  );
   licenseStarts.push(now);
   deviceStarts.push(now);
   ipStarts.push(now);
   startsByLicense.set(prep.licenseKey, licenseStarts);
   startsByDevice.set(prep.deviceId, deviceStarts);
   startsByIp.set(reservation.ip, ipStarts);
-  return { ok: true, quotaDay: q.day };
+  return {
+    ok: true,
+    quotaDay: q.day,
+    quotaBucket: q.bucket,
+    tier: q.tier,
+    configRevision: q.revision,
+    route,
+    rates: q.routingState.config.rates
+  };
 }
 
 // Release an admission's daily reservation. Safe to call more than once: the
@@ -2227,7 +2702,7 @@ function releaseAdmissionQuota(holder) {
   if (!holder?.quotaDay) return false;
   const day = holder.quotaDay;
   holder.quotaDay = null;
-  return refundQuota(day, holder.licenseKey, holder.providerId);
+  return refundQuota(day, holder.licenseKey, holder.quotaBucket);
 }
 
 function releaseJobAccounting(reservation) {
@@ -2301,13 +2776,21 @@ setInterval(() => {
 // a dashboard estimate at published rates — not a billing-grade figure (the
 // event is tagged est_rates so the dashboard can say so).
 const USAGE_RATES = [
+  [/^glm-5\.3-flash$/i, { in: 0.075 / 1e6, out: 0.25 / 1e6 }],
   [/^qwen/i,        { in: 0.32 / 1e6, out: 1.28 / 1e6 }],
   [/^deepseek/i,    { in: 0.20 / 1e6, out: 0.40 / 1e6 }],
   [/^gemini-2\.5/i, { in: 0.30 / 1e6, out: 2.50 / 1e6 }],
   [/^gemini/i,      { in: 0.10 / 1e6, out: 0.40 / 1e6 }]
 ];
 
-function estimateCost(model, tokensIn, tokensOut) {
+function estimateCost(model, tokensIn, tokensOut, configuredRates = null) {
+  const exact = configuredRates && Object.hasOwn(configuredRates, String(model || ''))
+    ? configuredRates[String(model || '')]
+    : null;
+  if (exact) {
+    return tokensIn * exact.input_usd_per_m / 1e6 +
+      tokensOut * exact.output_usd_per_m / 1e6;
+  }
   for (const [re, rate] of USAGE_RATES) {
     if (re.test(String(model || ''))) return tokensIn * rate.in + tokensOut * rate.out;
   }
@@ -2394,11 +2877,13 @@ function reportJobUsage(job) {
       model,
       tokens_in: tokensIn,
       tokens_out: tokensOut,
-      cost_usd: estimateCost(model, tokensIn, tokensOut),
+      cost_usd: estimateCost(model, tokensIn, tokensOut, job.modelRates),
       meta: {
         src: 'vps',
         ok: !job.error && job.cancelled !== true && !streamError,
         est_rates: true,
+        model_tier: job.modelTier || null,
+        model_config_revision: job.modelConfigRevision || 0,
         ...timings
       }
     };
@@ -2610,6 +3095,10 @@ async function handleAiStart(req, res, rawBody) {
       ctrl: new AbortController(), lastAccess: Date.now(), accounting, token, cancelled: false,
       providerId: prep.providerId, // for the post-job usage report + quota release
       licenseKey: prep.licenseKey,
+      quotaBucket: admission.quotaBucket,
+      modelTier: admission.tier,
+      modelConfigRevision: admission.configRevision,
+      modelRates: admission.rates,
       // Carried so a user cancel can forget the /ai/start idempotency entry
       // together with the job it names; a cancelled job must not be
       // resurrectable by a later identical retry.
@@ -2648,7 +3137,7 @@ async function handleAiStart(req, res, rawBody) {
     const launch = () => {
       if (runnerStarted) return;
       runnerStarted = true;
-      runJob(job, prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs).catch((e) => {
+      runJob(job, admission.route, prep.body, prep.messages, prep.hasImages, prep.hasPdfs).catch((e) => {
         console.error('job runner crashed', e && e.stack || String(e));
         job.error = job.error || UNAVAILABLE;
         job.done = true;
@@ -2863,7 +3352,9 @@ async function handleAiChat(req, res, rawBody) {
     const admission = admitJobStart(accounting, prep);
     if (admission.err) return sendErr(res, admission.err.status, admission.err.message);
     quotaHolder = {
-      licenseKey: prep.licenseKey, providerId: prep.providerId, quotaDay: admission.quotaDay
+      licenseKey: prep.licenseKey,
+      quotaBucket: admission.quotaBucket,
+      quotaDay: admission.quotaDay
     };
 
     totalTimer = setTimeout(() => tripLimit(
@@ -2874,7 +3365,7 @@ async function handleAiChat(req, res, rawBody) {
       `UPSTREAM_CONNECT_TIMEOUT: ИИ-сервис не начал отвечать за ${connectTimeoutMs / 1000} секунд.`
     ), connectTimeoutMs);
     const conn = await connectUpstream(
-      prep.provider, prep.body, prep.messages, prep.hasImages, prep.hasPdfs, ctrl.signal
+      admission.route, prep.body, prep.messages, prep.hasImages, prep.hasPdfs, ctrl.signal
     );
     clearTimeout(connectTimer);
     connectTimer = null;
@@ -3072,13 +3563,44 @@ const server = http.createServer((req, res) => {
   catch { return sendErr(res, 400, 'Некорректный запрос.'); }
   const pathName = url.pathname;
 
+  if (pathName === '/admin/model-config') {
+    const corsHeaders = modelAdminCors(req);
+    if (!corsHeaders) return sendJson(res, 403, { ok: false, reason: 'origin_not_allowed' });
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204, { ...BASE_HEADERS, ...corsHeaders });
+      return res.end();
+    }
+    if (req.method === 'GET') return handleModelConfigGet(req, res, corsHeaders);
+    if (req.method === 'PUT') {
+      // Authenticate before reserving a request-body slot. This keeps an
+      // unauthenticated caller from tying up the bounded body parser with a
+      // deliberately slow upload.
+      const auth = modelAdminAllowed(req);
+      if (!auth.ok) {
+        return sendJson(res, auth.status, {
+          ok: false,
+          reason: auth.status === 503 ? 'model_admin_key_not_configured' :
+            auth.status === 429 ? 'too_many_attempts' : 'unauthorized'
+        }, corsHeaders);
+      }
+      return withBody(
+        req, res,
+        (raw) => handleModelConfigPut(res, raw, corsHeaders),
+        MAX_SMALL_BODY_BYTES * 4
+      );
+    }
+    return sendJson(res, 405, { ok: false, reason: 'method_not_allowed' }, {
+      ...corsHeaders, Allow: 'GET, PUT, OPTIONS'
+    });
+  }
   if (req.method === 'OPTIONS') { res.writeHead(204, BASE_HEADERS); return res.end(); }
   if (pathName === '/health') return sendJson(res, 200, { ok: true });
   if (pathName === '/ready') {
     const checks = {
       upstream_key: Boolean(UPSTREAM_KEY),
       quota_config: QUOTA_CONFIG_VALID,
-      quota_store: verifyQuotaPersistenceForReadiness()
+      quota_store: verifyQuotaPersistenceForReadiness(),
+      model_config: modelConfigHealthy
     };
     const ok = Object.values(checks).every(Boolean);
     return sendJson(res, ok ? 200 : 503, { ok, checks });
@@ -3147,16 +3669,24 @@ if [ ! -f "$ENV_FILE" ]; then
 AI_PROXY_API_KEY=
 # Required as x-admin-key for /ai/chat and /ai/streamtest. Empty disables both.
 ADMIN_KEY=
+# Separate scoped key for GET/PUT /admin/model-config. Generate with:
+#   openssl rand -hex 32
+# A missing or shorter-than-32-byte value disables browser model control.
+MODEL_ADMIN_KEY=
+# Exact browser origin allowed to call the model-control route (no path/slash).
+MODEL_DASHBOARD_ORIGIN=https://ayeepat.github.io
 # Server-truth usage reporting to the license worker's POST /t/ai. Must match
 # the worker secret (`npx wrangler secret put INGEST_KEY`). Empty disables it.
 INGEST_KEY=
 QUOTA_FILE=/var/lib/smesh-proxy/quota.json
+MODEL_CONFIG_FILE=/var/lib/smesh-proxy/model-config.json
 # Optional overrides (defaults already match the Cloudflare worker):
 # AI_PROXY_BASE_URL=https://api.302.ai/v1
 # LICENSE_VERIFY_URL=https://smeshapi.site/verify
 # INGEST_URL=https://smeshapi.site/t/ai
-# PROXY_QWEN_DAILY=80
-# PROXY_DEEPSEEK_DAILY=150
+# Bootstrap values used until the first dashboard save:
+# PROXY_FRONTIER_DAILY=15
+# PROXY_STANDARD_DAILY=150
 # PROXY_GLOBAL_DAILY=3000
 # PROXY_PDF_MODEL=gemini-2.5-flash
 # PROXY_PDF_FALLBACK_MODELS=gemini-2.5-flash-lite
@@ -3177,6 +3707,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 EnvironmentFile=/etc/smesh-proxy.env
+EnvironmentFile=-/etc/smesh-proxy-model-admin.env
 # EnvironmentFile values override Environment= regardless of directive order.
 # UnsetEnvironment= is applied last, so installer upgrades also neutralize
 # legacy editable PORT/HOST entries. Node then uses its canonical defaults,
@@ -3211,7 +3742,7 @@ ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 SystemCallArchitectures=native
 # MemoryDenyWriteExecute is omitted because Node's V8 JIT needs writable-executable pages.
-# The app persists only its daily quota counters; logs stay in journald.
+# The app persists daily quota counters and validated live model config; logs stay in journald.
 ReadWritePaths=/var/lib/smesh-proxy
 MemoryMax=768M
 TasksMax=128
