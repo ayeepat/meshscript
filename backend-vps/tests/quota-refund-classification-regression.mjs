@@ -31,6 +31,18 @@ const classifierSource = sourceSection(
   '\n\n/* --------------------------- poll-job store'
 );
 
+// connectUpstream applies the quality policy per ACTUAL model, so it reaches
+// for the model regexes declared far above the classifier section. They are
+// EXTRACTED from the production file rather than re-typed here: a hand-copied
+// regex would drift from the real policy without any test noticing, and a
+// missing one is not a soft failure — the sandbox throws ReferenceError on
+// every connect, which is how this suite broke when the GLM branch landed.
+const modelPolicySource = sourceSection(
+  serverSource,
+  'const GLM_53_FLASH',
+  '\nconst MAX_BODY_BYTES'
+);
+
 // Only the collaborators connectUpstream actually reaches for. sleep is a
 // no-op so the retry ladder does not slow the suite down.
 function makeContext({ fetchImpl, models = ['qwen-test'], sleepImpl = async () => {} }) {
@@ -55,7 +67,7 @@ function makeContext({ fetchImpl, models = ['qwen-test'], sleepImpl = async () =
     fetch: async (...args) => { calls.push(args); return fetchImpl(calls.length); }
   };
   vm.runInNewContext(
-    `${classifierSource}\nglobalThis.__connectUpstream = connectUpstream;`,
+    `${modelPolicySource}\n${classifierSource}\nglobalThis.__connectUpstream = connectUpstream;`,
     context,
     { filename: 'connect-upstream.js' }
   );

@@ -171,14 +171,21 @@
 ```sh
 npm ci
 npm run verify
+npm --prefix backend-vps test
+npm --prefix motion run check
+npm --prefix backend run deploy -- --dry-run
 npm run package:extension
 npm run verify:package
 ```
 
-`verify` — разбор исходников плюс все регрессии (`tests/`), включая инварианты
-готовности к публикации. `package:extension` собирает детерминированный архив
-для магазина, `verify:package` проверяет, что архив совпадает с исходниками.
-Те же команды CI гоняет на каждый push и pull request.
+`verify` — разбор исходников плюс все регрессии из `tests/`, включая инварианты
+готовности к публикации. **Прокси к ИИ он не проверяет:** его регрессии лежат в
+`backend-vps/tests/` и запускаются отдельной командой. Пропустить её легко, а
+цена высокая — именно так в `main` уехал сломанный VM-песочник
+`quota-refund-classification`. `package:extension` собирает детерминированный
+архив для магазина, `verify:package` проверяет, что архив совпадает с
+исходниками. Все эти команды CI гоняет на каждый push и pull request, так что
+локально стоит прогонять их тем же списком.
 
 Серверные части описаны у себя: [backend/](backend/README.md) — воркер лицензий
 и платежей, [backend-vps/](backend-vps/README.md) — прокси к ИИ,
