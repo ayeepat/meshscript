@@ -7,36 +7,45 @@ each point maps to code in this repo.
 ## What the extension does
 
 A personal homework/test assistant for the Moscow school diary **МЭШ**
-(`school.mos.ru`). New users activate a purchased СМЭШ license, which routes AI
-requests through our proxy. An older installation that already holds the
-user's own provider key may continue to call that provider directly. The
-extension reads the homework on the page the user is already viewing, sends it
-to an AI provider, and shows the answer. It never logs into anything on the
-user's behalf and never submits a test.
+(`school.mos.ru`). Users activate a purchased СМЭШ license, which routes every
+AI request through our own proxy. The extension reads the homework on the page
+the user is already viewing, sends it to an AI provider, and shows the answer.
+It never logs into anything on the user's behalf and never submits a test.
 
-**Provider selection is not exposed to the user.** As shipped
-(`SHOW_PROVIDER_UI = false` in `src/lib/config.js`) there is no provider picker
-and no field for a third-party API key. Fresh installations therefore use the
-licensed proxy. The bring-your-own-key adapters (OpenRouter, Groq, Alibaba
-Model Studio) remain in the source and still run for an installation that was
-configured before the flag was introduced and still holds its own key; those
-requests go directly to the selected provider, which is why the corresponding
-host permissions remain below. The vendor names are hidden from the product UI
-only. They are named in full here and in the privacy policy at
-`smeshai.xyz/privacy`, and the consent screen says that homework content may be
-sent either through the СМЭШ proxy or directly with a previously saved key.
+It is an independent product and is not affiliated with, endorsed by, or
+operated by МЭШ, mos.ru, or the Moscow Department of Education. The extension
+only reads pages the signed-in user opens themselves.
+
+**Provider selection is not exposed, and this build ships no direct-to-vendor
+path at all.** With `SHOW_PROVIDER_UI = false` (`src/lib/config.js`) there is no
+provider picker and no field for a third-party API key, so **every** AI request
+goes through `ai.smeshapi.site`. The bring-your-own-key adapters (OpenRouter,
+Groq, Alibaba Model Studio) remain in the source behind that flag, but the
+matching host permissions were **removed** from `manifest.json`: an unreachable
+host permission is not a permission we should be asking for.
+`tests/byo-provider-surface-regression.mjs` fails the build if the flag is ever
+re-enabled without restoring them. The model vendor is an internal server-side
+routing choice: 302.AI receives the request and forwards it to the model chain
+currently selected by the operator. The privacy policy at
+`smeshai.xyz/privacy` must therefore name 302.AI, explain this downstream-model
+routing, and keep its current processor list accurate. The consent screen says
+that homework content is sent to third-party AI services through the СМЭШ
+proxy.
 
 ## Consent gate (required before any data leaves the device)
 
 On first run the popup shows a consent screen that states plainly that task
-text, test screenshots and attached files (including audio clips sent for
-transcription) leave the device and go to third-party AI services. Licensed AI
-requests use our proxy at `ai.smeshapi.site`; a pre-existing bring-your-own-key
-setup may call its provider directly. Those services are OpenRouter, Groq,
-Qwen (Alibaba) and DeepSeek; they are named in the linked privacy policy rather
-than in the checkbox text, which keeps the in-product disclosure readable for
-a schoolchild while the full list stays one click away. No AI request of any
-kind (solving, transcription) is made until the
+text, test screenshots and attached files leave the device and go to
+third-party AI services. All AI requests use our proxy at `ai.smeshapi.site`.
+The immediate processor behind it is 302.AI; the VPS selects separate live
+chains for Auto, Think, standard, vision and PDF requests. Changing that chain
+does not change what data leaves the device, but the public privacy policy must
+be updated before introducing a downstream processor it does not already
+cover. Audio is deliberately **not** listed as an outbound category:
+transcription runs on a BYO Groq key this build cannot collect, so an attached
+clip never leaves the device — the provider adapters replace it with a text note
+(`fileToContentPart` in `src/lib/deepseek.js`). No AI request of any
+kind is made until the
 user accepts (`src/lib/consent.js`; every outbound handler in
 `src/background/service-worker.js` re-checks it). The shared provider and
 transcription network boundaries perform one final storage-backed check
@@ -48,19 +57,18 @@ when consent is withdrawn. Consent is reviewable and revocable in Settings →
 
 | Permission | Why it is needed |
 |---|---|
-| `storage`, `unlimitedStorage` | All local: settings, API keys, the GDZ catalog cache, and a **7-day** solve history. `unlimitedStorage` because a cached textbook catalog and inlined answer images can exceed the default quota. Nothing is synced. `chrome.storage.local` is locked to trusted contexts (`setAccessLevel`) so content scripts cannot read keys. |
+| `storage`, `unlimitedStorage` | All local: settings, API keys, the GDZ catalog cache, a **7-day** solve history and a **7-day** cache of already-solved test pages (kept so reopening the same questions does not re-bill the same completion). `unlimitedStorage` because a cached textbook catalog and inlined answer images can exceed the default quota. Nothing is synced. `chrome.storage.local` is locked to trusted contexts (`setAccessLevel`) so content scripts cannot read keys. |
 | `activeTab` | On an explicit user click, screenshot the visible test page and read its text to solve it. |
 | `scripting` | Inject the content script that reads the user's homework cards and fills test answers into the form fields on the Mesh page. |
-| `alarms` | A periodic local-data retention sweep (history 7 d, week scan 24 h, pending file handoffs 1 h). No network involved. |
+| `alarms` | A periodic local-data retention sweep (history 7 d, solved-test cache 7 d, week scan 24 h, pending file handoffs 1 h). No network involved. |
 
 ## Host permissions
 
 | Host | Why |
 |---|---|
 | `https://school.mos.ru/*`, `https://uchebnik.mos.ru/*` | Read the user's **own** diary/homework/test player and download attachments from the two exact Mesh origins, inside the user's already-authenticated session. Scripted child-frame capture additionally requires a positively identified test-player document; unrelated MOS frames are excluded. |
-| `https://openrouter.ai/*`, `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*` | The BYO-key AI providers (OpenRouter, Groq, and Alibaba Model Studio for power users' own Qwen/DeepSeek keys). Not reachable from the shipped UI — see "Provider selection is not exposed" above — but still used by pre-existing installs that hold their own key, and by Groq Whisper for audio transcription. |
-| `https://ai.smeshapi.site/*` | Our AI proxy for licensed users: Qwen/DeepSeek requests require the license, anonymous device id and the random one-device activation bearer; the key and public UUID alone are insufficient. Receives the same consent-gated task content as a direct provider call. |
-| `https://*.smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. |
+| `https://ai.smeshapi.site/*` | Our AI proxy for licensed users, and **the only origin any AI request reaches**. Requests require the license, anonymous device id and the random one-device activation bearer; the key and public UUID alone are insufficient. The VPS sends consent-gated task content to 302.AI using its currently saved model chain. |
+| `https://smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. Apex only — the site 301s `www.` to apex and the fetch refuses redirects. Normal links to the public site do not need host access. |
 | `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body), the GDZ proxy (`POST /gdz/fetch`, see below) and, **only if the user opts in**, anonymous usage statistics (see below). |
 
 ## GDZ textbook answers (no host permission, no declarativeNetRequest)
@@ -100,10 +108,11 @@ Homework text never enters this path.
 
 ## Data handling
 
-- **AI providers** receive task text / screenshots / attachments (and audio
-  clips for transcription on listening tasks) over HTTPS — authenticated with
-  the user's own key on the BYO path, or with the license key on the proxy
-  path. This is the core function and is gated by consent. Nothing leaves the
+- **AI providers** receive task text / screenshots / attachments over HTTPS,
+  always through the СМЭШ proxy and authenticated with the license key. Audio
+  clips are the one attachment type that never leaves the device in this build
+  (see the consent section above). This is the core function and is gated by
+  consent. Nothing leaves the
   device during a passive week scan: whether a homework card needs a file is
   decided on-device by regex heuristics (`src/lib/task-classifier.js`), and the
   first network request for a row happens only after the user presses «Решить»
@@ -112,8 +121,14 @@ Homework text never enters this path.
   to download the user's own attachments. Downloads are restricted to an
   explicit `school.mos.ru`/`uchebnik.mos.ru` allowlist (HTTPS only, redirects
   re-validated hop by hop) and the token is never sent anywhere else.
-- **Pseudonymous usage statistics are OPT-IN and off by default.** If (and only
-  if) the user enables the separate «Анонимная статистика» toggle in Settings,
+- **Pseudonymous usage statistics are covered by the single consent tick.** The
+  separate «Анонимная статистика» toggle was removed: accepting the terms and
+  privacy policy is what enables statistics, and declining or withdrawing that
+  consent stops them (`src/lib/consent.js` writes `telemetryEnabled` alongside
+  the consent record; `src/lib/telemetry.js` still checks both at flush time).
+  Nothing is sent before that acceptance. The linked terms and privacy policy
+  are therefore the disclosure surface — the extension UI no longer enumerates
+  what is collected. While consent stands,
   small content-free batches go to `smeshapi.site/t` with a short-lived,
   device-bound capability issued by a successful license verification;
   licensed proxy calls may additionally send provider-observed token/cost
@@ -135,7 +150,8 @@ Homework text never enters this path.
 
 ## Not present
 
-No background tracking (statistics are opt-in, content-free and deletable), no
+No background tracking (statistics require the user's acceptance, are
+content-free and deletable), no
 ad/affiliate injection, no remote code execution (no `eval`, no remotely-loaded
 scripts — the remote config is signed and validated *data*, and selectors must
 exactly match a compiled allowlist before reaching `querySelector`), no automatic

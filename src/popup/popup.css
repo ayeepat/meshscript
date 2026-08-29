@@ -214,6 +214,7 @@ body.compact .secbtn { padding: 9px 12px; font-size: 12px; }
   white-space: normal; word-break: break-word;
 }
 .answer .spinner { margin-right: 9px; vertical-align: -2px; }
+.answer .long-think-note { margin-top: 8px; }
 .answer .ai-notice {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
   margin-top: 10px; padding-top: 8px; border-top: 1px solid var(--separator);
@@ -245,6 +246,15 @@ body.compact .answer .ai-notice { font-size: 11px; }
 }
 .notice a { color: var(--warn); font-weight: 600; text-decoration: none; white-space: nowrap; }
 .notice a:hover { text-decoration: underline; }
+
+/* ---------- Hand-off to the full-screen tour ---------- */
+.handoff { padding: 18px 16px 16px; }
+.handoff-title {
+  margin: 0 0 6px;
+  font-family: var(--font-display); font-size: 18px; font-weight: 700;
+  letter-spacing: -0.4px; line-height: 1.2; text-wrap: balance;
+}
+.handoff-lede { margin: 0 0 14px; font-size: 12.5px; line-height: 1.55; color: var(--secondary); }
 
 /* ---------- First-run onboarding ---------- */
 .onboard { padding: 16px; }
@@ -314,7 +324,7 @@ body.compact .supportbtn { margin-top: 8px; font-size: 12px; padding: 8px 10px; 
 
 /* ---------- Legal footer ---------- */
 .legal {
-  display: flex; align-items: center; justify-content: center; gap: 8px;
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 8px;
   padding: 10px 16px 13px;
   font-size: 11px; color: var(--tertiary);
   border-top: 1px solid var(--separator);
@@ -322,4 +332,11 @@ body.compact .supportbtn { margin-top: 8px; font-size: 12px; padding: 8px 10px; 
 .legal a { color: var(--tertiary); text-decoration: none; transition: color 0.15s ease; }
 .legal a:hover { color: var(--accent); }
 .legal .legal-dot { opacity: 0.5; }
+/* Own row under the two links — the extension must not read as an official
+   МЭШ product. flex-basis, not a block, so the links keep their centred row. */
+.legal .legal-note {
+  flex-basis: 100%; margin: 0; text-align: center;
+  font-size: 10px; line-height: 1.45; opacity: 0.8;
+}
 body.compact .legal { padding: 8px 12px 11px; font-size: 10.5px; }
+body.compact .legal .legal-note { font-size: 9.5px; }

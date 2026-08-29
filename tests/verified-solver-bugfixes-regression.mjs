@@ -361,7 +361,7 @@ assert.match(popup, /вопросы не распознаны — проверь
 // Groq Whisper; if the cache misses twice, the second call increments fetches.
 const localStore = {
   groqApiKey: 'test-key',
-  aiConsent: { accepted: true, version: 2, at: new Date().toISOString() }
+  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
 };
 const sessionStore = {};
 const storageArea = (store) => ({
@@ -430,7 +430,7 @@ assert.equal(whisperCalls, 3);
 // still replaces the audio, exactly as it did before caching existed.
 const cacheFailureStore = {
   groqApiKey: 'test-key',
-  aiConsent: { accepted: true, version: 2, at: new Date().toISOString() }
+  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
 };
 chrome.storage.local = {
   async get(keys) {

@@ -16,7 +16,7 @@
 
 import { BACKEND_URL } from './config.js';
 import { getDeviceId } from './history.js';
-import { getLicenseStatus } from './license.js';
+import { getLicenseStatus, isUsableLicenseStatus } from './license.js';
 import { fetchTextBounded } from './http.js';
 
 const STORAGE_KEY = 'referralState';
@@ -104,7 +104,7 @@ async function getMyReferralCodeOnce({ sync = false } = {}) {
       method: 'POST',
       body: {
         device_id: deviceId,
-        license_key: lic?.ok ? lic.key : null,
+        license_key: isUsableLicenseStatus(lic) ? lic.key : null,
         referral_auth: referralAuth,
         known_code: state.code || null
       }

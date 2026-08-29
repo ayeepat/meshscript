@@ -5,9 +5,8 @@ import {
 
 const MAX_PILL_TEXT_CHARS = 15000;
 
-/** Read bounded, accessible DOM text from the exact documents captured. */
-export async function capturePillDomText(capture, scripting = chrome.scripting) {
-  const expectedDocuments = Object.fromEntries(
+function expectedCaptureDocuments(capture) {
+  return Object.fromEntries(
     capture.documents.map((document) => [document.pageId, {
       signature: document.signature,
       principal: document.principal,
@@ -15,6 +14,11 @@ export async function capturePillDomText(capture, scripting = chrome.scripting) 
       requireTestDocument: document.frameId !== 0,
     }])
   );
+}
+
+/** Read bounded, accessible DOM text from the exact documents captured. */
+export async function capturePillDomText(capture, scripting = chrome.scripting) {
+  const expectedDocuments = expectedCaptureDocuments(capture);
   let results;
   try {
     results = await executeScriptInCapturedDocuments(capture, {
@@ -64,4 +68,51 @@ export async function capturePillDomText(capture, scripting = chrome.scripting) 
     if (pageText.length >= MAX_PILL_TEXT_CHARS) break;
   }
   return pageText;
+}
+
+/**
+ * Detect visible, substantial visual/media material in the exact captured test
+ * documents. scraper.js owns the DOM heuristic so popup and pill routing cannot
+ * drift apart; this wrapper supplies the same document/signature/principal
+ * binding as the text capture before trusting its boolean.
+ */
+export async function captureTestVisualMedia(capture, scripting = chrome.scripting) {
+  const expectedDocuments = expectedCaptureDocuments(capture);
+  try {
+    await executeScriptInCapturedDocuments(capture, { files: ['src/content/scraper.js'] }, scripting);
+  } catch { /* normally already injected; the bound read below is authoritative */ }
+
+  let results;
+  try {
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (expected) => {
+        try {
+          const pageId = window.__smeshCaptureDocumentId;
+          const expectedDocument = pageId && expected[pageId];
+          const signature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const principal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedDocument || expectedDocument.signature !== signature ||
+              expectedDocument.principal !== principal ||
+              expectedDocument.url !== String(location.href || '') ||
+              (expectedDocument.requireTestDocument &&
+                !(typeof window.__smeshIsTestDocument === 'function' && window.__smeshIsTestDocument() === true))) {
+            return { stale: true, visualMedia: false };
+          }
+          return {
+            stale: false,
+            visualMedia: typeof window.__smeshHasVisualMedia === 'function' &&
+              window.__smeshHasVisualMedia() === true,
+          };
+        } catch {
+          return { stale: false, visualMedia: false };
+        }
+      },
+      args: [expectedDocuments],
+    }, scripting);
+  } catch {
+    throw testCaptureChangedError();
+  }
+  if (results.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
+  return results.some((entry) => entry?.result?.visualMedia === true);
 }

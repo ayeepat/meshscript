@@ -388,6 +388,57 @@ warning when the flag is set — the totals are floors, not exact values.
 for older dashboards; invalid or oversized offsets are rejected rather than
 silently clamped onto a repeated page.
 
+Revenue is reported gross AND net: `revenue_rub` is what was charged in the
+window, `refunded_rub` is what was returned in it (counted by `refunded_at`, so
+a refund of an older sale lands in the current period), and `net_revenue_rub` is
+the difference. When `payment_orders` cannot be read, `refunds_known` is false
+and `net_revenue_rub` is **null** — never silently equal to gross.
+
+Four owner-facing business routes round this out. `GET /admin/stats/subscriptions`
+is a snapshot, not a window: live subscriptions, MRR normalised to 30 days from
+each plan's own term, what lapses in 7/30 days, and lifetime holders (excluded
+from MRR). It consults `license_revocations` directly rather than the mirrored
+`purchases.status`, so a key revoked for abuse stops counting as live revenue
+even if the mirror write was lost. `GET /admin/stats/funnel?days=N` reads
+`payment_orders` — every order CREATED, so abandoned checkouts become visible;
+a pending order inside its validity window counts as in-flight, not lost.
+`GET /admin/stats/margin?days=N&limit=N` answers "what does this customer cost
+to serve": `devices.license_key` is permanently NULL by design, so it joins the
+only surviving direction, `purchases.device_ids` → `events`, counting `ai_call`
+rows (never client-reported `solve` rows, which would double-count the same
+spend). Those rows are themselves opt-in — `reportJobUsage()` on the VPS only
+reports a job that carried `telemetry_opt_in`, and the extension's
+`telemetryEnabled` is off by default — so a customer with no `ai_call` rows is
+**not measured**, not free. Each row therefore carries `cost_observed`, the
+response reports `observed`/`unobserved`/`observed_paid_rub`, and the dashboard
+renders an unobserved customer's cost and margin as unknown. Reporting them at
+zero would rank the unmeasured heavy user as the most profitable account on a
+panel whose only job is finding loss-makers.
+`GET /admin/stats/worklists` returns the
+same counts `/admin/health` reports, from the same `collectWorklists()`
+definition so the two cannot drift; when the probe itself fails it returns
+`worklists: null`, never zeros — "could not check" must not read as "nothing is
+stuck".
+
+Licence keys are masked to a `key_hint` on every stats route, including the
+purchases list. A key is a bearer credential and these routes are reachable
+from a browser holding only `STATS_SECRET`. This is partial: `next_cursor`
+still encodes `[issued_at, license_key]` in plain base64, so a caller paging
+through recovers one key per page. Closing that needs an opaque cursor.
+
+`GET /admin/stats/feedback?days=N` and `GET /admin/stats/tickets?limit=N` are
+the Telegram half: reminder/win-back funnel per stage, survey answer codes,
+account bindings, bot-update outcomes, the support forwarding queue, and the
+ticket bodies from KV. Two retention floors bound them and are reported in
+`coverage` as the oldest surviving row rather than assumed:
+`subscription_notifications` is pruned at 365 days and `telegram_updates` at 7,
+while `support_forward_outbox` is never pruned. `feedback` degrades per source —
+a D1 that is one migration behind returns zeros for the missing table and names
+it in `unavailable` instead of failing the whole view. `tickets` deliberately
+omits the sender's Telegram id, username and display name: it is reachable from
+a browser with the read-only stats token, so it exposes what was said, not who
+said it.
+
 Wrangler prints your worker URL, for example
 `https://smesh-licenses.<account>.workers.dev`. Hit `GET /health` to confirm
 it's up. The production custom domain is bound from Cloudflare → Workers →
@@ -517,15 +568,77 @@ curl -X POST 'https://smeshapi.site/deactivate' \
 # → { "ok": true, "deactivated": true }
 ```
 
-Deactivation is the only supported transfer path. It releases the active slot
-but retains the original `activated_at` timestamp. Device transfer therefore
-does not restart a paid subscription period.
+Deactivation releases the active slot but retains the original `activated_at`
+timestamp. Device transfer therefore does not restart a paid subscription
+period.
 
-## Support Bot
+There are two ways to release a slot. From the device itself, `/deactivate`
+with the bearer token above. From Telegram, `/sub` → «Отвязать от устройства»,
+for the buyer who no longer has that computer — the whole point being that they
+cannot present its token.
 
-Reuses the same `TELEGRAM_BOT_TOKEN`. The «Поддержка» buttons in the extension
-(popup + settings) open `t.me/<bot>?start=support`. A user writes to the bot,
-the worker forwards the ticket to you, and your replies relay back to the user.
+A remote release also writes `license_release_fence`. Without it the release
+does not stick: the released installation still holds the key and re-verifies
+on its own 24-hour clock, and `claimActiveInstallation` re-activates whichever
+installation arrives first, so the seat came back minutes later and the buyer's
+new computer kept seeing `device_in_use`. The fence names the released DEVICE
+rather than its token (a client drops its token on a rejected verdict, and that
+must not make it eligible again), and it is lifted by any successful
+activation, by a verify carrying `activation_intent: true` — which the
+extension sends only when the user has just typed the key in — or by its own
+30-day expiry, so an installation that never updates is not locked out
+permanently. The released device sees `released_remotely`.
+
+## The Bot
+
+One bot (`TELEGRAM_BOT_TOKEN`), three surfaces on the same webhook, tried in
+order: the checkout deep link, the subscription commands, then support — which
+deliberately treats anything left over as a ticket rather than dropping it.
+
+### Support
+
+The «Поддержка» buttons in the extension (popup + settings) open
+`t.me/<bot>?start=support`. A user writes to the bot, the worker forwards the
+ticket to you, and your replies relay back to the user.
+
+### Subscriptions (`/sub`)
+
+`/sub`, the «🔑 Моя подписка» menu button, or `t.me/<bot>?start=sub` shows the
+buyer their plan, activation date, which installation holds the single device
+slot (masked — the raw id and the full key are never echoed back), the expiry
+with days remaining, and a button that releases the device as described above.
+
+Ownership comes from two places. `purchases.telegram_user_id` is the identity
+Telegram asserted during checkout; `license_telegram_links` is the identity a
+buyer delivered by email proves later by sending the key to the bot. A link is
+only created while the key has no other Telegram owner, which is what makes
+"only the bound account may release the device" an authorization rule rather
+than a display convention. Guessing keys through that flow is an existence
+oracle, so attempts are budgeted per account per Moscow day (`bind_attempt`) on
+top of the shared five-messages-a-minute limit.
+
+Buttons never carry the license key: callback data is echoed verbatim into the
+`/telegram/debug` record, so a release button carries a position plus the key's
+last four characters and is re-resolved under the caller's own identity.
+
+### Lifecycle messages
+
+The cron sweep (every five minutes) queues four messages per subscription in
+`subscription_notifications`: three days before expiry, one day before, ten
+minutes after it lapses, and a one-tap «почему не продлили» survey three days
+later for people who did not come back. Each row is claimed by compare-and-set
+under a lease before Telegram is contacted, and `UNIQUE(license_key, stage)` is
+the send-once guarantee.
+
+Every row is re-checked against live state at send time, because a queued
+reminder is a claim about the future: a referral credit moves the expiry (the
+row reschedules instead of firing), a refund revokes the key, and a renewal
+mints a NEW key — so anyone with current coverage is neither told their access
+ended nor asked why they left. A 400/403 from Telegram (blocked bot, deleted
+account) closes the row instead of burning twelve attempts; the survey answer
+is stored as a fixed code, while free text goes to your chat as a ticket you
+can reply to. `/admin/health` counts stuck rows as
+`worklists.subscription_notify_exhausted`.
 
 Setup:
 
@@ -564,6 +677,10 @@ unset ADMIN_TOKEN
 Then set `SUPPORT_BOT_URL` in `src/lib/config.js` to your bot's `@username`.
 To answer a user, just **reply** to the ticket message in Telegram — the bot
 relays your reply to them. `wrangler tail` shows webhook logs.
+
+`POST /telegram/setup` also registers the command menu, so **re-run it after
+deploying a release that adds or renames a command** (it is what put `/sub` in
+the blue «/» menu). It is idempotent.
 
 ## Test Payments
 

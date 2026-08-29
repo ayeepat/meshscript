@@ -5,7 +5,7 @@ const TOKEN = `tm1.${'A'.repeat(64)}.${'B'.repeat(43)}`;
 const store = new Map([
   ['telemetryEnabled', true],
   ['aiProvider', 'qwen'],
-  ['aiConsent', { accepted: true, version: 2, at: new Date().toISOString() }],
+  ['aiConsent', { accepted: true, version: 3, at: new Date().toISOString() }],
   ['deviceId', DEVICE]
 ]);
 

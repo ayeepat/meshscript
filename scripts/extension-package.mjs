@@ -20,6 +20,10 @@ const PACKAGE_TREES = Object.freeze([
   { directory: 'src', extensions: new Set(['.css', '.html', '.js', '.mjs']) },
   { directory: 'assets/fonts', extensions: new Set(['.woff2']) },
   { directory: 'assets/icons', extensions: new Set(['.png']) },
+  // Product screenshots shown by the onboarding tour. Bundled rather than
+  // hotlinked from the site: the tour is the student's first minute with the
+  // extension and must not depend on the network to have any pictures in it.
+  { directory: 'assets/onboarding', extensions: new Set(['.jpg']) },
 ]);
 
 const crcTable = new Uint32Array(256);
@@ -270,7 +274,7 @@ export async function defaultArchivePath(repoRoot = DEFAULT_ROOT) {
   if (!/^\d+(?:\.\d+){0,3}$/.test(manifest.version || '')) {
     throw new Error(`invalid Chrome extension version: ${JSON.stringify(manifest.version)}`);
   }
-  return path.join(repoRoot, `smesh-ai-yandex-v${manifest.version}.zip`);
+  return path.join(repoRoot, `smesh-ai-chrome-v${manifest.version}.zip`);
 }
 
 export async function writeExtensionArchive(outputPath, repoRoot = DEFAULT_ROOT) {

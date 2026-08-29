@@ -94,6 +94,9 @@ CREATE TABLE IF NOT EXISTS purchases (
   amount_kopecks   INTEGER                -- authoritative minor units for money
 );
 CREATE INDEX IF NOT EXISTS idx_purchases_issued ON purchases(issued_at);
+-- The Telegram support bot resolves «/sub» from the buyer's numeric id.
+CREATE INDEX IF NOT EXISTS idx_purchases_telegram
+  ON purchases(telegram_user_id);
 
 -- Authoritative payment idempotency registry. KV cannot atomically perform
 -- "create if absent", so simultaneous gateway deliveries could mint two keys.
@@ -327,6 +330,37 @@ CREATE TABLE IF NOT EXISTS license_activations (
 CREATE INDEX IF NOT EXISTS idx_license_activations_device
   ON license_activations(device_id) WHERE status = 'active';
 
+-- Which Telegram account owns a key. `purchases.telegram_user_id` covers only
+-- buyers who paid through the Telegram checkout binding; buyers delivered by
+-- email prove ownership by sending the key to the bot, and that proof is
+-- recorded here. A link is created only while the key has no other Telegram
+-- owner, which is what makes "only the bound account may release the device"
+-- an actual authorization rule rather than a display convention.
+CREATE TABLE IF NOT EXISTS license_telegram_links (
+  license_key      TEXT    PRIMARY KEY,
+  telegram_user_id TEXT    NOT NULL,
+  linked_at        INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_license_telegram_links_user
+  ON license_telegram_links(telegram_user_id);
+
+-- Makes a remote device release stick. Deactivation only sets the activation
+-- row inactive, and claimActiveInstallation re-activates whichever installation
+-- verifies first — the released machine still holds the key and re-verifies on
+-- its own schedule, so a release requested from the bot was silently undone
+-- minutes later. The fence names the released DEVICE rather than its bearer
+-- token, because a client that drops the token on a rejected verdict must not
+-- become eligible to re-claim the seat by doing so. Any successful activation
+-- clears it, a deliberate re-activation the user typed bypasses it, and the
+-- cron prune expires it so an installation that never updates is not locked
+-- out forever.
+CREATE TABLE IF NOT EXISTS license_release_fence (
+  license_key TEXT    PRIMARY KEY,
+  device_id   TEXT    NOT NULL,
+  released_at INTEGER NOT NULL,
+  released_by TEXT
+);
+
 -- Authoritative revocation registry. The KV license row is rewritten wholesale
 -- by concurrent mutators (the /verify device mirror, referral expiry
 -- extensions) and KV reads can be stale for up to a minute, so a revocation
@@ -422,6 +456,35 @@ CREATE TABLE IF NOT EXISTS telegram_updates (
 CREATE INDEX IF NOT EXISTS idx_telegram_updates_claimed
   ON telegram_updates(claimed_at);
 
+-- Durable outbox for subscription lifecycle messages: two expiry reminders, the
+-- notice just after a subscription lapses, and the win-back survey three days
+-- later. Telegram sends are not idempotent and cron sweeps can overlap, so each
+-- row is claimed by compare-and-set under a lease with backoff before it is
+-- attempted — the same shape as delivery_outbox and support_forward_outbox.
+-- UNIQUE(license_key, stage) is the send-once guarantee. The surrogate id keeps
+-- the license key (a bearer credential) out of Telegram callback_data and out
+-- of the webhook debug record; `answer_code` stores only the fixed survey
+-- choice, never the free-text reply, which goes to the owner's chat alone.
+CREATE TABLE IF NOT EXISTS subscription_notifications (
+  id               INTEGER PRIMARY KEY AUTOINCREMENT,
+  license_key      TEXT    NOT NULL,
+  stage            TEXT    NOT NULL CHECK (stage IN ('expiry_3d', 'expiry_1d', 'expired', 'winback')),
+  telegram_user_id TEXT    NOT NULL,
+  due_at           INTEGER NOT NULL,
+  created_at       INTEGER NOT NULL,
+  attempts         INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  next_attempt_at  INTEGER NOT NULL,
+  claim_token      TEXT,
+  lease_until      INTEGER,
+  sent_at          INTEGER,
+  cancelled_at     INTEGER,
+  answer_code      TEXT,
+  answered_at      INTEGER,
+  UNIQUE (license_key, stage)
+);
+CREATE INDEX IF NOT EXISTS idx_subscription_notifications_due
+  ON subscription_notifications(sent_at, cancelled_at, next_attempt_at, lease_until);
+
 -- Deletion tombstones for /t/delete. Without one, an in-flight ingest request
 -- admitted before the deletion can recreate the device and its events right
 -- after the delete returns success. Deletion writes the tombstone and the
@@ -439,7 +502,9 @@ CREATE TABLE IF NOT EXISTS device_tombstones (
 -- increments under concurrency; this table keeps each budget authoritative.
 -- Rows from old days can be pruned.
 --
--- `scope` values: ip | device | admin_fail | verify_fail | gdz | gdz_cover.
+-- `scope` values: ip | device | admin_fail | verify_fail | gdz | gdz_cover |
+-- support_rate (per-minute bot flood control) | bind_attempt (per-day cap on
+-- «send me your key» guesses, which would otherwise be a key-existence oracle).
 -- The two GDZ scopes bucket by a SHA-256 of the license key, never the key
 -- itself (src/gdz.js); covers are metered separately from answer lookups so
 -- browsing the textbook picker cannot eat the day's answer allowance.

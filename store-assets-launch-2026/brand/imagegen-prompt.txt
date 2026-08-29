@@ -1,0 +1,13 @@
+Инструмент: встроенный OpenAI ImageGen
+Режим: создание нового растрового изображения по текстовому запросу с логотипом СМЭШ AI как визуальным референсом
+
+Use case: ads-marketing
+Asset type: subtle Chrome Web Store promotional background, raster only
+Primary request: create a restrained brand background inspired only by the supplied СМЭШ AI teal circular logomark
+Input images: Image 1 is a style and geometry reference only; do not redraw it as a logo and do not add text
+Scene/backdrop: warm off-white paper surface with extremely subtle natural paper fibers; two or three broad flat teal arc fragments entering from the outer edges, leaving a large clean central area for a real logo and product screenshot to be composited later
+Style/medium: minimal editorial graphic design, calm, precise, flat shapes, brand-consistent
+Composition/framing: landscape 16:10, full bleed, clear silhouette at thumbnail size, central negative space, arcs must stay near edges
+Color palette: #f7f4ee warm paper, #1f8f8b muted teal, #d8ece9 pale teal, tiny touches of #efece3 only
+Constraints: no text, no letters, no logos, no UI, no browser window, no icons, no gradients, no glow, no 3D, no perspective, no shadows, no glassmorphism, no decorative particles, no watermark; keep it simple enough to serve as a quiet background behind real assets
+Avoid: purple, neon, futuristic AI motifs, busy patterns, fake interface, generic tech advertising

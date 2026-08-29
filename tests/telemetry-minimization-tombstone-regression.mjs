@@ -193,6 +193,21 @@ const deleteDevice = (env, device = DEVICE) => handleDeleteDevice(new Request('h
   assert.equal(serverStored.model, null);
   assert.deepEqual(JSON.parse(serverStored.meta), { src: 'vps' });
 
+  await handleServerIngest(new Request('https://smeshapi.site/t/ai', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ events: [{
+      device_id: DEVICE,
+      provider: 'deepseek',
+      model: 'glm-5.3-flash',
+      tokens_in: 120,
+      tokens_out: 40,
+      cost_usd: 0.000019,
+      meta: { src: 'vps' }
+    }] })
+  }), env);
+  assert.equal(db.events.at(-1).model, 'glm-5.3-flash',
+    'server-observed GLM usage must retain its model id for owner cost analytics');
+
   const noise = await ingest(env, [{ ts: Date.now(), type: 'error', meta: { MSG: 'x', blob: { a: 1 } } }]);
   assert.equal(noise.ok, true);
   assert.equal(db.events.at(-1).meta, null, 'meta with nothing allowlisted stores as NULL');

@@ -256,6 +256,11 @@ function createStartupHarness(gdzResult) {
     initialFiles: [],
     activeKey: 'lesson-1',
     sameMeshRow: () => true,
+    // No previously solved copy of this lesson: these cases exercise the GDZ →
+    // solve path. Answer reuse has its own coverage in
+    // tests/answer-reuse-regression.mjs.
+    storedLesson: async () => null,
+    renderChat() {},
     maybeShowGdz: () => gdz.promise,
     thinkingBubble: () => ({
       remove() {},
@@ -308,6 +313,9 @@ function createStartupHarness(gdzResult) {
   const startupOwner = chat.pendingOwner;
   assert.equal(chat.pending, true, 'GDZ discovery must mark the chat pending synchronously');
   assert.equal(typeof startupOwner, 'symbol');
+  // Let the (empty) answer-reuse lookup settle, so the supersession below still
+  // lands on the GDZ continuation this case is about.
+  for (let tick = 0; tick < 5; tick += 1) await Promise.resolve();
 
   // Model a defensive supersession and then finish the older discovery. Its
   // continuation/finally must not clear or send through the newer owner.

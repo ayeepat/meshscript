@@ -31,6 +31,7 @@ payload = {
   ok: true,
   type: 'lifetime',
   expires_at: null,
+  activation_token: 'a'.repeat(43),
   telemetry_token: goodToken,
   telemetry_token_expires_at: expiry
 };
@@ -42,6 +43,7 @@ assert.equal(store.get('licenseStatus').telemetry_token, goodToken);
 payload = {
   ok: true,
   type: 'lifetime',
+  activation_token: 'b'.repeat(43),
   telemetry_token: 'not-a-token',
   telemetry_token_expires_at: Date.now() + 60_000
 };
@@ -52,6 +54,7 @@ assert.equal(Object.hasOwn(malformed, 'telemetry_token'), false,
 payload = {
   ok: true,
   type: 'lifetime',
+  activation_token: 'c'.repeat(43),
   telemetry_token: goodToken,
   telemetry_token_expires_at: Date.now() - 1
 };

@@ -15,6 +15,12 @@
  * (for /telegram/debug). Ticket bodies live in KV; the sequence and rate
  * budgets and the owner-forwarding outbox live authoritatively in D1 so
  * concurrent updates cannot collide and provider outages cannot lose tickets.
+ *
+ * This module also owns the primitives every other bot surface reuses — the
+ * Telegram transport, the rate limit, the update-effect reservation and
+ * routeSubmission — so there is exactly one implementation of "talk to
+ * Telegram without leaking the token" and one durable path to the owner's chat.
+ * delivery/subscription.js is the other surface; it runs first on each update.
  */
 
 import { fetchDelivery } from './http.js';
@@ -29,8 +35,9 @@ const DEFAULT_SUPPORT_KV_TIMEOUT_MS = 5_000;
 const WELCOME =
   'Здравствуйте! 👋 Это бот поддержки СМЭШ AI.\n\nЧем можем помочь? Выберите вариант ниже:';
 const HELP_TEXT =
-  'ℹ️ Бот поддержки СМЭШ AI\n\n' +
+  'ℹ️ Бот СМЭШ AI\n\n' +
   'Здесь можно:\n' +
+  '🔑 Моя подписка (/sub) — срок, устройство, отвязка ключа\n' +
   '🆘 Создать обращение — задать вопрос или сообщить о проблеме\n' +
   '💡 Предложить идею — предложить, что добавить или улучшить\n\n' +
   'Нажмите /start, чтобы открыть меню. Мы ответим вам прямо в этом чате.';
@@ -41,8 +48,12 @@ const FEATURE_PROMPT =
 const TEMPORARILY_UNAVAILABLE =
   '⚠️ Поддержка временно недоступна. Пожалуйста, отправьте сообщение ещё раз через несколько минут.';
 
+// `sub:card` is claimed by the subscription surface, which runs before this
+// one on every update — the button lives here only because this is the menu
+// the user sees. Keep the prefix in sync with delivery/subscription.js.
 const MENU = {
   inline_keyboard: [
+    [{ text: '🔑 Моя подписка', callback_data: 'sub:card' }],
     [{ text: '🆘 Создать обращение', callback_data: 'new_ticket' }],
     [{ text: '💡 Предложить идею', callback_data: 'new_feature' }]
   ]
@@ -55,7 +66,7 @@ const MENU = {
 const ID_RE = /#id(\d+)(?![\s\S]*#id\d)/;
 const senderName = (u = {}) => [u.first_name, u.last_name].filter(Boolean).join(' ') || 'без имени';
 
-function clipText(value, max, suffix = '') {
+export function clipText(value, max, suffix = '') {
   const text = String(value ?? '');
   if (text.length <= max) return text;
   const keep = Math.max(0, max - suffix.length);
@@ -65,7 +76,7 @@ function clipText(value, max, suffix = '') {
   return clipped + suffix;
 }
 
-function telegramUserId(value) {
+export function telegramUserId(value) {
   const id = String(value ?? '').trim();
   if (!/^[1-9]\d{0,18}$/.test(id)) return null;
   try {
@@ -87,7 +98,7 @@ function telegramChatId(value) {
   }
 }
 
-function supportOwnerId(env) {
+export function supportOwnerId(env) {
   return telegramUserId(env.SUPPORT_CHAT_ID);
 }
 
@@ -122,7 +133,10 @@ async function boundedSupportKv(env, operation) {
   }
 }
 
-async function tg(env, method, body) {
+// The single Telegram transport for every bot surface (support, subscriptions).
+// It clips oversized text and, crucially, never lets a fetch failure carry the
+// token-bearing URL into a log or a returned error.
+export async function tg(env, method, body) {
   const payload = { ...body };
   if ((method === 'sendMessage' || method === 'editMessageText') && 'text' in payload) {
     payload.text = clipText(payload.text, TELEGRAM_TEXT_LIMIT);
@@ -218,7 +232,7 @@ async function reserveTicketNo(env, updateId, claimVersion) {
  * Telegram sendMessage has no idempotency key; if the network send succeeds
  * and our completion write is lost, retrying the effect would deliver twice.
  */
-async function reserveTelegramUpdateEffect(env, updateId, claimVersion, effectKind) {
+export async function reserveTelegramUpdateEffect(env, updateId, claimVersion, effectKind) {
   if (updateId == null) return true;
   if (!env.DB || !Number.isSafeInteger(claimVersion)) {
     throw new Error('telegram update effect registry unavailable');
@@ -262,7 +276,7 @@ async function nextTicketNo(env) {
 // Per-user rate limit on fixed one-minute buckets, counted atomically in D1
 // (the KV read-modify-write undercounted under concurrency, so a burst never
 // actually tripped it). Bucket rows age out with the telemetry_budget prune.
-async function checkRate(env, uid) {
+export async function checkRate(env, uid) {
   if (!env.DB) {
     return { count: 0, blocked: true, justBlocked: false, unavailable: true };
   }
@@ -394,6 +408,11 @@ async function releaseSupportForwardClaim(env, ticketNo, claimToken) {
   }
 }
 
+// Everything a user can send the owner through the ticket pipeline. 'winback'
+// is the free-text answer to the «почему не продлили» survey; it reuses this
+// path so the owner can simply reply to it like any other message.
+const SUBMISSION_MODES = new Set(['ticket', 'feature', 'winback']);
+
 function parseTicket(raw, expectedNo) {
   let ticket;
   try { ticket = JSON.parse(raw); } catch { return null; }
@@ -402,7 +421,7 @@ function parseTicket(raw, expectedNo) {
   if (!uid || String(ticket.no) !== String(expectedNo)) return null;
   return {
     no: String(expectedNo),
-    mode: ticket.mode === 'feature' ? 'feature' : 'ticket',
+    mode: SUBMISSION_MODES.has(ticket.mode) ? ticket.mode : 'ticket',
     uid,
     name: clipText(ticket.name || 'без имени', 128),
     username: clipText(ticket.username || '', 64),
@@ -410,10 +429,14 @@ function parseTicket(raw, expectedNo) {
   };
 }
 
+const OWNER_HEADERS = {
+  feature: (no) => `💡 Предложение #${no}`,
+  winback: (no) => `🗣 Почему не продлил #${no}`,
+  ticket: (no) => `🆘 Обращение #${no}`
+};
+
 function ownerForwardText(ticket) {
-  const header = ticket.mode === 'feature'
-    ? `💡 Предложение #${ticket.no}`
-    : `🆘 Обращение #${ticket.no}`;
+  const header = (OWNER_HEADERS[ticket.mode] || OWNER_HEADERS.ticket)(ticket.no);
   const handle = ticket.username ? `@${ticket.username}` : '—';
   const prefix = `${header}\nОт: ${ticket.name} (${handle})\n\n`;
   const suffix =
@@ -673,10 +696,16 @@ export async function processSupportUpdate(
   return { kind: `submit_${mode}`, no: r.no, steps };
 }
 
-async function routeSubmission(
+/**
+ * Persist one user submission, forward it to the owner durably, and confirm it
+ * to the sender. Exported so other bot surfaces (the subscription survey) reuse
+ * the same ticket numbering, retry outbox and owner-reply routing instead of
+ * inventing a second, less durable path to the same chat.
+ */
+export async function routeSubmission(
   env, { mode, msg, ownerId, updateId = null, claimVersion = null }
 ) {
-  const isFeature = mode === 'feature';
+  const submissionMode = SUBMISSION_MODES.has(mode) ? mode : 'ticket';
   const from = msg.from || {};
   const chatId = msg.chat.id;
   const userId = telegramUserId(from.id);
@@ -687,7 +716,7 @@ async function routeSubmission(
 
   // Minimal record — gives you a history and powers the «Вопрос решён» button.
   await env.LICENSES.put(`ticket:${no}`, JSON.stringify({
-    no, mode, uid: userId, name: clipText(senderName(from), 128),
+    no, mode: submissionMode, uid: userId, name: clipText(senderName(from), 128),
     username: from.username ? clipText(from.username, 64) : null,
     text: clipText(body, 4000), status: 'open', at: new Date().toISOString()
   }), { expirationTtl: TICKET_TTL });
@@ -704,9 +733,16 @@ async function routeSubmission(
   // outbox above but must not tell the student their message was received a
   // second time under the same number.
   if (fresh) {
-    if (isFeature) {
+    if (submissionMode === 'feature') {
       steps.push(await tg(env, 'sendMessage', {
         chat_id: chatId, text: `Спасибо за идею! 💡 Записал как предложение #${no} — мы обязательно его рассмотрим.`
+      }));
+    } else if (submissionMode === 'winback') {
+      // No «вопрос решён» button here: this is feedback, not an open ticket.
+      // The owner can still reply to it, and the reply lands in this chat.
+      steps.push(await tg(env, 'sendMessage', {
+        chat_id: chatId,
+        text: 'Спасибо, что написали. Прочитаем каждое слово — и если поправимо, поправим. Захотите вернуться: /sub'
       }));
     } else {
       steps.push(await tg(env, 'sendMessage', {

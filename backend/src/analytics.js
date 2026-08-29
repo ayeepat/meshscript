@@ -18,6 +18,12 @@
 
 import { getLicense, markMaterialized } from './licenses.js';
 import { cleanDeviceId, cleanPublicDeviceId } from './referrals.js';
+// Retry ceilings for the two Telegram outboxes, so "stuck" in the dashboard
+// means the same thing the senders mean by it. subscription.js imports this
+// module back for the rate-limit budget; the cycle is safe because neither
+// side touches the other at module-evaluation time.
+import { SUBSCRIPTION_NOTIFY_MAX_ATTEMPTS } from './delivery/subscription.js';
+import { SUPPORT_FORWARD_MAX_ATTEMPTS } from './delivery/support.js';
 
 const MSK_OFFSET_MS = 3 * 60 * 60 * 1000;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -61,6 +67,8 @@ const MODELS = new Set([
   'qwen3.7-plus',
   'qwen-vl-plus',
   'qwen-plus',
+  'glm-5.3-flash',
+  'glm-4.6v-flash',
   'deepseek-v4-flash'
 ]);
 // "Real usage" = a student actually used a feature (heartbeats/installs/errors
@@ -824,28 +832,62 @@ async function usageRollup(env, from, to = null) {
   return out;
 }
 
+// Money that came in, and money that went back out.
+//
+// `purchases` is issuance: every key ever minted, including ones whose payment
+// was later returned. Netting refunds out of it by joining is not possible in
+// general — a June purchase can be refunded in August — so refunds are counted
+// on their own clock (`refunded_at`) the way an accounting period does, and the
+// window reports gross, refunded and net side by side. Reporting only gross
+// after a refund is how a dashboard tells its owner they earned money they no
+// longer have.
 async function revenueRollup(env, fromTs, toTs = null) {
   const where = fromTs
     ? (toTs ? 'WHERE issued_at >= ?1 AND issued_at < ?2' : 'WHERE issued_at >= ?1')
     : '';
   const binds = fromTs ? (toTs ? [fromTs, toTs] : [fromTs]) : [];
-  const row = await env.DB.prepare(
-    `SELECT
-       COUNT(*)                                            AS licenses,
-       SUM(CASE WHEN amount_kopecks > 0 THEN 1 ELSE 0 END) AS paid,
-       SUM(COALESCE(amount_kopecks, 0))                    AS revenue_kopecks,
-       AVG(CASE WHEN amount_kopecks > 0 THEN amount_kopecks END) AS avg_check_kopecks,
-       SUM(type = 'subscription')                          AS subscriptions,
-       SUM(type = 'lifetime')                              AS lifetimes,
-       SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END) AS revoked,
-       SUM(COALESCE(is_preorder, 0))                       AS preorders,
-       SUM(CASE WHEN gateway = 'referral' THEN 1 ELSE 0 END) AS referral_rewards
-     FROM purchases ${where}`
-  ).bind(...binds).first();
+  const refundWhere = fromTs
+    ? (toTs ? 'AND refunded_at >= ?1 AND refunded_at < ?2' : 'AND refunded_at >= ?1')
+    : '';
+  const [row, refunds] = await Promise.all([
+    env.DB.prepare(
+      `SELECT
+         COUNT(*)                                            AS licenses,
+         SUM(CASE WHEN amount_kopecks > 0 THEN 1 ELSE 0 END) AS paid,
+         SUM(COALESCE(amount_kopecks, 0))                    AS revenue_kopecks,
+         AVG(CASE WHEN amount_kopecks > 0 THEN amount_kopecks END) AS avg_check_kopecks,
+         SUM(type = 'subscription')                          AS subscriptions,
+         SUM(type = 'lifetime')                              AS lifetimes,
+         SUM(CASE WHEN status = 'revoked' THEN 1 ELSE 0 END) AS revoked,
+         SUM(COALESCE(is_preorder, 0))                       AS preorders,
+         SUM(CASE WHEN gateway = 'referral' THEN 1 ELSE 0 END) AS referral_rewards
+       FROM purchases ${where}`
+    ).bind(...binds).first(),
+    // Test-environment orders can never be refunded (refundRobokassaOrder
+    // rejects them), so this is production money by construction.
+    env.DB.prepare(
+      `SELECT COUNT(*)                                          AS refunds,
+              SUM(COALESCE(refund_kopecks, amount_kopecks))     AS refunded_kopecks
+       FROM payment_orders
+       WHERE status = 'refunded' AND environment = 'production' ${refundWhere}`
+    ).bind(...binds).first().catch((e) => {
+      // Older deployments (and unit fixtures) predate the payment authority
+      // tables. Gross revenue is still the truth then; say the net is unknown
+      // rather than quietly presenting gross as net.
+      console.error('refund rollup unavailable', String(e));
+      return null;
+    })
+  ]);
   const out = {};
   for (const k of Object.keys(row || {})) out[k] = num(row[k]);
   out.revenue_rub = out.revenue_kopecks / 100;
   out.avg_check_rub = out.avg_check_kopecks / 100;
+  out.refunds_known = refunds !== null;
+  out.refunds = num(refunds?.refunds);
+  out.refunded_rub = num(refunds?.refunded_kopecks) / 100;
+  // Null, not gross, when refunds could not be read: an unknown net must not
+  // be indistinguishable from a net that happens to equal gross.
+  out.net_revenue_rub = refunds === null ? null : out.revenue_rub - out.refunded_rub;
   return out;
 }
 
@@ -1252,7 +1294,23 @@ export async function statsPurchases(env, rawOptions) {
       ? offset + limit
       : null,
     next_cursor: hasMore && page.length ? purchaseCursor(page[page.length - 1]) : null,
-    purchases: page,
+    // `SELECT *` includes license_key, a bearer credential that activates the
+    // product. This route is reachable from a browser holding only the
+    // read-only stats token, and the point of splitting STATS_SECRET off from
+    // ADMIN_SECRET is that a compromised dashboard cannot grant entitlements —
+    // which it could, if it could read every key. The list renders by
+    // date/type/gateway/amount/contact/status, so the key becomes a hint that
+    // still tells rows apart. Cursor pagination is unaffected: purchaseCursor()
+    // is evaluated on `page` above, before this mapping.
+    //
+    // PARTIAL, and deliberately not overclaimed: next_cursor is base64 of
+    // [issued_at, license_key] (see purchaseCursor), so a caller who pages
+    // through still recovers one key per page. Closing that needs an opaque
+    // cursor — the tiebreaker cannot simply move to rowid, because
+    // mirrorLicense() uses INSERT OR REPLACE and rewrites it.
+    purchases: page.map(({ license_key, ...rest }) => ({
+      ...rest, key_hint: maskLicenseKey(license_key)
+    })),
     gateways: (gateways?.results || []).map((row) => ({
       ...row,
       revenue_rub: num(row.revenue_kopecks) / 100
@@ -1363,6 +1421,533 @@ export async function statsReferrals(env) {
     total_referred_purchases: codes.reduce((s, c) => s + c.purchases, 0),
     total_days_earned: codes.reduce((s, c) => s + c.days_earned, 0),
     top: codes.slice(0, 50)
+  };
+}
+
+/* --------------------- subscription state & funnel --------------------- */
+
+const MONTH_MS = 30 * DAY_MS;
+
+/**
+ * GET /admin/stats/subscriptions — the state of the book RIGHT NOW, not money
+ * that arrived in some window. Windowed revenue cannot answer "how many
+ * subscriptions do I actually have and what lapses this week", which for a
+ * subscription business is the first question of the day.
+ *
+ * MRR normalises each live subscription to 30 days from its own term
+ * (`amount / (expires_at - issued_at) * 30d`), so a 90-day plan and a monthly
+ * one contribute comparably instead of the 90-day one looking like a spike.
+ * Lifetime keys are excluded from MRR entirely — they are not recurring.
+ *
+ * `license_revocations` is the authoritative registry, so it is consulted
+ * directly rather than trusting the mirrored `purchases.status`: a key revoked
+ * for abuse must not keep counting as live revenue because a best-effort
+ * mirror write was lost.
+ */
+export async function statsSubscriptions(env) {
+  const now = Date.now();
+  const live = `type = 'subscription' AND status = 'active'
+    AND NOT EXISTS (
+      SELECT 1 FROM license_revocations r WHERE r.license_key = purchases.license_key
+    )`;
+  const [active, lifetimes, lapsed] = await Promise.all([
+    env.DB.prepare(
+      `SELECT COUNT(*)                                             AS active,
+              SUM(CASE WHEN expires_at <= ?2 THEN 1 ELSE 0 END)    AS expiring_7d,
+              SUM(CASE WHEN expires_at <= ?3 THEN 1 ELSE 0 END)    AS expiring_30d,
+              SUM(CASE WHEN issued_at IS NOT NULL AND expires_at > issued_at
+                       THEN COALESCE(amount_kopecks, 0) * ?4 * 1.0 / (expires_at - issued_at)
+                       ELSE 0 END)                                 AS mrr_kopecks
+       FROM purchases WHERE ${live} AND expires_at > ?1`
+    ).bind(now, now + 7 * DAY_MS, now + 30 * DAY_MS, MONTH_MS).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM purchases
+       WHERE type = 'lifetime' AND status = 'active'
+         AND NOT EXISTS (
+           SELECT 1 FROM license_revocations r WHERE r.license_key = purchases.license_key
+         )`
+    ).first(),
+    // Lapsed and not replaced by a newer key for the same contact — the
+    // closest thing to churn this schema can prove. A buyer who renewed with
+    // a fresh key is deliberately not counted as lost.
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM purchases AS lapsed
+       WHERE lapsed.type = 'subscription'
+         AND lapsed.expires_at <= ?1 AND lapsed.expires_at > ?2
+         AND NOT EXISTS (
+           SELECT 1 FROM purchases AS newer
+           WHERE newer.expires_at > ?1
+             AND newer.license_key <> lapsed.license_key
+             AND (
+               (lapsed.email IS NOT NULL AND newer.email = lapsed.email) OR
+               (lapsed.telegram_user_id IS NOT NULL
+                 AND newer.telegram_user_id = lapsed.telegram_user_id)
+             )
+         )`
+    ).bind(now, now - 30 * DAY_MS).first()
+  ]);
+
+  const activeCount = num(active?.active);
+  const mrrRub = num(active?.mrr_kopecks) / 100;
+  return {
+    ok: true,
+    active: activeCount,
+    lifetimes: num(lifetimes?.n),
+    expiring_7d: num(active?.expiring_7d),
+    expiring_30d: num(active?.expiring_30d),
+    lapsed_30d: num(lapsed?.n),
+    mrr_rub: mrrRub,
+    arpu_rub: activeCount ? mrrRub / activeCount : null
+  };
+}
+
+/**
+ * GET /admin/stats/funnel?days=N — checkout conversion from `payment_orders`,
+ * which records every order the server CREATED, not only the ones that paid.
+ * Revenue views can only ever show the buyers who succeeded; the ones who
+ * reached Robokassa and left are invisible there and are usually the largest
+ * recoverable group.
+ *
+ * Production only: test-environment orders are the owner's own rehearsals and
+ * would otherwise read as real abandoned demand.
+ */
+export async function statsFunnel(env, days) {
+  const now = Date.now();
+  const fromTs = days > 0 ? now - days * DAY_MS : 0;
+  const row = await env.DB.prepare(
+    `SELECT
+       COUNT(*)                                                      AS created,
+       SUM(COALESCE(amount_kopecks, 0))                              AS created_kopecks,
+       SUM(CASE WHEN status IN ('paid','fulfilled','review','refund_pending','refunded')
+                THEN 1 ELSE 0 END)                                   AS paid,
+       SUM(CASE WHEN status IN ('paid','fulfilled','review','refund_pending','refunded')
+                THEN COALESCE(amount_kopecks, 0) ELSE 0 END)         AS paid_kopecks,
+       SUM(CASE WHEN status = 'fulfilled' THEN 1 ELSE 0 END)         AS fulfilled,
+       SUM(CASE WHEN status = 'review' THEN 1 ELSE 0 END)            AS review,
+       SUM(CASE WHEN status = 'refunded' THEN 1 ELSE 0 END)          AS refunded,
+       SUM(CASE WHEN status = 'expired' THEN 1 ELSE 0 END)           AS expired,
+       -- A pending order inside its own validity window is still in play; one
+       -- past it was abandoned and simply not swept yet.
+       SUM(CASE WHEN status = 'pending' AND expires_at >  ?2 THEN 1 ELSE 0 END) AS in_flight,
+       SUM(CASE WHEN status = 'pending' AND expires_at <= ?2 THEN 1 ELSE 0 END) AS abandoned_pending,
+       SUM(CASE WHEN status = 'expired' OR (status = 'pending' AND expires_at <= ?2)
+                THEN COALESCE(amount_kopecks, 0) ELSE 0 END)         AS lost_kopecks
+     FROM payment_orders
+     WHERE environment = 'production' AND created_at >= ?1`
+  ).bind(fromTs, now).first();
+
+  const created = num(row?.created);
+  const paid = num(row?.paid);
+  const abandoned = num(row?.expired) + num(row?.abandoned_pending);
+  return {
+    ok: true,
+    days: days || 0,
+    created,
+    paid,
+    fulfilled: num(row?.fulfilled),
+    review: num(row?.review),
+    refunded: num(row?.refunded),
+    in_flight: num(row?.in_flight),
+    abandoned,
+    // Null rather than 0 with no orders: "nobody converted" and "nobody came"
+    // are different problems with different fixes.
+    conversion_rate: created ? paid / created : null,
+    paid_rub: num(row?.paid_kopecks) / 100,
+    // What the abandoned carts were worth at list price — the size of the prize
+    // for fixing checkout, not money that was ever owed.
+    lost_rub: num(row?.lost_kopecks) / 100
+  };
+}
+
+/**
+ * GET /admin/stats/margin?days=N — what each paying customer cost to serve.
+ *
+ * You charge a flat price and pay per token, so the question "is this
+ * subscriber profitable" has a real answer, and no view answered it: the users
+ * table ranks by spend without knowing what anyone paid.
+ *
+ * `devices.license_key` is permanently NULL by design (data minimization), so
+ * the join runs the only direction that still exists: purchases.device_ids →
+ * events, counting the `ai_call` rows the VPS proxy reports.
+ *
+ * COVERAGE — those rows are themselves opt-in. reportJobUsage() in
+ * backend-vps/server.js returns early unless the job carried
+ * `telemetry_opt_in`, which the extension sends only when the student turned
+ * `telemetryEnabled` on in Settings, and that defaults OFF. So a customer with
+ * no `ai_call` rows is "not measured", NOT "cost nothing" — and reporting them
+ * at 0 would rank exactly the unmeasured heavy user as the most profitable
+ * account on the page, which is the opposite of what this view is for. Each row
+ * therefore carries `cost_observed`, and the caller must render an unobserved
+ * customer's cost and margin as unknown rather than as zero.
+ *
+ * Keys are returned masked. This route is reachable from a browser holding the
+ * read-only stats token, and a licence key is a bearer credential.
+ */
+export async function statsMargin(env, days, limit) {
+  const want = Math.max(1, Math.min(500, Math.trunc(num(limit)) || 100));
+  const fromTs = days > 0 ? Date.now() - days * DAY_MS : 0;
+  const rows = await env.DB.prepare(
+    `SELECT p.license_key, p.type, p.status, p.amount_kopecks, p.issued_at, p.expires_at,
+            (SELECT COUNT(*) FROM json_each(COALESCE(p.device_ids, '[]'))) AS devices,
+            COALESCE((
+              SELECT SUM(e.cost_usd) FROM events e
+              WHERE e.type = 'ai_call'
+                AND e.ts >= COALESCE(p.issued_at, 0)
+                AND e.device_id IN (SELECT value FROM json_each(COALESCE(p.device_ids, '[]')))
+            ), 0) AS api_cost_usd,
+            COALESCE((
+              SELECT COUNT(*) FROM events e
+              WHERE e.type = 'ai_call'
+                AND e.ts >= COALESCE(p.issued_at, 0)
+                AND e.device_id IN (SELECT value FROM json_each(COALESCE(p.device_ids, '[]')))
+            ), 0) AS api_calls
+     FROM purchases p
+     WHERE p.amount_kopecks > 0 AND COALESCE(p.issued_at, 0) >= ?1
+     ORDER BY api_cost_usd DESC
+     LIMIT ?2`
+  ).bind(fromTs, want).all();
+
+  const customers = (rows?.results || []).map((r) => ({
+    key_hint: maskLicenseKey(r.license_key),
+    type: r.type || null,
+    status: r.status || null,
+    paid_rub: num(r.amount_kopecks) / 100,
+    issued_at: r.issued_at ?? null,
+    expires_at: r.expires_at ?? null,
+    devices: num(r.devices),
+    api_calls: num(r.api_calls),
+    api_cost_usd: num(r.api_cost_usd),
+    // Whether this customer's usage is visible at all (see COVERAGE above).
+    // Without a single reported call there is no evidence either way, and the
+    // margin is unknown rather than equal to the whole price.
+    cost_observed: num(r.api_calls) > 0
+  }));
+  const observed = customers.filter((c) => c.cost_observed);
+  return {
+    ok: true,
+    days: days || 0,
+    // Totals cover the returned page only; it is ordered by cost, so the page
+    // is the expensive tail — exactly the population worth rate-limiting.
+    counted: customers.length,
+    // Split so the dashboard can say how much of the page it can actually
+    // reason about instead of implying the whole book is covered.
+    observed: observed.length,
+    unobserved: customers.length - observed.length,
+    paid_rub: customers.reduce((s, c) => s + c.paid_rub, 0),
+    // Revenue from the customers whose cost IS known — the only subset against
+    // which the cost total below is a fair comparison.
+    observed_paid_rub: observed.reduce((s, c) => s + c.paid_rub, 0),
+    api_cost_usd: observed.reduce((s, c) => s + c.api_cost_usd, 0),
+    customers
+  };
+}
+
+// Licence keys are bearer credentials. The dashboard needs to tell rows apart,
+// not to be able to activate the product, so it gets a stable hint instead.
+function maskLicenseKey(key) {
+  const text = String(key || '');
+  return text.length <= 4 ? '••••' : `••••${text.slice(-4)}`;
+}
+
+/**
+ * The "someone has to touch this" queues. Every one of these means a promise
+ * to a paying customer is currently unkept — most sharply `delivery_exhausted`,
+ * which is "money taken, key never delivered".
+ *
+ * This is the single definition; /admin/health and /admin/stats/worklists both
+ * call it, so the operator view and the readiness probe cannot drift apart.
+ * Thresholds are passed in because they belong to the senders that enforce them.
+ */
+export async function collectWorklists(env, thresholds = {}) {
+  const deliveryMax = num(thresholds.deliveryMaxAttempts) || 30;
+  const refundStalledMax = num(thresholds.refundPollStalledAttempts) || 6;
+  const supportMax = num(thresholds.supportForwardMaxAttempts) || SUPPORT_FORWARD_MAX_ATTEMPTS;
+  const notifyMax = num(thresholds.subscriptionNotifyMaxAttempts) || SUBSCRIPTION_NOTIFY_MAX_ATTEMPTS;
+
+  const [
+    exhausted, review, reconciliationErrors, refundUnknown, refundStalled,
+    referralUnsettled, referralLegacy, supportExhausted, subscriptionExhausted
+  ] = await Promise.all([
+    env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM delivery_outbox WHERE delivered_at IS NULL AND attempts >= ?1'
+    ).bind(deliveryMax).first(),
+    env.DB.prepare(
+      'SELECT COUNT(*) AS n FROM payment_review WHERE resolved_at IS NULL'
+    ).first(),
+    // Last-attempt provider/signature errors remain fail-closed and retryable.
+    // Surface them so a bad merchant credential or a lasting Robokassa outage
+    // cannot become an invisible ten-minute loop.
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM payment_orders AS orders
+       WHERE orders.environment = 'production' AND orders.status = 'pending'
+         AND orders.reconciled_at IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM payment_events AS failed
+           WHERE failed.gateway = 'robokassa'
+             AND failed.payment_id = CAST(orders.order_id AS TEXT)
+             AND failed.event_type = 'reconciliation_provider_error'
+             AND failed.created_at >= orders.reconciled_at
+         )`
+    ).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM payment_orders
+       WHERE status = 'refund_pending' AND refund_request_id IS NULL`
+    ).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM payment_refund_poll p
+       JOIN payment_orders o ON o.order_id = p.order_id
+       WHERE o.status = 'refund_pending' AND o.refund_status = 'processing'
+         AND p.attempts >= ?1`
+    ).bind(refundStalledMax).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM referral_credit_state
+       WHERE status = 'pending'
+          OR (status = 'applied' AND materialized_at IS NULL)
+          OR (status = 'cancelled' AND target_kind = 'reversal' AND materialized_at IS NULL)`
+    ).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM referral_credits c
+       WHERE NOT EXISTS (
+         SELECT 1 FROM referral_credit_state s WHERE s.license_key = c.license_key
+       )`
+    ).first(),
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM support_forward_outbox
+       WHERE forwarded_at IS NULL AND attempts >= ?1`
+    ).bind(supportMax).first(),
+    // Reminders are not money, but a queue that quietly stopped sending is
+    // still a promise to a paying customer that nobody is keeping.
+    env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM subscription_notifications
+       WHERE sent_at IS NULL AND cancelled_at IS NULL AND attempts >= ?1`
+    ).bind(notifyMax).first()
+  ]);
+
+  return {
+    delivery_exhausted: num(exhausted?.n),
+    payment_review_open: num(review?.n),
+    payment_reconciliation_errors: num(reconciliationErrors?.n),
+    refund_submission_unknown: num(refundUnknown?.n),
+    refund_poll_stalled: num(refundStalled?.n),
+    referral_unsettled: num(referralUnsettled?.n),
+    referral_legacy_unjournaled: num(referralLegacy?.n),
+    support_forward_exhausted: num(supportExhausted?.n),
+    subscription_notify_exhausted: num(subscriptionExhausted?.n)
+  };
+}
+
+/** GET /admin/stats/worklists — the same counts, read-only for the dashboard. */
+export async function statsWorklists(env, thresholds) {
+  try {
+    const worklists = await collectWorklists(env, thresholds);
+    return {
+      ok: true,
+      worklists,
+      total: Object.values(worklists).reduce((s, n) => s + n, 0)
+    };
+  } catch (e) {
+    // "I could not check" must never render as "nothing is stuck".
+    console.error('worklists unavailable', String(e));
+    return { ok: true, worklists: null, total: null, unavailable: true };
+  }
+}
+
+/* ------------------- Telegram bot, reminders, feedback ------------------ */
+
+/**
+ * GET /admin/stats/feedback?days=N — the bot half of the product: expiry
+ * reminders, the win-back survey after a subscription lapses, support/idea
+ * submissions and Telegram account bindings.
+ *
+ * Unlike usage costs, nothing here is a client-reported estimate: every row was
+ * written by the worker itself as it actually talked to Telegram, so these are
+ * counts of things that provably happened. What DOES bound them is retention,
+ * and both bounds are reported as the oldest row each table still holds rather
+ * than as a hardcoded number — a window wider than the data would otherwise
+ * render as a confident undercount:
+ *
+ *   subscription_notifications  pruned after 365 days
+ *   telegram_updates            pruned after 7 days   (see pruneTelegramUpdates)
+ *   support_forward_outbox      never pruned → totals are all-time
+ *
+ * Survey free text is deliberately absent: subscription_notifications stores
+ * only the fixed choice, and the written reply goes to the owner's chat and the
+ * ticket record (see statsTickets).
+ */
+export async function statsFeedback(env, days) {
+  const fromTs = days > 0 ? Date.now() - days * DAY_MS : 0;
+
+  // The bot's tables arrive with their own migrations, and the subscription
+  // lifecycle ones are newer than the support ones. A view that 500s until
+  // every migration is applied is worse than a view that names the part it
+  // could not read, so each source fails on its own and is reported.
+  const unavailable = [];
+  const source = (name, query) => query.catch((e) => {
+    console.error(`stats feedback source ${name} unavailable`, String(e));
+    unavailable.push(name);
+    return null;
+  });
+
+  const [stages, reasons, links, kinds, support, coverage] = await Promise.all([
+    // One row per lifecycle stage. `cancelled` is the good outcome for a
+    // reminder: the subscription was renewed (or the key changed hands) before
+    // the message went out, so the send was called off.
+    source('reminders', env.DB.prepare(
+      `SELECT stage,
+              COUNT(*)                                                     AS queued,
+              SUM(CASE WHEN sent_at IS NOT NULL THEN 1 ELSE 0 END)         AS sent,
+              SUM(CASE WHEN cancelled_at IS NOT NULL THEN 1 ELSE 0 END)    AS cancelled,
+              SUM(CASE WHEN sent_at IS NULL AND cancelled_at IS NULL
+                       THEN 1 ELSE 0 END)                                  AS pending,
+              SUM(CASE WHEN sent_at IS NULL AND cancelled_at IS NULL
+                            AND attempts >= ?2 THEN 1 ELSE 0 END)          AS stalled
+       FROM subscription_notifications WHERE created_at >= ?1 GROUP BY stage`
+    ).bind(fromTs, SUBSCRIPTION_NOTIFY_MAX_ATTEMPTS).all()),
+    source('winback', env.DB.prepare(
+      `SELECT answer_code AS code, COUNT(*) AS n
+       FROM subscription_notifications
+       WHERE stage = 'winback' AND answer_code IS NOT NULL AND created_at >= ?1
+       GROUP BY answer_code ORDER BY n DESC`
+    ).bind(fromTs).all()),
+    source('links', env.DB.prepare(
+      `SELECT COUNT(*) AS total,
+              SUM(CASE WHEN linked_at >= ?1 THEN 1 ELSE 0 END) AS in_window
+       FROM license_telegram_links`
+    ).bind(fromTs).first()),
+    // What the bot actually did, by outcome. NULL result_kind = an update whose
+    // handler never completed (lease still open or a crash mid-flight).
+    source('updates', env.DB.prepare(
+      `SELECT COALESCE(result_kind, 'incomplete') AS kind, COUNT(*) AS n
+       FROM telegram_updates WHERE claimed_at >= ?1 GROUP BY 1 ORDER BY n DESC`
+    ).bind(fromTs).all()),
+    source('support', env.DB.prepare(
+      `SELECT COUNT(*)                                                  AS total,
+              SUM(CASE WHEN forwarded_at IS NOT NULL THEN 1 ELSE 0 END) AS forwarded,
+              SUM(CASE WHEN forwarded_at IS NULL THEN 1 ELSE 0 END)     AS pending,
+              SUM(CASE WHEN forwarded_at IS NULL AND attempts >= ?2
+                       THEN 1 ELSE 0 END)                               AS exhausted,
+              MIN(CASE WHEN forwarded_at IS NULL THEN created_at END)   AS oldest_pending_at
+       FROM support_forward_outbox WHERE created_at >= ?1`
+    ).bind(fromTs, SUPPORT_FORWARD_MAX_ATTEMPTS).first()),
+    source('coverage', env.DB.prepare(
+      `SELECT (SELECT MIN(created_at) FROM subscription_notifications) AS oldest_notification_at,
+              (SELECT MIN(claimed_at) FROM telegram_updates)           AS oldest_update_at,
+              (SELECT MIN(created_at) FROM support_forward_outbox)     AS oldest_ticket_at`
+    ).first())
+  ]);
+
+  const byStage = {};
+  for (const r of stages?.results || []) {
+    byStage[r.stage] = {
+      queued: num(r.queued), sent: num(r.sent), cancelled: num(r.cancelled),
+      pending: num(r.pending), stalled: num(r.stalled)
+    };
+  }
+  const stage = (name) => byStage[name] || { queued: 0, sent: 0, cancelled: 0, pending: 0, stalled: 0 };
+
+  const winbackSent = stage('winback').sent;
+  const answers = (reasons?.results || []).map((r) => ({ code: r.code, n: num(r.n) }));
+  const answered = answers.reduce((s, a) => s + a.n, 0);
+
+  return {
+    ok: true,
+    days: days || 0,
+    reminders: {
+      expiry_3d: stage('expiry_3d'),
+      expiry_1d: stage('expiry_1d'),
+      expired: stage('expired'),
+      winback: stage('winback')
+    },
+    winback: {
+      sent: winbackSent,
+      answered,
+      // Share of delivered surveys that got a tap. Null rather than 0 when
+      // nothing has been sent yet — an unasked question has no response rate.
+      response_rate: winbackSent ? answered / winbackSent : null,
+      reasons: answers
+    },
+    telegram: {
+      linked_total: num(links?.total),
+      linked_in_window: num(links?.in_window),
+      updates: (kinds?.results || []).map((r) => ({ kind: r.kind, n: num(r.n) })),
+      updates_total: (kinds?.results || []).reduce((s, r) => s + num(r.n), 0)
+    },
+    support: {
+      total: num(support?.total),
+      forwarded: num(support?.forwarded),
+      pending: num(support?.pending),
+      exhausted: num(support?.exhausted),
+      oldest_pending_at: support?.oldest_pending_at ?? null
+    },
+    coverage: {
+      oldest_notification_at: coverage?.oldest_notification_at ?? null,
+      oldest_update_at: coverage?.oldest_update_at ?? null,
+      oldest_ticket_at: coverage?.oldest_ticket_at ?? null
+    },
+    // Non-empty ⇒ those blocks are zeros because they could not be read, not
+    // because nothing happened. The dashboard must say which.
+    unavailable
+  };
+}
+
+// Ticket bodies live in KV under `ticket:<no>` for 90 days (see support.js).
+const TICKET_SCAN_LIMIT = 3000;
+
+/**
+ * GET /admin/stats/tickets?limit=N — what people actually wrote: support
+ * questions, feature ideas and the free-text answers to the win-back survey,
+ * newest first.
+ *
+ * The sender's Telegram identity (uid / username / display name) is stored on
+ * the record but deliberately NOT returned. This endpoint is reachable with the
+ * read-only STATS_SECRET from a browser; the ticket number is enough to find
+ * the person in the owner's own Telegram chat, so a compromised dashboard token
+ * exposes what was said, not who said it.
+ */
+export async function statsTickets(env, limit) {
+  const want = Math.max(1, Math.min(200, Math.trunc(num(limit)) || 50));
+  let cursor;
+  const numbers = [];
+  do {
+    const page = await env.LICENSES.list({ prefix: 'ticket:', cursor, limit: 1000 });
+    for (const k of page.keys) {
+      const no = Number(k.name.slice('ticket:'.length));
+      if (Number.isFinite(no)) numbers.push(no);
+    }
+    cursor = page.list_complete ? null : page.cursor;
+  } while (cursor && numbers.length < TICKET_SCAN_LIMIT);
+
+  // KV lists lexicographically ("ticket:1000" < "ticket:999"), so the newest
+  // tickets are only found by sorting the numbers the sequence issued.
+  numbers.sort((a, b) => b - a);
+  const newest = numbers.slice(0, want);
+  const records = await Promise.all(newest.map(async (no) => {
+    const raw = await env.LICENSES.get(`ticket:${no}`);
+    if (!raw) return null;
+    let rec;
+    try { rec = JSON.parse(raw); } catch { return null; }
+    return {
+      no,
+      mode: rec.mode || 'ticket',
+      status: rec.status || 'open',
+      at: rec.at || null,
+      text: String(rec.text || '')
+    };
+  }));
+
+  const tickets = records.filter(Boolean);
+  const counts = { ticket: 0, feature: 0, winback: 0, open: 0 };
+  for (const t of tickets) {
+    if (Object.hasOwn(counts, t.mode)) counts[t.mode] += 1;
+    if (t.status !== 'resolved') counts.open += 1;
+  }
+  return {
+    ok: true,
+    truncated: !!cursor,
+    // Everything KV still holds — bodies expire 90 days after submission.
+    total_retained: numbers.length,
+    counts,
+    tickets
   };
 }
 

@@ -819,7 +819,8 @@ body.consent-missing .consent-panel { border-color: var(--warn); }
   border-top: 1px solid var(--separator);
   background: var(--card);
 }
-.history-conversation[hidden] { display: none; }
+/* (The per-element `[hidden]` patch that used to live here is now covered
+   globally by theme.css — see the `[hidden]` rule there.) */
 .history-message {
   position: relative;
   max-width: min(78%, 680px);

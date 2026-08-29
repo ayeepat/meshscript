@@ -117,11 +117,13 @@ try {
   assert.equal(initial.status, 200);
   const initialState = await initial.json();
   assert.equal(initialState.revision, 0);
-  assert.deepEqual(initialState.config.routes.deepseek.text, ['glm-5.3-flash']);
-  assert.deepEqual(initialState.config.routes.deepseek.vision, ['glm-5.3-flash']);
-  assert.deepEqual(initialState.config.routes.qwen.vision, ['glm-5.3-flash'],
-    'old Auto clients that pre-route screenshots to qwen must still reach GLM');
-  assert.equal(initialState.config.routes.standard.text[0], 'glm-5.3-flash');
+  assert.deepEqual(initialState.config.routes.deepseek.text, ['qwen3.7-plus']);
+  assert.deepEqual(initialState.config.routes.deepseek.vision, ['qwen3.7-plus', 'qwen-vl-plus']);
+  assert.deepEqual(initialState.config.routes.qwen.vision, ['qwen3.7-plus', 'qwen-vl-plus'],
+    'vision chains must contain vision-capable models only — text-only qwen-plus ' +
+    'answers an image request with a confident wrong guess instead of an error');
+  assert.equal(initialState.config.routes.standard.text[0], 'glm-5.3-flash',
+    'the cheap post-frontier chain stays on GLM: it is ~4x cheaper per token than Qwen');
   assert.equal(initialState.config.routes.standard.vision[0], 'glm-5.3-flash');
   assert.equal(initialState.config.limits.requests_per_minute, 5);
   assert.equal(initialState.config.limits.frontier_per_license, 15);
@@ -277,6 +279,75 @@ try {
   assert.equal(persisted.config.limits.standard_per_license, 70);
   assert.equal(persisted.config.routes.standard.text[0], 'glm-5.3-flash');
   assert.equal(persisted.history[0].revision, 3);
+
+  /* ---- the live Auto model: Qwen 3.7 Plus, on its own quality policy ---- */
+  // Qwen thinks by default and has NO OpenAI-style effort levels, so the
+  // low-effort hint every installed client sends with a test solve must be
+  // dropped rather than forwarded — and never turned into GLM's thinking/max
+  // pair, which is a different vendor's knob.
+  const beforeQwen = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
+  const qwenConfig = structuredClone(beforeQwen.config);
+  qwenConfig.limits.frontier_per_license = 5;
+  qwenConfig.limits.force_standard = false;
+  qwenConfig.routes.deepseek.text = ['qwen3.7-plus'];
+  qwenConfig.routes.deepseek.vision = ['qwen3.7-plus'];
+  const qwenSaved = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: beforeQwen.revision, reason: 'auto → qwen3.7-plus', config: qwenConfig
+    })
+  });
+  if (qwenSaved.status !== 200) throw new Error(`qwen save failed: ${qwenSaved.status} ${await qwenSaved.text()}`);
+
+  // Canonical base64 of arbitrary bytes: the VPS validates the data-URI shape
+  // and never decodes the pixels, so no real PNG is needed to exercise routing.
+  const imageDataUri = 'data:image/png;base64,' +
+    Buffer.from('smesh-model-control-regression-image').toString('base64');
+  const qwenIdentity = {
+    license_key: 'SMESH-QWEN-CONTROL-TEST',
+    device_id: '123e4567-e89b-42d3-a456-426614174002'
+  };
+  const startQwen = async (nonce, content) => {
+    const expectedCalls = calls.length + 1;
+    const response = await fetch(`${base}/ai/start`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider: 'deepseek',
+        ...qwenIdentity,
+        activation_token: 'a'.repeat(43),
+        messages: [{ role: 'user', content }],
+        // Exactly what solveTest sends for a test page it judged easy.
+        reasoning_effort: 'low',
+        response_format: 'json_object',
+        idempotency_key: `qwen-policy-${nonce}`
+      })
+    });
+    if (response.status !== 200) throw new Error(`qwen start failed: ${response.status} ${await response.text()}`);
+    for (let i = 0; i < 100 && calls.length < expectedCalls; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    return upstreamBodies.at(-1);
+  };
+
+  const qwenText = await startQwen('text', 'реши тест');
+  assert.equal(calls.at(-1), 'qwen3.7-plus', 'Auto must resolve to the dashboard-selected Qwen model');
+  assert.equal(qwenText.reasoning_effort, undefined,
+    'Qwen has no effort levels — the client hint must be dropped, not forwarded');
+  assert.equal(qwenText.thinking, undefined,
+    "GLM's forced-thinking pair must never be sent to a Qwen model");
+  assert.deepEqual(qwenText.response_format, { type: 'json_object' },
+    'a text test solve keeps JSON mode, which is what the answer parser expects');
+
+  const qwenVisionBody = await startQwen('vision', [
+    { type: 'text', text: 'реши тест по скриншоту' },
+    { type: 'image_url', image_url: { url: imageDataUri } }
+  ]);
+  assert.equal(calls.at(-1), 'qwen3.7-plus');
+  assert.equal(qwenVisionBody.reasoning_effort, undefined);
+  assert.equal(qwenVisionBody.response_format, undefined,
+    'Qwen JSON mode is unreliable once an image is in the request (same finding ' +
+    'that makes src/lib/qwen.js drop it client-side); the answer parser recovers ' +
+    'the {answers:[{n,a}]} shape from prose instead');
 } finally {
   proxy.kill('SIGTERM');
   upstream.close();

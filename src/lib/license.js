@@ -112,6 +112,26 @@ function statusNotExpired(status, now) {
   return Number.isFinite(t) && t > now;
 }
 
+const ACTIVATION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+
+/**
+ * A positive license verdict is useful only when the client also holds the
+ * per-installation bearer capability required by every licensed API call.
+ * Keep this contract shared by verification, popup readiness, Settings and
+ * the proxy boundary so «Активна» can never mean «the server will reject it».
+ */
+export function licenseUsabilityReason(status, now = Date.now()) {
+  if (!status?.key) return 'no_key';
+  if (!status.ok) return status.reason || 'no_key';
+  if (!statusNotExpired(status, now)) return 'expired';
+  if (!ACTIVATION_TOKEN_RE.test(status.activation_token || '')) return 'bad_activation';
+  return null;
+}
+
+export function isUsableLicenseStatus(status, now = Date.now()) {
+  return licenseUsabilityReason(status, now) === null;
+}
+
 export const REASON_MESSAGES = {
   not_found: 'Ключ не найден. Проверьте, нет ли опечатки.',
   expired: 'Срок действия ключа истёк.',
@@ -121,6 +141,7 @@ export const REASON_MESSAGES = {
   bad_device: 'Не удалось подтвердить устройство. Переустановите расширение и попробуйте снова.',
   bad_activation: 'Не удалось подтвердить активацию этого устройства. Деактивируйте ключ или напишите в поддержку.',
   activation_mismatch: 'Ключ активирован на другом устройстве. Сначала деактивируйте его на устройстве №1.',
+  released_remotely: 'Ключ отвязан от этого устройства через Telegram-бота. Чтобы снова пользоваться им здесь, вставьте ключ в поле выше ещё раз.',
   service_unavailable: 'Сервер лицензий временно недоступен. Попробуйте ещё раз позже.',
   network: 'Не удалось связаться с сервером. Проверьте подключение.',
   no_key: 'Лицензия не активирована.'
@@ -176,7 +197,9 @@ async function bumpGeneration() {
  * 200 JSON verdict advances lastVerifiedAt; failed attempts cannot renew the
  * entitlement's absolute offline grace.
  */
-export async function verifyKey(key, { onlyIfCurrent = false, generation = null } = {}) {
+export async function verifyKey(
+  key, { onlyIfCurrent = false, generation = null, intent = false } = {}
+) {
   // The generation this verify runs under: passed in by setLicenseKey (which
   // just bumped it), captured here for background revalidation.
   const startedUnder = generation ?? await currentGeneration();
@@ -206,7 +229,7 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
   const priorBeforeRequest = await loadStatus();
   const priorActivationToken = priorBeforeRequest?.key === trimmed &&
     typeof priorBeforeRequest.activation_token === 'string' &&
-    /^[A-Za-z0-9_-]{43}$/.test(priorBeforeRequest.activation_token)
+    ACTIVATION_TOKEN_RE.test(priorBeforeRequest.activation_token)
     ? priorBeforeRequest.activation_token
     : '';
   let result;
@@ -220,7 +243,13 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
       body: JSON.stringify({
         key: trimmed,
         device_id: deviceId,
-        ...(priorActivationToken ? { activation_token: priorActivationToken } : {})
+        ...(priorActivationToken ? { activation_token: priorActivationToken } : {}),
+        // Set only when the user just entered this key here. The backend uses
+        // it to tell a deliberate activation apart from the revalidation every
+        // installation runs on its own clock: after the key is released from
+        // the Telegram bot, only the deliberate one may take the seat back —
+        // otherwise this device would silently undo the release minutes later.
+        ...(intent ? { activation_intent: true } : {})
       }),
       cache: 'no-store',
       redirect: 'error',
@@ -245,7 +274,7 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
       result.erasure_token.length <= 1024 ? result.erasure_token : null;
     const erasureExpiresAt = Number(result?.erasure_token_expires_at);
     const returnedActivationToken = typeof result?.activation_token === 'string' &&
-      /^[A-Za-z0-9_-]{43}$/.test(result.activation_token)
+      ACTIVATION_TOKEN_RE.test(result.activation_token)
       ? result.activation_token
       : '';
     const status = {
@@ -259,6 +288,15 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
     };
     if (status.ok && (returnedActivationToken || priorActivationToken)) {
       status.activation_token = returnedActivationToken || priorActivationToken;
+    }
+    // `ok:true` without this capability is not an active installation from the
+    // extension's point of view: /ai/start, uploads, GDZ and deactivation all
+    // require it. Fail at the verification boundary instead of painting a
+    // misleading green status and failing only after the user clicks Solve.
+    const unusableReason = licenseUsabilityReason(status, verdictAt);
+    if (status.ok && unusableReason) {
+      status.ok = false;
+      status.reason = unusableReason;
     }
     // The capability is deliberately coupled to a fresh successful verify.
     // Never cache a malformed, expired, or error-response token, and never
@@ -290,7 +328,7 @@ export async function verifyKey(key, { onlyIfCurrent = false, generation = null 
     // Soft failure: leave the prior status in place if we had one,
     // surface a network reason in the UI.
     const prior = await loadStatus();
-    if (prior && prior.ok && prior.key === trimmed) {
+    if (prior && isUsableLicenseStatus(prior) && prior.key === trimmed) {
       const stale = { ...prior, checkedAt: Date.now(), softError: 'network' };
       // saveIfCurrent embeds startedUnder. Never carry the prior row's
       // generation forward as if it described this verification attempt.
@@ -308,15 +346,14 @@ async function setLicenseKeyHere(key) {
   const requested = normalizeEnteredLicenseKey(key);
   const current = await loadStatus();
   if (!requested) return deactivateLicenseHere();
-  const currentHasActivation = current?.ok === true ||
-    /^[A-Za-z0-9_-]{43}$/.test(current?.activation_token || '');
+  const currentHasActivation = ACTIVATION_TOKEN_RE.test(current?.activation_token || '');
   if (current?.key && current.key !== requested && currentHasActivation) {
     throw new Error('Сначала деактивируйте текущий ключ на этом устройстве, затем введите другой.');
   }
   // Bump BEFORE mutating so every verify already in flight (background
   // revalidation or an earlier overlapping save) drops its stale verdict.
   const generation = await bumpGeneration();
-  return verifyKey(requested, { generation });
+  return verifyKey(requested, { generation, intent: true });
 }
 
 async function deactivateLicenseHere() {
@@ -334,11 +371,11 @@ async function deactivateLicenseHere() {
     await clearStatus();
     return { key: '', ok: false, reason: 'no_key', checkedAt: Date.now() };
   }
-  if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+  if (!ACTIVATION_TOKEN_RE.test(token)) {
     // A pre-migration cache must first exchange its historical device binding
     // for the server-issued capability; never clear locally and strand the key.
     const refreshed = await verifyKey(status.key, { onlyIfCurrent: true });
-    if (!refreshed.ok || !/^[A-Za-z0-9_-]{43}$/.test(refreshed.activation_token || '')) {
+    if (!isUsableLicenseStatus(refreshed)) {
       throw new Error(reasonMessage(refreshed.reason || 'bad_activation'));
     }
     return deactivateLicenseHere();
@@ -422,20 +459,20 @@ export async function ensureLicensed() {
   }
   const now = Date.now();
   const lastVerifiedAt = Number(status.lastVerifiedAt) || 0;
-  const hasActivation = /^[A-Za-z0-9_-]{43}$/.test(status.activation_token || '');
-  if (status.ok && hasActivation && statusNotExpired(status, now) && now - lastVerifiedAt < VERIFY_CACHE_MS) return;
+  if (isUsableLicenseStatus(status, now) && now - lastVerifiedAt < VERIFY_CACHE_MS) return;
 
   const prior = status;
   status = await verifyKey(status.key, { onlyIfCurrent: true });
   if (status.softError !== 'network') {
-    if (status.ok) return;
-    throw new Error(reasonMessage(status.reason));
+    const reason = licenseUsabilityReason(status);
+    if (!reason) return;
+    throw new Error(reasonMessage(reason));
   }
 
   // Legacy rows deliberately have lastVerifiedAt=0: checkedAt was renewed by
   // the old fail-open path and is not trustworthy migration evidence.
   const priorVerifiedAt = Number(prior.lastVerifiedAt) || 0;
-  if (prior.ok && /^[A-Za-z0-9_-]{43}$/.test(prior.activation_token || '') &&
+  if (isUsableLicenseStatus(prior) &&
       statusNotExpired(prior, Date.now()) && Date.now() - priorVerifiedAt < LICENSE_OFFLINE_GRACE_MS) return;
   throw new Error(reasonMessage('network'));
 }

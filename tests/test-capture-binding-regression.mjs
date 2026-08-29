@@ -7,7 +7,7 @@ import {
   sameTestCaptureContext,
   withMatchingTestCapture,
 } from '../src/lib/test-capture-context.js';
-import { capturePillDomText } from '../src/lib/pill-dom-capture.js';
+import { capturePillDomText, captureTestVisualMedia } from '../src/lib/pill-dom-capture.js';
 
 const captured = {
   tabId: 41,
@@ -148,6 +148,30 @@ assert.match(pillText, /Решите уравнение/);
 assert.match(pillText, /Варианты ответа/);
 assert.equal(screenshotCalls, 0, 'the in-page pill must remain DOM-only without activeTab');
 
+// Media detection is bound to the same exact browser documents as text capture.
+// One positive frame is enough to choose Qwen; a text-only capture stays false.
+for (const [visualFrames, expected] of [
+  [new Set(), false],
+  [new Set([childDocument.documentId]), true],
+]) {
+  let readCalls = 0;
+  const hasVisualMedia = await captureTestVisualMedia(pillCapture, {
+    async executeScript(details) {
+      if (details.files) return [];
+      readCalls += 1;
+      assert.deepEqual(details.target.documentIds,
+        pillCapture.documents.map((document) => document.documentId));
+      return details.target.documentIds.map((documentId, index) => ({
+        frameId: index,
+        documentId,
+        result: { stale: false, visualMedia: visualFrames.has(documentId) },
+      }));
+    },
+  });
+  assert.equal(readCalls, 1);
+  assert.equal(hasVisualMedia, expected);
+}
+
 // The per-frame budget must charge the "\n\n" separator it prepends. Without
 // that the result overran its own cap, and a frame arriving with no room left
 // still appended a bare separator.
@@ -250,6 +274,59 @@ assert.equal(mutations, 1, 'a child/account mismatch must fail before any answer
 // student signals. A token refresh can change the raw bearer token, so only the
 // bounded stable claims — never the token itself — participate.
 const scraper = readFileSync(new URL('../src/content/scraper.js', import.meta.url), 'utf8');
+const visualStart = scraper.indexOf('const TEST_VISUAL_MEDIA_SELECTOR');
+const visualEnd = scraper.indexOf('\nfunction stableSignatureControlSemantics', visualStart);
+assert.ok(visualStart >= 0 && visualEnd > visualStart, 'visual media detector source not found');
+
+function visualElement(tagName, width, height, attrs = {}, backgroundImage = 'none') {
+  return {
+    tagName,
+    backgroundImage,
+    getBoundingClientRect: () => ({ width, height, left: 10, top: 10, right: 10 + width, bottom: 10 + height }),
+    getAttribute: (name) => attrs[name] || '',
+    closest: () => null,
+  };
+}
+
+function runVisualDetector(media, all = media) {
+  const context = {
+    innerWidth: 1200,
+    innerHeight: 900,
+    document: {
+      documentElement: { clientWidth: 1200, clientHeight: 900 },
+      querySelectorAll: (selector) => selector === '*' ? all : media,
+    },
+    getComputedStyle: (element) => ({
+      display: 'block', visibility: 'visible', contentVisibility: 'visible',
+      opacity: '1', position: 'static', overflow: 'visible', overflowX: 'visible',
+      overflowY: 'visible', transform: 'none', clip: 'auto', clipPath: 'none',
+      backgroundImage: element.backgroundImage,
+    }),
+    SIGNATURE_ELEMENT_SCAN_LIMIT: 4096,
+    SIGNATURE_MUTABLE_ANSWER_SELECTOR: '.answer-widget',
+    signatureElementIsVisuallyHidden: () => false,
+  };
+  vm.createContext(context);
+  vm.runInContext(
+    `${scraper.slice(visualStart, visualEnd)}\nthis.__smeshHasVisualMedia = testPageHasVisualMedia;`,
+    context,
+  );
+  return context.__smeshHasVisualMedia();
+}
+
+assert.equal(runVisualDetector([visualElement('svg', 24, 24)]), false,
+  'a normal UI icon must not route a text-only test to Qwen');
+assert.equal(runVisualDetector([visualElement('img', 320, 180)]), true,
+  'a substantial visible image must route the test to Qwen');
+assert.equal(runVisualDetector([visualElement('img', 28, 28, { alt: 'График функции' })]), true,
+  'an explicitly labelled graph is a visual signal even when compact');
+assert.equal(runVisualDetector([], [visualElement('div', 400, 220, {}, 'url(question.png)')]), true,
+  'a substantial CSS background image must also route to Qwen');
+assert.equal(runVisualDetector([], [visualElement('div', 400, 220, {}, 'linear-gradient(red, blue)')]), false,
+  'a decorative CSS gradient must not route a text-only test to Qwen');
+assert.equal(runVisualDetector([visualElement('canvas', 400, 220, { class: 'myscript-answer' })]), false,
+  'an answer-input canvas must not be mistaken for question media');
+
 const principalStart = scraper.indexOf('const MAX_CAPTURE_PRINCIPAL_PART');
 const principalEnd = scraper.indexOf('\n/**\n * Resolve the numeric student_id', principalStart);
 assert.ok(principalStart >= 0 && principalEnd > principalStart, 'principal encoder source not found');
@@ -532,8 +609,10 @@ const panelIndex = solveCase.indexOf('await showAnswersInTab', solveGuardIndex);
 assert.ok(solveIndex >= 0 && solveGuardIndex > solveIndex && panelIndex > solveGuardIndex,
   'the worker must revalidate only after AI returns and before displaying answers');
 
-assert.match(popup, /payload: \{ text: pageText, screenshot, tabId, provider, capture \}/,
-  'popup solve requests must carry the captured identity');
+assert.match(popup, /payload: \{ text: pageText, screenshot, hasVisualMedia, tabId, provider, capture \}/,
+  'popup solve requests must carry the captured identity and media-routing signal');
+assert.match(popup, /if \(hasVisualMedia\) \{[\s\S]*captureVisibleTarget\(currentTab\)/,
+  'the popup must capture pixels only after the page reports visual media');
 assert.match(popup, /payload: \{ tabId: tab\.id, questions, capture \}/,
   'popup autofill requests must carry the same captured identity');
 assert.match(popup, /payload: \{ tabId, capture \}/,

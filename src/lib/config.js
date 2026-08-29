@@ -19,6 +19,17 @@
 // services, and docs/STORE-REVIEW.md plus the site's privacy policy still name
 // them. Hiding a picker must not turn into hiding the actual data recipients,
 // especially when the audience is schoolchildren.
+//
+// ⚠️ FLIPPING THIS BACK TO true ALSO REQUIRES restoring the BYO provider host
+// permissions in manifest.json (`https://openrouter.ai/*`,
+// `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*`). They were
+// dropped for the Chrome Web Store release because no shipped UI path could
+// reach them, and an unreachable host permission is a review risk. Without them
+// every BYO request — including the hidden `qwenApiKey` owner escape hatch and
+// Groq Whisper transcription — fails at fetch() with an opaque CORS error
+// instead of the adapter's own message.
+// tests/byo-provider-surface-regression.mjs fails the build if the flag and the
+// manifest ever disagree.
 export const SHOW_PROVIDER_UI = false;
 
 // What actually answers while the picker is hidden. DeepSeek is the cheapest
@@ -74,7 +85,11 @@ export const LICENSE_OFFLINE_GRACE_MS = 48 * 60 * 60 * 1000;
 // WITHOUT shipping a new build through store review. Everything has a built-in
 // fallback, so a 404 / unreachable host changes nothing. Point this at a static
 // file on your site; the expected shape is documented in remote-config.js.
-export const RUNTIME_CONFIG_URL = 'https://www.smeshai.xyz/extension-config.json';
+// NOTE: apex, NOT `www.`. The site 301s every `www.smeshai.xyz` request to the
+// apex host, and fetchFresh() uses `redirect: 'error'` on purpose — so a `www.`
+// URL here can never resolve, no matter what is published. The host permission
+// in manifest.json must keep matching this origin exactly.
+export const RUNTIME_CONFIG_URL = 'https://smeshai.xyz/extension-config.json';
 
 // Refresh the cached runtime config at most this often (6h). Long enough to be
 // nearly free, short enough that a hot-fix reaches users the same day.

@@ -357,6 +357,8 @@ function createSaveHarness({
     hydrateSettingsForm: () => hydration,
     loadSecondaryUi: async () => {},
     getLicenseStatus: async () => priorStatus,
+    isUsableLicenseStatus: (status) => !!status?.key && status.ok === true &&
+      /^[A-Za-z0-9_-]{43}$/.test(status.activation_token || ''),
     normalizeEnteredLicenseKey(raw) {
       let normalized = String(raw || '').trim().toUpperCase().replace(/\s+/g, '');
       const compact = /^SMESH-([23456789ABCDEFGHJKMNPQRSTVWXYZ]{12})$/.exec(normalized);
@@ -434,7 +436,7 @@ function createSaveHarness({
   harness.fields.licenseKey.value = 'license-a';
   const saving = harness.context.__saveApi.requestSettingsSave();
   await waitUntil(() => harness.licenseCalls.length === 1, 'same failed key retry');
-  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true });
+  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true, activation_token: 'a'.repeat(43) });
   assert.equal(await saving, true,
     'an unrelated usage-dashboard error must not abort license activation');
 }
@@ -846,7 +848,9 @@ function createSaveHarness({
     rateLimits: { openrouter: 71, groq: 72, qwen: 73, deepseek: 74 }
   });
   assert.equal(harness.licenseCalls[0].key, 'LICENSE-DURING-LOAD');
-  harness.licenseCalls[0].resolve({ key: 'LICENSE-DURING-LOAD', ok: true });
+  harness.licenseCalls[0].resolve({
+    key: 'LICENSE-DURING-LOAD', ok: true, activation_token: 'a'.repeat(43)
+  });
   await saving;
 }
 
@@ -871,7 +875,7 @@ function createSaveHarness({
   assert.equal(harness.context.__saveApi.generation(), 2,
     'the queued click must own license UI before its writer starts');
 
-  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true });
+  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true, activation_token: 'a'.repeat(43) });
   await first;
   assert.deepEqual(harness.licensePaints, [],
     'the first save must not paint after a newer save click');
@@ -886,7 +890,7 @@ function createSaveHarness({
     rateLimits: { openrouter: 30, groq: 41, qwen: 30, deepseek: 30 }
   }, 'the queued request must persist the complete normalized click-time snapshot');
   harness.fields.licenseKey.value = 'LICENSE-B';
-  harness.licenseCalls[1].resolve({ key: 'LICENSE-B', ok: true });
+  harness.licenseCalls[1].resolve({ key: 'LICENSE-B', ok: true, activation_token: 'b'.repeat(43) });
   await second;
   assert.deepEqual(
     harness.licensePaints.map(({ status }) => status.key),
@@ -904,7 +908,7 @@ function createSaveHarness({
   await waitUntil(() => harness.licenseCalls.length === 1, 'stale license paint save');
   harness.fields.licenseKey.value = 'unsaved-b';
   harness.fields.licenseKey.dispatch('input');
-  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true });
+  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true, activation_token: 'a'.repeat(43) });
   await saving;
   assert.deepEqual(harness.licensePaints, []);
   assert.equal(harness.fields.licStatus.textContent, 'Изменено · сохраните');
@@ -918,7 +922,7 @@ function createSaveHarness({
   harness.fields.licenseKey.value = 'license-a';
   const first = harness.context.__saveApi.requestSettingsSave();
   await waitUntil(() => harness.licenseCalls.length === 1, 'first toast save');
-  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true });
+  harness.licenseCalls[0].resolve({ key: 'LICENSE-A', ok: true, activation_token: 'a'.repeat(43) });
   await first;
   const oldTimer = harness.context.__saveApi.toastTimer();
   assert.equal(harness.fields.status.classList.contains('show'), true);
@@ -926,7 +930,7 @@ function createSaveHarness({
   harness.fields.licenseKey.value = 'license-b';
   const second = harness.context.__saveApi.requestSettingsSave();
   await waitUntil(() => harness.licenseCalls.length === 2, 'second toast save');
-  harness.licenseCalls[1].resolve({ key: 'LICENSE-B', ok: true });
+  harness.licenseCalls[1].resolve({ key: 'LICENSE-B', ok: true, activation_token: 'b'.repeat(43) });
   await second;
   const newTimer = harness.context.__saveApi.toastTimer();
   assert.notEqual(newTimer, oldTimer);

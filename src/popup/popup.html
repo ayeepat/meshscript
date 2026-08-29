@@ -23,9 +23,20 @@
 
   <div id="notice" class="notice" hidden></div>
 
+  <!-- Hand-off to the full-screen tour. Normally invisible: the tour opens by
+       itself on install and, once, for everyone who installed before it
+       existed. This is the recovery path for the device whose tab never
+       appeared — and it opens the tour in a real tab rather than cramming it
+       into 380 pixels. -->
+  <section id="tourHandoff" class="handoff" hidden>
+    <h2 class="handoff-title">Привет! Давайте познакомимся</h2>
+    <p class="handoff-lede">За минуту покажу, как СМЭШ решает домашку и тесты, читает файлы из дневника и находит ответы в вашем учебнике. Знакомство откроется в отдельной вкладке — здесь для него тесновато.</p>
+    <button id="startTour" class="bigbtn" type="button"><span>Показать знакомство</span></button>
+  </section>
+
   <section id="onboardView" class="onboard" hidden>
     <h2 class="ob-title">Добро пожаловать в СМЭШ AI</h2>
-    <p class="ob-lede">Решаю домашку и тесты из электронного дневника МЭШ. Активируйте ключ доступа — и можно начинать.</p>
+    <p class="ob-lede">Решаю домашку и тесты из электронного дневника. Активируйте ключ доступа — и можно начинать.</p>
 
     <div class="ob-step">
       <div class="ob-h">1 · Ключ доступа</div>
@@ -37,7 +48,7 @@
         <button data-p="qwen" type="button">Qwen</button>
         <button data-p="deepseek" type="button">DeepSeek</button>
       </div>
-      <a id="obKeyLink" class="ob-link" href="https://www.smeshai.xyz/" target="_blank" rel="noopener noreferrer">Купить лицензию СМЭШ →</a>
+      <a id="obKeyLink" class="ob-link" href="https://smeshai.xyz/" target="_blank" rel="noopener noreferrer">Купить лицензию СМЭШ →</a>
       <input id="obKey" class="ob-input" type="text" placeholder="SMESH-XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false" />
     </div>
 
@@ -45,12 +56,13 @@
       <div class="ob-h">2 · Согласие</div>
       <label class="ob-consent">
         <input id="obConsent" type="checkbox" />
-        <!-- Deliberately still says the data leaves the device and goes to
-             third-party AI services. Only the vendor names moved to the
-             privacy policy linked right here. -->
-        <span>Понимаю, что текст заданий, скриншоты и прикреплённые файлы (включая аудио для расшифровки) отправляются сторонним ИИ-сервисам — через сервер СМЭШ или напрямую, если в расширении сохранён мой ключ такого сервиса. Их список указан в политике конфиденциальности. Принимаю
-          <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a> и
-          <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия</a>.</span>
+        <!-- One acceptance, no enumeration: what is sent, to whom, and the
+             usage statistics that used to have their own checkbox all live in
+             the two linked documents. They are the only disclosure surface
+             left, so they have to actually describe those flows. -->
+        <span>Я принимаю
+          <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a> и
+          <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a>.</span>
       </label>
     </div>
 
@@ -86,7 +98,7 @@
 
   <div id="testView" class="testview" hidden>
     <span id="provBadge" class="provbadge" hidden></span>
-    <p class="testlede muted">Откройте тест МЭШ на экране — я сниму скриншот страницы и пришлю короткие ответы.</p>
+    <p class="testlede muted">Откройте тест на экране — я сниму скриншот страницы и пришлю короткие ответы.</p>
     <button id="solveTest" class="bigbtn">
       <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 14.5l.8 2.2L22 17.5l-2.2.8L19 20.5l-.8-2.2L16 17.5l2.2-.8z"/></svg>
       <span>Решить тест</span>
@@ -108,9 +120,10 @@
   </a>
 
   <footer class="legal">
-    <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Конфиденциальность</a>
+    <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Конфиденциальность</a>
     <span class="legal-dot">·</span>
-    <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия</a>
+    <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия</a>
+    <p class="legal-note">Независимый сервис. Не связан ни с одним электронным журналом.</p>
   </footer>
 
   <script type="module" src="popup.js"></script>

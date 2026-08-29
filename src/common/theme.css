@@ -221,6 +221,18 @@
 
 /* Shared primitives reused across every extension page. -------------------- */
 * { box-sizing: border-box; }
+
+/* The `hidden` attribute must actually hide. Its UA rule is `display: none`,
+   which ANY author `display:` declaration silently outranks — so every element
+   that ships `hidden` but is also styled `display: flex/block/inline-flex`
+   rendered anyway. That leaked the vendor-name provider picker into onboarding,
+   the «OPR GRQ QWN DSK» switcher and the OpenRouter spend tiles into Settings,
+   and the provider badge into the dashboard, all of which SHOW_PROVIDER_UI is
+   supposed to keep out of a student's view. `!important` is the intended tool
+   here: `hidden` is a state, not a style, and nothing may override it.
+   tests/hidden-attribute-regression.mjs pins this. */
+[hidden] { display: none !important; }
+
 svg { flex: none; }
 
 /* Refine every line icon (Lucide-style, drawn with fill="none") to a lighter,
@@ -267,6 +279,20 @@ svg[fill="none"] { stroke-width: 1.75; }
 /* Live "thinking" status verb + elapsed counter (see common/thinking.js).
    Tabular numerals keep the seconds counter from jiggling the layout. */
 .thinkverb { font-variant-numeric: tabular-nums; }
+
+/* Appears only after an AI request has produced no answer for 30 seconds.
+   It is a compact reassurance beside the pending output, not a second loader. */
+.long-think-note {
+  display: inline-flex; align-items: center; gap: 6px;
+  max-width: 100%; margin-left: 4px; padding: 4px 8px;
+  border: 1px solid var(--accent-soft-strong); border-radius: var(--r-pill);
+  background: var(--accent-soft); color: var(--accent);
+  font-size: 11px; font-weight: 650; line-height: 1.3;
+}
+.long-think-note::before {
+  content: ''; flex: none; width: 5px; height: 5px;
+  border-radius: 50%; background: currentColor; opacity: 0.8;
+}
 
 /* Provider badge — tiny read-only "which AI is active" tag (GRQ / OPR / QWN / DSK).
    Shared by the popup test view and the dashboard header (see

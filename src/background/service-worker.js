@@ -11,14 +11,21 @@ import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js'
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import {
   appendSolveTurn,
+  findLessonSession,
   listSessions,
   listMessages,
   cleanupLocalData,
   deleteAllLocalData,
   getDeviceId,
 } from '../lib/history.js';
+import {
+  patchCachedTestAnswer,
+  readCachedTestAnswers,
+  writeCachedTestAnswers,
+} from '../lib/test-answer-cache.js';
 import { ensureLicensed, setLicenseKey, deactivateCurrentLicense } from '../lib/license.js';
 import { getMyReferralCode } from '../lib/referral.js';
+import { claimTour, releaseTourClaim } from '../lib/onboarding.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
 import { isBareTextbookRef, classifyTask, needsAudio, isEasyTask, isChatty, isLightFollowup, testPageEffort } from '../lib/task-classifier.js';
@@ -44,7 +51,7 @@ import {
   cleanupDashboardLaunches
 } from '../lib/dashboard-launch.js';
 import { addGdzBook, removeGdzBook } from '../lib/gdz-books.js';
-import { capturePillDomText } from '../lib/pill-dom-capture.js';
+import { capturePillDomText, captureTestVisualMedia } from '../lib/pill-dom-capture.js';
 import {
   executeScriptInCapturedDocuments,
   isTestCaptureContext,
@@ -318,14 +325,46 @@ getRuntimeConfig().catch(() => { /* offline / not hosted — defaults apply */ }
 // 6h (see telemetry.heartbeat), so frequent SW spin-ups don't spam the backend.
 heartbeat();
 
-// First install / version upgrade — a one-shot funnel signal. Fire-and-forget.
-chrome.runtime.onInstalled.addListener((details) => {
-  if (details.reason === 'install') track('install');
-  else if (details.reason === 'update') {
+// A Chrome toolbar popup cannot open itself after installation, and the tour is
+// a full-screen page by design — it never squeezes into the 380px popup. Open
+// it as a first-party tab instead.
+//
+// It opens ONCE PER DEVICE, forever, and the guard is lib/onboarding.js: the
+// record is written BEFORE the tab exists, so nothing here — a rejected tab, a
+// closed window, a second event — can produce a second showing. Two entry
+// points feed it and both go through the same claim:
+//   • install — the new student;
+//   • update  — the one-time backfill for everyone who installed before the
+//     tour existed. They only qualify because their device has no record at
+//     all; every later update finds one and stays silent.
+const WELCOME_PAGE = 'src/welcome/welcome.html';
+
+async function openOnboardingTour(source) {
+  const claim = await claimTour(source);
+  if (!claim) return false; // this device has already been shown the tour
+  try {
+    await chrome.tabs.create({ url: chrome.runtime.getURL(WELCOME_PAGE) });
+    return true;
+  } catch {
+    // The tab never existed, so the showing never happened. Give the claim back
+    // rather than burning the student's single onboarding on a Chrome hiccup.
+    await releaseTourClaim(claim).catch(() => { /* stays claimed; fail closed */ });
+    return false;
+  }
+}
+
+function handleExtensionInstalled(details) {
+  if (details?.reason === 'install') {
+    track('install');
+    openOnboardingTour('install').catch(() => { /* the toolbar remains the fallback */ });
+  } else if (details?.reason === 'update') {
     track('update', { meta: { from: details.previousVersion || null } });
     migrateNararouter().catch(() => { /* best-effort */ });
+    openOnboardingTour('update').catch(() => { /* the toolbar remains the fallback */ });
   }
-});
+}
+
+chrome.runtime.onInstalled.addListener(handleExtensionInstalled);
 
 // NaraRouter was removed (replaced by Qwen/DeepSeek). An install that still has
 // it selected would fall through to the dispatcher's OpenRouter default and
@@ -473,9 +512,15 @@ async function fetchGdzMaterial(subject, task) {
  * @param {object} p
  * @param {string} [p.mode] answer mode (brief/explain) — see subject-router
  * @param {string} [p.engine] dashboard engine toggle (auto/think) — picks the model
+ * @param {string} [p.lessonKey] stable lesson identity (lib/lesson-key.js) stored
+ *   on the session so reopening this exact homework row replays it for free
  * @param {(chunk:string)=>void} [onDelta] stream callback (token-by-token)
  */
-async function solve({ subject, task, files = [], sessionId = null, history = [], mode, engine }, onDelta, signal) {
+async function solve(
+  { subject, task, files = [], sessionId = null, history = [], mode, engine, lessonKey = '' },
+  onDelta,
+  signal
+) {
   // License gate. No-op until the configured launch instant (preorder window).
   // Throws a Russian-language error the catch path surfaces verbatim.
   await ensureLicensed();
@@ -567,15 +612,12 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   if (!finalBudget.ok) throw new Error(finalBudget.error);
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
-  // Dashboard engine toggle («Авто» / «Думать») decides the model for this
-  // solve: auto → DeepSeek at LOW reasoning effort (fastest, cheapest), think
-  // → Qwen (reasons by default; it has no effort knob — see qwen.js). Absent
-  // or unknown values (an older payload) keep the aiProvider setting, so the
-  // toggle stays dashboard-only. Image-bearing auto requests still upgrade
-  // DeepSeek→Qwen inside askAI: DeepSeek has no vision.
+  // Dashboard engine toggle («Авто» / «Думать») selects a stable proxy route:
+  // auto → legacy wire id `deepseek`, currently Qwen 3.7 Plus via live model
+  // control; think → Qwen. Absent/unknown values keep the stored provider.
   const engineProvider = engine === 'think' ? 'qwen' : engine === 'auto' ? 'deepseek' : null;
-  // PDFs require a PDF-capable backend. The СМЭШ proxy (Qwen/DeepSeek without
-  // a BYO Alibaba key) handles them itself — it re-routes a PDF-carrying job
+  // PDFs require a PDF-capable backend. The licensed СМЭШ proxy routes handle
+  // them server-side when there is no hidden BYO Alibaba key — it sends the job
   // to its Gemini chain server-side — so those requests pass through
   // untouched. Everyone else (Groq, OpenRouter, BYO DashScope) is forced to
   // OpenRouter, whose Gemini reads PDFs natively.
@@ -615,9 +657,10 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   }
   let usage = null, usedProvider = null;
   // LOW reasoning effort for turns that don't need model thinking (pure time-
-  // to-first-answer AND billed thinking tokens). Three routes, all gated on no
-  // NEW files this turn (a fresh attachment usually means real work), and all
-  // no-ops on Qwen which ignores the knob (DeepSeek/OpenRouter honor it):
+  // to-first-answer AND billed thinking tokens). The live Auto route is never
+  // downgraded here: its actual model is owner-controlled, and the VPS applies
+  // model-specific reasoning safely (Qwen 3.7 Plus thinks by default and is
+  // sent no effort at all; GLM-5.3-Flash is forced to max).
   //  - 'easy':    first-turn recall/lookup/choice (isEasyTask);
   //  - 'chatty':  first-turn greetings / "что ты умеешь" — nothing to solve;
   //  - 'followup': clarification of an already-solved task («объясни, я не
@@ -631,10 +674,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
   const askOpts = { onDelta, provider, signal, onUsage: (u, prov) => { usage = u; usedProvider = prov; } };
   let lowEffortReason = null;
   if (engineProvider === 'deepseek') {
-    // «Авто» exists to answer FAST: always request low effort. DeepSeek (and
-    // the OpenRouter PDF fallback above) honor the knob; after an image
-    // auto-upgrade to Qwen it's a harmless no-op.
-    lowEffortReason = 'engine_auto';
+    // Auto quality is controlled by the model-aware VPS policy.
   } else if (engineProvider === 'qwen') {
     // «Думать» is an explicit ask for full reasoning — never downgrade it,
     // even for turns the heuristics below would call light.
@@ -688,6 +728,7 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
       taskText: task,
       userContent: task || '(файл)',
       assistantContent: answer,
+      lessonKey,
     });
     return { answer, sessionId: committed.sessionId };
   } catch (e) {
@@ -696,10 +737,17 @@ async function solve({ subject, task, files = [], sessionId = null, history = []
 }
 
 /**
- * Solve an in-app Mesh test from a screenshot + extracted page text.
- * Answers are concise («№N: ответ») and intentionally NOT persisted.
+ * Solve an in-app Mesh test from extracted page text and an optional screenshot.
+ * Answers are concise («№N: ответ») and never enter the solve history the
+ * dashboard and Settings show.
+ *
+ * They ARE remembered by the local reuse cache its callers own (see
+ * lib/test-answer-cache.js): 7 days, this device only, keyed on the page's own
+ * capture signature, so reopening the same questions fills them without buying
+ * the same completion twice. This function neither reads nor writes that cache —
+ * SOLVE_TEST and pillSolveOnePage do, on either side of the call.
  */
-async function solveTest({ text, screenshot, provider, signal = null } = {}) {
+async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null } = {}) {
   await ensureLicensed();
   // Same privacy backstop as solve(): no consent → no provider call. Thrown so
   // the popup's requestSolve surfaces it as a clear error instead of a "result".
@@ -734,6 +782,9 @@ async function solveTest({ text, screenshot, provider, signal = null } = {}) {
   const askOpts = {
     responseFormat: 'json_object',
     reasoning: { effort: testEffort },
+    // A positive, page-bound DOM media signal lets the licensed Auto route
+    // receive the screenshot. Only hidden BYO DeepSeek is upgraded to Qwen.
+    visionPreferred: hasVisualMedia === true,
     // Every provider (groq/qwen/deepseek/openrouter and the СМЭШ proxy) already
     // honours opts.signal — it just was not being handed down. Without it a
     // cancelled pill stopped the FILLING and navigation but the paid provider
@@ -745,7 +796,9 @@ async function solveTest({ text, screenshot, provider, signal = null } = {}) {
   // Shrink the capture before it's sent: a full-page JPEG is still hundreds of
   // KB, and on the proxy (RU) path that becomes a chunked upload — fewer, faster
   // chunks the smaller it is. Fail-open (compressImageFiles returns it as-is).
-  const shot = screenshot ? (await compressImageFiles([screenshot]))[0] : null;
+  const shot = hasVisualMedia === true && screenshot
+    ? (await compressImageFiles([screenshot]))[0]
+    : null;
   const answer = await askAI(systemPrompt, userText, shot ? [shot] : [], [], askOpts);
   // An empty completion is a retryable provider failure, not a solved test.
   if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
@@ -753,7 +806,7 @@ async function solveTest({ text, screenshot, provider, signal = null } = {}) {
   }
   track('test_solve', {
     ...usageFields(usedProvider, usage),
-    files_img: screenshot ? 1 : 0,
+    files_img: shot ? 1 : 0,
     // Same observability as solve(): which effort testPageEffort() picked, so
     // low-effort mistakes on test pages show up in the dashboard, not in reviews.
     meta: { effort: testEffort }
@@ -788,7 +841,10 @@ async function resolveOneQuestion(
   // A retained screenshot carries the question on its own, so a page whose DOM
   // exposes almost no readable text (canvas/image questions — exactly where the
   // screenshot matters most) must not be refused outright.
-  const { pageText, capture } = await capturePageForPill(tabId, { allowThinText: !!panelScreenshot });
+  const { pageText, capture, hasVisualMedia } = await capturePageForPill(
+    tabId,
+    { allowThinText: !!panelScreenshot },
+  );
   await withMatchingTestCapture(panelCapture, async () => capture, async () => undefined);
   const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
   const n = String(index ?? '').trim();
@@ -808,6 +864,7 @@ async function resolveOneQuestion(
   const answer = await askAI(systemPrompt, focus, shot ? [shot] : [], [], {
     responseFormat: 'json_object',
     reasoning: { effort: 'high' },
+    visionPreferred: hasVisualMedia,
     onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   });
   if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
@@ -896,6 +953,26 @@ function parseTestAnswers(raw) {
     out.push(make(n, a));
   }
   return out;
+}
+
+/**
+ * Inverse of parseTestAnswers: rebuild the model's own {answers:[{n,a,c,p}]}
+ * wire shape from stored questions. Used when a test page is answered from the
+ * reuse cache instead of the provider — the popup formatter and every other
+ * consumer then keep the single code path they already have, and a round trip
+ * through parseTestAnswers returns the identical question objects.
+ */
+function serializeTestAnswers(questions) {
+  return JSON.stringify({
+    answers: (questions || []).map((question) => {
+      const wire = { n: question.index, a: question.answer };
+      if (question.choice != null && String(question.choice).trim() !== '') wire.c = question.choice;
+      if (Array.isArray(question.parts) && question.parts.length) {
+        wire.p = question.parts.map((part) => ({ l: part.label, v: part.value }));
+      }
+      return wire;
+    })
+  });
 }
 
 /**
@@ -1207,7 +1284,7 @@ async function verifyHomeworkDownloadBinding({
     launchError: principalError,
   })) {
     throw new Error(
-      'Скан домашних заданий или профиль МЭШ изменился. Обновите список и повторите.'
+      'Скан домашних заданий или профиль дневника изменился. Обновите список и повторите.'
     );
   }
   let response = null;
@@ -1221,7 +1298,7 @@ async function verifyHomeworkDownloadBinding({
   } catch { /* navigated, renderer gone, or content script unavailable */ }
   if (!response?.ok || response.matches !== true) {
     throw new Error(
-      'Страница, аккаунт или ученик МЭШ изменился. Обновите список и повторите.'
+      'Страница, аккаунт или ученик изменился. Обновите список и повторите.'
     );
   }
 }
@@ -2103,7 +2180,7 @@ function isMeshTestTab(tab) {
 
 function requireMeshTestTab(tab) {
   if (!isMeshTestTab(tab)) {
-    throw new Error('Для решения теста откройте тест МЭШ на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+    throw new Error('Для решения теста откройте тест на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
   }
 }
 
@@ -2117,7 +2194,10 @@ function requireMeshTestTab(tab) {
  */
 async function capturePageForPill(tabId, { allowThinText = false } = {}) {
   const captured = await readTestCaptureContext(tabId);
-  const pageText = await capturePillDomText(captured);
+  const [pageText, hasVisualMedia] = await Promise.all([
+    capturePillDomText(captured),
+    captureTestVisualMedia(captured),
+  ]);
   if (!allowThinText && pageText.trim().length < 20) {
     throw new Error(
       'Не удалось прочитать условие теста со страницы. Откройте значок СМЭШ AI на панели браузера, ' +
@@ -2129,33 +2209,56 @@ async function capturePageForPill(tabId, { allowThinText = false } = {}) {
     readTestCaptureContext,
     async (current) => current,
   );
-  return { pageText, capture };
+  return { pageText, capture, hasVisualMedia };
 }
 
 /**
  * Solve ONE captured page: run the existing solve path, drop the answers into
  * the in-page panel (showAnswersInTab) and autofill the form across every frame
  * (fillAllFrames). Returns the parsed questions + fill summary.
+ *
+ * A page whose capture signature is already in the local reuse cache skips the
+ * paid call entirely and goes straight to panel + autofill. The signature only
+ * matches when the questions AND their order are the same (see
+ * lib/test-answer-cache.js), so a re-rolled variant is solved fresh.
  */
 async function pillSolveOnePage(tabId, provider, signal = null) {
   // No screenshot on this path by construction: a page click grants no
   // activeTab, so the pill solves from the captured DOM text alone.
   throwIfPillCancelled(signal);
-  const { pageText, capture } = await capturePageForPill(tabId);
-  // Last gate before the PAID call.
+  const { pageText, capture, hasVisualMedia } = await capturePageForPill(tabId);
+  const reused = await readCachedTestAnswers(capture);
+  // Reuse skips solveTest, and with it solveTest's own gates. Filling a test is
+  // the licensed action whether or not this particular page costs a completion,
+  // and a withdrawn consent must stop the extension answering — so the reuse
+  // path repeats exactly the two checks the paid path would have run.
+  if (reused) {
+    await ensureLicensed();
+    if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
+  }
   throwIfPillCancelled(signal);
-  const answer = await solveTest({ text: pageText, provider, signal });
-  const questions = parseTestAnswers(answer);
+  let questions;
+  if (reused) {
+    questions = reused.questions;
+  } else {
+    // Last gate before the PAID call.
+    throwIfPillCancelled(signal);
+    const answer = await solveTest({ text: pageText, hasVisualMedia, provider, signal });
+    questions = parseTestAnswers(answer);
+    // Remember the page BEFORE filling it: the fill mutates the student's form,
+    // and only the answers themselves are worth another attempt's money.
+    if (questions.length) await writeCachedTestAnswers(capture, questions);
+  }
   throwIfPillCancelled(signal);
   return withMatchingTestCapture(capture, readTestCaptureContext, async () => {
-    if (!questions.length) return { questions, summary: { filled: [], skipped: [] } };
+    if (!questions.length) return { questions, cached: false, summary: { filled: [], skipped: [] } };
     // Each of these mutates the student's page; re-check between them so a
     // cancel cannot be overtaken by a panel that reappears or a late autofill.
     throwIfPillCancelled(signal);
     await showAnswersInTab(tabId, questions, capture);
     throwIfPillCancelled(signal);
     const summary = await fillAllFrames(tabId, questions, capture);
-    return { questions, summary };
+    return { questions, cached: !!reused, summary };
   });
 }
 
@@ -2206,13 +2309,14 @@ function notifyPill(tabId, payload) {
  */
 async function pillSolveAllPages(tabId, provider, signal = null) {
   let solved = 0;
+  let cached = 0;
   let partial = 0;
   let unrecognized = 0;
   let outcome = 'done';
   for (let page = 1; page <= PILL_MAX_PAGES; page++) {
     throwIfPillCancelled(signal);
     notifyPill(tabId, { phase: 'solve', page });
-    const { questions, summary } = await pillSolveOnePage(tabId, provider, signal);
+    const { questions, summary, cached: fromCache } = await pillSolveOnePage(tabId, provider, signal);
     const fillState = classifyAutopilotFill(questions, summary);
     if (fillState === 'unrecognized') {
       unrecognized++;
@@ -2225,6 +2329,7 @@ async function pillSolveAllPages(tabId, provider, signal = null) {
       break;
     }
     solved++;
+    if (fromCache) cached++;
     // Let the fill's React re-render settle so the signature reflects the filled
     // state — otherwise a late repaint could look like a navigation.
     await cancellableSleep(700, signal);
@@ -2245,7 +2350,7 @@ async function pillSolveAllPages(tabId, provider, signal = null) {
     if (nav === 'stuck') { outcome = 'stuck'; break; }
     await cancellableSleep(500, signal);
   }
-  return { outcome, solved, partial, unrecognized };
+  return { outcome, solved, cached, partial, unrecognized };
 }
 
 // One screen-solve operation per tab: the pill and popup drive capture →
@@ -2299,9 +2404,9 @@ const SENDER_MESSAGE_TYPES = {
     'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
     'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG',
     'GET_DEVICE_ID', 'SET_LICENSE_KEY', 'DEACTIVATE_LICENSE', 'SYNC_REFERRAL_POINTER', 'DELETE_LOCAL_DATA',
-    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LIST_SESSIONS', 'LIST_MESSAGES',
+    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LESSON_HISTORY', 'LIST_SESSIONS', 'LIST_MESSAGES',
     'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_COVER', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
-    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY'
+    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY', 'OPEN_ONBOARDING'
   ])
 };
 
@@ -2394,6 +2499,7 @@ const MESSAGE_SCHEMAS = {
   GET_ACTION_TOKEN: (msg) => noPayload(msg) && CONTENT_ACTIONS.has(msg.action) &&
     (PANEL_ACTIONS.has(msg.action) ? isPanelNonce(msg.panelNonce) : msg.panelNonce == null),
   GET_DEVICE_ID: noPayload,
+  OPEN_ONBOARDING: noPayload,
   SET_LICENSE_KEY: (msg) => payloadRecord(msg, ['key']) && isString(msg.payload.key, 512),
   DEACTIVATE_LICENSE: noPayload,
   SYNC_REFERRAL_POINTER: noPayload,
@@ -2407,15 +2513,17 @@ const MESSAGE_SCHEMAS = {
     isOptionalString(msg.payload.principal, 512) &&
     isOptionalString(msg.payload.principalError, 1024) &&
     (msg.payload.files == null || validFiles(msg.payload.files)),
-  SOLVE: (msg) => payloadRecord(msg, ['subject', 'task', 'files', 'sessionId', 'history', 'mode', 'engine']) &&
+  SOLVE: (msg) => payloadRecord(msg, ['subject', 'task', 'files', 'sessionId', 'history', 'mode', 'engine', 'lessonKey']) &&
     isString(msg.payload.subject, 1024) && isOptionalString(msg.payload.task) &&
     (msg.payload.files == null || validFiles(msg.payload.files)) &&
     isOptionalString(msg.payload.sessionId, 512) &&
     (msg.payload.history == null || validArray(msg.payload.history, validHistoryMessage)) &&
     isOptionalString(msg.payload.mode, 64) &&
-    isOptionalString(msg.payload.engine, 16),
-  SOLVE_TEST: (msg) => payloadRecord(msg, ['text', 'screenshot', 'tabId', 'provider', 'capture']) &&
+    isOptionalString(msg.payload.engine, 16) &&
+    isOptionalString(msg.payload.lessonKey, 128),
+  SOLVE_TEST: (msg) => payloadRecord(msg, ['text', 'screenshot', 'hasVisualMedia', 'tabId', 'provider', 'capture']) &&
     isOptionalString(msg.payload.text) && (msg.payload.screenshot == null || validFile(msg.payload.screenshot)) &&
+    isOptionalBoolean(msg.payload.hasVisualMedia) &&
     isSafeId(msg.payload.tabId) && isOptionalString(msg.payload.provider, 64) &&
     validTestCapture(msg.payload.capture, msg.payload.tabId),
   FILL_ANSWERS_ALL: (msg) => payloadRecord(msg, ['questions', 'panelNonce']) &&
@@ -2453,6 +2561,8 @@ const MESSAGE_SCHEMAS = {
     isString(msg.payload.principal, 512) &&
     isOptionalString(msg.payload.principalError, 1024) &&
     isHomeworkScanId(msg.payload.rowToken),
+  LESSON_HISTORY: (msg) => payloadRecord(msg, ['lessonKey']) &&
+    isString(msg.payload.lessonKey, 128),
   LIST_SESSIONS: noPayload,
   LIST_MESSAGES: (msg) => noPayload(msg) && isString(msg.sessionId, 512),
   GDZ_SEARCH: (msg) => payloadRecord(msg, ['grade', 'subjectId', 'subtype', 'query']) &&
@@ -2583,6 +2693,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         case 'GET_DEVICE_ID':
           sendResponse({ ok: true, deviceId: await getDeviceId() });
           break;
+        // The popup's fallback hand-off. It cannot open the tour itself: every
+        // claim has to run through this one worker so two entry points can
+        // never race into two tabs.
+        case 'OPEN_ONBOARDING':
+          sendResponse({ ok: true, opened: await openOnboardingTour('popup') });
+          break;
         case 'SET_LICENSE_KEY':
           sendResponse({ ok: true, status: await setLicenseKeyAndSyncReferral(msg.payload.key) });
           break;
@@ -2606,20 +2722,41 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           break;
         case 'SOLVE_TEST': {
           const { tabId, capture } = msg.payload;
-          const { answer, questions } = await withTabSolveLock(tabId, () => withKeepAlive(async () => {
-            const solved = await solveTest(msg.payload);
+          // Whether THIS request can actually show the model the page image.
+          // A text-only cached answer is not reused here (see readCached...):
+          // the screenshot route exists for pages the DOM text can't carry.
+          const withImage = msg.payload.hasVisualMedia === true && !!msg.payload.screenshot;
+          const { answer, questions, cached } = await withTabSolveLock(tabId, () => withKeepAlive(async () => {
+            const reused = await readCachedTestAnswers(capture, { image: withImage });
+            // Reuse skips solveTest's licence/consent gates — run them here, so
+            // an expired key or a withdrawn consent stops this path too.
+            if (reused) {
+              await ensureLicensed();
+              if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
+            }
             // Parse once: the panel needs it now, and the popup's «Решить все
-            // страницы» loop needs the structured questions to auto-fill.
-            const parsed = parseTestAnswers(solved);
+            // страницы» loop needs the structured questions to auto-fill. On a
+            // fresh solve the RAW reply still goes back to the popup — its
+            // formatter has salvage tiers for truncated and free-text replies
+            // that a re-serialised answer list would throw away.
+            const solved = reused ? '' : await solveTest(msg.payload);
+            const parsed = reused ? reused.questions : parseTestAnswers(solved);
+            if (!reused && parsed.length) {
+              await writeCachedTestAnswers(capture, parsed, { image: withImage });
+            }
             await withMatchingTestCapture(capture, readTestCaptureContext, async () => {
               // Hand the screenshot to the panel: the popup can take one, the
               // panel's «перерешать» cannot, so this is the only way a re-solve
               // sees the same material the first answer did.
               if (parsed.length) await showAnswersInTab(tabId, parsed, capture, msg.payload.screenshot);
             });
-            return { answer: solved, questions: parsed };
+            return {
+              answer: reused ? serializeTestAnswers(parsed) : solved,
+              questions: parsed,
+              cached: !!reused,
+            };
           }));
-          sendResponse({ ok: true, answer, questions });
+          sendResponse({ ok: true, answer, questions, cached });
           break;
         }
         case 'FILL_ANSWERS_ALL': {
@@ -2685,9 +2822,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // The pill was torn down while this message was in flight.
           if (!signal) { sendResponse({ ok: false, cancelled: true, error: 'отменено' }); break; }
           try {
-            const { questions, summary } = await withTabSolveLock(tabId, () =>
+            const { questions, summary, cached } = await withTabSolveLock(tabId, () =>
               withKeepAlive(() => pillSolveOnePage(tabId, msg.payload?.provider, signal)));
-            sendResponse({ ok: true, count: questions.length, summary });
+            sendResponse({ ok: true, count: questions.length, summary, cached: !!cached });
           } catch (e) {
             if (!isPillCancellation(e)) throw e;
             sendResponse({ ok: false, cancelled: true, error: e.message });
@@ -2705,9 +2842,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // The pill was torn down while this message was in flight.
           if (!signal) { sendResponse({ ok: false, cancelled: true, error: 'отменено' }); break; }
           try {
-            const { outcome, solved, partial, unrecognized } = await withTabSolveLock(tabId, () =>
+            const { outcome, solved, cached, partial, unrecognized } = await withTabSolveLock(tabId, () =>
               withKeepAlive(() => pillSolveAllPages(tabId, msg.payload?.provider, signal)));
-            sendResponse({ ok: true, outcome, solved, partial, unrecognized });
+            sendResponse({ ok: true, outcome, solved, cached, partial, unrecognized });
           } catch (e) {
             if (!isPillCancellation(e)) throw e;
             sendResponse({ ok: false, cancelled: true, error: e.message });
@@ -2749,6 +2886,15 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                   // Do not release an old AI result to content after a panel
                   // replacement, even when both captures happen to look alike.
                   matchingAnswerPanelContext(tabId, panelNonce);
+                  // Fold the correction into the reuse cache so the next visit
+                  // fills the answer the student kept, not the one they redid.
+                  // A panel opened by the pill carries no screenshot, so say so:
+                  // the entry must not keep claiming to be image-backed once one
+                  // of its answers was re-solved from text alone.
+                  await patchCachedTestAnswer(context.capture, msg.payload?.index, {
+                    ...answer,
+                    image: !!context.screenshot,
+                  });
                   return answer;
                 },
               );
@@ -2791,6 +2937,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         case 'DOWNLOAD_FILES':
           sendResponse({ ok: true, files: await downloadFiles(msg.payload || {}) });
+          break;
+        case 'LESSON_HISTORY':
+          // The dashboard asks this before opening a lesson: if this exact
+          // homework row was already solved, it replays the stored conversation
+          // instead of buying the same answer twice.
+          sendResponse({ ok: true, session: await findLessonSession(msg.payload?.lessonKey) });
           break;
         case 'LIST_SESSIONS':
           sendResponse({ ok: true, sessions: await listSessions() });

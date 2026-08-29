@@ -15,6 +15,7 @@ import { EXERCISE_SUBJECTS } from '../lib/gdz-match.js';
 import { DEFAULT_LIMITS, MAX_DAILY_LIMIT, getUsage, getUsageHistory } from '../lib/rate-limit.js';
 import {
   setLicenseKey, getLicenseStatus, reasonMessage, deactivateCurrentLicense,
+  isUsableLicenseStatus, licenseUsabilityReason,
   normalizeEnteredLicenseKey, validateEnteredLicenseKey
 } from '../lib/license.js';
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
@@ -182,8 +183,7 @@ async function loadSecondaryUi() {
   // default-value saves after the persisted form itself hydrated correctly.
   await Promise.allSettled([
     refreshUsage(),
-    loadConsentUi(),
-    loadPrivacyUi()
+    loadConsentUi()
   ]);
   loadReferralUi(); // network-backed, deliberately not awaited
 }
@@ -210,15 +210,16 @@ function renderLicenseStatus(status) {
     input.removeAttribute('aria-invalid');
     return;
   }
-  if (status.ok) {
+  if (isUsableLicenseStatus(status)) {
     const label = status.type === 'subscription' ? 'Активна · подписка' : 'Активна';
     pill.textContent = label;
     pill.dataset.state = 'ok';
     input.removeAttribute('aria-invalid');
     return;
   }
-  pill.textContent = reasonMessage(status.reason);
-  pill.dataset.state = status.reason === 'network' ? 'warn' : 'err';
+  const reason = licenseUsabilityReason(status);
+  pill.textContent = reasonMessage(reason);
+  pill.dataset.state = reason === 'network' ? 'warn' : 'err';
   input.setAttribute('aria-invalid', 'true');
 }
 
@@ -251,7 +252,7 @@ if (deactivateLicenseButton) {
 
 // Ready-made invite message for the «Скопировать приглашение» button.
 const inviteText = (code) =>
-  'Решаю домашку и тесты МЭШ через расширение СМЭШ AI — https://www.smeshai.xyz\n' +
+  'Решаю домашку и тесты через расширение СМЭШ AI — https://smeshai.xyz\n' +
   `Когда будешь оформлять подписку, введи мой код ${code} — тебе +10% дней к подписке, а мне пара дней в подарок :)`;
 
 function flashButton(btn, text = 'Скопировано!') {
@@ -364,25 +365,17 @@ function wireConsent() {
   };
 }
 
-/* ---------- Privacy: statistics opt-in + data deletion ---------- */
+/* ---------- Privacy: data deletion ---------- */
 
-let telemetryUiGeneration = 0;
+// No paint generation any more: with the toggle gone there is no checkbox whose
+// state could go stale against a slow write, only this one-way withdrawal.
 let telemetryWriteQueue = Promise.resolve();
-function enqueueTelemetryPreference(enabled) {
-  const generation = ++telemetryUiGeneration;
+function setTelemetryPreference(enabled) {
   const write = telemetryWriteQueue.then(() =>
     chrome.storage.local.set({ telemetryEnabled: !!enabled })
   );
   telemetryWriteQueue = write.catch(() => {});
-  return { generation, write };
-}
-
-async function loadPrivacyUi() {
-  const generation = telemetryUiGeneration;
-  const { telemetryEnabled = false } = await chrome.storage.local.get('telemetryEnabled');
-  if (generation === telemetryUiGeneration) {
-    setCheckedUnlessTouched('telemetryToggle', telemetryEnabled);
-  }
+  return write;
 }
 
 function privacyFlash(text, state = 'ok') {
@@ -394,35 +387,22 @@ function privacyFlash(text, state = 'ok') {
 }
 
 function wirePrivacy() {
-  // Statistics are OPT-IN (default off) and additionally gated on the general
-  // consent at flush time — see lib/telemetry.js.
-  document.getElementById('telemetryToggle').onchange = async (e) => {
-    const enabled = e.target.checked;
-    const pending = enqueueTelemetryPreference(enabled);
-    try { await pending.write; }
-    catch {
-      if (pending.generation !== telemetryUiGeneration) return;
-      try {
-        const stored = await chrome.storage.local.get('telemetryEnabled');
-        if (pending.generation === telemetryUiGeneration) {
-          e.target.checked = !!stored.telemetryEnabled;
-        }
-      } catch { /* a later toggle can retry */ }
-    }
-  };
+  // Statistics no longer have their own checkbox: they are part of the single
+  // agreement accepted above (consent.js setConsent writes telemetryEnabled).
+  // The erasure button below is what turns them back off, and lib/telemetry.js
+  // still refuses to send anything unless BOTH flags are true at flush time.
+
   // Server-side erasure: removes this device's pseudonymous rows from the
   // analytics DB. The device id is the only identifier the backend has.
   document.getElementById('deleteStats').onclick = async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true;
     try {
-      // Erasure also withdraws the telemetry opt-in. This prevents the next
-      // client flush or licensed proxy solve from immediately recreating rows.
-      const telemetryWrite = enqueueTelemetryPreference(false);
-      await telemetryWrite.write;
-      if (telemetryWrite.generation === telemetryUiGeneration) {
-        document.getElementById('telemetryToggle').checked = false;
-      }
+      // Erasure also withdraws the statistics flag. This prevents the next
+      // client flush or licensed proxy solve from immediately recreating rows,
+      // and it is the only remaining way to opt out of statistics without
+      // withdrawing consent altogether.
+      await setTelemetryPreference(false);
       const { telemetryErasureCapability: erasure } =
         await chrome.storage.local.get('telemetryErasureCapability');
       if (!erasure?.token || erasure.expires_at <= Date.now()) {
@@ -842,20 +822,15 @@ async function saveOnce(intent) {
   const newKey = intent.licenseKey;
   const priorStatus = await getLicenseStatus();
   let currentStatus = priorStatus;
-  const expiresAt = priorStatus?.expires_at ? Date.parse(priorStatus.expires_at) : NaN;
-  const activationTokenValid = /^[A-Za-z0-9_-]{43}$/.test(priorStatus?.activation_token || '');
   const needsVerification = (priorStatus?.key || '') !== newKey || (
-    !!newKey && (
-      !priorStatus?.ok || !activationTokenValid ||
-      (Number.isFinite(expiresAt) && expiresAt <= Date.now())
-    )
+    !!newKey && !isUsableLicenseStatus(priorStatus)
   );
   if (needsVerification) {
     currentStatus = await setLicenseKey(newKey);
   }
   if (licenseIntentOwnsUi(intent)) renderLicenseStatus(currentStatus);
   if (!saveIntentOwnsUi(intent)) return false;
-  if (newKey && !currentStatus?.ok) {
+  if (newKey && !isUsableLicenseStatus(currentStatus)) {
     showSaveFailure('Настройки сохранены, но ключ не активирован.');
     return false;
   }

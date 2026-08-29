@@ -42,6 +42,7 @@ class FakeD1 {
   referralUnsettled = 4;
   referralLegacyUnjournaled = 1;
   supportForwardExhausted = 5;
+  subscriptionNotifyExhausted = 7;
   failWorklists = false;
   budgets = new Map();
   writeEpoch = 1;
@@ -122,7 +123,8 @@ class FakeD1 {
           sql.includes('FROM payment_refund_poll') ||
           sql.includes('FROM referral_credit_state') ||
           sql.includes('FROM referral_credits') ||
-          sql.includes('FROM support_forward_outbox')
+          sql.includes('FROM support_forward_outbox') ||
+          sql.includes('FROM subscription_notifications')
         )) {
           throw new Error('worklist probe unavailable');
         }
@@ -156,6 +158,9 @@ class FakeD1 {
         if (sql.includes('FROM referral_credits c')) return { n: db.referralLegacyUnjournaled };
         if (sql.includes('FROM referral_credit_state')) return { n: db.referralUnsettled };
         if (sql.includes('FROM support_forward_outbox')) return { n: db.supportForwardExhausted };
+        if (sql.includes('FROM subscription_notifications')) {
+          return { n: db.subscriptionNotifyExhausted };
+        }
         return null;
       },
       async run() { return { meta: { changes: 1 } }; }
@@ -339,7 +344,8 @@ for (const table of HEALTH_TABLES) {
     refund_poll_stalled: 0,
     referral_unsettled: 4,
     referral_legacy_unjournaled: 1,
-    support_forward_exhausted: 5
+    support_forward_exhausted: 5,
+    subscription_notify_exhausted: 7
   },
     'the operator worklists must be surfaced');
   assert.equal(body.checks.worklists, true);
@@ -672,7 +678,8 @@ for (const table of HEALTH_TABLES) {
     refund_poll_stalled: null,
     referral_unsettled: null,
     referral_legacy_unjournaled: null,
-    support_forward_exhausted: null
+    support_forward_exhausted: null,
+    subscription_notify_exhausted: null
   });
 
   const publicHealth = await worker.fetch(new Request('https://api.example/health'), {}, ctx);

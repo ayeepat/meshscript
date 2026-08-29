@@ -7,15 +7,20 @@
 #   1-2. qwen3.7-plus / glm-5.3-flash — model exists, real completion
 #   3.   streaming — SSE `data: {...}` frames + usage frame + [DONE]
 #        (postStream() in src/lib/http.js parses this exact shape)
-#   4.   vision — glm-5.3-flash with a REAL 64x64 data:image/png;base64 part.
+#   4.   vision — a REAL 64x64 data:image/png;base64 part on both models.
 #        NOTE: a 1x1 pixel here 400s with err_code -10003 "Parameter error" —
 #        302.AI enforces a minimum image size, so a tiny placeholder image
 #        proves nothing. Do not shrink this back down.
-#   5.   JSON mode — response_format {"type":"json_object"}, text-only GLM
-#   6.   forced thinking + max effort — the Auto quality policy
+#   5.   JSON mode — response_format {"type":"json_object"}, text-only
+#   6.   quality policy per model — GLM forced thinking + max effort; Qwen
+#        sent bare, which is what the VPS does now that Auto is Qwen 3.7 Plus
 #   7.   error shape — deliberately bogus model name, protects the
 #        isUnpurchased() regex in backend/src/ai-proxy.js from silently
 #        breaking if 302.AI ever changes their error format
+#
+# Check 6's qwen3.7-plus case is the one that must NOT regress quietly: if
+# 302.AI ever starts accepting reasoning_effort on Qwen, the VPS policy in
+# backend-vps/server.js (QWEN_MODEL) can be revisited.
 #
 # Usage:  API_302_KEY=sk-... bash tests/302ai-verify.sh
 set -u
@@ -90,12 +95,21 @@ assert_stream "glm-5.3-flash streaming"     '{"model":"glm-5.3-flash","messages"
 
 echo "4. vision (64x64 data: image_url part)"
 assert_ok "glm-5.3-flash vision" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Какого цвета картинка? Одно слово."},{"type":"image_url","image_url":{"url":"data:image/png;base64,'"$PNG_B64"'"}}]}],"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":300}'
+# The live Auto/Think model. A test solve from the pill sends exactly this
+# shape (page screenshot + prompt) with NO response_format — see the VPS's
+# dropJsonForQwenVision.
+assert_ok "qwen3.7-plus vision" '{"model":"qwen3.7-plus","messages":[{"role":"user","content":[{"type":"text","text":"Какого цвета картинка? Одно слово."},{"type":"image_url","image_url":{"url":"data:image/png;base64,'"$PNG_B64"'"}}]}],"max_tokens":300}'
 
 echo "5. JSON mode (text-only)"
 assert_ok "glm-5.3-flash JSON mode" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Верни JSON вида {\"answer\": \"...\"} с ответом 2+2"}],"response_format":{"type":"json_object"},"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":300}'
+# The text test-solve path: JSON mode on Qwen with no effort field at all.
+assert_ok "qwen3.7-plus JSON mode" '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"Верни JSON вида {\"answers\": [{\"n\": 1, \"a\": \"4\"}]} с ответом 2+2"}],"response_format":{"type":"json_object"},"max_tokens":300}'
 
-echo "6. GLM forced thinking at max effort"
+echo "6. per-model quality policy"
 assert_ok "glm-5.3-flash thinking=max" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"сколько будет 17*23? Сначала проверь вычисление."}],"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":500}'
+# Qwen is sent BARE — it thinks by default and has no effort levels. This is
+# the exact body the VPS builds for an Auto text solve.
+assert_ok "qwen3.7-plus bare (thinks by default)" '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"сколько будет 17*23? Сначала проверь вычисление."}],"max_tokens":500}'
 
 echo "7. error shape for an unavailable model (guards isUnpurchased())"
 assert_error "bogus model name" '{"model":"smesh-definitely-not-a-model","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' '"err_code":-10008'

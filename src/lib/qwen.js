@@ -36,7 +36,7 @@ import { askViaProxy } from './smesh-proxy.js';
 import { isImageFile, isPdfFile, isTextFile } from './file-kinds.js';
 import { base64ToUtf8 } from './extract.js';
 import { reserveOne, commitOne, cancelOne } from './rate-limit.js';
-import { getLicenseStatus } from './license.js';
+import { getLicenseStatus, isUsableLicenseStatus } from './license.js';
 import { clipText } from './clip-text.js';
 
 // Independent of the proxy's env-configured model (ai-proxy.js
@@ -126,9 +126,7 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   let skipLocalCharge = false;
   if (!key) {
     const license = await getLicenseStatus();
-    if (!license?.key || (license.ok === false && license.reason !== 'network')) {
-      skipLocalCharge = true;
-    }
+    if (!isUsableLicenseStatus(license)) skipLocalCharge = true;
   }
 
   const userContent = buildUserContent(userText, files, allowPdf);

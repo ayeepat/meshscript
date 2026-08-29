@@ -11,8 +11,10 @@ import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge, PROVIDER_ABBR } from '../common/provider-badge.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
+import { getTourRecord, hasSeenTour } from '../lib/onboarding.js';
 import {
-  getLicenseStatus, setLicenseKey, reasonMessage, validateEnteredLicenseKey
+  getLicenseStatus, isUsableLicenseStatus, licenseUsabilityReason,
+  setLicenseKey, reasonMessage, validateEnteredLicenseKey
 } from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { DEFAULT_PROVIDER, SHOW_PROVIDER_UI, SUPPORT_BOT_URL } from '../lib/config.js';
@@ -24,6 +26,7 @@ import {
   testCaptureChangedError,
   withMatchingTestCapture,
 } from '../lib/test-capture-context.js';
+import { capturePillDomText, captureTestVisualMedia } from '../lib/pill-dom-capture.js';
 import { classifyAutopilotFill } from '../lib/test-autopilot.js';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -74,7 +77,7 @@ function setDropAttached(drop, files) {
   drop.classList.add('has');
   drop.querySelector('.dropicon').innerHTML = iconSvg('check', 13);
   drop.querySelector('.droplabel').textContent =
-    files.length === 1 ? files[0].name : `${filesLabel(files.length)} из МЭШ`;
+    files.length === 1 ? files[0].name : `${filesLabel(files.length)} из дневника`;
 }
 
 // Scanning the week is a passive act: no homework text leaves the device and
@@ -118,7 +121,7 @@ function isMeshTestTab(tab) {
 function requireMeshTestTab(tab) {
   if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
   if (!isMeshTestTab(tab)) {
-    throw new Error('Для решения теста откройте тест МЭШ на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+    throw new Error('Для решения теста откройте тест на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
   }
 }
 
@@ -167,7 +170,7 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     return false;
   }
   if (!card.principal || card.principalError || !card.scanId || !card.rowToken) {
-    autoFetchFailures.set(upKey, 'профиль или скан МЭШ не подтверждён');
+    autoFetchFailures.set(upKey, 'профиль или скан дневника не подтверждён');
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
@@ -178,11 +181,11 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
   autoFetched.add(upKey);
   const tabId = card.tabId;
   if (!tabId) {
-    autoFetchFailures.set(upKey, 'нет вкладки МЭШ');
+    autoFetchFailures.set(upKey, 'нет вкладки дневника');
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
-  if (!quiet) setDropLoading(drop, 'Ищу файл в МЭШ…');
+  if (!quiet) setDropLoading(drop, 'Ищу файл в дневнике…');
 
   const found = await sendToContent(tabId, {
     type: 'MESH_LIST_MATERIALS',
@@ -202,7 +205,7 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
   if (!bindingCheck?.ok || bindingCheck.matches !== true) {
     card.candidates = [];
     card.candidateAuth = null;
-    autoFetchFailures.set(upKey, 'профиль или список МЭШ изменился');
+    autoFetchFailures.set(upKey, 'профиль или список дневника изменился');
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
@@ -247,14 +250,14 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
   // upload (which always works). Stages come from listMaterialUrls.
   const why = {
     no_lesson_id: 'нет id задания',
-    no_token: 'нет входа в МЭШ',
+    no_token: 'нет входа в дневник',
     no_student_id: 'не нашёл student_id',
     ambiguous_student: 'не выбран активный ученик',
-    api_error: 'МЭШ API ' + (found?.status || ''),
+    api_error: 'API дневника ' + (found?.status || ''),
     no_urls: 'файла нет в задании',
     auth_redirect: 'нужна авторизация',
     download_failed: 'не скачалось',
-    binding_changed: 'профиль или список МЭШ изменился',
+    binding_changed: 'профиль или список дневника изменился',
     exception: 'ошибка запроса'
   }[found?.stage] || 'не найдено';
   autoFetchFailures.set(upKey, why);
@@ -272,10 +275,10 @@ async function chooseCandidateForCard(card) {
   let index = -1;
   if (labels.length === 1) {
     const name = card.candidates[0].name || 'Файл';
-    if (window.confirm(`МЭШ нашёл файл «${name}», но не смог однозначно подтвердить его строку. Прикрепить его к этому заданию?`)) index = 0;
+    if (window.confirm(`Дневник нашёл файл «${name}», но не смог однозначно подтвердить его строку. Прикрепить его к этому заданию?`)) index = 0;
   } else {
     const answer = window.prompt(
-      'МЭШ нашёл несколько файлов, но их принадлежность строке неоднозначна. Введите номер нужного файла:\n\n' + labels.join('\n')
+      'Дневник нашёл несколько файлов, но их принадлежность строке неоднозначна. Введите номер нужного файла:\n\n' + labels.join('\n')
     );
     const n = Number(answer);
     if (Number.isInteger(n) && n >= 1 && n <= labels.length) index = n - 1;
@@ -334,7 +337,7 @@ async function runFetchDiag(btn) {
   out.hidden = false;
   out.value = 'Запускаю диагностику…';
   const tab = await getActiveTab();
-  if (!tab?.id) { out.value = 'Не удалось определить вкладку. Откройте страницу МЭШ.'; return; }
+  if (!tab?.id) { out.value = 'Не удалось определить вкладку. Откройте страницу дневника.'; return; }
 
   const seen = new Set();
   const results = [];
@@ -415,7 +418,7 @@ function buildCard(day, item, scanContext) {
     const note = document.createElement('div');
     note.className = 'audionote';
     note.innerHTML = iconSvg('headphones', 14);
-    note.append('Для аудирования нужен аудиофайл или расшифровка. Если файл приложен в МЭШ, попробую подтянуть его сам.');
+    note.append('Для аудирования нужен аудиофайл или расшифровка. Если файл приложен в дневнике, попробую подтянуть его сам.');
     card.querySelector('.task').after(note);
   }
 
@@ -442,7 +445,7 @@ function buildCard(day, item, scanContext) {
       // The explicit per-row action is what authorizes pulling this row's files
       // from Mesh — nothing was pre-downloaded during the passive week scan.
       if (!cardObj.fetchPromise && item.homeworkId && !uploads[upKey]?.length) {
-        setDropLoading(drop, 'Ищу файл в МЭШ…');
+        setDropLoading(drop, 'Ищу файл в дневнике…');
         cardObj.fetchPromise = startAutoFetch(cardObj, { quiet: firstKind !== 'attachment' });
       }
       // Wait for the in-flight fetch so a quick click doesn't open the solve
@@ -806,32 +809,40 @@ async function captureVisibleTarget(target) {
 }
 
 /**
- * Capture the visible test page: top-frame text + a JPEG screenshot. Page text
- * is best-effort (some pages/iframes forbid injection). JPEG (q90), not PNG: a
- * retina PNG is 1.5–4 MB of base64 and the whole capture rides ONE /ai/start
- * POST, which is too slow for the RU DPI per-connection clamp window (see
- * lib/smesh-proxy.js); q90 keeps test text and formulas perfectly readable.
- * @returns {Promise<{pageText:string, screenshot:object}>}
+ * Read the captured test documents and detect substantial visible media. A
+ * text-only page stays DOM-only and therefore stays on DeepSeek. Only a page
+ * with a positive media signal gets a JPEG screenshot for Qwen; this matters
+ * because attaching any screenshot would otherwise make askAI's image safety
+ * router upgrade every test indiscriminately.
+ * @returns {Promise<{pageText:string, screenshot:object|null, hasVisualMedia:boolean}>}
  */
 async function capturePage(tab) {
   const currentTab = await chrome.tabs.get(tab.id);
   requireMeshTestTab(currentTab);
   const captured = await currentTestCapture(currentTab.id);
-  const [pageText, dataUrl] = await withTimeout(
+  const [pageText, hasVisualMedia] = await withTimeout(
     Promise.all([
-      chrome.scripting
-        .executeScript({ target: { tabId: currentTab.id }, func: () => document.body.innerText.slice(0, 15000) })
-        .then(([inj]) => inj?.result || '')
-        .catch(() => ''),
-      captureVisibleTarget(currentTab)
+      capturePillDomText(captured),
+      captureTestVisualMedia(captured),
     ]),
     20000,
-    'Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.'
+    'Не удалось прочитать страницу теста. Откройте тест на активной вкладке и попробуйте снова.'
   );
-  // Guard against a missing/empty capture so we surface a clear message instead
-  // of throwing on dataUrl.split (which read as a cryptic error).
-  const b64 = (dataUrl || '').split(',')[1];
-  if (!b64) throw new Error('Не удалось снять скриншот страницы. Откройте тест МЭШ на активной вкладке и попробуйте снова.');
+  let screenshot = null;
+  if (hasVisualMedia) {
+    // JPEG (q90), not PNG: a retina PNG is 1.5–4 MB of base64 and the whole
+    // capture rides one proxy upload. q90 keeps graphs and formulas readable.
+    const dataUrl = await withTimeout(
+      captureVisibleTarget(currentTab),
+      20000,
+      'Не удалось снять скриншот страницы. Откройте тест на активной вкладке и попробуйте снова.'
+    );
+    const b64 = (dataUrl || '').split(',')[1];
+    if (!b64) {
+      throw new Error('Не удалось снять скриншот страницы. Откройте тест на активной вкладке и попробуйте снова.');
+    }
+    screenshot = { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' };
+  }
   const capture = await withMatchingTestCapture(
     captured,
     currentTestCapture,
@@ -839,7 +850,8 @@ async function capturePage(tab) {
   );
   return {
     pageText,
-    screenshot: { mimeType: 'image/jpeg', dataBase64: b64, name: 'screen.jpg' },
+    screenshot,
+    hasVisualMedia,
     capture,
   };
 }
@@ -863,14 +875,14 @@ function timeoutMessage(provider) {
   return `Не удалось получить ответ за 2 минуты. Проверьте интернет и настройки ${name}, затем попробуйте ещё раз.`;
 }
 
-async function requestSolve(tabId, screenshot, pageText, capture) {
+async function requestSolve(tabId, screenshot, pageText, hasVisualMedia, capture) {
   const { aiProvider } = await chrome.storage.local.get('aiProvider');
   const provider = PROVIDER_ABBR[aiProvider] ? aiProvider : undefined;
   return withTimeout(
     new Promise((resolve) => {
       chrome.runtime.sendMessage({
         type: 'SOLVE_TEST',
-        payload: { text: pageText, screenshot, tabId, provider, capture },
+        payload: { text: pageText, screenshot, hasVisualMedia, tabId, provider, capture },
       }, (r) => {
         if (chrome.runtime.lastError) resolve({ ok: false, error: chrome.runtime.lastError.message });
         else resolve(r || { ok: false, error: 'нет ответа' });
@@ -896,17 +908,26 @@ async function solveTestOnScreen() {
     const tab = await getActiveTab();
     requireMeshTestTab(tab);
 
-    const { pageText, screenshot, capture } = await capturePage(tab);
+    const { pageText, screenshot, hasVisualMedia, capture } = await capturePage(tab);
 
     // Live status: a shifting verb + elapsed seconds so a long reasoning pass
     // never looks frozen. Stopped the moment the answer lands or an error fires.
-    ticker = startThinking(box);
-    const resp = await requestSolve(tab.id, screenshot, pageText, capture);
+    ticker = startThinking(box, { longNotice: true });
+    const resp = await requestSolve(tab.id, screenshot, pageText, hasVisualMedia, capture);
     ticker.stop();
     ticker = null;
     if (!resp.ok) throw new Error(resp.error || 'нет ответа');
     await withMatchingTestCapture(capture, currentTestCapture, async () => undefined);
     const plain = renderAnswer(box, resp.answer);
+    // The worker reuses a previous solve when the page's questions and their
+    // order are unchanged. Say so rather than letting an instant answer look
+    // like a model that skipped the work.
+    if (resp.cached) {
+      const reused = document.createElement('p');
+      reused.className = 'muted';
+      reused.textContent = 'Ответы из вашей истории — этот тест уже решался, ИИ не запрашивался заново.';
+      box.appendChild(reused);
+    }
     const copyLabel = document.getElementById('copyTestLabel');
     copyBtn.hidden = false;
     copyLabel.textContent = 'Скопировать ответы';
@@ -1056,9 +1077,9 @@ async function solveAllPages() {
 
     for (let page = 1; page <= MAX_PAGES; page++) {
       // Solve the visible page. Progress reads «Страница N · Решаю… 12s».
-      ticker = startThinking(box, { prefix: `Страница ${page}` });
-      const { pageText, screenshot, capture } = await capturePage(tab);
-      const resp = await requestSolve(tab.id, screenshot, pageText, capture);
+      ticker = startThinking(box, { prefix: `Страница ${page}`, longNotice: true });
+      const { pageText, screenshot, hasVisualMedia, capture } = await capturePage(tab);
+      const resp = await requestSolve(tab.id, screenshot, pageText, hasVisualMedia, capture);
       if (!resp.ok) throw new Error(resp.error || 'нет ответа');
       ticker.stop();
       ticker = null;
@@ -1146,7 +1167,7 @@ async function scanHomework() {
     return;
   }
   if (!/^https:\/\/school\.mos\.ru\/diary\//.test(tab.url || '')) {
-    showMessage('<p class="muted">Откройте страницу дневника Mesh (school.mos.ru/diary/...) и нажмите на иконку снова. Для теста МЭШ откройте вкладку «Тест».</p>');
+    showMessage('<p class="muted">Откройте страницу электронного дневника (school.mos.ru/diary/...) и нажмите на иконку снова. Для теста откройте вкладку «Тест».</p>');
     return;
   }
   const resp = await sendScan(tab.id);
@@ -1164,7 +1185,7 @@ const OB_PROVIDERS = ['groq', 'openrouter', 'qwen', 'deepseek'];
 // proxy, and the LICENSE key is the credential (lib/smesh-proxy.js). The
 // student never sees the words "API key" for them.
 const PROVIDER_KEY_FIELD = { groq: 'groqApiKey', openrouter: 'openrouterApiKey' };
-const LICENSE_LINK = { url: 'https://www.smeshai.xyz/', label: 'Купить лицензию СМЭШ →', placeholder: 'SMESH-XXXX-XXXX-XXXX' };
+const LICENSE_LINK = { url: 'https://smeshai.xyz/', label: 'Купить лицензию СМЭШ →', placeholder: 'SMESH-XXXX-XXXX-XXXX' };
 const PROVIDER_KEY_LINK = {
   groq: { url: 'https://console.groq.com/keys', label: 'Получить бесплатный ключ →', placeholder: 'gsk_…' },
   openrouter: { url: 'https://openrouter.ai/keys', label: 'Получить ключ OpenRouter →', placeholder: 'sk-or-v1-…' },
@@ -1252,10 +1273,18 @@ async function finishOnboarding() {
         if (!validation.ok) { showObError(validation.message); return; }
         document.getElementById('obKey').value = validation.key;
         const r = await setLicenseKey(validation.key);
-        if (!r.ok) { showObError(reasonMessage(r.reason)); return; }
+        if (!isUsableLicenseStatus(r)) {
+          showObError(reasonMessage(licenseUsabilityReason(r)));
+          return;
+        }
       } else {
         const status = await getLicenseStatus();
-        if (!status?.ok) { showObError('Введите ключ лицензии СМЭШ (SMESH-…) или купите её на сайте.'); return; }
+        if (!isUsableLicenseStatus(status)) {
+          showObError(status?.key
+            ? reasonMessage(licenseUsabilityReason(status))
+            : 'Введите ключ лицензии СМЭШ (SMESH-…) или купите её на сайте.');
+          return;
+        }
       }
     }
     showObError('');
@@ -1298,7 +1327,7 @@ function wireOnboarding() {
 async function isReadyToSolve() {
   if (!(await hasConsent())) return false;
   const stored = await chrome.storage.local.get(
-    ['aiProvider', 'licenseStatus', 'qwenApiKey', ...Object.values(PROVIDER_KEY_FIELD)]
+    ['aiProvider', 'qwenApiKey', ...Object.values(PROVIDER_KEY_FIELD)]
   );
   // Same grandfathering rule as ai.resolveStoredProvider: a BYO value with no
   // stored key can't answer and can't be fixed, so it counts as the licensed
@@ -1310,19 +1339,39 @@ async function isReadyToSolve() {
   if (provider === 'qwen' || provider === 'deepseek') {
     // Hidden BYO Model Studio key bypasses the license entirely.
     if (stored.qwenApiKey) return true;
-    // Otherwise the license must be USABLE, not merely entered: a confirmed-bad
-    // verdict (expired / revoked / not_found / device_in_use) has no working
-    // credential, so send the user to onboarding — where the error and a fix
-    // field are shown — instead of letting every «Решить» dead-end on the proxy.
-    // A network-only failure is ambiguous (the key may be fine, the verify just
-    // didn't reach the server), so we DON'T bounce on it — mirroring license.js's
-    // keep-last-good policy and askViaProxy's deliberate leniency.
-    const lic = stored.licenseStatus;
-    return !!lic?.key && (lic.ok === true || lic.reason === 'network');
+    // Read through license.js rather than trusting the raw storage row: that
+    // rejects obsolete generations and applies the same capability/expiry
+    // contract used at the network boundary. A genuine offline soft failure
+    // keeps the prior usable row, so it still passes here.
+    return isUsableLicenseStatus(await getLicenseStatus());
   }
   // Fall back to OpenRouter's key field for any unknown/legacy provider value.
   const field = PROVIDER_KEY_FIELD[provider] || 'openrouterApiKey';
   return !!stored[field];
+}
+
+/* ---------- Hand-off to the full-screen onboarding tour ---------- */
+
+// The tour lives in its own tab (src/welcome/), opens once per device and is
+// claimed in the service worker BEFORE that tab exists — so by the time the
+// popup runs, a device that was shown the tour always has a record. This card
+// therefore appears only when the automatic opening never happened at all
+// (Chrome refused the tab), and it hands the student over to the full screen
+// instead of trying to be a tour inside a 380px popup.
+async function offerTourHandoff() {
+  let record = null;
+  try {
+    record = await getTourRecord();
+  } catch {
+    return false; // fail closed: an unreadable record must not re-offer the tour
+  }
+  if (hasSeenTour(record)) return false;
+  document.getElementById('tourHandoff').hidden = false;
+  document.querySelector('nav.tabs').hidden = true;
+  document.getElementById('hwView').hidden = true;
+  document.getElementById('testView').hidden = true;
+  document.getElementById('onboardView').hidden = true;
+  return true;
 }
 
 /* ---------- Runtime-config notice (update required / operator message) ---------- */
@@ -1361,10 +1410,21 @@ async function init() {
   document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
   mountProviderBadge('provBadge'); // tiny "which AI" tag on the test tab
   wireOnboarding();
+  document.getElementById('startTour').onclick = async () => {
+    // Only the worker may open the tour: it owns the single claim, so two
+    // entry points can never turn into two tabs. If it refuses — the tour was
+    // claimed between this popup opening and the click — reload into the normal
+    // UI rather than closing onto nothing.
+    const reply = await sendToBackground({ type: 'OPEN_ONBOARDING' });
+    if (reply?.opened) window.close();
+    else location.reload();
+  };
 
   // Runtime config first (drives both the update banner and the scrape overrides),
   // then decide between onboarding and the normal flow.
   renderNotice(await loadRuntimeConfig());
+
+  if (await offerTourHandoff()) return;
 
   if (await isReadyToSolve()) {
     scanHomework();

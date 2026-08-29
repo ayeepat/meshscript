@@ -38,6 +38,14 @@ const SINGLE_DEVICE_LIMIT = 1;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_SUBSCRIPTION_DAYS = 3650;
 
+// How long a device released from the Telegram bot stays barred from silently
+// re-claiming its own seat. The window exists because the release is remote:
+// the released installation still holds the key and keeps re-verifying, so
+// without a fence it takes the seat back before the buyer reaches their new
+// computer. It is bounded rather than permanent so an installation that never
+// updates — and therefore never sends an activation intent — heals on its own.
+export const RELEASE_FENCE_MS = 30 * DAY_MS;
+
 /**
  * Uniform symbols from ALPHABET. Shared with referrals.js so the two credential
  * generators cannot drift apart.
@@ -749,15 +757,104 @@ async function seedHistoricalDevices(env, key, knownDevices, now) {
 }
 
 /**
+ * The remote-release fence for one license, or null when the released window
+ * has passed. Read only for an inactive activation row: while a row is active
+ * the device match already decides the verdict, and /verify is a hot path.
+ */
+async function releaseFenceFor(env, key) {
+  const fence = await env.DB.prepare(
+    'SELECT device_id, released_at FROM license_release_fence WHERE license_key = ?1'
+  ).bind(key).first();
+  if (!fence) return null;
+  const releasedAt = Number(fence.released_at);
+  if (!Number.isSafeInteger(releasedAt)) return null;
+  return releasedAt + RELEASE_FENCE_MS > Date.now() ? fence : null;
+}
+
+async function clearReleaseFence(env, key) {
+  // Best effort by design: a stale fence only bars the released installation
+  // from re-claiming a seat it no longer holds, and it expires on its own. It
+  // must never be able to fail an activation that already committed.
+  try {
+    await env.DB.prepare(
+      'DELETE FROM license_release_fence WHERE license_key = ?1'
+    ).bind(key).run();
+  } catch (error) {
+    console.warn('release fence clear failed', error?.name || 'error');
+  }
+}
+
+/**
+ * Release the active installation on the owner's behalf (the Telegram bot's
+ * «отвязать от устройства»), without the bearer capability that /deactivate
+ * requires — the whole point is that the buyer no longer has that device.
+ *
+ * Recording the fence in the same transaction is what makes the release stick:
+ * the released installation still holds the key and keeps re-verifying, and
+ * claimActiveInstallation re-activates whichever installation arrives first.
+ * The fence is written only when no installation is active afterwards, so a
+ * concurrent activation by another device is never fenced out of its own seat.
+ */
+export async function releaseActivation(env, rawKey, { releasedBy = null } = {}) {
+  const key = normalizeKey(rawKey);
+  if (!key) return { ok: false, reason: 'not_found' };
+  if (!env.DB) return { ok: false, reason: 'service_unavailable' };
+  try {
+    const row = await env.DB.prepare(
+      'SELECT status, device_id FROM license_activations WHERE license_key = ?1'
+    ).bind(key).first();
+    if (!row) return { ok: true, released: false, device_id: null };
+    if (row.status !== 'active') {
+      return { ok: true, released: false, device_id: null };
+    }
+    const now = Date.now();
+    const [released] = await env.DB.batch([
+      env.DB.prepare(
+        `UPDATE license_activations
+         SET status = 'inactive', device_id = NULL, token_hash = NULL,
+             generation = generation + 1, deactivated_at = ?3
+         WHERE license_key = ?1 AND status = 'active' AND device_id = ?2`
+      ).bind(key, row.device_id, now),
+      env.DB.prepare(
+        `INSERT INTO license_release_fence
+           (license_key, device_id, released_at, released_by)
+         SELECT ?1, ?2, ?3, ?4
+         WHERE NOT EXISTS (
+           SELECT 1 FROM license_activations
+           WHERE license_key = ?1 AND status = 'active'
+         )
+         ON CONFLICT(license_key) DO UPDATE SET
+           device_id = excluded.device_id,
+           released_at = excluded.released_at,
+           released_by = excluded.released_by`
+      ).bind(key, row.device_id, now, releasedBy == null ? null : String(releasedBy))
+    ]);
+    return {
+      ok: true,
+      released: (released?.meta?.changes || 0) > 0,
+      device_id: row.device_id
+    };
+  } catch (error) {
+    console.warn('license release registry unavailable', error?.name || 'error');
+    return { ok: false, reason: 'service_unavailable' };
+  }
+}
+
+/**
  * Authorize exactly one active extension installation.
  *
  * The client UUID identifies the installation but is not an authenticator.
  * First activation returns a random bearer capability; every later verify and
  * deactivation must prove possession of it. A competing installation that only
  * knows the license key receives `device_in_use` and cannot take over.
+ *
+ * `intent` marks a verification the USER asked for by entering the key here,
+ * as opposed to the background revalidation every installation runs on its own
+ * schedule. Only the former may take a seat back through a release fence.
  */
 async function claimActiveInstallation(
-  env, key, deviceId, rawToken, knownDevices, entitlement = null, attempt = 0
+  env, key, deviceId, rawToken, knownDevices, entitlement = null,
+  { intent = false, attempt = 0 } = {}
 ) {
   if (!env.DB) return { ok: false, reason: 'registry_unavailable' };
   try {
@@ -790,7 +887,8 @@ async function claimActiveInstallation(
       if ((touched?.meta?.changes || 0) < 1) {
         if (attempt < 1) {
           return claimActiveInstallation(
-            env, key, deviceId, rawToken, knownDevices, entitlement, attempt + 1
+            env, key, deviceId, rawToken, knownDevices, entitlement,
+            { intent, attempt: attempt + 1 }
           );
         }
         return { ok: false, reason: 'device_in_use', device_number: 1 };
@@ -802,6 +900,20 @@ async function claimActiveInstallation(
         activated_at: Number(row.activated_at) || null,
         expires_at: existingExpiry == null ? null : new Date(existingExpiry).toISOString()
       };
+    }
+
+    // The seat was released remotely and this is the installation it was taken
+    // from. Its cached key is still live and it re-verifies on its own clock,
+    // so accepting the claim here would hand the seat straight back and the
+    // buyer's new computer would keep seeing `device_in_use`. Refuse until the
+    // user deliberately re-enters the key here (intent) or the window lapses.
+    // The fence names the device, never the bearer token: a client that drops
+    // its token on a rejected verdict must not become eligible by doing so.
+    if (row && !intent) {
+      const fence = await releaseFenceFor(env, key);
+      if (fence && fence.device_id === deviceId) {
+        return { ok: false, reason: 'released_remotely' };
+      }
     }
 
     // Before this migration `license_devices` was the only record. Preserve
@@ -843,6 +955,9 @@ async function claimActiveInstallation(
       await env.DB.prepare(
         'INSERT OR IGNORE INTO license_devices (license_key, device_id, added_at) VALUES (?1, ?2, ?3)'
       ).bind(key, deviceId, now).run();
+      // Somebody now holds the seat — whichever device it is, the release this
+      // fence was protecting has completed and it must not outlive it.
+      await clearReleaseFence(env, key);
       const activatedAt = Number(row?.activated_at) || now;
       const expiresAt = activationBoundExpiry(entitlement, activatedAt);
       if (entitlement && expiresAt == null) {
@@ -858,7 +973,8 @@ async function claimActiveInstallation(
     }
     if (attempt < 2) {
       return claimActiveInstallation(
-        env, key, deviceId, rawToken, knownDevices, entitlement, attempt + 1
+        env, key, deviceId, rawToken, knownDevices, entitlement,
+        { intent, attempt: attempt + 1 }
       );
     }
     return { ok: false, reason: 'device_in_use', device_number: 1 };
@@ -946,8 +1062,15 @@ export async function deactivateLicense(env, rawKey, deviceId, rawToken) {
   }
 }
 
-/** Verify a license for one authenticated active installation. */
-export async function verifyLicense(env, rawKey, deviceId, activationToken = '') {
+/**
+ * Verify a license for one authenticated active installation.
+ *
+ * `intent` is set only when the user just entered this key here, which is the
+ * one case allowed to take a seat back through a remote-release fence.
+ */
+export async function verifyLicense(
+  env, rawKey, deviceId, activationToken = '', { intent = false } = {}
+) {
   const key = normalizeKey(rawKey);
   if (!key) return { ok: false, reason: 'not_found' };
   // Operator bypass: a single server-side secret the operator types into their
@@ -1011,7 +1134,8 @@ export async function verifyLicense(env, rawKey, deviceId, activationToken = '')
   }
   if (configuredDeviceLimit(env) == null) return { ok: false, reason: 'service_unavailable' };
   const activation = await claimActiveInstallation(
-    env, key, deviceId, activationToken, license.device_ids, activationEntitlement
+    env, key, deviceId, activationToken, license.device_ids, activationEntitlement,
+    { intent }
   );
   if (!activation.ok) {
     return activation.reason === 'registry_unavailable'

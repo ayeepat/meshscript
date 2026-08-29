@@ -207,21 +207,24 @@
 
   /* ---------- Live "thinking" status (mirrors common/thinking.js) ---------- */
   // thinking.js is an ES module (can't be imported into a classic content
-  // script), so its pattern is inlined: a shifting verb + elapsed seconds, with
+  // script), so its pattern is inlined: an ordered phase + elapsed seconds, with
   // an updatable prefix so the multi-page loop can show «Страница N».
   const THINK_WORDS = [
-    'Думаю', 'Решаю', 'Считаю', 'Разбираю', 'Анализирую',
-    'Соображаю', 'Вникаю', 'Размышляю', 'Сверяю', 'Проверяю',
-    'Читаю условие', 'Выстраиваю ход решения', 'Слежу за условием задачи',
-    'Иду по шагам', 'Прикидываю план решения', 'Ищу подходящий способ',
-    'Прохожу задание по порядку', 'Складываю картину', 'Уточняю детали',
-    'Сверяюсь с заданием', 'Прикидываю варианты', 'Формулирую ответ'
+    'Читаю условие',
+    'Разбираю задание',
+    'Ищу подход к решению',
+    'Решаю по шагам',
+    'Сверяю результат',
+    'Формулирую ответ'
   ];
+  const LONG_THINKING_DELAY_MS = 30000;
+  const LONG_THINKING_NOTICE = 'Thinking longer for a more accurate response.';
   function startThinking(el, opts = {}) {
-    const startedAt = Date.now();
-    let wi = Math.floor(Math.random() * THINK_WORDS.length);
+    let startedAt = Date.now();
+    let wi = 0;
     let prefix = opts.prefix ? opts.prefix + ' · ' : '';
-    let secTimer = null, wordTimer = null;
+    const longNotice = opts.longNoticeEl || null;
+    let secTimer = null, wordTimer = null, longNoticeTimer = null;
     const paint = () => {
       if (!el.isConnected) { stop(); return; }
       const secs = Math.floor((Date.now() - startedAt) / 1000);
@@ -230,12 +233,50 @@
     const stop = () => {
       if (secTimer) clearInterval(secTimer);
       if (wordTimer) clearInterval(wordTimer);
+      if (longNoticeTimer != null) clearTimeout(longNoticeTimer);
       secTimer = wordTimer = null;
+      longNoticeTimer = null;
+      if (longNotice) longNotice.hidden = true;
+    };
+    const startLongNoticeTimer = () => {
+      if (!longNotice) return;
+      if (longNoticeTimer != null) clearTimeout(longNoticeTimer);
+      longNotice.hidden = true;
+      longNoticeTimer = setTimeout(() => {
+        longNoticeTimer = null;
+        if (!el.isConnected || !longNotice.isConnected) { stop(); return; }
+        longNotice.hidden = false;
+      }, LONG_THINKING_DELAY_MS);
+    };
+    const startWordTimer = () => {
+      if (wordTimer) clearInterval(wordTimer);
+      wordTimer = setInterval(() => {
+        if (wi >= THINK_WORDS.length - 1) {
+          clearInterval(wordTimer);
+          wordTimer = null;
+          return;
+        }
+        wi += 1;
+        paint();
+      }, 2400);
     };
     paint();
     secTimer = setInterval(paint, 1000);
-    wordTimer = setInterval(() => { wi = (wi + 1) % THINK_WORDS.length; paint(); }, 2400);
-    return { stop, setPrefix: (p) => { prefix = p ? p + ' · ' : ''; paint(); } };
+    startWordTimer();
+    startLongNoticeTimer();
+    return {
+      stop,
+      setPrefix: (p) => {
+        const nextPrefix = p ? p + ' · ' : '';
+        if (nextPrefix === prefix) return;
+        prefix = nextPrefix;
+        startedAt = Date.now();
+        wi = 0;
+        startWordTimer();
+        startLongNoticeTimer();
+        paint();
+      }
+    };
   }
 
   /* ---------- State / theme persistence (chrome.storage) ---------- */
@@ -489,6 +530,23 @@
         .pill.result .status { display: flex; }
         .pill.result .status .stext { color: var(--p-muted); white-space: normal; }
 
+        .long-think-note {
+          position: absolute; top: calc(100% + 8px); left: 0; right: 0;
+          display: flex; align-items: flex-start; gap: 6px;
+          padding: 7px 10px;
+          background: var(--p-bg); color: var(--p-accent);
+          border: 1px solid var(--p-border); border-radius: 10px;
+          box-shadow: var(--p-shadow);
+          font-family: "SmeshManrope", -apple-system, sans-serif;
+          font-size: 11px; font-weight: 650; line-height: 1.35;
+          pointer-events: none;
+        }
+        .long-think-note[hidden] { display: none; }
+        .long-think-note::before {
+          content: ''; flex: none; width: 5px; height: 5px; margin-top: 5px;
+          border-radius: 50%; background: currentColor; opacity: 0.8;
+        }
+
         .spinner {
           display: inline-block; flex: none;
           width: 14px; height: 14px;
@@ -522,6 +580,7 @@
           <span class="spinner" aria-hidden="true"></span>
           <span class="stext"></span>
         </div>
+        <div class="long-think-note" role="status" aria-live="polite" hidden>${LONG_THINKING_NOTICE}</div>
         <button class="close" title="Скрыть (Esc)" aria-label="Скрыть">×</button>
       </div>
     `;
@@ -618,7 +677,10 @@
     pill.classList.remove('result');
     pill.classList.add('busy');
     if (thinker) thinker.stop();
-    thinker = startThinking(stext, { prefix });
+    thinker = startThinking(stext, {
+      prefix,
+      longNoticeEl: shadow.querySelector('.long-think-note'),
+    });
   }
   function showResult(text, isError) {
     if (thinker) { thinker.stop(); thinker = null; }
@@ -758,7 +820,10 @@
     if (!r.ok) { showResult(errText(r.error), true); return; }
     if (!r.count) { showResult('Вопросы не распознаны. Проверьте, что тест на экране.', true); return; }
     const filled = (r.summary && r.summary.filled ? r.summary.filled.length : 0);
-    showResult(`Готово · заполнено ${filled} из ${r.count}`);
+    // `cached` means these answers came from this device's own earlier solve of
+    // the SAME questions in the same order — say so, so an instant result reads
+    // as reuse rather than as a suspiciously fast model.
+    showResult(`${r.cached ? 'Из истории' : 'Готово'} · заполнено ${filled} из ${r.count}`);
   }
 
   async function solveAll() {
@@ -772,7 +837,8 @@
     if (gen !== runGen || !shadow) return;
     busy = false;
     if (!r.ok) { showResult(errText(r.error), true); return; }
-    showResult(paginationSummary(r.outcome, r.solved));
+    const reused = Number(r.cached) > 0 ? ` Из истории: ${r.cached}.` : '';
+    showResult(paginationSummary(r.outcome, r.solved) + reused);
   }
 
   // Turn a raw worker error into something readable. The worker's own errors

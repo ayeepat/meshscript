@@ -56,11 +56,16 @@ const PROVIDERS = {
   },
   deepseek: {
     // Frozen route id for old extension builds; it is not the upstream vendor.
-    modelDefault: 'glm-5.3-flash',
+    modelDefault: 'qwen3.7-plus',
     modelVar: 'PROXY_AUTO_MODEL',
+    // qwen3.7-plus is multimodal, so Auto needs no separate vision model; the
+    // vision fallback stays vision-capable for the same reason as PROVIDERS.qwen.
+    visionFallbackVar: 'PROXY_AUTO_VISION_FALLBACK_MODELS',
     name: 'Auto',
     capVar: 'PROXY_DEEPSEEK_DAILY',
     capDefault: 150,
+    // Kept true so an env switch back to DeepSeek/GLM restores passthrough; the
+    // per-model policy below suppresses it while Auto resolves to Qwen.
     reasoningEffort: true
   }
 };
@@ -69,6 +74,10 @@ const PROVIDERS = {
 // scripted caller can't smuggle arbitrary strings into the upstream request.
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
 const GLM_53_FLASH = /^glm-5\.3-flash$/i;
+// Qwen thinks by default and exposes no OpenAI-style effort levels (only
+// enable_thinking/thinking_budget), so reasoning_effort is never sent to it.
+// Mirrors backend-vps/server.js QWEN_MODEL — keep both in sync.
+const QWEN_MODEL = /^qwen/i;
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // base64 photos of worksheets fit; nothing sane exceeds this
 const MAX_MESSAGES = 60;                // system + capped history + current turn
@@ -302,10 +311,19 @@ async function handleAiChatInner(request, env) {
       stream: true,
       stream_options: { include_usage: true }
     };
-    if (body.response_format === 'json_object') {
+    // Qwen + an image is the one combination where json_object has proved
+    // unreliable (see src/lib/qwen.js wantJson); the test solver's parser
+    // recovers its {answers:[{n,a}]} shape from prose, so dropping the flag is
+    // the safer half of that trade. Mirrors backend-vps/server.js.
+    if (body.response_format === 'json_object' && !(hasImages && QWEN_MODEL.test(model))) {
       upstreamBody.response_format = { type: 'json_object' };
     }
-    if (GLM_53_FLASH.test(model)) {
+    // Per-ACTUAL-model quality policy, mirroring backend-vps/server.js: Qwen
+    // has no effort knob, GLM must be forced to think, everything else keeps
+    // the ordinary client passthrough.
+    if (QWEN_MODEL.test(model)) {
+      // no effort knob to send
+    } else if (GLM_53_FLASH.test(model)) {
       upstreamBody.thinking = { type: 'enabled' };
       upstreamBody.reasoning_effort = 'max';
     } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {

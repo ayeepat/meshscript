@@ -4,7 +4,7 @@ const records = new Map([
   ['aiProvider', 'openrouter'],
   ['openrouterApiKey', 'test-key'],
   ['groqApiKey', 'test-key'],
-  ['aiConsent', { accepted: true, version: 2, at: new Date().toISOString() }],
+  ['aiConsent', { accepted: true, version: 3, at: new Date().toISOString() }],
 ]);
 const changeListeners = new Set();
 let consentBarrier = null;
@@ -107,6 +107,29 @@ function pauseNextConsentRead() {
   barrier.release();
   await assert.rejects(pending, new RegExp(CONSENT_REQUIRED_MESSAGE.slice(0, 24)));
   assert.equal(fetchCalls, 0, 'no transcription request may start after consent withdrawal');
+}
+
+/* A harness that seeds a STALE consent version stops testing consent at all:
+ * acceptedRecord() rejects it, hasConsent() is false from the first line, and
+ * every "withdrawal blocks the request" assertion above still passes — against
+ * a request that was never allowed to start. That is exactly what happened to
+ * six suites when CONSENT_VERSION went to 3, and it passed silently. Pin every
+ * seed in the suite to the shipped version so the next bump fails loudly. */
+{
+  const { readFileSync, readdirSync } = await import('node:fs');
+  const { CONSENT_VERSION } = await import('../src/lib/consent.js');
+  const directory = new URL('./', import.meta.url);
+  for (const name of readdirSync(directory).filter((file) => file.endsWith('.mjs'))) {
+    const text = readFileSync(new URL(name, directory), 'utf8');
+    for (const line of text.split('\n')) {
+      if (!line.includes('aiConsent')) continue;
+      const seeded = /version:\s*(\d+)/.exec(line);
+      if (!seeded) continue;
+      assert.equal(Number(seeded[1]), CONSENT_VERSION,
+        `${name} seeds consent v${seeded[1]} but the extension ships ` +
+        `v${CONSENT_VERSION} — that test is no longer exercising consent`);
+    }
+  }
 }
 
 console.log('consent network-boundary regressions passed');

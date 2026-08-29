@@ -131,7 +131,7 @@ body {
   font-weight: 700; font-size: 13px; margin-bottom: 6px; color: var(--warn);
 }
 .msg.assistant.thinking {
-  display: flex; align-items: center; gap: 9px;
+  display: flex; align-items: center; gap: 9px; flex-wrap: wrap;
   color: var(--secondary); padding-right: 17px; width: auto;
 }
 .msg.assistant .copybtn {
@@ -292,6 +292,26 @@ body {
 .send:active { transform: scale(0.92); background: var(--accent-press); }
 
 .week .lesson.active .spinner { border-color: var(--accent-soft); border-top-color: var(--accent); }
+
+/* ---------- Replayed lesson notice (answer reused from local history) ------ */
+.restoredbar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  max-width: 720px; margin: 0 0 14px; padding: 9px 13px;
+  background: var(--accent-soft); border: 1px solid var(--separator);
+  border-radius: var(--r-pill);
+  font-size: 12.5px; line-height: 1.35; color: var(--secondary);
+}
+.restoredbar .rb-note { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.restoredbar .rb-note svg { flex: none; color: var(--accent); opacity: 0.9; }
+.restoredbar .rb-again {
+  margin-left: auto; flex: none;
+  background: var(--card); color: var(--accent);
+  border: 1px solid var(--separator); border-radius: var(--r-pill);
+  padding: 5px 12px; font: inherit; font-weight: 700; cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.restoredbar .rb-again:hover { border-color: var(--accent); }
+.restoredbar .rb-again:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 /* ---------- GDZ answer card (ready solutions, no AI) ---------- */
 .gdzcard {

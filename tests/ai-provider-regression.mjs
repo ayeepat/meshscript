@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import { parse as parseHtml } from 'parse5';
 
 const store = {
-  aiConsent: { accepted: true, version: 2, at: new Date().toISOString() }
+  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
 };
 
 function pick(keys) {
@@ -30,7 +30,12 @@ globalThis.chrome = {
   }
 };
 
-const { askAI, normalizeAIProvider, resolveStoredProvider } = await import('../src/lib/ai.js');
+const {
+  askAI,
+  normalizeAIProvider,
+  resolveStoredProvider,
+  routeVisionPreferredProvider,
+} = await import('../src/lib/ai.js');
 const { getUsage } = await import('../src/lib/rate-limit.js');
 const { httpError } = await import('../src/lib/http.js');
 const { DEFAULT_PROVIDER, SHOW_PROVIDER_UI } = await import('../src/lib/config.js');
@@ -100,6 +105,14 @@ assert.equal(normalizeAIProvider('qwen'), 'qwen');
 assert.equal(normalizeAIProvider('deepseek'), 'deepseek');
 assert.equal(normalizeAIProvider('nararouter'), DEFAULT_PROVIDER);
 assert.equal(normalizeAIProvider('nararouter', null), null);
+assert.equal(routeVisionPreferredProvider('deepseek', true), 'deepseek',
+  'licensed Auto must keep visual test work on its multimodal live route');
+assert.equal(routeVisionPreferredProvider('deepseek', true, true), 'qwen',
+  'hidden BYO DeepSeek must still upgrade visual work to BYO Qwen');
+assert.equal(routeVisionPreferredProvider('deepseek', false), 'deepseek',
+  'text homework must keep the stable Auto route');
+assert.equal(routeVisionPreferredProvider('groq', true), 'groq',
+  'a grandfathered explicit BYO provider must remain selected');
 
 // The default has to be a provider the СМЭШ license can actually reach. With
 // the picker hidden there is no way to enter a BYO key, so defaulting to one
@@ -140,7 +153,8 @@ assert.ok(
 }
 
 assertContains('../src/popup/popup.js', "const provider = PROVIDER_ABBR[aiProvider] ? aiProvider : undefined;");
-assertContains('../src/popup/popup.js', "payload: { text: pageText, screenshot, tabId, provider, capture }");
+assertContains('../src/popup/popup.js',
+  "payload: { text: pageText, screenshot, hasVisualMedia, tabId, provider, capture }");
 assertContains('../src/popup/popup.js', 'function requireMeshTestTab(tab)');
 assertContains('../src/popup/popup.js', 'Другие вкладки расширение не снимает и не отправляет ИИ.');
 
@@ -208,7 +222,11 @@ function element(properties = {}) {
 // at the end of this file.
 function createOnboardingHarness({
   typed = 'gsk_test', existing = '', verdict = { ok: true }, throwVerification = false,
-  showProviderUi = true, defaultProvider = 'deepseek', provider = 'groq'
+  showProviderUi = true, defaultProvider = 'deepseek', provider = 'groq',
+  licenseStatus = {
+    key: 'SMESH-2345-6789-ABCD', ok: true, expires_at: null,
+    activation_token: 'a'.repeat(43)
+  }
 } = {}) {
   const providerButtons = [element({ dataset: { p: 'groq' } }), element({ dataset: { p: 'openrouter' } })];
   const elements = {
@@ -251,8 +269,12 @@ function createOnboardingHarness({
       return verdict;
     },
     async setConsent(value) { consentWrites.push(value); },
-    async setLicenseKey() { return { ok: true }; },
-    async getLicenseStatus() { return { ok: true }; },
+    async setLicenseKey() { return licenseStatus; },
+    async getLicenseStatus() { return licenseStatus; },
+    isUsableLicenseStatus: (status) => !!status?.key && status.ok === true &&
+      /^[A-Za-z0-9_-]{43}$/.test(status.activation_token || ''),
+    licenseUsabilityReason: (status) => status?.reason ||
+      (status?.ok ? 'bad_activation' : 'no_key'),
     reasonMessage: (reason) => String(reason || ''),
     showTab: (name) => tabs.push(name),
     scanHomework: () => { scans += 1; }
@@ -372,9 +394,13 @@ assertContains('../src/content/test-pill.js', "payload: { provider: providerId, 
 // solveTest also takes the pill's cancellation signal and hands it to askAI, so
 // closing the pill stops the PAID provider call — see test-pill-lifecycle.
 assertContains('../src/background/service-worker.js',
-  'async function solveTest({ text, screenshot, provider, signal = null } = {})');
+  'async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null } = {})');
 assertContains('../src/background/service-worker.js', 'const providerOverride = normalizeAIProvider(provider, null);');
 assertContains('../src/background/service-worker.js', 'if (providerOverride) askOpts.provider = providerOverride;');
+assertContains('../src/background/service-worker.js', 'visionPreferred: hasVisualMedia === true,');
+assertContains('../src/lib/deepseek.js', 'if (allowImages && isImageFile(f))');
+assertContains('../src/lib/deepseek.js', "type: 'image_url'");
+assertContains('../src/lib/deepseek.js', 'const capabilities = { allowImages: !key, allowPdf: !key };');
 assertContains('../src/lib/smesh-proxy.js', 'const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;');
 assertContains('../src/lib/smesh-proxy.js', 'upload_token: uploadToken');
 
@@ -396,6 +422,23 @@ assertContains('../src/lib/smesh-proxy.js', 'upload_token: uploadToken');
     'the hidden-picker path must not persist an API key');
   assert.deepEqual(harness.consentWrites, [true]);
   assert.equal(harness.scans(), 1);
+}
+
+// A bare positive verdict is not enough for the licensed route: without the
+// per-installation bearer token the first proxy request is guaranteed to fail.
+{
+  const harness = createOnboardingHarness({
+    showProviderUi: false,
+    provider: 'groq',
+    typed: '',
+    licenseStatus: { key: 'SMESH-2345-6789-ABCD', ok: true }
+  });
+  await harness.context.__onboarding.finishOnboarding();
+  assert.equal(harness.writes.length, 0,
+    'onboarding must not accept a license the proxy cannot authenticate');
+  assert.equal(harness.consentWrites.length, 0);
+  assert.equal(harness.scans(), 0);
+  assert.equal(harness.elements.obError.hidden, false);
 }
 
 // No vendor name may reach a student surface while the picker is hidden.

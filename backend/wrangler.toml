@@ -138,6 +138,10 @@ SCHOOL_YEAR_DAYS = "273"
 CHECKOUT_PROMO_MONTH_PRICE_RUB = "10"
 CHECKOUT_PROMO2_MONTH_PRICE_RUB = "69"
 CHECKOUT_TELEGRAM_BOT_USERNAME = "smeshaibot"
+# Where the bot's «Продлить подписку» button sends people (/sub card, expiry
+# reminders, win-back survey). Must be https; anything else falls back to the
+# built-in default rather than shipping Telegram a URL it will reject.
+SITE_PRICING_URL = "https://smeshai.xyz/pricing/"
 # The old browser-supplied contact route bypasses Telegram ownership binding.
 LEGACY_PAYMENT_ORDER_ENABLED = "false"
 
@@ -169,14 +173,14 @@ GDZ_DAILY_LIMIT = "600"
 # the edge, so this mostly bounds a cold cache.
 GDZ_COVER_DAILY_LIMIT = "2000"
 
-# ── AI proxy (ai-proxy.js): Qwen/DeepSeek for licensed users, no user keys ───
+# ── Retired AI proxy: stable Think/Auto routes for licensed users ─────────────
 # The production extension uses the VPS proxy, which is the sole quota
 # authority. Keep the legacy Worker route retired unless an operator is
 # deliberately running a separately reviewed emergency migration.
 AI_PROXY_LEGACY_ENABLED = "false"
 # Requires the AI_PROXY_API_KEY secret (see above) + the proxy_quota table
 # (schema.sql). Daily request caps, all env-tunable without a redeploy:
-# OpenAI-compatible base URL. 302.AI resells Qwen + DeepSeek with no KYC —
+# OpenAI-compatible base URL. 302.AI resells the configured models with no KYC —
 # switched from DashScope International 2026-07-07 (Alibaba wanted passport
 # KYC for a direct key). ai-proxy.js appends /chat/completions itself.
 AI_PROXY_BASE_URL = "https://api.302.ai/v1"
@@ -191,7 +195,13 @@ PROXY_QWEN_FALLBACK_MODELS = "qwen-vl-plus,qwen-plus"
 # modelChoices). qwen-vl-plus is vision-capable (verified live); deliberately
 # excludes qwen-plus.
 PROXY_QWEN_VISION_FALLBACK_MODELS = "qwen-vl-plus"
-PROXY_DEEPSEEK_MODEL = "deepseek-v4-flash"
+# `deepseek` remains the wire route id for compatibility; this retired
+# emergency path resolves it to Qwen 3.7 Plus, same as the live VPS default.
+PROXY_AUTO_MODEL = "qwen3.7-plus"
+# Auto is multimodal, so this only matters if qwen3.7-plus itself is refused.
+# Vision-capable models ONLY — text-only stand-ins answer image requests with a
+# confident wrong guess (see PROXY_QWEN_VISION_FALLBACK_MODELS above).
+PROXY_AUTO_VISION_FALLBACK_MODELS = "qwen-vl-plus"
 # per-license per-provider…
 PROXY_QWEN_DAILY = "80"
 PROXY_DEEPSEEK_DAILY = "150"

@@ -85,11 +85,11 @@ export function classifyTask(task) {
 // billed). Pure regex, same rationale as the rest of this file: an LLM call to
 // classify difficulty would add the very latency we're trying to remove.
 //
-// IMPORTANT: this only changes the `reasoning_effort` knob, which is honored
-// ONLY on the DeepSeek and OpenRouter/Gemini paths — Qwen (qwen3.7-plus, the
-// keyless proxy default for vision) thinks by default and ignores it, so this
-// is a no-op there, never a regression. See the effort comments in qwen.js /
-// deepseek.js / smesh-proxy.js.
+// IMPORTANT: this only emits a client effort hint. The VPS may strengthen it
+// for the actual live model, or drop it entirely: the live Auto/Think model
+// (Qwen 3.7 Plus) has no compatible effort levels and thinks by default, and
+// GLM-5.3-Flash on the cheap chain is always forced to thinking=max. See the
+// effort comments in qwen.js / deepseek.js / smesh-proxy.js.
 //
 // The gate is deliberately ASYMMETRIC: a false "hard" costs only a little speed
 // (we keep the current default effort), while a false "easy" could under-think

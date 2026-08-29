@@ -153,12 +153,24 @@ model chains. A dashboard save affects every **new** request immediately; an
 in-flight job keeps the route snapshot it started with.
 
 `deepseek` is now only a compatibility id. The default Auto text and image
-chains use `glm-5.3-flash`; GLM receives `thinking: {type: "enabled"}` and
-`reasoning_effort: "max"` regardless of the low-effort hint sent by an older
-extension. The default Think vision chain also uses GLM so older builds that
-pre-route Auto screenshots to `qwen` still reach GLM. Think text remains Qwen.
-The dashboard's DeepSeek preset restores `deepseek-v4-flash` for Auto text but
-keeps GLM for images, because DeepSeek V4 is text-only.
+chains use `qwen3.7-plus` (multimodal, falling back to `qwen-vl-plus` for
+images), which is also the default Think chain — so a test solve and a homework
+solve run on the same model whichever route the client picked.
+
+The quality policy is applied per **actual model**, not per route, because each
+model has a different thinking knob:
+
+| model | what the VPS sends |
+| --- | --- |
+| `qwen*` | nothing — Qwen thinks by default and has no effort levels, so a client's `reasoning_effort` hint is dropped. `response_format: json_object` is also dropped when the request carries an image, where Qwen's JSON mode is unreliable. |
+| `glm-5.3-flash` | `thinking: {type: "enabled"}` + `reasoning_effort: "max"`, regardless of the low-effort hint an older extension sends. |
+| anything else | the client's `reasoning_effort`, if the route has passthrough enabled. |
+
+The standard (cheap) chain deliberately stays on `glm-5.3-flash`: it is the
+post-frontier fallback, and GLM is roughly four times cheaper per token than
+Qwen 3.7 Plus. The dashboard's presets switch Auto between Qwen 3.7 Plus, GLM
+and DeepSeek; the DeepSeek preset restores `deepseek-v4-flash` for Auto text but
+keeps a multimodal model for images, because DeepSeek V4 is text-only.
 
 The owner dashboard calls `GET/PUT /admin/model-config` with
 `X-Model-Admin-Key`. This key is separate from `ADMIN_KEY`, `STATS_SECRET`,

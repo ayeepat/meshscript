@@ -46,8 +46,8 @@
           <button data-pref="dark" type="button" title="Тёмная" aria-label="Тёмная тема"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
         </div>
         <div class="legal-links">
-          <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Конфиденциальность</a>
-          <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия</a>
+          <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">Конфиденциальность</a>
+          <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">Условия</a>
         </div>
       </div>
     </aside>
@@ -67,22 +67,19 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
             <div>
               <h3>Конфиденциальность и данные</h3>
-              <!-- Neutral about which vendor, explicit that data leaves the
-                   device and reaches third parties. The named list lives in the
-                   linked privacy policy. -->
-              <p>Чтобы получить ответ, расширение отправляет текст заданий, скриншоты теста и прикреплённые файлы (включая аудио для расшифровки) сторонним ИИ-сервисам. Запрос идёт через сервер СМЭШ (ai.smeshapi.site) или напрямую, если в расширении сохранился ваш ключ такого сервиса. Полный список получателей — в <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политике конфиденциальности</a>. История хранится только локально и не дольше 7 дней.</p>
+              <!-- Deliberately a pointer, not an enumeration: what is sent,
+                   to whom and for how long — including usage statistics — is
+                   described in the linked terms and privacy policy, which is
+                   what the single checkbox below accepts. -->
+              <p>Что расширение отправляет, кому и на какой срок — в <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условиях использования</a> и <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политике конфиденциальности</a>.</p>
             </div>
           </div>
           <label class="consent-row">
             <input id="consentToggle" type="checkbox" />
-            <span>Я согласен на обработку данных и принимаю
-              <a href="https://www.smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a> и
-              <a href="https://www.smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a>.
+            <span>Я принимаю
+              <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a> и
+              <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a>.
               Остальные разделы настроек откроются после подтверждения.</span>
-          </label>
-          <label class="consent-row">
-            <input id="telemetryToggle" type="checkbox" />
-            <span>Отправлять анонимную статистику использования (тип события, предмет, число токенов, тип браузера и версия — без текста заданий, ответов и файлов). Выключено по умолчанию; работает только вместе с согласием выше.</span>
           </label>
           <div class="consent-actions">
             <button id="deleteStats" class="resetbtn" type="button">Удалить статистику и отключить сбор</button>

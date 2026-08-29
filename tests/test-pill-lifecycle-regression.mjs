@@ -429,9 +429,11 @@ for (const [label, stop] of [
   );
   assert.match(workerSource, /if \(id && preCancelledPillOps\.delete\(id\)\) return null;/,
     'a cancel that arrives before the solve message must block that operation');
-  assert.match(workerSource, /const answer = await solveTest\(\{ text: pageText, provider, signal \}\);/,
-    'the pill solve must hand its cancellation signal to solveTest');
-  assert.match(workerSource, /async function solveTest\(\{ text, screenshot, provider, signal = null \} = \{\}\)/,
+  assert.match(workerSource,
+    /const answer = await solveTest\(\{ text: pageText, hasVisualMedia, provider, signal \}\);/,
+    'the pill solve must hand its media signal and cancellation signal to solveTest');
+  assert.match(workerSource,
+    /async function solveTest\(\{ text, screenshot, hasVisualMedia = false, provider, signal = null \} = \{\}\)/,
     'solveTest must accept a signal');
   const askOpts = workerSource.slice(
     workerSource.indexOf('const askOpts = {'),

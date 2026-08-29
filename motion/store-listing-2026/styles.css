@@ -1,0 +1,313 @@
+@font-face {
+  font-family: 'Manrope';
+  src: url('../public/store-listing-2026/manrope-cyrillic.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Manrope';
+  src: url('../public/store-listing-2026/manrope-latin.woff2') format('woff2');
+  font-weight: 200 800;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Unbounded';
+  src: url('../public/store-listing-2026/unbounded-cyrillic.woff2') format('woff2');
+  font-weight: 600 800;
+  font-style: normal;
+}
+@font-face {
+  font-family: 'Unbounded';
+  src: url('../public/store-listing-2026/unbounded-latin.woff2') format('woff2');
+  font-weight: 600 800;
+  font-style: normal;
+}
+
+* { box-sizing: border-box; }
+
+.canvas,
+.promo-small,
+.promo-marquee {
+  overflow: hidden;
+  color: #2a2620;
+  background: #f7f4ee;
+  font-family: 'Manrope', sans-serif;
+}
+
+.paper {
+  background: #f7f4ee;
+}
+
+.generated-background {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  mix-blend-mode: multiply;
+}
+
+.edge-rule {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  background: #1f8f8b;
+}
+
+.brand-lockup {
+  position: absolute;
+  left: 46px;
+  top: 37px;
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font-family: 'Unbounded', sans-serif;
+  font-size: 17px;
+  font-weight: 750;
+  letter-spacing: -0.7px;
+}
+
+.brand-mark {
+  width: 40px;
+  height: 40px;
+  object-fit: contain;
+}
+
+.copy-block {
+  position: absolute;
+  z-index: 5;
+  left: 48px;
+  top: 164px;
+  width: 300px;
+}
+
+.eyebrow {
+  color: #6b6354;
+  font-size: 14px;
+  line-height: 1.35;
+  font-weight: 800;
+  letter-spacing: 1.55px;
+}
+
+.short-rule {
+  width: 78px;
+  height: 4px;
+  margin-top: 20px;
+  background: #1f8f8b;
+}
+
+.copy-block h1 {
+  margin: 30px 0 0;
+  font-family: 'Unbounded', sans-serif;
+  font-size: 43px;
+  line-height: 1.08;
+  font-weight: 740;
+  letter-spacing: -2.6px;
+}
+
+.copy-block h1 .accent {
+  color: #1f8f8b;
+}
+
+.copy-block p {
+  max-width: 285px;
+  margin: 27px 0 0;
+  color: #6b6354;
+  font-size: 20px;
+  line-height: 1.42;
+  font-weight: 560;
+  letter-spacing: -0.2px;
+}
+
+.product-frame {
+  position: absolute;
+  z-index: 3;
+  left: 382px;
+  top: 53px;
+  width: 850px;
+  height: 694px;
+  overflow: hidden;
+  border: 1px solid rgba(42, 38, 32, 0.14);
+  border-radius: 22px;
+  background: #ffffff;
+  box-shadow: 0 24px 64px rgba(52, 45, 33, 0.16), 0 3px 10px rgba(52, 45, 33, 0.08);
+}
+
+.product-image {
+  position: absolute;
+  max-width: none;
+  object-fit: cover;
+}
+
+.shot-homework {
+  left: -148px;
+  top: 0;
+  width: auto;
+  height: 694px;
+}
+
+.shot-test {
+  left: -520px;
+  top: -62px;
+  width: 1370px;
+  height: auto;
+}
+
+.shot-files {
+  left: -300px;
+  top: 0;
+  width: auto;
+  height: 694px;
+}
+
+.shot-result {
+  left: -236px;
+  top: 0;
+  width: auto;
+  height: 694px;
+}
+
+.shot-gdz {
+  left: -220px;
+  top: 0;
+  width: auto;
+  height: 694px;
+}
+
+.privacy-mask {
+  position: absolute;
+  z-index: 4;
+  left: 0;
+  top: 0;
+  width: 100%;
+  height: 66px;
+  background: #ffffff;
+}
+
+.focus-box {
+  position: absolute;
+  z-index: 6;
+  border: 3px solid #1f8f8b;
+  border-radius: 14px;
+  box-shadow: 0 0 0 6px rgba(31, 143, 139, 0.13);
+}
+
+.pointer {
+  position: absolute;
+  z-index: 8;
+  inset: 0;
+  width: 1280px;
+  height: 800px;
+  pointer-events: none;
+}
+
+.pointer path {
+  fill: none;
+  stroke: #1f8f8b;
+  stroke-width: 4;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.truth-note {
+  position: absolute;
+  z-index: 6;
+  left: 48px;
+  bottom: 43px;
+  color: #756d5e;
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.promo-small-lockup {
+  position: absolute;
+  z-index: 5;
+  left: 61px;
+  top: 87px;
+  display: flex;
+  align-items: center;
+  gap: 23px;
+  color: #2a2620;
+  font-family: 'Unbounded', sans-serif;
+  font-size: 38px;
+  font-weight: 760;
+  letter-spacing: -2.3px;
+}
+
+.promo-small-lockup img {
+  width: 105px;
+  height: 105px;
+  object-fit: contain;
+}
+
+.promo-small .edge-rule,
+.promo-marquee .edge-rule {
+  left: 0;
+  right: 0;
+  top: auto;
+  bottom: 0;
+  width: auto;
+  height: 8px;
+}
+
+.marquee-copy {
+  position: absolute;
+  z-index: 5;
+  left: 82px;
+  top: 58px;
+  width: 560px;
+}
+
+.marquee-copy .brand-lockup {
+  position: static;
+  font-size: 24px;
+  gap: 15px;
+}
+
+.marquee-copy .brand-mark {
+  width: 58px;
+  height: 58px;
+}
+
+.marquee-copy h1 {
+  margin: 49px 0 0;
+  font-family: 'Unbounded', sans-serif;
+  font-size: 62px;
+  line-height: 1.05;
+  font-weight: 760;
+  letter-spacing: -4px;
+}
+
+.marquee-copy p {
+  margin: 29px 0 0;
+  color: #6b6354;
+  font-size: 25px;
+  line-height: 1.35;
+  font-weight: 580;
+}
+
+.marquee-frame {
+  position: absolute;
+  z-index: 4;
+  right: 56px;
+  top: 47px;
+  width: 664px;
+  height: 466px;
+  overflow: hidden;
+  border: 1px solid rgba(42, 38, 32, 0.14);
+  border-radius: 22px;
+  background: #fff;
+  box-shadow: 0 24px 64px rgba(52, 45, 33, 0.18);
+}
+
+.marquee-frame img {
+  position: absolute;
+  left: -152px;
+  top: 0;
+  width: auto;
+  height: 466px;
+  max-width: none;
+}

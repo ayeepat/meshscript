@@ -8,18 +8,16 @@
  * an earlier build keeps working as long as its key is there — see
  * resolveStoredProvider below.
  *
- * Four providers: OpenRouter (BYO key, main solver, reads PDFs natively),
- * Groq (BYO free key, vision + text, also transcribes listening audio — see
- * groq.js's transcribeAudio), Qwen (qwen3.7-plus —
- * vision + text) and DeepSeek (deepseek-v4-flash — cheapest, TEXT ONLY, no
- * vision). Qwen and DeepSeek need NO user key: they run through the СМЭШ
- * license proxy (smesh-proxy.js), with a hidden BYO Alibaba-key path for
- * power users (see qwen.js/deepseek.js). opts {onDelta, responseFormat} are
- * forwarded for streaming / JSON.
+ * Four stable client routes: OpenRouter and Groq for grandfathered BYO users,
+ * Think (`qwen`), and Auto (`deepseek`, a legacy wire id). The live VPS model
+ * control currently resolves Auto to Qwen 3.7 Plus; retaining the route id
+ * lets already-installed Chrome builds switch models without an update.
+ * A hidden Alibaba BYO key still makes the legacy route call real DeepSeek
+ * directly, so that compatibility path remains text-only.
  */
 import { askOpenRouter } from './openrouter.js';
 import { askGroq } from './groq.js';
-import { askQwen } from './qwen.js';
+import { askQwen, getByoKey } from './qwen.js';
 import { askDeepseek } from './deepseek.js';
 import { isImageFile, isPdfFile } from './file-kinds.js';
 import { SECURITY_GUARD } from './security-prompt.js';
@@ -33,6 +31,18 @@ const BYO_KEY_FIELD = { openrouter: 'openrouterApiKey', groq: 'groqApiKey' };
 
 export function normalizeAIProvider(provider, fallback = DEFAULT_PROVIDER) {
   return AI_PROVIDERS.includes(provider) ? provider : fallback;
+}
+
+/**
+ * The licensed Auto route is vision-capable. Only the hidden BYO version still
+ * points at text-only DeepSeek and therefore needs Qwen for visual material.
+ */
+export function routeVisionPreferredProvider(
+  provider,
+  visionPreferred = false,
+  legacyDeepseekByo = false,
+) {
+  return visionPreferred && legacyDeepseekByo && provider === 'deepseek' ? 'qwen' : provider;
 }
 
 /**
@@ -65,20 +75,18 @@ export async function askAI(systemPrompt, userText, files = [], history = [], op
   let chosen = await resolveStoredProvider(
     AI_PROVIDERS.includes(opts.provider) ? opts.provider : aiProvider
   );
-  // DeepSeek V4 has no vision at all — a test screenshot or photo sent there
-  // would come back as a guess about an image the model never saw. Requests
-  // that carry an image (in this turn OR replayed history) auto-upgrade to
-  // Qwen: both run on the same Alibaba Model Studio key, so if DeepSeek was
-  // selectable at all, Qwen is guaranteed to work too.
+  // Images can live in the current turn or replayed history. PDFs count too:
+  // direct DashScope cannot consume our file part, while the licensed proxy
+  // sends them through its verified PDF chain.
   if (chosen === 'deepseek') {
     const hasImages = files.some(isImageFile) ||
       history.some((m) => m.role !== 'assistant' && m.files?.some(isImageFile));
-    // A PDF in a replayed turn is still part of this provider request. Looking
-    // only at the current turn silently routed follow-ups to a text-only model,
-    // which then guessed about the document it could not read.
     const hasPdfs = files.some(isPdfFile) ||
       history.some((m) => m.role !== 'assistant' && m.files?.some(isPdfFile));
-    if (hasImages || hasPdfs) chosen = 'qwen';
+    const needsVisionFallback = opts.visionPreferred === true || hasImages || hasPdfs;
+    if (needsVisionFallback) {
+      chosen = routeVisionPreferredProvider(chosen, true, Boolean(await getByoKey()));
+    }
   }
   // Tag the usage frame with the provider we actually routed to, so callers
   // (telemetry) don't have to re-derive it. Pure pass-through when no onUsage.

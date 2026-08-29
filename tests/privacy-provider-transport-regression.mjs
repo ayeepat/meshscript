@@ -139,8 +139,12 @@ for (const id of ['openrouter', 'groq', 'qwen', 'deepseek']) {
 }
 assert.doesNotMatch(settingsJs, /PROVIDER_TO_OPTION/);
 assert.match(settingsJs, /PROVIDER_OPTIONS\.has\(stored\.aiProvider\) \? stored\.aiProvider/);
-assert.match(settingsJs, /enqueueTelemetryPreference\(false\)/,
-  'server erasure must also withdraw opt-in through the serialized preference writer');
+assert.match(settingsJs, /setTelemetryPreference\(false\)/,
+  'server erasure must also withdraw statistics through the serialized preference writer');
+// With the checkbox folded into the single agreement, this button is the only
+// remaining way to stop collection without withdrawing consent entirely.
+assert.doesNotMatch(settingsJs, /telemetryToggle/,
+  'the statistics checkbox is gone; nothing may still reach for it');
 
 // Both halves of the consent boundary are explicit and fail closed.
 assert.match(source('../src/lib/smesh-proxy.js'), /telemetryOptIn = stored\.telemetryEnabled === true/);

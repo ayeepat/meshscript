@@ -274,9 +274,10 @@ const PROVIDERS = {
     // them until a Web Store update. The dashboard remains the authority that
     // can point this route back at DeepSeek (or any other 302.AI model).
     name: 'Auto',
-    model: (env.PROXY_AUTO_MODEL || 'glm-5.3-flash').trim(),
+    model: (env.PROXY_AUTO_MODEL || 'qwen3.7-plus').trim(),
     fallbacks: '',
-    visionFallbacks: (env.PROXY_AUTO_VISION_FALLBACK_MODELS || 'glm-5.3-flash'),
+    // qwen3.7-plus is multimodal, so Auto needs no separate vision model.
+    visionFallbacks: (env.PROXY_AUTO_VISION_FALLBACK_MODELS || 'qwen-vl-plus'),
     reasoningEffort: true
   }
 };
@@ -324,11 +325,19 @@ function bootstrapModelConfig() {
   const qwenText = commaModels([
     PROVIDERS.qwen.model, PROVIDERS.qwen.fallbacks
   ].filter(Boolean).join(','));
+  // Vision chains list VISION-CAPABLE models only. PROVIDERS.qwen.fallbacks
+  // ends in text-only qwen-plus, which answers an image request with HTTP 200
+  // and a confident wrong guess instead of an error (live probe, see the
+  // visionFallbackVar comment in backend/src/ai-proxy.js) — a silent bad
+  // answer is worse than no answer, so it never enters a vision chain.
+  const qwenVision = commaModels([
+    PROVIDERS.qwen.model, PROVIDERS.qwen.visionFallbacks
+  ].filter(Boolean).join(','));
   const deepseekText = commaModels([
     PROVIDERS.deepseek.model, PROVIDERS.deepseek.fallbacks
   ].filter(Boolean).join(','));
   const deepseekVision = commaModels([
-    PROVIDERS.deepseek.model, PROVIDERS.deepseek.visionFallbacks, PROVIDERS.deepseek.fallbacks
+    PROVIDERS.deepseek.model, PROVIDERS.deepseek.visionFallbacks
   ].filter(Boolean).join(','));
   return {
     limits: {
@@ -347,9 +356,9 @@ function bootstrapModelConfig() {
     routes: {
       qwen: {
         // Older extensions upgrade Auto screenshots to the `qwen` route before
-        // they reach the VPS. Keeping its vision chain on GLM moves those
-        // already-installed clients too; Think text remains Qwen.
-        label: 'Think', text: qwenText, vision: ['glm-5.3-flash'],
+        // they reach the VPS. Now that Auto is Qwen too, that upgrade lands on
+        // the same model the request would have used anyway.
+        label: 'Think', text: qwenText, vision: qwenVision,
         reasoning_effort: PROVIDERS.qwen.reasoningEffort
       },
       deepseek: {
@@ -365,6 +374,8 @@ function bootstrapModelConfig() {
       }
     },
     rates: {
+      'qwen3.7-plus': { input_usd_per_m: 0.32, output_usd_per_m: 1.28 },
+      'qwen-vl-plus': { input_usd_per_m: 0.32, output_usd_per_m: 1.28 },
       'glm-5.3-flash': { input_usd_per_m: 0.075, output_usd_per_m: 0.25 },
       'glm-4.6v-flash': { input_usd_per_m: 0, output_usd_per_m: 0 }
     }
@@ -602,6 +613,12 @@ function routeForRequest(providerId, tier, hasImages, hasPdfs, state = modelStat
 
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
 const GLM_53_FLASH = /^glm-5\.3-flash$/i;
+// The Qwen line on 302.AI THINKS BY DEFAULT and has no OpenAI-style effort
+// levels — its only knobs are enable_thinking/thinking_budget. Sending
+// reasoning_effort is at best ignored and at worst a -10003 parameter error,
+// so the Auto route's effort passthrough is suppressed per ACTUAL model rather
+// than per route: the dashboard can point Auto at a model that does honour it.
+const QWEN_MODEL = /^qwen/i;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Request bodies arrive before JSON credentials can be verified. Bound that
 // anonymous pre-authentication memory separately from active AI job storage.
@@ -2486,17 +2503,31 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
       model, messages, temperature: 0.3, max_tokens: MAX_TOKENS_OUT,
       stream: true, stream_options: { include_usage: true }
     };
-    if (body.response_format === 'json_object') upstreamBody.response_format = { type: 'json_object' };
-    // GLM-5.3-Flash supports forced thinking plus max/high/low effort. Existing
-    // Web Store builds send Auto as the legacy `deepseek` route with LOW
-    // effort, so merely switching the dashboard model would quietly keep GLM
-    // shallow for those users. Enforce the quality policy per ACTUAL model;
-    // dashboard switches to other models retain the ordinary passthrough.
+    // JSON mode is dropped when a Qwen model is asked to read an IMAGE: Qwen
+    // has shown unreliable json_object behaviour once a picture is in the
+    // request, which is why the client-side wrapper already strips it there
+    // (src/lib/qwen.js wantJson). The test solver survives this — its parser
+    // recovers the {answers:[{n,a}]} shape out of ordinary prose — whereas a
+    // model that silently stops honouring the format returns nothing usable.
+    const dropJsonForQwenVision = hasImages && QWEN_MODEL.test(model);
+    if (body.response_format === 'json_object' && !dropJsonForQwenVision) {
+      upstreamBody.response_format = { type: 'json_object' };
+    }
+    // The quality policy is enforced per ACTUAL model, not per route: the
+    // dashboard owns which model each route resolves to, and every model has a
+    // different thinking knob.
+    //   - Qwen (the live Auto/Think model) thinks by default and has no effort
+    //     levels, so nothing is sent — see QWEN_MODEL.
+    //   - GLM-5.3-Flash (the cheap standard chain) needs forced thinking at max
+    //     effort, otherwise a client's LOW hint leaves it shallow.
+    //   - anything else the dashboard picks keeps the ordinary passthrough.
     // PDF jobs use the separate Gemini chain, where these fields are unverified.
-    if (!hasPdfs && GLM_53_FLASH.test(model)) {
+    if (hasPdfs || QWEN_MODEL.test(model)) {
+      // no effort knob to send
+    } else if (GLM_53_FLASH.test(model)) {
       upstreamBody.thinking = { type: 'enabled' };
       upstreamBody.reasoning_effort = 'max';
-    } else if (!hasPdfs && provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
+    } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
     // Serialize ONCE per model attempt, not once per retry — retries resend
@@ -3718,8 +3749,8 @@ MODEL_CONFIG_FILE=/var/lib/smesh-proxy/model-config.json
 # PROXY_FRONTIER_DAILY=15
 # PROXY_STANDARD_DAILY=70
 # PROXY_GLOBAL_DAILY=3000
-# PROXY_AUTO_MODEL=glm-5.3-flash
-# PROXY_AUTO_VISION_FALLBACK_MODELS=glm-5.3-flash
+# PROXY_AUTO_MODEL=qwen3.7-plus
+# PROXY_AUTO_VISION_FALLBACK_MODELS=qwen-vl-plus
 # PROXY_PDF_MODEL=gemini-2.5-flash
 # PROXY_PDF_FALLBACK_MODELS=gemini-2.5-flash-lite
 ENV_EOF

@@ -1,8 +1,16 @@
 # Signing the runtime config
 
 The extension accepts only a P-256-signed envelope at
-`https://www.smeshai.xyz/extension-config.json`. Bare JSON and legacy cached
+`https://smeshai.xyz/extension-config.json`. Bare JSON and legacy cached
 objects are deliberately rejected.
+
+**Publish at the apex host, not `www.`.** The site 301-redirects every
+`www.smeshai.xyz` request to the apex, and `fetchFresh()` in
+`src/lib/remote-config.js` uses `redirect: 'error'` on purpose — a `www.` URL
+can therefore never resolve, whatever is published behind it. The URL in
+`src/lib/config.js` and the `host_permissions` entry in `manifest.json` must
+keep naming that same apex origin; `tests/runtime-config-host-regression.mjs`
+fails the build if they drift apart.
 
 1. Edit a private, bare JSON file. `configVersion` must increase monotonically.
    Include signed integer millisecond timestamps `issuedAt` and `expiresAt`;

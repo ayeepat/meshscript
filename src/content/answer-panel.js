@@ -14,6 +14,7 @@
   const STORAGE_KEY = 'smeshAnswerPanel';
   const DEFAULT_W = 400;
   const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
+  const LONG_THINKING_NOTICE = 'Thinking longer for a more accurate response.';
   // The worker's fill runs three passes across every frame — native inputs, the
   // MathQuill main-world pass, then the ASYNC interactive pass that opens each
   // custom dropdown (~0.7s per dropdown). A matching question with several
@@ -148,7 +149,7 @@
     // so a single doubtful answer doesn't need a full-page re-solve. data-qi
     // carries the array index back to the handler.
     return `<li data-qid="${qid}">` +
-      `<span class="qline">${inner}</span>` +
+      `<span class="qline">${inner}<span class="long-think-note" role="status" aria-live="polite" hidden>${LONG_THINKING_NOTICE}</span></span>` +
       `<button class="btn-resolve" type="button" data-qi="${i}" title="Перерешать этот вопрос" aria-label="Перерешать этот вопрос">↻</button>` +
       `</li>`;
   }
@@ -368,6 +369,18 @@
         .btn-resolve.failed { color: var(--p-danger); border-color: var(--p-danger); opacity: 1; }
         /* The answer slot while its question is being re-solved. */
         .a.resolving { color: var(--p-muted); font-style: italic; }
+        .long-think-note {
+          display: inline-flex; align-items: center; gap: 5px;
+          max-width: 100%; margin: 6px 0 0 26px; padding: 4px 7px;
+          color: var(--p-accent); background: var(--p-btn-hover);
+          border: 1px solid var(--p-btn-border); border-radius: 999px;
+          font-size: 10.5px; font-weight: 650; line-height: 1.3;
+        }
+        .long-think-note[hidden] { display: none; }
+        .long-think-note::before {
+          content: ''; flex: none; width: 4px; height: 4px;
+          border-radius: 50%; background: currentColor; opacity: 0.8;
+        }
         @keyframes smesh-resolve-spin { to { transform: rotate(360deg); } }
         @media (prefers-reduced-motion: reduce) {
           button { transition: none; }
@@ -594,12 +607,22 @@
     const prevText = aEl.textContent;
     aEl.textContent = '…';
 
+    const longNotice = li.querySelector('.long-think-note');
+    if (longNotice) longNotice.hidden = true;
+    const longNoticeTimer = globalThis.setTimeout?.(() => {
+      if (longNotice && isPanelCurrent(generation, panelNonce, li) && li.isConnected) {
+        longNotice.hidden = false;
+      }
+    }, 30000);
+
     const r = await sendMsg('RESOLVE_QUESTION', {
       index: q.index != null ? q.index : i + 1,
       prevAnswer: prev,
       questionText: q.text || '',
       panelNonce,
     }, 130000, panelNonce);
+    if (longNoticeTimer != null) globalThis.clearTimeout?.(longNoticeTimer);
+    if (longNotice) longNotice.hidden = true;
 
     // The worker validates after AI completion, but the same-document player
     // can switch question/account between that read and message delivery. Do

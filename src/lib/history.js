@@ -9,10 +9,16 @@
  *   meshHistory: { sessions: Session[], messages: { [sessionId]: Message[] } }
  *   meshHistoryGen: UUID changed with every whole-history write
  *
- * Session = { id, subject, task_text, created_at }
+ * Session = { id, subject, task_text, lesson_key, created_at }
  * Message = { id, session_id, role, content, created_at }
+ *
+ * `lesson_key` (see lib/lesson-key.js) is what lets the dashboard reopen a
+ * lesson it already solved and replay the stored conversation instead of
+ * spending another completion. Sessions written by older builds simply have
+ * no key and never match, so they keep behaving as before.
  */
 
+import { TEST_ANSWER_CACHE_KEY, TEST_ANSWER_CACHE_TTL_MS } from './test-answer-cache.js';
 import { wipeDashboardLaunches } from './dashboard-launch.js';
 
 const STORAGE_KEY = 'meshHistory';
@@ -73,6 +79,19 @@ function mutateState(mutator) {
   });
   stateQueue = run.catch(() => {});
   return run;
+}
+
+// A pure read: load, apply the TTL in memory, answer. Deliberately NOT
+// mutateState — that rewrites the whole history object and mints a new
+// generation on every call, so merely opening a lesson (findLessonSession runs
+// before every dashboard lesson) or listing Settings history would churn the
+// store and invalidate any writer mid-recheck. The 7-day prune is still
+// PERSISTED by every real mutation and by the retention alarm's
+// cleanupLocalData(); doing it here as well only affects what this caller sees,
+// which is the part that has to be correct.
+async function readState() {
+  const stored = await chrome.storage.local.get(STORAGE_KEY);
+  return prune(stateFromStored(stored[STORAGE_KEY]));
 }
 
 // Drop anything older than TTL_MS. Returns a fresh state with stale sessions
@@ -182,7 +201,9 @@ export async function appendSolveTurn({
   taskText,
   userContent,
   assistantContent,
+  lessonKey = '',
 }) {
+  const key = typeof lessonKey === 'string' ? lessonKey : '';
   return mutateState((state) => {
     let session = sessionId
       ? state.sessions.find((candidate) => candidate.id === sessionId)
@@ -192,6 +213,7 @@ export async function appendSolveTurn({
         id: crypto.randomUUID(),
         subject,
         task_text: taskText,
+        lesson_key: key,
         created_at: new Date().toISOString()
       };
       state.sessions.unshift(session);
@@ -214,17 +236,53 @@ export async function appendSolveTurn({
   });
 }
 
+/**
+ * The stored conversation for a lesson the student already solved, or null.
+ *
+ * Returns the NEWEST session carrying this key that actually reached a real
+ * answer — an assistant turn with text. That last condition is what keeps the
+ * reuse honest: a lesson whose only stored turn is a half-written or empty
+ * reply is worth re-solving, not replaying.
+ *
+ * Messages come back as plain {role, content}. Attachments are deliberately not
+ * part of history (every read/write of this store serializes the whole object,
+ * so base64 photos and PDFs in it would make the dashboard's own history slow
+ * for everyone), so a replayed lesson carries its text, not its files.
+ */
+export async function findLessonSession(lessonKey) {
+  if (typeof lessonKey !== 'string' || !lessonKey) return null;
+  const state = await readState();
+  const candidates = state.sessions
+    .filter((session) => session.lesson_key === lessonKey)
+    .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  for (const session of candidates) {
+    const messages = [...(state.messages[session.id] || [])]
+      .sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
+    const answered = messages.some((message) =>
+      message?.role === 'assistant' && typeof message.content === 'string' && message.content.trim());
+    if (!answered) continue;
+    return {
+      sessionId: session.id,
+      subject: session.subject || '',
+      createdAt: session.created_at,
+      messages: messages.map((message) => ({
+        role: message.role,
+        content: typeof message.content === 'string' ? message.content : ''
+      }))
+    };
+  }
+  return null;
+}
+
 export async function listSessions() {
-  return mutateState((state) =>
-    [...state.sessions].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
-  );
+  const state = await readState();
+  return [...state.sessions].sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
 }
 
 export async function listMessages(sessionId) {
-  return mutateState((state) => {
-    const msgs = state.messages[sessionId] || [];
-    return [...msgs].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
-  });
+  const state = await readState();
+  const msgs = state.messages[sessionId] || [];
+  return [...msgs].sort((a, b) => Date.parse(a.created_at) - Date.parse(b.created_at));
 }
 
 /* ---------------------- scheduled retention sweep ---------------------- */
@@ -239,7 +297,8 @@ const USER_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const TRANSCRIPT_CACHE_TTL_MS = 6 * 60 * 60 * 1000;
 
 // These storage-owned shapes avoid imports from their feature modules:
-// taskClassCache and gdzTaskCache both map opaque keys to {v:<value>,at:number}.
+// taskClassCache, gdzTaskCache and testAnswerCache all map opaque keys to
+// {v:<value>,at:number}.
 // Bare legacy values have no defensible age, so the sweep deliberately drops them.
 function pruneTimestampedCache(cache, cutoff) {
   if (!cache || typeof cache !== 'object' || Array.isArray(cache)) return null;
@@ -258,10 +317,11 @@ export async function cleanupLocalData() {
   await mutateState(() => null).catch(() => {});
   try {
     const {
-      weekHomework, pendingUpload, taskClassCache, gdzTaskCache, smeshTranscriptCache
+      weekHomework, pendingUpload, taskClassCache, gdzTaskCache, smeshTranscriptCache,
+      [TEST_ANSWER_CACHE_KEY]: testAnswerCache
     } = await chrome.storage.local.get([
       'weekHomework', 'pendingUpload', 'taskClassCache', 'gdzTaskCache',
-      'smeshTranscriptCache'
+      'smeshTranscriptCache', TEST_ANSWER_CACHE_KEY
     ]);
     const stale = [];
     const updates = {};
@@ -284,6 +344,13 @@ export async function cleanupLocalData() {
       );
       if (fresh && Object.keys(fresh).length) updates.smeshTranscriptCache = fresh;
       else stale.push('smeshTranscriptCache');
+    }
+    // Solved test pages share the history TTL: reusing an answer the student
+    // can no longer see in their own history would be surprising.
+    if (testAnswerCache != null) {
+      const fresh = pruneTimestampedCache(testAnswerCache, Date.now() - TEST_ANSWER_CACHE_TTL_MS);
+      if (fresh && Object.keys(fresh).length) updates[TEST_ANSWER_CACHE_KEY] = fresh;
+      else stale.push(TEST_ANSWER_CACHE_KEY);
     }
     if (Object.keys(updates).length) await chrome.storage.local.set(updates);
     if (stale.length) await chrome.storage.local.remove(stale);
@@ -313,7 +380,7 @@ async function deleteAllLocalDataHere() {
       chrome.storage.local.remove([
         STORAGE_KEY, 'weekHomework', 'pendingUpload', 'taskClassCache', 'gdzTaskCache', 'tmLastHb',
         'rateAttempts', 'rateUsage', 'rateHistory', 'rateReservations', 'orUsageSnap',
-        'smeshTranscriptCache'
+        'smeshTranscriptCache', TEST_ANSWER_CACHE_KEY
       ]),
       // Upgrade cleanup: old builds briefly kept transcripts in session.
       // Current builds use trusted-only local storage (removed above), but the

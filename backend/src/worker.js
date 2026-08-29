@@ -16,7 +16,8 @@
  *   GET  /admin/license      Inspect one license by key
  *   GET  /admin/referral     Inspect a referral record by code or device
  *   POST /admin/referral/retry-pending  Recover durable incomplete referral credits
- *   POST /telegram/webhook   Support bot: user tickets → owner, replies → user
+ *   POST /telegram/webhook   Bot: /sub subscription card and device release,
+ *                            user tickets → owner, replies → user
  *   POST /checkout/session   Create a short-lived server-priced checkout
  *   POST /checkout/status    Poll checkout/payment/delivery state by capability
  *   POST /checkout/payment   Create signed hosted-payment fields after Telegram binding
@@ -45,6 +46,10 @@ import {
   processSupportUpdate, retryPendingSupportForwards,
   supportConfigValid, SUPPORT_FORWARD_MAX_ATTEMPTS
 } from './delivery/support.js';
+import {
+  processSubscriptionUpdate, pruneSubscriptionLifecycle,
+  sweepSubscriptionNotifications, SUBSCRIPTION_NOTIFY_MAX_ATTEMPTS
+} from './delivery/subscription.js';
 import { readJsonBounded } from './request-body.js';
 import {
   issueTelemetryToken, verifyTelemetryToken, issueErasureToken, verifyErasureToken
@@ -282,6 +287,11 @@ export default {
       catch (e) { console.error('delivery retry sweep failed', safeErrorText(e, env)); }
       try { await retryPendingSupportForwards(env); }
       catch (e) { console.error('support retry sweep failed', safeErrorText(e, env)); }
+      // Expiry reminders and the win-back survey. Every row is claimed before a
+      // send, so a five-minute cadence is what makes "ten minutes after expiry"
+      // land within a five-minute window rather than whenever traffic happens.
+      try { await sweepSubscriptionNotifications(env); }
+      catch (e) { console.error('subscription notification sweep failed', safeErrorText(e, env)); }
       try { await referrals.retryPendingReferralCredits(env, 50); }
       catch (e) { console.error('referral retry sweep failed', safeErrorText(e, env)); }
       try {
@@ -327,6 +337,8 @@ export default {
       catch (e) { console.error('payment order prune failed', safeErrorText(e, env)); }
       try { await pruneTelegramUpdates(env); }
       catch (e) { console.error('telegram update prune failed', safeErrorText(e, env)); }
+      try { await pruneSubscriptionLifecycle(env); }
+      catch (e) { console.error('subscription lifecycle prune failed', safeErrorText(e, env)); }
       // Identifier lifecycle: expire raw-IP/device budget rows, stale quota
       // days, and aged deletion tombstones (see pruneExpiredAnalytics).
       try { await analytics.pruneExpiredAnalytics(env); }
@@ -368,7 +380,12 @@ async function handleVerify(request, env) {
     const activationToken = typeof body.activation_token === 'string'
       ? body.activation_token.trim()
       : '';
-    result = await verifyLicense(env, key, deviceId, activationToken);
+    // Strict `true` only: the flag says "the user just typed this key here",
+    // which is the sole way past a remote-release fence. Anything looser would
+    // let a stale background revalidation claim the intent by accident.
+    result = await verifyLicense(env, key, deviceId, activationToken, {
+      intent: body.activation_intent === true
+    });
   } catch (e) {
     // A reservation is a charge only for a completed anonymous miss. Storage
     // exceptions can happen after D1 has claimed a device slot but before KV
@@ -624,13 +641,24 @@ async function handleTelegramWebhook(request, env, ctx) {
   let result;
   let failed = false;
   try {
+    // Three surfaces, most specific first: the checkout deep link, then the
+    // subscription commands and buttons, then support — which deliberately
+    // treats anything left over as a ticket rather than losing it.
     const checkout = await processCheckoutStart(env, update);
-    result = checkout.handled
-      ? checkout
-      : await processSupportUpdate(env, update, {
-          updateId: claim.updateId,
-          claimVersion: claim.claimVersion
-        });
+    if (checkout.handled) {
+      result = checkout;
+    } else {
+      const subscription = await processSubscriptionUpdate(env, update, {
+        updateId: claim.updateId,
+        claimVersion: claim.claimVersion
+      });
+      result = subscription.handled
+        ? subscription
+        : await processSupportUpdate(env, update, {
+            updateId: claim.updateId,
+            claimVersion: claim.claimVersion
+          });
+    }
   }
   catch (e) {
     const safeError = safeErrorText(e, env);
@@ -829,7 +857,8 @@ async function handleTelegramSetup(request, env) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
       commands: [
-        { command: 'start', description: 'Меню поддержки' },
+        { command: 'start', description: 'Меню бота' },
+        { command: 'sub', description: 'Моя подписка: срок и устройство' },
         { command: 'help', description: 'Помощь и как пользоваться' }
       ]
     }),
@@ -1720,7 +1749,23 @@ const STATS_ROUTES = {
   retention:  (env)    => analytics.statsRetention(env),
   referrals:  (env)    => analytics.statsReferrals(env),
   errors:     (env, q) => analytics.statsErrors(env, Number(q.get('days')) || 0),
+  feedback:   (env, q) => analytics.statsFeedback(env, Number(q.get('days')) || 0),
+  tickets:    (env, q) => analytics.statsTickets(env, Number(q.get('limit')) || 50),
+  subscriptions: (env) => analytics.statsSubscriptions(env),
+  funnel:     (env, q) => analytics.statsFunnel(env, Number(q.get('days')) || 0),
+  margin:     (env, q) => analytics.statsMargin(env, Number(q.get('days')) || 0,
+    Number(q.get('limit')) || 100),
+  worklists:  (env)    => analytics.statsWorklists(env, WORKLIST_THRESHOLDS),
   rate:       (env, q) => analytics.statsRate(env, q.get('force') === '1')
+};
+
+// The retry ceilings the senders actually enforce, handed to the shared
+// worklist rollup so /admin/health and the dashboard cannot drift apart.
+const WORKLIST_THRESHOLDS = {
+  deliveryMaxAttempts: DELIVERY_MAX_ATTEMPTS,
+  refundPollStalledAttempts: REFUND_POLL_STALLED_ATTEMPTS,
+  supportForwardMaxAttempts: SUPPORT_FORWARD_MAX_ATTEMPTS,
+  subscriptionNotifyMaxAttempts: SUBSCRIPTION_NOTIFY_MAX_ATTEMPTS
 };
 
 // GET /admin/stats/<name> — aggregation endpoints for the owner dashboard
@@ -1861,7 +1906,11 @@ const HEALTH_REQUIRED_TABLE_SIGNATURES = {
   license_activations:
     'license_key:TEXT:0::1|status:TEXT:1::0|device_id:TEXT:0::0|token_hash:TEXT:0::0|generation:INTEGER:1:1:0|activated_at:INTEGER:0::0|last_seen_at:INTEGER:0::0|deactivated_at:INTEGER:0::0',
   license_devices: 'license_key:TEXT:1::1|device_id:TEXT:1::2|added_at:INTEGER:1::0',
+  license_release_fence:
+    'license_key:TEXT:0::1|device_id:TEXT:1::0|released_at:INTEGER:1::0|released_by:TEXT:0::0',
   license_revocations: 'license_key:TEXT:0::1|revoked_at:INTEGER:1::0|reason:TEXT:0::0',
+  license_telegram_links:
+    'license_key:TEXT:0::1|telegram_user_id:TEXT:1::0|linked_at:INTEGER:1::0',
   payment_issuance:
     'gateway:TEXT:1::1|payment_id:TEXT:1::2|license_key:TEXT:1::0|license_json:TEXT:1::0|created_at:INTEGER:1::0',
   payment_events:
@@ -1882,6 +1931,8 @@ const HEALTH_REQUIRED_TABLE_SIGNATURES = {
   referral_credits: 'license_key:TEXT:0::1|ref_code:TEXT:1::0|claimed_at:INTEGER:1::0',
   runtime_write_fence:
     'singleton:INTEGER:0::1|write_epoch:INTEGER:1::0|writes_enabled:INTEGER:1:1:0|updated_at:INTEGER:1::0',
+  subscription_notifications:
+    'id:INTEGER:0::1|license_key:TEXT:1::0|stage:TEXT:1::0|telegram_user_id:TEXT:1::0|due_at:INTEGER:1::0|created_at:INTEGER:1::0|attempts:INTEGER:1:0:0|next_attempt_at:INTEGER:1::0|claim_token:TEXT:0::0|lease_until:INTEGER:0::0|sent_at:INTEGER:0::0|cancelled_at:INTEGER:0::0|answer_code:TEXT:0::0|answered_at:INTEGER:0::0',
   support_forward_outbox:
     'ticket_no:TEXT:0::1|source_chat_id:TEXT:0::0|source_message_id:INTEGER:0::0|has_attachment:INTEGER:1:0:0|created_at:INTEGER:1::0|attempts:INTEGER:1:0:0|next_attempt_at:INTEGER:1::0|claim_token:TEXT:0::0|lease_until:INTEGER:0::0|text_forwarded_at:INTEGER:0::0|attachment_forwarded_at:INTEGER:0::0|forwarded_at:INTEGER:0::0',
   telegram_updates:
@@ -1920,9 +1971,15 @@ const HEALTH_REQUIRED_TABLE_DDL = {
     'createtablelicense_devices(license_keytextnotnull,device_idtextnotnull,added_atintegernotnull,--msepochprimarykey(license_key,device_id))',
     'createtablelicense_devices(license_keytextnotnull,device_idtextnotnull,added_atintegernotnull,primarykey(license_key,device_id))'
   ],
+  license_release_fence: [
+    'createtablelicense_release_fence(license_keytextprimarykey,device_idtextnotnull,released_atintegernotnull,released_bytext)'
+  ],
   license_revocations: [
     'createtablelicense_revocations(license_keytextprimarykey,revoked_atintegernotnull,--msepochreasontext)',
     'createtablelicense_revocations(license_keytextprimarykey,revoked_atintegernotnull,reasontext)'
+  ],
+  license_telegram_links: [
+    'createtablelicense_telegram_links(license_keytextprimarykey,telegram_user_idtextnotnull,linked_atintegernotnull)'
   ],
   payment_issuance: ['createtablepayment_issuance(gatewaytextnotnull,payment_idtextnotnull,license_keytextnotnullunique,license_jsontextnotnull,created_atintegernotnull,primarykey(gateway,payment_id))'],
   payment_events: ['createtablepayment_events(idintegerprimarykeyautoincrement,gatewaytextnotnull,payment_idtextnotnull,order_idinteger,environmenttext,event_typetextnotnull,amount_kopecksinteger,currencytext,details_jsontext,created_atintegernotnull)'],
@@ -1949,6 +2006,9 @@ const HEALTH_REQUIRED_TABLE_DDL = {
   ],
   referral_credits: ['createtablereferral_credits(license_keytextprimarykey,ref_codetextnotnull,claimed_atintegernotnull)'],
   runtime_write_fence: ['createtableruntime_write_fence(singletonintegerprimarykeycheck(singleton=1),write_epochintegernotnullcheck(write_epoch>=1),writes_enabledintegernotnulldefault1check(writes_enabledin(0,1)),updated_atintegernotnull)'],
+  subscription_notifications: [
+    "createtablesubscription_notifications(idintegerprimarykeyautoincrement,license_keytextnotnull,stagetextnotnullcheck(stagein('expiry_3d','expiry_1d','expired','winback')),telegram_user_idtextnotnull,due_atintegernotnull,created_atintegernotnull,attemptsintegernotnulldefault0check(attempts>=0),next_attempt_atintegernotnull,claim_tokentext,lease_untilinteger,sent_atinteger,cancelled_atinteger,answer_codetext,answered_atinteger,unique(license_key,stage))"
+  ],
   support_forward_outbox: ['createtablesupport_forward_outbox(ticket_notextprimarykey,source_chat_idtext,source_message_idinteger,has_attachmentintegernotnulldefault0check(has_attachmentin(0,1)),created_atintegernotnull,attemptsintegernotnulldefault0check(attempts>=0),next_attempt_atintegernotnull,claim_tokentext,lease_untilinteger,text_forwarded_atinteger,attachment_forwarded_atinteger,forwarded_atinteger,check(has_attachment=0orforwarded_atisnotnullor(source_chat_idisnotnullandsource_message_idisnotnull)))'],
   telegram_updates: ['createtabletelegram_updates(update_idintegerprimarykey,claimed_atintegernotnull,lease_untilintegernotnull,completed_atinteger,result_kindtext,ticket_notext)'],
   telemetry_budget: [
@@ -2007,6 +2067,19 @@ const HEALTH_REQUIRED_INDEXES = {
     table: 'purchases', unique: false, columns: ['issued_at'],
     ddl: 'createindexidx_purchases_issuedonpurchases(issued_at)'
   },
+  idx_purchases_telegram: {
+    table: 'purchases', unique: false, columns: ['telegram_user_id'],
+    ddl: 'createindexidx_purchases_telegramonpurchases(telegram_user_id)'
+  },
+  idx_license_telegram_links_user: {
+    table: 'license_telegram_links', unique: false, columns: ['telegram_user_id'],
+    ddl: 'createindexidx_license_telegram_links_useronlicense_telegram_links(telegram_user_id)'
+  },
+  idx_subscription_notifications_due: {
+    table: 'subscription_notifications', unique: false,
+    columns: ['sent_at', 'cancelled_at', 'next_attempt_at', 'lease_until'],
+    ddl: 'createindexidx_subscription_notifications_dueonsubscription_notifications(sent_at,cancelled_at,next_attempt_at,lease_until)'
+  },
   idx_telegram_updates_claimed: {
     table: 'telegram_updates', unique: false, columns: ['claimed_at'],
     ddl: 'createindexidx_telegram_updates_claimedontelegram_updates(claimed_at)'
@@ -2030,6 +2103,13 @@ const HEALTH_REQUIRED_UNIQUE_CONSTRAINTS = [{
   label: 'payment_issuance.UNIQUE(license_key)',
   table: 'payment_issuance',
   columns: ['license_key'],
+  origin: 'u'
+}, {
+  // The send-once guarantee for every subscription reminder. Without the
+  // constraint a retry that lost its completion write mails the buyer twice.
+  label: 'subscription_notifications.UNIQUE(license_key, stage)',
+  table: 'subscription_notifications',
+  columns: ['license_key', 'stage'],
   origin: 'u'
 }];
 function tableColumnSignature(columns) {
@@ -2108,7 +2188,8 @@ async function handleAdminHealth(request, env) {
     refund_poll_stalled: null,
     referral_unsettled: null,
     referral_legacy_unjournaled: null,
-    support_forward_exhausted: null
+    support_forward_exhausted: null,
+    subscription_notify_exhausted: null
   };
 
   try {
@@ -2243,70 +2324,7 @@ async function handleAdminHealth(request, env) {
     }
     if (checks.schema) {
       try {
-        const [
-          exhausted, review, reconciliationErrors, refundUnknown, refundStalled,
-          referralUnsettled, referralLegacy, supportExhausted
-        ] = await Promise.all([
-          env.DB.prepare(
-            'SELECT COUNT(*) AS n FROM delivery_outbox WHERE delivered_at IS NULL AND attempts >= ?1'
-          ).bind(DELIVERY_MAX_ATTEMPTS).first(),
-          env.DB.prepare(
-            'SELECT COUNT(*) AS n FROM payment_review WHERE resolved_at IS NULL'
-          ).first(),
-          // Last-attempt provider/signature errors remain fail-closed and
-          // retryable. Surface them so a bad merchant credential or a lasting
-          // Robokassa outage cannot become an invisible ten-minute loop.
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM payment_orders AS orders
-             WHERE orders.environment = 'production' AND orders.status = 'pending'
-               AND orders.reconciled_at IS NOT NULL
-               AND EXISTS (
-                 SELECT 1 FROM payment_events AS failed
-                 WHERE failed.gateway = 'robokassa'
-                   AND failed.payment_id = CAST(orders.order_id AS TEXT)
-                   AND failed.event_type = 'reconciliation_provider_error'
-                   AND failed.created_at >= orders.reconciled_at
-               )`
-          ).first(),
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM payment_orders
-             WHERE status = 'refund_pending' AND refund_request_id IS NULL`
-          ).first(),
-          // A refund whose provider poll keeps failing now backs off instead of
-          // blocking the queue, which is correct but silent. Surface the ones
-          // that have backed off repeatedly so a permanently stuck refund is
-          // operator work rather than an invisible retry loop.
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM payment_refund_poll p
-             JOIN payment_orders o ON o.order_id = p.order_id
-             WHERE o.status = 'refund_pending' AND o.refund_status = 'processing'
-               AND p.attempts >= ?1`
-          ).bind(REFUND_POLL_STALLED_ATTEMPTS).first(),
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM referral_credit_state
-             WHERE status = 'pending'
-                OR (status = 'applied' AND materialized_at IS NULL)
-                OR (status = 'cancelled' AND target_kind = 'reversal' AND materialized_at IS NULL)`
-          ).first(),
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM referral_credits c
-             WHERE NOT EXISTS (
-               SELECT 1 FROM referral_credit_state s WHERE s.license_key = c.license_key
-             )`
-          ).first(),
-          env.DB.prepare(
-            `SELECT COUNT(*) AS n FROM support_forward_outbox
-             WHERE forwarded_at IS NULL AND attempts >= ?1`
-          ).bind(SUPPORT_FORWARD_MAX_ATTEMPTS).first()
-        ]);
-        worklists.delivery_exhausted = Number(exhausted?.n) || 0;
-        worklists.payment_review_open = Number(review?.n) || 0;
-        worklists.payment_reconciliation_errors = Number(reconciliationErrors?.n) || 0;
-        worklists.refund_submission_unknown = Number(refundUnknown?.n) || 0;
-        worklists.refund_poll_stalled = Number(refundStalled?.n) || 0;
-        worklists.referral_unsettled = Number(referralUnsettled?.n) || 0;
-        worklists.referral_legacy_unjournaled = Number(referralLegacy?.n) || 0;
-        worklists.support_forward_exhausted = Number(supportExhausted?.n) || 0;
+        Object.assign(worklists, await analytics.collectWorklists(env, WORKLIST_THRESHOLDS));
         checks.worklists = true;
       } catch (e) {
         console.error('health: worklist probe failed', safeErrorText(e, env));

@@ -20,6 +20,7 @@ import {
   validateRequestFileBudget
 } from '../lib/upload-limits.js';
 import { awaitStablePendingRead } from '../lib/pending-read.js';
+import { lessonKeyFor } from '../lib/lesson-key.js';
 import { principalBindingMatches } from '../lib/principal-binding.js';
 
 // Tiny "which AI model will answer" tag next to the theme switch. In the
@@ -71,11 +72,12 @@ const weekEl = document.getElementById('week');
 const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
 
 // key -> { key, day, subject, task, homeworkId, homeworkItemId, rowToken,
-//          sessionId, history, started, pending, pendingOwner, thinkingOwner }
+//          lessonKey, sessionId, history, started, pending, pendingOwner,
+//          thinkingOwner, restoredCount }
 const chats = new Map();
 let activeKey = null;
 let answerMode = 'brief'; // 'brief' (concise, keeps steps) | 'explain' (tutor)
-let solveEngine = 'auto'; // 'auto' (DeepSeek, fast) | 'think' (Qwen, reasons longer)
+let solveEngine = 'auto'; // owner-controlled Auto route | Think (Qwen)
 let weekDataError = '';
 // Must match service-worker.js MAX_HISTORY_MESSAGES. The dashboard retains the
 // full conversation for local rendering, but only this completed tail is ever
@@ -259,7 +261,7 @@ function thinkingBubble(opts) {
   const d = document.createElement('div');
   d.className = 'msg assistant thinking';
   chatEl.appendChild(d); // append BEFORE animating so the ticker sees it connected
-  d.__ticker = startThinking(d, opts);
+  d.__ticker = startThinking(d, { longNotice: true, ...opts });
   chatEl.scrollTop = chatEl.scrollHeight;
   return d;
 }
@@ -312,6 +314,32 @@ function releaseChatOperation(chat, owner) {
   return true;
 }
 
+/**
+ * Header shown above a lesson replayed from local history instead of solved
+ * again. It exists so an instant answer never reads as a glitch, and so the
+ * student always has a way back to a fresh solve. «Решить заново» is offered
+ * only while the replayed conversation is untouched — once follow-ups have been
+ * asked, wiping the chat would throw away work the student did in this tab.
+ */
+function restoredBarEl(chat) {
+  const bar = document.createElement('div');
+  bar.className = 'restoredbar';
+  const note = document.createElement('span');
+  note.className = 'rb-note';
+  note.innerHTML = `${iconSvg('clock', 13)}<span>Ответ из вашей истории — ИИ не запрашивался заново.</span>`;
+  bar.appendChild(note);
+  if (chat.history.length === chat.restoredCount) {
+    const again = document.createElement('button');
+    again.className = 'rb-again';
+    again.type = 'button';
+    again.textContent = 'Решить заново';
+    again.title = 'Забыть сохранённый ответ и решить это задание с нуля';
+    again.onclick = () => solveLessonAgain(chat);
+    bar.appendChild(again);
+  }
+  return bar;
+}
+
 /** Re-render the whole chat from a lesson's stored history (no animation). */
 function renderChat(chat) {
   // A pending chat can have an older ticker whose element was detached by a
@@ -323,6 +351,7 @@ function renderChat(chat) {
     chatEl.innerHTML = '<p class="hintmsg">Выберите урок слева, чтобы получить решение.</p>';
     return;
   }
+  if (chat.restoredCount) chatEl.appendChild(restoredBarEl(chat));
   const card = gdzCardEl(chat); // GDZ answers sit above the chat
   if (card) chatEl.appendChild(card);
   chat.history.forEach((m, i) => {
@@ -733,7 +762,10 @@ function runSolveAttempt(chat, task, files, history, owner = Symbol('solve')) {
     try {
       port.postMessage({
         type: 'SOLVE',
-        payload: { subject: chat.subject, task, files, sessionId: chat.sessionId, history, mode: answerMode, engine: solveEngine }
+        payload: {
+          subject: chat.subject, task, files, sessionId: chat.sessionId, history,
+          mode: answerMode, engine: solveEngine, lessonKey: chat.lessonKey || ''
+        }
       });
     } catch (error) {
       finish(`Ошибка: ${error?.message || 'не удалось отправить запрос'}`, { isError: true });
@@ -785,21 +817,88 @@ function retryLastTurn(chat) {
 }
 
 /**
+ * The stored conversation for this exact homework row, or null. One message to
+ * the worker, which owns the history store; a failure here is never fatal, it
+ * just means the lesson is solved normally.
+ */
+async function storedLesson(chat) {
+  if (!chat.lessonKey) return null;
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: 'LESSON_HISTORY',
+      payload: { lessonKey: chat.lessonKey }
+    });
+    const session = response?.ok ? response.session : null;
+    return session?.messages?.length ? session : null;
+  } catch { return null; }
+}
+
+/**
+ * Drop a replayed answer and solve this lesson from scratch («Решить заново»).
+ * The old session stays in Settings' history; the fresh solve simply becomes
+ * the newer one this row replays next time.
+ */
+function solveLessonAgain(chat) {
+  if (chat.pending) return;
+  chat.history = [];
+  chat.sessionId = null;
+  chat.restoredCount = 0;
+  chat.gdz = null;
+  chat.started = false;
+  if (activeKey === chat.key) renderChat(chat);
+  renderSidebar();
+  void startLesson(chat, { reuse: false });
+}
+
+/**
  * First open of a lesson: send the task as-is. The subject prompt from
  * Settings is applied as the SYSTEM prompt by the service worker — sending
  * it here too would duplicate it and break the bare-"Упр. N" photo guard.
  * If the popup attached a file for this lesson, include it.
+ *
+ * Before any of that: if this row was already solved on this device, replay
+ * that conversation. It is the same task text for the same student, so paying
+ * for the answer a second time buys nothing — and the replayed chat keeps its
+ * session id, so follow-ups continue the same conversation.
+ *
+ * Reuse is skipped when the launch carries files for THIS row. The lesson key
+ * is built from the task text, not from attachments, so a stored answer can
+ * predate the photo or PDF the student just attached — and replaying it would
+ * silently throw that material away. Attaching a file is an explicit ask to
+ * solve with it.
  */
-async function startLesson(chat) {
+async function startLesson(chat, { reuse = true } = {}) {
   chat.started = true;
   const owner = Symbol('startup');
   if (!beginChatOperation(chat, owner)) {
     chat.started = false;
     return false;
   }
+
   // The files were consumed together with this dashboard's one-time launch.
   // Keep the row-token check as a defense-in-depth ownership boundary.
   const files = sameMeshRow(launchPayload, chat) ? initialFiles : [];
+
+  if (reuse && !files.length) {
+    const stored = await storedLesson(chat);
+    // A lesson switch or a composer send may have taken the chat while the
+    // lookup was in flight; only this operation may still write to it.
+    if (!ownsChatOperation(chat, owner)) return false;
+    if (stored) {
+      chat.sessionId = stored.sessionId;
+      chat.history = stored.messages.map((message) => ({
+        role: message.role,
+        content: message.content
+      }));
+      chat.restoredCount = chat.history.length;
+      stopThinking(chat, owner);
+      releaseChatOperation(chat, owner);
+      if (activeKey === chat.key) renderChat(chat);
+      renderSidebar();
+      return true;
+    }
+  }
+
   if (files.length) initialFiles = [];
 
   // Ready GDZ answers are free (no API), shown as a card above the chat. The
@@ -810,7 +909,7 @@ async function startLesson(chat) {
   // can still ask follow-ups in the composer.
   if (activeKey === chat.key) {
     stopThinking(chat);
-    chat.thinkingEl = thinkingBubble({ words: ['Ищу готовые ответы'] });
+    chat.thinkingEl = thinkingBubble({ words: ['Ищу готовые ответы'], longNotice: false });
     chat.thinkingOwner = owner;
   }
   renderSidebar();
@@ -1448,8 +1547,8 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
 
 /* ---------- Engine toggle (Авто / Думать) ---------- */
 
-// Which model solves: «Авто» answers fast (DeepSeek, low reasoning effort),
-// «Думать» reasons at length (Qwen thinks by default). Applies to the NEXT
+// Which route solves: «Авто» uses the live owner-controlled model (Qwen 3.7
+// Plus by default); «Думать» uses Qwen. Applies to the NEXT
 // send — an in-flight solve keeps the engine it started with.
 const engineSeg = document.getElementById('engineSeg');
 function markEngine(engine) {
@@ -1524,8 +1623,19 @@ const WEEK_SCAN_MAX_AGE_MS = 15 * 60 * 1000;
           homeworkItemId: item.homeworkItemId || '',
           rowToken: item.rowToken || '',
           scanId: cacheScanId || '',
+          // Scan-independent identity for the answer-reuse lookup. rowToken is
+          // minted fresh by every scan, so it can only separate rows inside
+          // this tab — see lib/lesson-key.js.
+          lessonKey: lessonKeyFor({
+            principal: cachePrincipal,
+            day: group.day,
+            subject: item.subject,
+            task: item.task,
+            homeworkId: item.homeworkId,
+            homeworkItemId: item.homeworkItemId,
+          }),
           sessionId: null, history: [], started: false, pending: false,
-          pendingOwner: null, thinkingOwner: null
+          pendingOwner: null, thinkingOwner: null, restoredCount: 0
         });
       }
     }

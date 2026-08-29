@@ -351,7 +351,7 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
   // fetch() throws on a non-Latin-1 header value (so no Cyrillic in X-Title).
   const headers = {
     Authorization: `Bearer ${key}`,
-    'HTTP-Referer': 'https://www.smeshai.xyz',
+    'HTTP-Referer': 'https://smeshai.xyz',
     'X-Title': 'SMESH AI'
   };
 

@@ -537,7 +537,7 @@ function oneActiveSignal(values, source) {
     return {
       id: null,
       source,
-      error: 'Не удалось однозначно определить активного ученика. Переключитесь на нужный профиль в дневнике МЭШ и обновите страницу.'
+      error: 'Не удалось однозначно определить активного ученика. Переключитесь на нужный профиль в электронном дневнике и обновите страницу.'
     };
   }
   return null;
@@ -702,11 +702,11 @@ function currentHomeworkPrincipal() {
         principal: null,
         error: state === 'ambiguous'
           ? 'Не удалось однозначно определить активного ученика.'
-          : 'Не удалось подтвердить выбранного ученика в дневнике МЭШ.'
+          : 'Не удалось подтвердить выбранного ученика в электронном дневнике.'
       };
     }
   } catch {
-    return { principal: null, error: 'Не удалось проверить аккаунт МЭШ.' };
+    return { principal: null, error: 'Не удалось проверить аккаунт дневника.' };
   }
   return { principal, error: null };
 }
@@ -787,7 +787,7 @@ async function resolveStudentId(headers) {
     return {
       id: null,
       source: 'ambiguous_profiles',
-      error: 'В аккаунте несколько учеников, а активный профиль дневника не определён. Выберите нужного ученика в МЭШ, обновите страницу и повторите.',
+      error: 'В аккаунте несколько учеников, а активный профиль дневника не определён. Выберите нужного ученика в дневнике, обновите страницу и повторите.',
       debug: tried
     };
   }
@@ -1487,7 +1487,7 @@ function scanHomeworks() {
     result.principalError = binding.error ? String(binding.error).slice(0, 1024) : null;
   } catch {
     result.principal = null;
-    result.principalError = 'Не удалось проверить аккаунт МЭШ.';
+    result.principalError = 'Не удалось проверить аккаунт дневника.';
   }
   return result;
 }
@@ -3657,6 +3657,88 @@ function stableSignatureResourceSemantics(root) {
   return { value: tokens.join(';'), safe };
 }
 
+// Provider routing signal for test pages. This is deliberately visual rather
+// than tag-only: Mesh uses many tiny SVG icons in its shell, and treating any
+// <svg> as a graph would send every text-only test to Qwen. A visible,
+// substantial raster/vector/canvas/media surface (or an explicitly labelled
+// graph/diagram) is enough. Large answer-input canvases are excluded because
+// they contain handwriting controls, not question material.
+const TEST_VISUAL_MEDIA_SELECTOR = [
+  'img', 'picture', 'svg', 'canvas', 'video', 'audio', 'object[data]',
+  'embed[src]', '[role="img"]'
+].join(', ');
+const TEST_VISUAL_LABEL_RE = /(?:график|диаграмм|схем|рисунок|изображени|иллюстрац|карт[ауы]|черт[её]ж|graph|chart|diagram|image|illustration|map)/iu;
+
+function testVisualMediaRect(element) {
+  let rect;
+  try { rect = element.getBoundingClientRect(); } catch { return null; }
+  const width = Math.max(0, Number(rect?.width) || 0);
+  const height = Math.max(0, Number(rect?.height) || 0);
+  if (!width || !height) return null;
+  const viewportWidth = Math.max(0,
+    Number(typeof innerWidth === 'number' ? innerWidth : 0) ||
+    Number(document.documentElement?.clientWidth) || 0);
+  const viewportHeight = Math.max(0,
+    Number(typeof innerHeight === 'number' ? innerHeight : 0) ||
+    Number(document.documentElement?.clientHeight) || 0);
+  if (viewportWidth && viewportHeight &&
+      (rect.right <= 0 || rect.bottom <= 0 || rect.left >= viewportWidth || rect.top >= viewportHeight)) {
+    return null;
+  }
+  return { width, height };
+}
+
+function isTestAnswerMediaWidget(element) {
+  const attr = (name) => {
+    try { return String(element.getAttribute?.(name) || ''); } catch { return ''; }
+  };
+  try {
+    if (element.closest?.(SIGNATURE_MUTABLE_ANSWER_SELECTOR)) return true;
+  } catch { /* detached/test element */ }
+  return /(?:myscript|mathquill|mathfield|answer|input|signature)/i.test(
+    `${attr('class')} ${attr('id')} ${attr('data-testid')} ${attr('data-test')}`
+  );
+}
+
+function isSubstantialTestVisual(element, style = null) {
+  if (signatureElementIsVisuallyHidden(element, style) || isTestAnswerMediaWidget(element)) return false;
+  const rect = testVisualMediaRect(element);
+  if (!rect) return false;
+  const attr = (name) => {
+    try { return String(element.getAttribute?.(name) || ''); } catch { return ''; }
+  };
+  const label = [attr('alt'), attr('title'), attr('aria-label')].join(' ');
+  if (TEST_VISUAL_LABEL_RE.test(label) && rect.width >= 24 && rect.height >= 24) return true;
+  const tag = String(element.tagName || '').toLowerCase();
+  if (tag === 'audio') return true;
+  return Math.min(rect.width, rect.height) >= 36 && rect.width * rect.height >= 3000;
+}
+
+function testPageHasVisualMedia() {
+  let media = [];
+  let all = [];
+  try {
+    media = Array.from(document.querySelectorAll(TEST_VISUAL_MEDIA_SELECTOR));
+    all = Array.from(document.querySelectorAll('*')).slice(0, SIGNATURE_ELEMENT_SCAN_LIMIT);
+  } catch { return false; }
+  for (const element of media) {
+    let style = null;
+    try { style = getComputedStyle(element); } catch { /* detached/test element */ }
+    if (isSubstantialTestVisual(element, style)) return true;
+  }
+  // Some Mesh questions are drawn as CSS background images rather than media
+  // elements. Scan within the same fixed element budget used by page identity.
+  for (const element of all) {
+    let style = null;
+    try { style = getComputedStyle(element); } catch { continue; }
+    // Gradients and other decorative CSS paint are not question media. Only a
+    // real referenced image is useful input for the vision model.
+    if (!/url\s*\(/i.test(style?.backgroundImage || '')) continue;
+    if (isSubstantialTestVisual(element, style)) return true;
+  }
+  return false;
+}
+
 function stableSignatureControlSemantics(unit) {
   const labels = (unit.inputs || []).map((input) => {
     const label = unit.type === 'text' ? fieldLabel(input) : controlLabelText(input);
@@ -3771,6 +3853,7 @@ function clickDiscoveredPagination(expectedSignature = '', expectedPrincipal = '
   return { status: activatePaginationControl(nextEl) ? 'clicked' : 'none' };
 }
 
+window.__smeshHasVisualMedia = testPageHasVisualMedia;
 window.__smeshPageSig = pageSignature;
 window.__smeshCurrentPrincipal = currentPrincipalIdentity;
 window.__smeshNextDiscovery = discoverPagination;

@@ -13,7 +13,9 @@
  */
 
 import { BACKEND_URL } from './config.js';
-import { getLicenseStatus } from './license.js';
+import {
+  getLicenseStatus, isUsableLicenseStatus, licenseUsabilityReason, reasonMessage
+} from './license.js';
 import { getDeviceId } from './history.js';
 import { fetchBounded } from './bounded-fetch.js';
 
@@ -47,11 +49,11 @@ const isBackendUrl = (url) => {
  * @throws {Error} with a ready Russian sentence — callers surface it directly
  */
 export async function gdzProxyFetch(kind, url) {
-  // Only require that a key has been ENTERED; the server re-verifies and its
-  // verdict comes back as a finished message. Mirrors askViaProxy: a stale
-  // local cache must not block a user whose license is actually fine.
   const status = await getLicenseStatus();
   if (!status?.key) throw new Error(NEED_LICENSE);
+  if (!isUsableLicenseStatus(status)) {
+    throw new Error(reasonMessage(licenseUsabilityReason(status)));
+  }
   const deviceId = await getDeviceId();
 
   const { res, bytes } = await fetchBounded(ENDPOINT, {

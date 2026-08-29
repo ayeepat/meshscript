@@ -1,7 +1,7 @@
 /**
  * Dashboard engine toggle regression — the «Авто» / «Думать» segment must
  * actually decide which model answers a dashboard solve:
- *   - «Авто»   → DeepSeek at LOW reasoning effort (fastest, cheapest);
+ *   - «Авто»   → the live Auto route (Qwen 3.7 Plus by default);
  *   - «Думать» → Qwen (reasons by default; no effort knob to downgrade).
  * The toggle is DASHBOARD-ONLY: it rides the SOLVE port payload through the
  * validated privileged boundary and must never leak into popup / pill flows.
@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const store = {
-  aiConsent: { accepted: true, version: 2, at: new Date().toISOString() }
+  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
 };
 
 function pick(keys) {
@@ -77,9 +77,9 @@ await expectProxyPath('engine auto → deepseek override', () =>
 await expectProxyPath('engine think → qwen override', () =>
   askAI('system', 'user', [], [], { provider: 'qwen' })
 );
-// «Авто» with a photo attached: DeepSeek has no vision, so askAI must upgrade
-// the request to Qwen (same key/proxy) — still never OpenRouter.
-await expectProxyPath('engine auto + image upgrades to qwen', () =>
+// «Авто» with a photo stays on the multimodal licensed Auto route. Hidden BYO
+// DeepSeek is covered separately by ai-provider-regression.
+await expectProxyPath('engine auto + image stays on licensed auto', () =>
   askAI('system', 'user', [{ mimeType: 'image/png', dataBase64: 'aGk=', name: 'photo.png' }], [],
     { provider: 'deepseek' })
 );
@@ -192,6 +192,9 @@ assert.deepEqual((await postedSolve('auto')).payload, {
   history: [],
   mode: 'brief',
   engine: 'auto',
+  // The lesson's answer-reuse key rides every solve so the stored session can
+  // be found again (empty here — this fixture chat has no Mesh row identity).
+  lessonKey: '',
 });
 assert.equal((await postedSolve('think')).payload.engine, 'think');
 
@@ -237,7 +240,7 @@ assert.equal((await postedSolve('think')).payload.engine, 'think');
     JSON.parse(JSON.stringify(context.__effort({
       engineProvider: 'deepseek', files: [{}], history: [], task: 'hard', provider: 'deepseek',
     }))),
-    { lowEffortReason: 'engine_auto', reasoning: { effort: 'low' } }
+    { lowEffortReason: null }
   );
   assert.deepEqual(
     JSON.parse(JSON.stringify(context.__effort({

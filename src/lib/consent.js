@@ -1,16 +1,24 @@
 /**
- * One-time data-processing consent.
+ * One-time acceptance of the terms of use and the privacy policy.
  *
  * This tool sends homework content — task text, page screenshots and the files
- * the user attaches (or that we auto-pull from Mesh) — to third-party AI
+ * the user attaches (or that we auto-pull from the diary) — to third-party AI
  * providers (OpenRouter, Groq, Qwen/Alibaba Model Studio, DeepSeek — the last
- * two also via the licensed СМЭШ proxy at ai.smeshapi.site) to get an answer.
- * The same consent covers the auxiliary AI feature that rides the same data:
- * audio transcription of listening tasks (Groq Whisper). Anonymous usage statistics
- * are a SEPARATE, additional opt-in (`telemetryEnabled`, see telemetry.js) —
- * consent alone never turns them on. Because the audience is schoolchildren,
- * all of that has to be disclosed plainly and accepted EXPLICITLY before the
- * first AI call, not buried in a footer link.
+ * two also via the licensed СМЭШ proxy at ai.smeshapi.site) to get an answer,
+ * plus audio transcription of listening tasks (Groq Whisper). Since v3 it ALSO
+ * covers usage statistics: the separate «Анонимная статистика» checkbox was
+ * removed at the owner's request, so accepting here writes `telemetryEnabled`
+ * too. What is actually sent is described in the linked terms and privacy
+ * policy rather than in the checkbox itself.
+ *
+ * ⚠️ The in-product surface therefore no longer discloses the data flows —
+ * only the linked documents do. Those documents are now load-bearing: if
+ * smeshai.xyz/terms and /privacy do not describe the AI recipients AND the
+ * usage statistics, nothing in the product does, and Chrome Web Store review
+ * treats undisclosed analytics as a User Data Policy violation.
+ *
+ * telemetry.js still enforces BOTH flags at flush time, so Settings →
+ * «Удалить статистику и отключить сбор» remains a working opt-out.
  *
  * The record is stored in chrome.storage.local so it syncs nowhere and never
  * leaves the device. Bumping CONSENT_VERSION re-prompts everyone (use it if the
@@ -53,7 +61,11 @@ try {
 // NOT bumped when remote task classification was removed: dropping a data flow
 // leaves the accepted disclosure broader than what actually happens, so the
 // existing consent still covers it and nobody needs to re-accept.
-export const CONSENT_VERSION = 2;
+// v3 (2026-08): the statistics checkbox was folded into this one acceptance.
+// That ADDS a data flow to what a single tick authorizes, so it must re-prompt
+// — silently turning statistics on for someone who deliberately left the old
+// checkbox unticked is exactly what a version bump exists to prevent.
+export const CONSENT_VERSION = 3;
 
 // Surfaced verbatim by the service-worker backstop when an AI call is attempted
 // without consent (the popup onboarding normally collects it long before this).
@@ -93,10 +105,17 @@ export async function consentNetworkSignal(callerSignal = null) {
   return combined.signal;
 }
 
-/** Record (or withdraw) consent for the current version. */
+/**
+ * Record (or withdraw) acceptance for the current version.
+ *
+ * Statistics ride along: there is no separate checkbox any more, so the single
+ * tick is what turns `telemetryEnabled` on, and withdrawing turns it off.
+ * Written in the same call so the two can never disagree — telemetry.js reads
+ * both and refuses to send unless both are true.
+ */
 export async function setConsent(accepted) {
   const rec = { accepted: !!accepted, version: CONSENT_VERSION, at: new Date().toISOString() };
-  await chrome.storage.local.set({ [KEY]: rec });
+  await chrome.storage.local.set({ [KEY]: rec, telemetryEnabled: !!accepted });
   updateConsentAbortState(rec);
   return rec;
 }

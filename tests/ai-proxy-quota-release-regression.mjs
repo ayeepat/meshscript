@@ -146,7 +146,38 @@ const realFetch = globalThis.fetch;
 let licenseSeq = 0;
 const nextLicense = () => `${LICENSE}-${++licenseSeq}`;
 
-/* ---- emergency Auto route also uses GLM with forced maximum thinking ---- */
+/* -- emergency Auto route mirrors the VPS: Qwen 3.7 Plus, no effort knob -- */
+// Qwen thinks by default and has no OpenAI-style effort levels, so the low
+// hint an installed client sends with a test solve must be DROPPED here —
+// forwarding it risks a -10003 parameter error, and GLM's thinking/max pair
+// belongs to a different vendor entirely.
+{
+  const db = new QuotaD1(5, 10);
+  const key = nextLicense();
+  let upstreamBody = null;
+  globalThis.fetch = async (_url, options) => {
+    upstreamBody = JSON.parse(options.body);
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+  };
+  try {
+    const response = await handleAiChat(
+      chatRequest(key, 'deepseek', { reasoning_effort: 'low', response_format: 'json_object' }),
+      environment(db, key)
+    );
+    assert.equal(response.status, 200);
+  } finally { globalThis.fetch = realFetch; }
+
+  assert.equal(upstreamBody.model, 'qwen3.7-plus');
+  assert.equal(upstreamBody.reasoning_effort, undefined);
+  assert.equal(upstreamBody.thinking, undefined);
+  assert.deepEqual(upstreamBody.response_format, { type: 'json_object' },
+    'a text test solve keeps JSON mode');
+}
+
+/* ---- GLM stays selectable, and keeps its forced maximum thinking ---- */
 {
   const db = new QuotaD1(5, 10);
   const key = nextLicense();
@@ -161,7 +192,7 @@ const nextLicense = () => `${LICENSE}-${++licenseSeq}`;
   try {
     const response = await handleAiChat(
       chatRequest(key, 'deepseek', { reasoning_effort: 'low' }),
-      environment(db, key)
+      environment(db, key, { PROXY_AUTO_MODEL: 'glm-5.3-flash' })
     );
     assert.equal(response.status, 200);
   } finally { globalThis.fetch = realFetch; }

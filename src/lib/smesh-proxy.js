@@ -1,6 +1,6 @@
 /**
- * Client for the СМЭШ AI proxy (ai.smeshapi.site, the AWS box) — Qwen and
- * DeepSeek for licensed users WITHOUT their own Alibaba key. The СМЭШ license
+ * Client for the СМЭШ AI proxy (ai.smeshapi.site) — stable Think (`qwen`) and
+ * Auto (`deepseek`, legacy id) routes for licensed users. The СМЭШ license
  * key + device id are the credentials; the server holds the real API key,
  * re-verifies the license per request and enforces daily quotas server-side
  * (the caps in rate-limit.js remain as client UX; the server is
@@ -50,7 +50,9 @@ import { hasConsent } from './consent.js';
 
 import { createSseSink, readResponseTextBounded } from './http.js';
 import { AI_BACKEND_URL } from './config.js';
-import { getLicenseStatus } from './license.js';
+import {
+  getLicenseStatus, isUsableLicenseStatus, licenseUsabilityReason, reasonMessage
+} from './license.js';
 import { getDeviceId } from './history.js';
 import { validateProxyMessagesBudget } from './upload-limits.js';
 
@@ -401,15 +403,19 @@ async function createUploadTicket(licenseKey, deviceId, activationToken, size, s
 }
 
 export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, signal = null, responseFormat = null, reasoning = null } = {}) {
-  // Only require that a key has been ENTERED — the server re-verifies anyway,
-  // and its verdict (expired/revoked/…) comes back as a ready Russian message.
-  // A stale local cache must not block a user whose license is actually fine.
+  // The proxy requires both the public key and the per-installation bearer
+  // capability. Keep this defensive check even though normal callers already
+  // pass through ensureLicensed(): no direct caller may emit an unauthenticated
+  // paid request while the UI claims the installation is active.
   const status = await getLicenseStatus();
   if (!status?.key) {
     throw new Error(
       'Расширение работает по лицензии СМЭШ. ' +
       'Введите ключ доступа (SMESH-…) в настройках расширения.'
     );
+  }
+  if (!isUsableLicenseStatus(status)) {
+    throw new Error(reasonMessage(licenseUsabilityReason(status)));
   }
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
@@ -440,8 +446,9 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   };
   if (responseFormat) body.response_format = responseFormat;
   // OpenRouter-style {effort} → the flat reasoning_effort field the proxy
-  // whitelists (it forwards it only where the model has a real effort knob —
-  // DeepSeek; Qwen thinks by default and has none).
+  // whitelists. The VPS applies the final policy per actual live model (for
+  // example, Qwen thinks by default and is sent no effort at all, while
+  // GLM-5.3-Flash is forced to thinking=max).
   if (reasoning?.effort) body.reasoning_effort = reasoning.effort;
 
   // The WHOLE /ai/start body must fit under the per-connection allowance —

@@ -173,7 +173,7 @@ function deferred() {
   const consentSource = sourceSection(
     settingsSource,
     'let consentUiGeneration =',
-    '/* ---------- Privacy: statistics'
+    '/* ---------- Privacy: data deletion'
   );
   const consentRead = deferred();
   const consentToggle = { id: 'consentToggle', checked: true, onchange: null };
@@ -253,38 +253,29 @@ function deferred() {
   assert.deepEqual(rendered, [], 'a late license snapshot must not repaint status after key editing');
 }
 
+// Statistics no longer have a checkbox to go stale against — they ride the one
+// consent tick — but «Удалить статистику» still writes the flag through this
+// queue, and an older write must never land after a newer one.
 {
   const privacySource = sourceSection(
     settingsSource,
-    'let telemetryUiGeneration =',
+    'let telemetryWriteQueue =',
     '\nfunction privacyFlash'
   );
-  const privacyRead = deferred();
-  const telemetryToggle = { id: 'telemetryToggle', checked: true };
-  const touchedControls = new Set(['telemetryToggle']);
   const writes = [];
   const context = {
-    touchedControls,
     chrome: { storage: { local: {
-      get: () => privacyRead.promise,
       set(value) { writes.push(value.telemetryEnabled); return Promise.resolve(); }
-    } } },
-    setCheckedUnlessTouched(id, checked) {
-      if (!touchedControls.has(id)) telemetryToggle.checked = !!checked;
-    }
+    } } }
   };
   vm.runInNewContext(
-    `${privacySource}\nglobalThis.__privacyApi = { loadPrivacyUi, enqueueTelemetryPreference };`,
+    `${privacySource}\nglobalThis.__privacyApi = { setTelemetryPreference };`,
     context,
     { filename: 'settings-privacy-section.js' });
-  const loading = context.__privacyApi.loadPrivacyUi();
-  privacyRead.resolve({ telemetryEnabled: false });
-  await loading;
-  assert.equal(telemetryToggle.checked, true, 'a stale telemetry snapshot must not undo a user toggle');
-
-  const first = context.__privacyApi.enqueueTelemetryPreference(true);
-  const second = context.__privacyApi.enqueueTelemetryPreference(false);
-  await Promise.all([first.write, second.write]);
+  await Promise.all([
+    context.__privacyApi.setTelemetryPreference(true),
+    context.__privacyApi.setTelemetryPreference(false)
+  ]);
   assert.deepEqual(writes, [true, false], 'telemetry writes must persist in user-action order');
 }
 
