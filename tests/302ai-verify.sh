@@ -4,15 +4,15 @@
 # shape / stream framing and exits non-zero if anything regresses — 302.AI's
 # model catalogue, error shapes, or streaming format can all change under us.
 #
-#   1-2. qwen3.7-plus / deepseek-v4-flash — model exists, real completion
+#   1-2. qwen3.7-plus / glm-5.3-flash — model exists, real completion
 #   3.   streaming — SSE `data: {...}` frames + usage frame + [DONE]
 #        (postStream() in src/lib/http.js parses this exact shape)
-#   4.   vision — qwen3.7-plus with a REAL 64x64 data:image/png;base64 part.
+#   4.   vision — glm-5.3-flash with a REAL 64x64 data:image/png;base64 part.
 #        NOTE: a 1x1 pixel here 400s with err_code -10003 "Parameter error" —
 #        302.AI enforces a minimum image size, so a tiny placeholder image
 #        proves nothing. Do not shrink this back down.
-#   5.   JSON mode — response_format {"type":"json_object"}, text-only qwen
-#   6.   reasoning_effort passthrough — DeepSeek's documented effort knob
+#   5.   JSON mode — response_format {"type":"json_object"}, text-only GLM
+#   6.   forced thinking + max effort — the Auto quality policy
 #   7.   error shape — deliberately bogus model name, protects the
 #        isUnpurchased() regex in backend/src/ai-proxy.js from silently
 #        breaking if 302.AI ever changes their error format
@@ -82,20 +82,20 @@ assert_error() {
 
 echo "1-2. model existence"
 assert_ok "qwen3.7-plus plain completion"      '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"привет"}],"max_tokens":20}'
-assert_ok "deepseek-v4-flash plain completion" '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":20}'
+assert_ok "glm-5.3-flash plain completion"     '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"привет"}],"max_tokens":100}'
 
 echo "3. streaming + usage frame"
 assert_stream "qwen3.7-plus streaming"      '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"скажи одно слово"}],"max_tokens":20,"stream":true,"stream_options":{"include_usage":true}}'
-assert_stream "deepseek-v4-flash streaming" '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"скажи одно слово"}],"max_tokens":20,"stream":true,"stream_options":{"include_usage":true}}'
+assert_stream "glm-5.3-flash streaming"     '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"скажи одно слово"}],"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":300,"stream":true,"stream_options":{"include_usage":true}}'
 
 echo "4. vision (64x64 data: image_url part)"
-assert_ok "qwen3.7-plus vision" '{"model":"qwen3.7-plus","messages":[{"role":"user","content":[{"type":"text","text":"Какого цвета картинка? Одно слово."},{"type":"image_url","image_url":{"url":"data:image/png;base64,'"$PNG_B64"'"}}]}],"max_tokens":150}'
+assert_ok "glm-5.3-flash vision" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":[{"type":"text","text":"Какого цвета картинка? Одно слово."},{"type":"image_url","image_url":{"url":"data:image/png;base64,'"$PNG_B64"'"}}]}],"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":300}'
 
 echo "5. JSON mode (text-only)"
-assert_ok "qwen3.7-plus JSON mode" '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"Верни JSON вида {\"answer\": \"...\"} с ответом 2+2"}],"response_format":{"type":"json_object"},"max_tokens":150}'
+assert_ok "glm-5.3-flash JSON mode" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"Верни JSON вида {\"answer\": \"...\"} с ответом 2+2"}],"response_format":{"type":"json_object"},"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":300}'
 
-echo "6. reasoning_effort passthrough (DeepSeek)"
-assert_ok "deepseek-v4-flash reasoning_effort=high" '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"сколько будет 17*23?"}],"reasoning_effort":"high","max_tokens":300}'
+echo "6. GLM forced thinking at max effort"
+assert_ok "glm-5.3-flash thinking=max" '{"model":"glm-5.3-flash","messages":[{"role":"user","content":"сколько будет 17*23? Сначала проверь вычисление."}],"thinking":{"type":"enabled"},"reasoning_effort":"max","max_tokens":500}'
 
 echo "7. error shape for an unavailable model (guards isUnpurchased())"
 assert_error "bogus model name" '{"model":"smesh-definitely-not-a-model","messages":[{"role":"user","content":"hi"}],"max_tokens":5}' '"err_code":-10008'

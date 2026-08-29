@@ -1,5 +1,5 @@
 /**
- * License-gated AI proxy: Qwen + DeepSeek via 302.AI (OpenAI-compatible
+ * Retired license-gated AI proxy: stable Think + Auto routes via 302.AI
  * reseller — no Alibaba KYC needed for the key) for licensed users WITHOUT
  * their own API key. The extension sends its СМЭШ license key + device id +
  * random activation bearer as the credential; this worker holds the single AI_PROXY_API_KEY secret (a
@@ -55,13 +55,12 @@ const PROVIDERS = {
     // maps to the solver's medium/high effort semantics.
   },
   deepseek: {
-    modelDefault: 'deepseek-v4-flash',
-    modelVar: 'PROXY_DEEPSEEK_MODEL',
-    name: 'DeepSeek',
+    // Frozen route id for old extension builds; it is not the upstream vendor.
+    modelDefault: 'glm-5.3-flash',
+    modelVar: 'PROXY_AUTO_MODEL',
+    name: 'Auto',
     capVar: 'PROXY_DEEPSEEK_DAILY',
     capDefault: 150,
-    // DeepSeek V4's documented effort knob, confirmed live through 302.AI
-    // (medium → ~55 reasoning tokens, high → ~141 on the same question).
     reasoningEffort: true
   }
 };
@@ -69,6 +68,7 @@ const PROVIDERS = {
 // The only effort values the client may pick; anything else is dropped so a
 // scripted caller can't smuggle arbitrary strings into the upstream request.
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
+const GLM_53_FLASH = /^glm-5\.3-flash$/i;
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // base64 photos of worksheets fit; nothing sane exceeds this
 const MAX_MESSAGES = 60;                // system + capped history + current turn
@@ -113,15 +113,14 @@ const CORS = {
 };
 
 const UNAVAILABLE = 'ИИ-сервис временно недоступен. Попробуйте позже или переключитесь на другой провайдер в настройках.';
-const NEED_LICENSE = 'Qwen и DeepSeek работают по лицензии СМЭШ. Введите ключ доступа (SMESH-…) в настройках расширения.';
+const NEED_LICENSE = 'Модели СМЭШ работают по лицензии. Введите ключ доступа (SMESH-…) в настройках расширения.';
 const NEED_DEVICE_ID = 'Не удалось подтвердить устройство. Обновите расширение СМЭШ AI до последней версии и попробуйте снова.';
 
 // License failure → what the student should actually do. Mirrors the
-// extension's REASON_MESSAGES but phrased for the "license = access to
-// Qwen/DeepSeek" situation.
+// extension's REASON_MESSAGES but phrased for the licensed-model situation.
 const LICENSE_ERRORS = {
   not_found: 'Ключ лицензии не найден. Проверьте его в настройках расширения.',
-  expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться Qwen и DeepSeek.',
+  expired: 'Срок действия лицензии истёк. Продлите её, чтобы пользоваться моделями СМЭШ.',
   revoked: 'Эта лицензия была отозвана. Напишите в поддержку.',
   device_in_use: 'Ключ уже используется на устройстве №1. Сначала нажмите «Деактивировать ключ» на устройстве №1.',
   device_limit: 'Ключ уже используется на устройстве №1. Сначала деактивируйте его там.',
@@ -306,7 +305,10 @@ async function handleAiChatInner(request, env) {
     if (body.response_format === 'json_object') {
       upstreamBody.response_format = { type: 'json_object' };
     }
-    if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
+    if (GLM_53_FLASH.test(model)) {
+      upstreamBody.thinking = { type: 'enabled' };
+      upstreamBody.reasoning_effort = 'max';
+    } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
 

@@ -11,6 +11,7 @@ const temp = await mkdtemp(path.join(os.tmpdir(), 'smesh-model-control-'));
 const quotaFile = path.join(temp, 'quota.json');
 const modelFile = path.join(temp, 'model-config.json');
 const calls = [];
+const upstreamBodies = [];
 
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
@@ -23,6 +24,7 @@ const upstream = http.createServer(async (req, res) => {
   }
   if (req.url === '/v1/chat/completions') {
     calls.push(body.model);
+    upstreamBodies.push(body);
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
     res.end(
       `data: ${JSON.stringify({ model: body.model, choices: [{ delta: { content: 'ok' } }], usage: { prompt_tokens: 10, completion_tokens: 2 } })}\n\n` +
@@ -115,7 +117,12 @@ try {
   assert.equal(initial.status, 200);
   const initialState = await initial.json();
   assert.equal(initialState.revision, 0);
+  assert.deepEqual(initialState.config.routes.deepseek.text, ['glm-5.3-flash']);
+  assert.deepEqual(initialState.config.routes.deepseek.vision, ['glm-5.3-flash']);
+  assert.deepEqual(initialState.config.routes.qwen.vision, ['glm-5.3-flash'],
+    'old Auto clients that pre-route screenshots to qwen must still reach GLM');
   assert.equal(initialState.config.routes.standard.text[0], 'glm-5.3-flash');
+  assert.equal(initialState.config.routes.standard.vision[0], 'glm-5.3-flash');
   assert.equal(initialState.config.limits.requests_per_minute, 5);
   assert.equal(initialState.config.limits.frontier_per_license, 15);
   assert.equal(initialState.config.limits.standard_per_license, 70);
@@ -149,6 +156,7 @@ try {
     device_id: identity.deviceId || '123e4567-e89b-42d3-a456-426614174000',
     activation_token: 'a'.repeat(43),
     messages: [{ role: 'user', content: `hello ${nonce}` }],
+    reasoning_effort: 'low',
     idempotency_key: `model-control-${nonce}`
   });
   const start = async (provider, nonce, identity) => {
@@ -176,6 +184,12 @@ try {
   await start('qwen', '2');
   assert.deepEqual(calls, ['frontier-test-model', 'glm-5.3-flash'],
     'the combined frontier allowance must spill the second route into the standard chain');
+  assert.equal(upstreamBodies[0].reasoning_effort, 'low',
+    'a dashboard-selected non-GLM Auto model must retain ordinary effort passthrough');
+  assert.equal(upstreamBodies[0].thinking, undefined);
+  assert.equal(upstreamBodies[1].reasoning_effort, 'max',
+    'GLM must override low-effort requests from already-installed Auto clients');
+  assert.deepEqual(upstreamBodies[1].thinking, { type: 'enabled' });
 
   const live = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
   const hot = structuredClone(live.config);
@@ -190,6 +204,9 @@ try {
   await start('deepseek', '3');
   assert.equal(calls[2], 'step-3.5-flash',
     'the first request after a dashboard save must use the new model without a restart');
+  assert.equal(upstreamBodies[2].reasoning_effort, undefined,
+    'the GLM-only max policy must not leak into another standard model');
+  assert.equal(upstreamBodies[2].thinking, undefined);
 
   const rollbackState = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
   const rolledBack = await fetch(`${base}/admin/model-config`, {

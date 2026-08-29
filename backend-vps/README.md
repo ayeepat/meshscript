@@ -152,6 +152,14 @@ The extension sends only the stable internal routes `deepseek` (Auto) and
 model chains. A dashboard save affects every **new** request immediately; an
 in-flight job keeps the route snapshot it started with.
 
+`deepseek` is now only a compatibility id. The default Auto text and image
+chains use `glm-5.3-flash`; GLM receives `thinking: {type: "enabled"}` and
+`reasoning_effort: "max"` regardless of the low-effort hint sent by an older
+extension. The default Think vision chain also uses GLM so older builds that
+pre-route Auto screenshots to `qwen` still reach GLM. Think text remains Qwen.
+The dashboard's DeepSeek preset restores `deepseek-v4-flash` for Auto text but
+keeps GLM for images, because DeepSeek V4 is text-only.
+
 The owner dashboard calls `GET/PUT /admin/model-config` with
 `X-Model-Admin-Key`. This key is separate from `ADMIN_KEY`, `STATS_SECRET`,
 `INGEST_KEY` and `AI_PROXY_API_KEY`. It can change only:

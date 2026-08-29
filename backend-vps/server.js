@@ -187,10 +187,14 @@ const PROVIDERS = {
     reasoningEffort: false
   },
   deepseek: {
-    name: 'DeepSeek',
-    model: (env.PROXY_DEEPSEEK_MODEL || 'deepseek-v4-flash').trim(),
+    // `deepseek` is a frozen client route id, not the upstream vendor. Old
+    // Chrome builds already send it for Auto, so changing the id would strand
+    // them until a Web Store update. The dashboard remains the authority that
+    // can point this route back at DeepSeek (or any other 302.AI model).
+    name: 'Auto',
+    model: (env.PROXY_AUTO_MODEL || 'glm-5.3-flash').trim(),
     fallbacks: '',
-    visionFallbacks: '',
+    visionFallbacks: (env.PROXY_AUTO_VISION_FALLBACK_MODELS || 'glm-5.3-flash'),
     reasoningEffort: true
   }
 };
@@ -207,12 +211,10 @@ function providerById(id) {
   return typeof id === 'string' && Object.hasOwn(PROVIDERS, id) ? PROVIDERS[id] : null;
 }
 
-// PDF-capable model. Neither Qwen nor DeepSeek reads PDFs through the
-// OpenAI-compat endpoint, but 302.AI's Gemini does (verified live 2026-07-08:
-// a {type:'file'} data-URI part came back correctly read, streaming). Any
-// job that carries a PDF part is routed to THIS model chain instead of the
-// provider's own — the quota is still charged to the provider the student
-// picked.
+// PDF-capable model. Keep document parsing on the independently verified PDF
+// chain: 302.AI's Gemini accepts a {type:'file'} data-URI part and reads it in
+// streaming mode (verified live 2026-07-08). Any PDF job is routed here; its
+// quota is still charged to the stable client route the student selected.
 const PDF_MODEL = (env.PROXY_PDF_MODEL || 'gemini-2.5-flash').trim();
 // gemini-2.0-flash is gone from 302.AI (returns -10003 parameter error,
 // checked 2026-07-11); -lite verified live same day: reads a PDF file part.
@@ -240,9 +242,6 @@ function bootstrapModelConfig() {
   const qwenText = commaModels([
     PROVIDERS.qwen.model, PROVIDERS.qwen.fallbacks
   ].filter(Boolean).join(','));
-  const qwenVision = commaModels([
-    PROVIDERS.qwen.model, PROVIDERS.qwen.visionFallbacks, PROVIDERS.qwen.fallbacks
-  ].filter(Boolean).join(','));
   const deepseekText = commaModels([
     PROVIDERS.deepseek.model, PROVIDERS.deepseek.fallbacks
   ].filter(Boolean).join(','));
@@ -265,7 +264,10 @@ function bootstrapModelConfig() {
     },
     routes: {
       qwen: {
-        label: 'Think', text: qwenText, vision: qwenVision,
+        // Older extensions upgrade Auto screenshots to the `qwen` route before
+        // they reach the VPS. Keeping its vision chain on GLM moves those
+        // already-installed clients too; Think text remains Qwen.
+        label: 'Think', text: qwenText, vision: ['glm-5.3-flash'],
         reasoning_effort: PROVIDERS.qwen.reasoningEffort
       },
       deepseek: {
@@ -273,7 +275,7 @@ function bootstrapModelConfig() {
         reasoning_effort: PROVIDERS.deepseek.reasoningEffort
       },
       standard: {
-        label: 'Standard', text: ['glm-5.3-flash'], vision: ['glm-4.6v-flash'],
+        label: 'Standard', text: ['glm-5.3-flash'], vision: ['glm-5.3-flash'],
         reasoning_effort: false
       },
       pdf: {
@@ -517,6 +519,7 @@ function routeForRequest(providerId, tier, hasImages, hasPdfs, state = modelStat
 }
 
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
+const GLM_53_FLASH = /^glm-5\.3-flash$/i;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Request bodies arrive before JSON credentials can be verified. Bound that
 // anonymous pre-authentication memory separately from active AI job storage.
@@ -2402,9 +2405,16 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
       stream: true, stream_options: { include_usage: true }
     };
     if (body.response_format === 'json_object') upstreamBody.response_format = { type: 'json_object' };
-    // reasoning_effort is a DeepSeek knob; a PDF job runs on the Gemini chain
-    // instead, where the param is unverified — never send it there.
-    if (!hasPdfs && provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
+    // GLM-5.3-Flash supports forced thinking plus max/high/low effort. Existing
+    // Web Store builds send Auto as the legacy `deepseek` route with LOW
+    // effort, so merely switching the dashboard model would quietly keep GLM
+    // shallow for those users. Enforce the quality policy per ACTUAL model;
+    // dashboard switches to other models retain the ordinary passthrough.
+    // PDF jobs use the separate Gemini chain, where these fields are unverified.
+    if (!hasPdfs && GLM_53_FLASH.test(model)) {
+      upstreamBody.thinking = { type: 'enabled' };
+      upstreamBody.reasoning_effort = 'max';
+    } else if (!hasPdfs && provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
     // Serialize ONCE per model attempt, not once per retry — retries resend

@@ -126,16 +126,17 @@ function environment(db, licenseKey = LICENSE, overrides = {}) {
   };
 }
 
-function chatRequest(licenseKey = LICENSE) {
+function chatRequest(licenseKey = LICENSE, provider = 'qwen', extra = {}) {
   return new Request('https://smeshapi.site/ai/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      provider: 'qwen',
+      provider,
       license_key: licenseKey,
       device_id: DEVICE,
       activation_token: ACTIVATION_TOKEN,
-      messages: [{ role: 'user', content: 'hi' }]
+      messages: [{ role: 'user', content: 'hi' }],
+      ...extra
     })
   });
 }
@@ -144,6 +145,31 @@ const day = new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
 const realFetch = globalThis.fetch;
 let licenseSeq = 0;
 const nextLicense = () => `${LICENSE}-${++licenseSeq}`;
+
+/* ---- emergency Auto route also uses GLM with forced maximum thinking ---- */
+{
+  const db = new QuotaD1(5, 10);
+  const key = nextLicense();
+  let upstreamBody = null;
+  globalThis.fetch = async (_url, options) => {
+    upstreamBody = JSON.parse(options.body);
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+  };
+  try {
+    const response = await handleAiChat(
+      chatRequest(key, 'deepseek', { reasoning_effort: 'low' }),
+      environment(db, key)
+    );
+    assert.equal(response.status, 200);
+  } finally { globalThis.fetch = realFetch; }
+
+  assert.equal(upstreamBody.model, 'glm-5.3-flash');
+  assert.equal(upstreamBody.reasoning_effort, 'max');
+  assert.deepEqual(upstreamBody.thinking, { type: 'enabled' });
+}
 
 /* --------- a thrown upstream fetch RETAINS the charge (ambiguous) --------- */
 {
