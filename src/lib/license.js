@@ -277,6 +277,12 @@ export async function verifyKey(
       ACTIVATION_TOKEN_RE.test(result.activation_token)
       ? result.activation_token
       : '';
+    // The backend alone knows the owner credential. Preserve an earlier
+    // server-issued marker for the same key so diagnostics remain available
+    // during a later licence outage, but never accept a truthy lookalike.
+    const developerMode = (result?.ok === true && result?.developer_mode === true) || (
+      priorBeforeRequest?.key === trimmed && priorBeforeRequest?.developer_mode === true
+    );
     const status = {
       key: trimmed,
       ok: !!result.ok,
@@ -286,6 +292,7 @@ export async function verifyKey(
       checkedAt: verdictAt,
       lastVerifiedAt: verdictAt
     };
+    if (developerMode) status.developer_mode = true;
     if (status.ok && (returnedActivationToken || priorActivationToken)) {
       status.activation_token = returnedActivationToken || priorActivationToken;
     }

@@ -382,6 +382,47 @@ for (const table of HEALTH_TABLES) {
   assert.equal((await d1IngestedHealth.json()).checks.schema, true);
   d1IngestedHealthDb.close();
 
+  // The production database predates migration adoption: license_ref was
+  // appended after license_type instead of being created before it. Runtime
+  // statements name both columns, so preserve that one exact complete legacy
+  // fingerprint rather than rebuilding a live analytics table for ordering.
+  const adoptedProductionDb = new FakeD1(HEALTH_TABLES);
+  const adoptedDeviceColumns = adoptedProductionDb.columns.get('devices');
+  const licenseRefIndex = adoptedDeviceColumns.findIndex(({ name }) => name === 'license_ref');
+  const [licenseRef] = adoptedDeviceColumns.splice(licenseRefIndex, 1);
+  adoptedDeviceColumns.push(licenseRef);
+  adoptedProductionDb.tableSql.set('devices', `CREATE TABLE devices (
+    device_id TEXT PRIMARY KEY,
+    first_seen INTEGER NOT NULL, -- ms epoch
+    last_seen INTEGER NOT NULL, -- ms epoch
+    browser TEXT, -- chrome | yandex | opera | edge | firefox | other
+    ua TEXT, -- raw UA, for debugging odd browsers
+    version TEXT, -- extension version
+    provider TEXT, -- last selected AI provider
+    license_key TEXT, -- last known key on this device (may be null)
+    license_type TEXT -- lifetime | subscription | none
+    , license_ref TEXT
+  )`);
+  adoptedProductionDb.tableSql.set('payment_review', `CREATE TABLE payment_review (
+    gateway TEXT NOT NULL, payment_id TEXT NOT NULL, invoice_id TEXT,
+    amount_rub REAL, reason TEXT NOT NULL, -- no_floor_configured | below_floor | no_contact | no_plan_matched
+    fields_json TEXT, created_at INTEGER NOT NULL, -- ms epoch
+    resolved_at INTEGER, environment TEXT, amount_kopecks INTEGER,
+    resolution TEXT, resolution_note TEXT, PRIMARY KEY (gateway, payment_id)
+  )`);
+  adoptedProductionDb.tableSql.set('telemetry_budget', `CREATE TABLE telemetry_budget (
+    day TEXT NOT NULL, scope TEXT NOT NULL, -- ip | device
+    budget_key TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, scope, budget_key)
+  )`);
+  const adoptedProductionHealth = await get({
+    ...healthy,
+    DB: adoptedProductionDb
+  });
+  assert.equal(adoptedProductionHealth.status, 200,
+    'readiness must accept the exact complete schema already serving production');
+  assert.equal((await adoptedProductionHealth.json()).checks.schema, true);
+
   const malformedD1MetadataDb = new DatabaseSync(':memory:');
   malformedD1MetadataDb.exec(schemaSql.replace(/--[^\r\n]*/g, ''));
   malformedD1MetadataDb.exec(
@@ -422,6 +463,26 @@ for (const table of HEALTH_TABLES) {
   assert.equal(noIngestKey.status, 503,
     'telemetry attestation cannot operate without a strong signing secret');
   assert.equal((await noIngestKey.json()).checks.ingest_key, false);
+
+  const noStatsSecret = await get({ ...healthy, STATS_SECRET: undefined });
+  assert.equal(noStatsSecret.status, 503,
+    'readiness must not report green while the read-only operations dashboard is inaccessible');
+  assert.equal((await noStatsSecret.json()).checks.stats_secret, false);
+
+  const noPaymentFloor = await get({
+    ...healthy,
+    MIN_PAYMENT_RUB: undefined,
+    SUBSCRIPTION_MIN_RUB: undefined,
+    LIFETIME_MIN_RUB: undefined
+  });
+  assert.equal(noPaymentFloor.status, 503,
+    'readiness must not report green without the webhook payment floor');
+  assert.equal((await noPaymentFloor.json()).checks.payment_floor, false);
+
+  const malformedLegacyPlan = await get({ ...healthy, MIN_PAYMENT_RUB: ' 199' });
+  assert.equal(malformedLegacyPlan.status, 503,
+    'every named readiness check must participate in the aggregate verdict');
+  assert.equal((await malformedLegacyPlan.json()).checks.payment_plan, false);
 
   const noCheckoutCapabilitySecret = await get({
     ...healthy, CHECKOUT_CAPABILITY_SECRET: undefined
@@ -689,23 +750,53 @@ for (const table of HEALTH_TABLES) {
 /* ---- B-17: purchases list reports truncation ---- */
 {
   const db = new FakeD1(HEALTH_TABLES);
+  // The cursor is sealed under the Worker-only INGEST_KEY, so the stats env
+  // needs one exactly as production does.
+  const statsEnv = { DB: db, INGEST_KEY: 'i'.repeat(32) };
   db.purchaseRows = Array.from({ length: 501 }, (_, i) => ({
     license_key: `SMESH-${String(1000 - i).padStart(4, '0')}`,
     issued_at: 10_000 - i
   }));
-  const full = await statsPurchases({ DB: db }, { days: 0, limit: 500 });
+  const full = await statsPurchases(statsEnv, { days: 0, limit: 500 });
   assert.equal(full.truncated, true, 'a 501st row must flag the list as partial');
   assert.equal(full.purchases.length, 500);
   assert.equal(full.next_offset, 500);
 
-  const last = await statsPurchases({ DB: db }, { days: 0, limit: 500, offset: full.next_offset });
+  // The whole reason the row body masks license_key: the cursor must not hand
+  // it straight back. Plain base64 of [issued_at, license_key] let a caller set
+  // limit=1 and page out every key in the table.
+  assert.ok(full.next_cursor, 'a truncated page must still offer a keyset cursor');
+  assert.doesNotMatch(full.next_cursor, /SMESH/i, 'the cursor must not carry a licence key');
+  assert.doesNotMatch(
+    Buffer.from(full.next_cursor.split('.')[1] || '', 'base64url').toString('latin1'),
+    /SMESH/i,
+    'the cursor must not merely encode a licence key — it must be sealed'
+  );
+  const forged = await statsPurchases(statsEnv, {
+    days: 0,
+    cursor: `pc1.${Buffer.from(JSON.stringify([10_000, 'SMESH-0999'])).toString('base64url')}`
+  });
+  assert.deepEqual(
+    forged, { ok: false, reason: 'bad_cursor', status: 400 },
+    'an unsealed or tampered cursor must be refused, not trusted'
+  );
+  const suffixed = await statsPurchases(statsEnv, {
+    days: 0,
+    cursor: `${full.next_cursor}.ignored`
+  });
+  assert.deepEqual(
+    suffixed, { ok: false, reason: 'bad_cursor', status: 400 },
+    'an authenticated cursor must still have exactly one canonical spelling'
+  );
+
+  const last = await statsPurchases(statsEnv, { days: 0, limit: 500, offset: full.next_offset });
   assert.equal(last.purchases.length, 1,
     'the row beyond the first page must be retrievable, not merely disclosed');
   assert.equal(last.has_more, false);
   assert.equal(last.next_offset, null);
 
   const cursorLast = await statsPurchases(
-    { DB: db },
+    statsEnv,
     { days: 0, limit: 500, cursor: full.next_cursor }
   );
   assert.equal(cursorLast.purchases.length, 1,
@@ -714,14 +805,14 @@ for (const table of HEALTH_TABLES) {
   assert.equal(cursorLast.offset, null);
 
   const oversized = await statsPurchases(
-    { DB: db },
+    statsEnv,
     { days: 0, offset: 1_000_001 }
   );
   assert.deepEqual(oversized, { ok: false, reason: 'bad_offset', status: 400 },
     'oversized offsets must be rejected rather than clamped backward into an infinite page loop');
 
   db.purchaseRows = db.purchaseRows.slice(0, 12);
-  const small = await statsPurchases({ DB: db }, { days: 0 });
+  const small = await statsPurchases(statsEnv, { days: 0 });
   assert.equal(small.truncated, false);
   assert.equal(small.purchases.length, 12);
 }

@@ -32,12 +32,15 @@ payload = {
   type: 'lifetime',
   expires_at: null,
   activation_token: 'a'.repeat(43),
+  developer_mode: true,
   telemetry_token: goodToken,
   telemetry_token_expires_at: expiry
 };
 const valid = await verifyKey('SMESH-TOKEN-TEST-0001');
 assert.equal(valid.telemetry_token, goodToken);
 assert.equal(valid.telemetry_token_expires_at, expiry);
+assert.equal(valid.developer_mode, true,
+  'a strict server-issued owner marker must survive the client cache boundary');
 assert.equal(store.get('licenseStatus').telemetry_token, goodToken);
 
 payload = {
@@ -50,15 +53,20 @@ payload = {
 const malformed = await verifyKey('SMESH-TOKEN-TEST-0002');
 assert.equal(Object.hasOwn(malformed, 'telemetry_token'), false,
   'a new verdict must drop the previous capability instead of carrying it forward');
+assert.equal(Object.hasOwn(malformed, 'developer_mode'), false,
+  'an owner marker must never cross a licence-key transition');
 
 payload = {
   ok: true,
   type: 'lifetime',
   activation_token: 'c'.repeat(43),
+  developer_mode: 'true',
   telemetry_token: goodToken,
   telemetry_token_expires_at: Date.now() - 1
 };
 const expired = await verifyKey('SMESH-TOKEN-TEST-0003');
 assert.equal(Object.hasOwn(expired, 'telemetry_token'), false);
+assert.equal(Object.hasOwn(expired, 'developer_mode'), false,
+  'truthy response data must not impersonate the strict owner marker');
 
 console.log('license telemetry-token cache regressions passed');

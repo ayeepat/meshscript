@@ -307,18 +307,30 @@ const solveTestBody = worker.slice(
   worker.indexOf('async function solveTest('),
   worker.indexOf('async function resolveOneQuestion(')
 );
-const emptyGuard = "if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER)";
-assert.ok(solveTestBody.includes(emptyGuard), 'solveTest must reject empty/sentinel provider answers');
-assert.ok(solveTestBody.indexOf(emptyGuard) < solveTestBody.indexOf("track('test_solve'"),
+// The emptiness test and the throw are now two statements: the owner-only
+// diagnostics recorder sits between them so that an empty completion — a
+// provider failure worth inspecting — is still traced before it is rejected.
+// The invariant is unchanged: nothing may treat an empty answer as a solve.
+const emptyTest = "const empty = !answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER;";
+const emptyThrow = 'if (empty) throw new Error';
+assert.ok(solveTestBody.includes(emptyTest), 'solveTest must detect empty/sentinel provider answers');
+assert.ok(solveTestBody.includes(emptyThrow), 'solveTest must reject empty/sentinel provider answers');
+assert.ok(solveTestBody.indexOf(emptyThrow) < solveTestBody.indexOf("track('test_solve'"),
   'solveTest must reject an empty answer before recording successful solve telemetry');
+// The trace must not itself claim the failed solve succeeded.
+assert.ok(solveTestBody.includes('ok: !empty'),
+  'the diagnostics trace must record an empty completion as a failure');
 
 const resolveOneBody = worker.slice(
   worker.indexOf('async function resolveOneQuestion('),
   worker.indexOf('function normalizeParts(')
 );
-assert.ok(resolveOneBody.includes(emptyGuard), 'single-question re-solve must reject empty/sentinel answers');
-assert.ok(resolveOneBody.indexOf(emptyGuard) < resolveOneBody.indexOf("track('test_requestion'"),
+assert.ok(resolveOneBody.includes(emptyTest), 'single-question re-solve must detect empty/sentinel answers');
+assert.ok(resolveOneBody.includes(emptyThrow), 'single-question re-solve must reject empty/sentinel answers');
+assert.ok(resolveOneBody.indexOf(emptyThrow) < resolveOneBody.indexOf("track('test_requestion'"),
   'single-question re-solve must reject an empty answer before success telemetry');
+assert.ok(resolveOneBody.includes('ok: !empty'),
+  'the diagnostics trace must record an empty re-solve as a failure');
 
 assert.match(dashboard,
   /port\.onDisconnect\.addListener\(\(\) => finish\([\s\S]*?Ответ оборван — соединение прервано[\s\S]*?\{ isError: true \}\)\);/,

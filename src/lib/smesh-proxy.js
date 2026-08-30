@@ -402,7 +402,7 @@ async function createUploadTicket(licenseKey, deviceId, activationToken, size, s
   return ticket;
 }
 
-export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, signal = null, responseFormat = null, reasoning = null } = {}) {
+export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, onReasoning = null, signal = null, responseFormat = null, reasoning = null } = {}) {
   // The proxy requires both the public key and the per-installation bearer
   // capability. Keep this defensive check even though normal callers already
   // pass through ensureLicensed(): no direct caller may emit an unauthenticated
@@ -532,7 +532,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   };
 
   // ---- poll loop: drain the buffered SSE text through the shared parser ----
-  const sink = createSseSink({ label, onDelta, onUsage, rawErrors: true });
+  const sink = createSseSink({ label, onDelta, onUsage, onReasoning, rawErrors: true });
   let cursor = 0;
   let lastDataAt = Date.now();
   let failures = 0;

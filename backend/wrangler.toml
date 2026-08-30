@@ -73,6 +73,11 @@ migrations_dir = "migrations"
 # value to "true" in a 100% maintenance deployment, then explicitly restores
 # false after both KV and D1 artifacts validate.
 BACKUP_MAINTENANCE = "false"
+# «Пригласи друга» is not live yet: /referral/* answers `coming_soon` and a code
+# typed at checkout earns nobody anything (see referralsEnabled in worker.js).
+# Set to "true" to launch the programme — the extension's own card is a separate
+# switch, src/lib/config.js REFERRALS_ENABLED, and ships with a release.
+REFERRALS_ENABLED = "false"
 # RUNTIME_WRITE_EPOCH is deliberately NOT pinned in this file. It is a
 # dashboard/CLI-managed non-secret variable which must equal the durable D1
 # row; the backup protocol increments it. keep_vars=true preserves it across

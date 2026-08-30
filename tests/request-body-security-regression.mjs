@@ -60,7 +60,11 @@ class FakeKV {
   async get(key) { return this.store.get(key) || null; }
   async put(key, value) { this.store.set(key, value); }
 }
-const env = { LICENSES: new FakeKV() };
+// REFERRALS_ENABLED: the programme ships off, and a disabled /referral/* route
+// refuses before it reads a body. The transport hardening below (body caps,
+// capability-never-in-a-query-string, device-id validation) has to keep being
+// proved on the live handlers, so this fixture opts in.
+const env = { LICENSES: new FakeKV(), REFERRALS_ENABLED: 'true' };
 const ctx = { waitUntil() {} };
 const oversizedReferral = await worker.fetch(new Request('https://api.example/referral/code', {
   method: 'POST',

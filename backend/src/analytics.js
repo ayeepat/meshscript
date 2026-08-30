@@ -1197,29 +1197,75 @@ const PURCHASE_LIST_DEFAULT = 100;
 const PURCHASE_OFFSET_MAX = 1_000_000;
 const PURCHASE_CURSOR_MAX_CHARS = 512;
 
-function purchaseCursor(row) {
-  const payload = JSON.stringify([Number(row?.issued_at) || 0, String(row?.license_key || '')]);
-  const bytes = new TextEncoder().encode(payload);
+const PURCHASE_CURSOR_PREFIX = 'pc1';
+
+const cursorBytesToBase64Url = (bytes) => {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+};
+
+/**
+ * The keyset tiebreaker is the license key — a bearer credential that activates
+ * the product — so the cursor carrying it must be opaque to whoever holds it.
+ * It was plain base64: masking the key in the row body then handing the caller
+ * the same key back inside `next_cursor` meant a STATS_SECRET holder could set
+ * `limit=1` and walk the whole table recovering one full key per request, which
+ * is exactly the power splitting STATS_SECRET off from ADMIN_SECRET exists to
+ * deny. Sealing it under a key the browser never holds keeps the pagination
+ * contract identical while making the cursor unreadable and unforgeable.
+ *
+ * Keyed on INGEST_KEY, the same Worker-only secret telemetry-token.js already
+ * uses to mint capabilities, and domain-separated from that use. Readiness
+ * requires it; without it no cursor is issued and offset paging still works.
+ */
+async function purchaseCursorKey(env) {
+  const secret = String(env?.INGEST_KEY || '');
+  if (secret.length < 32) return null;
+  const material = await crypto.subtle.digest(
+    'SHA-256', new TextEncoder().encode(`smesh-purchase-cursor:${secret}`)
+  );
+  return crypto.subtle.importKey('raw', material, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
-function parsePurchaseCursor(raw) {
+async function purchaseCursor(env, row) {
+  const key = await purchaseCursorKey(env);
+  if (!key) return null;
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const payload = new TextEncoder().encode(
+    JSON.stringify([Number(row?.issued_at) || 0, String(row?.license_key || '')])
+  );
+  const sealed = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, payload));
+  const envelope = new Uint8Array(iv.length + sealed.length);
+  envelope.set(iv);
+  envelope.set(sealed, iv.length);
+  return `${PURCHASE_CURSOR_PREFIX}.${cursorBytesToBase64Url(envelope)}`;
+}
+
+async function parsePurchaseCursor(env, raw) {
   if (raw == null || raw === '') return { ok: true, value: null };
   const value = typeof raw === 'string' ? raw.trim() : '';
-  if (!value || value.length > PURCHASE_CURSOR_MAX_CHARS || !/^[A-Za-z0-9_-]+$/.test(value)) {
+  if (!value || value.length > PURCHASE_CURSOR_MAX_CHARS) return { ok: false };
+  const parts = value.split('.');
+  const [prefix, body] = parts;
+  if (parts.length !== 2 || prefix !== PURCHASE_CURSOR_PREFIX ||
+      !body || !/^[A-Za-z0-9_-]+$/.test(body)) {
     return { ok: false };
   }
+  const key = await purchaseCursorKey(env);
+  if (!key) return { ok: false };
   try {
-    const padded = value.replace(/-/g, '+').replace(/_/g, '/') +
-      '='.repeat((4 - value.length % 4) % 4);
+    const padded = body.replace(/-/g, '+').replace(/_/g, '/') +
+      '='.repeat((4 - body.length % 4) % 4);
     const decoded = atob(padded);
-    if (btoa(decoded).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '') !== value) {
-      return { ok: false };
-    }
-    const bytes = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
-    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(bytes));
+    // Reject non-canonical aliases so one cursor has exactly one spelling.
+    const envelope = Uint8Array.from(decoded, (character) => character.charCodeAt(0));
+    if (cursorBytesToBase64Url(envelope) !== body || envelope.length <= 12) return { ok: false };
+    // AES-GCM authenticates: a tampered or foreign cursor throws here.
+    const opened = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: envelope.subarray(0, 12) }, key, envelope.subarray(12)
+    );
+    const parsed = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(opened));
     const issuedAt = Number(parsed?.[0]);
     const licenseKey = parsed?.[1];
     if (!Array.isArray(parsed) || parsed.length !== 2 ||
@@ -1233,7 +1279,7 @@ function parsePurchaseCursor(raw) {
   }
 }
 
-function purchaseListOptions(raw) {
+async function purchaseListOptions(env, raw) {
   const options = raw && typeof raw === 'object' ? raw : { days: raw };
   const days = Math.max(0, Math.min(3650, Math.trunc(Number(options.days) || 0)));
   const requestedLimit = Math.trunc(Number(options.limit) || PURCHASE_LIST_DEFAULT);
@@ -1242,13 +1288,13 @@ function purchaseListOptions(raw) {
   if (requestedOffset < 0 || requestedOffset > PURCHASE_OFFSET_MAX) {
     return { ok: false, reason: 'bad_offset', status: 400 };
   }
-  const cursor = parsePurchaseCursor(options.cursor);
+  const cursor = await parsePurchaseCursor(env, options.cursor);
   if (!cursor.ok) return { ok: false, reason: 'bad_cursor', status: 400 };
   return { ok: true, days, limit, offset: requestedOffset, cursor: cursor.value };
 }
 
 export async function statsPurchases(env, rawOptions) {
-  const options = purchaseListOptions(rawOptions);
+  const options = await purchaseListOptions(env, rawOptions);
   if (!options.ok) return options;
   const { days, limit, offset, cursor } = options;
   const fromTs = days > 0 ? Date.now() - days * DAY_MS : 0;
@@ -1281,6 +1327,11 @@ export async function statsPurchases(env, rawOptions) {
   const list = rows?.results || [];
   const hasMore = list.length > limit;
   const page = list.slice(0, limit);
+  // Sealed before the mapping below strips license_key, so the cursor still
+  // continues from the real keyset position without ever exposing it.
+  const nextCursor = hasMore && page.length
+    ? await purchaseCursor(env, page[page.length - 1])
+    : null;
   return {
     ok: true,
     limit,
@@ -1293,7 +1344,7 @@ export async function statsPurchases(env, rawOptions) {
     next_offset: hasMore && !cursor && offset + limit <= PURCHASE_OFFSET_MAX
       ? offset + limit
       : null,
-    next_cursor: hasMore && page.length ? purchaseCursor(page[page.length - 1]) : null,
+    next_cursor: nextCursor,
     // `SELECT *` includes license_key, a bearer credential that activates the
     // product. This route is reachable from a browser holding only the
     // read-only stats token, and the point of splitting STATS_SECRET off from
@@ -1303,11 +1354,11 @@ export async function statsPurchases(env, rawOptions) {
     // still tells rows apart. Cursor pagination is unaffected: purchaseCursor()
     // is evaluated on `page` above, before this mapping.
     //
-    // PARTIAL, and deliberately not overclaimed: next_cursor is base64 of
-    // [issued_at, license_key] (see purchaseCursor), so a caller who pages
-    // through still recovers one key per page. Closing that needs an opaque
-    // cursor — the tiebreaker cannot simply move to rowid, because
-    // mirrorLicense() uses INSERT OR REPLACE and rewrites it.
+    // COMPLETE now: next_cursor is AES-GCM sealed under a Worker-only key (see
+    // purchaseCursor), so paging no longer hands back one license key per page.
+    // The tiebreaker still cannot move to rowid — mirrorLicense() uses
+    // INSERT OR REPLACE and rewrites it — so the key stays in the cursor, but
+    // only the Worker can read it.
     purchases: page.map(({ license_key, ...rest }) => ({
       ...rest, key_hint: maskLicenseKey(license_key)
     })),
@@ -1326,15 +1377,23 @@ export async function statsPurchases(env, rawOptions) {
  */
 export async function statsRetention(env) {
   const [devices, activity] = await Promise.all([
-    env.DB.prepare('SELECT device_id, first_seen FROM devices').all(),
+    // Bounded like the activity scan beside it. This one used to have no LIMIT
+    // at all, so the `truncated` flag below — the whole point of which is to
+    // admit when the numbers are partial — covered only half the query, and the
+    // uncovered half was the one that grows without bound as installs do.
+    // Newest cohorts first: retention is a question about recent weeks.
+    env.DB.prepare(
+      'SELECT device_id, first_seen FROM devices ORDER BY first_seen DESC LIMIT 100000'
+    ).all(),
     env.DB.prepare(
       `SELECT device_id, day FROM events WHERE day >= ? GROUP BY device_id, day LIMIT 100000`
     ).bind(daysBack(90)).all()
   ]);
   const activityRows = activity?.results || [];
+  const deviceRows = devices?.results || [];
 
   const firstDay = {};
-  for (const d of devices?.results || []) firstDay[d.device_id] = mskDay(num(d.first_seen));
+  for (const d of deviceRows) firstDay[d.device_id] = mskDay(num(d.first_seen));
   const activeDays = {};
   for (const r of activityRows) (activeDays[r.device_id] ||= new Set()).add(r.day);
 
@@ -1379,7 +1438,7 @@ export async function statsRetention(env) {
 
   return {
     ok: true,
-    truncated: activityRows.length >= 100000,
+    truncated: activityRows.length >= 100000 || deviceRows.length >= 100000,
     classic: Object.fromEntries(Object.entries(classic).map(([k, v]) => [
       k, { eligible: v.n, returned: v.back, rate: v.n ? v.back / v.n : null }
     ])),

@@ -79,6 +79,16 @@ still be added as defense in depth.
 
 ### Referral program
 
+**Currently switched OFF.** `REFERRALS_ENABLED = "false"` in `wrangler.toml`
+makes all three `/referral/*` routes answer `{ reason: "coming_soon" }` without
+touching storage, and a code typed at checkout earns nobody anything; the
+extension's card says «Скоро» (`src/lib/config.js` `REFERRALS_ENABLED`). Admin
+routes, the pending-credit sweep and refund reversal stay live so days promised
+before the switch still settle. To launch: set the var to `"true"`, deploy, and
+ship an extension release with the client flag flipped — the mechanics below
+are unchanged and still covered by their regression tests, which opt in through
+the same var (`tests/referral-disabled-regression.mjs` covers the off state).
+
 Full mechanics live in `src/referrals.js` (see its header comment). Short
 version: every device mints one invite code (`REF-XXXX-XXXX`), shown in the
 extension's Settings. Rewards are payment-gated and the authoritative D1

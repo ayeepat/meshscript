@@ -130,7 +130,7 @@ export async function fetchTextBounded(url, init = {}, { timeoutMs = 15000, maxB
  * when the stream never delivered its terminal `data: [DONE]` frame, because
  * a cleanly closed socket without it is an incomplete answer, not a result.
  */
-export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, rawErrors = false }) {
+export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, onReasoning = null, rawErrors = false }) {
   let buffer = '';
   let full = '';
   // OpenAI-style streams terminate every COMPLETED answer with `data: [DONE]`.
@@ -176,6 +176,22 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
     else if (json?.x_groq?.usage) usage = json.x_groq.usage;
     const delta = json?.choices?.[0]?.delta?.content;
     if (delta) { full += delta; onDelta?.(delta); }
+    // The model's PRIVATE thinking channel. Providers spell it differently —
+    // OpenRouter/OpenAI-compat use `reasoning`, DashScope/DeepSeek/GLM use
+    // `reasoning_content` — and it must never reach `full`: the visible answer
+    // is answers-only JSON, and folding reasoning into it is exactly the bug
+    // openrouter.js documents (a panel that shows raw thinking, and an answers
+    // array truncated by the blob in front of it).
+    //
+    // It is surfaced ONLY through this opt-in side channel, which nothing but
+    // the owner-gated diagnostics recorder subscribes to. No subscriber ⇒ the
+    // deltas are read and dropped, exactly as before.
+    if (onReasoning) {
+      const reasoningDelta = json?.choices?.[0]?.delta?.reasoning ??
+        json?.choices?.[0]?.delta?.reasoning_content;
+      // Providers emit `""` on non-reasoning frames; only forward real text.
+      if (typeof reasoningDelta === 'string' && reasoningDelta) onReasoning(reasoningDelta);
+    }
   }
 
   return {
@@ -227,6 +243,8 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
  * @param {(usage:object)=>void} [opts.onUsage] final token/cost usage frame,
  *        merged with the top-level `model` id. Fired once, only on a clean
  *        finish. Pure side channel for telemetry — the return value is unchanged.
+ * @param {(chunk:string)=>void} [opts.onReasoning] the model's private thinking
+ *        deltas. Never part of the returned text; see createSseSink.
  * @param {number} [opts.timeoutMs] idle timeout between chunks
  * @param {boolean} [opts.rawErrors] pass server error messages through
  *        VERBATIM instead of the friendly status mapping. For the СМЭШ proxy
@@ -235,7 +253,7 @@ export function createSseSink({ label = 'AI', onDelta = null, onUsage = null, ra
  *        them — a 403 there means "no license", not "bad API key".
  * @returns {Promise<string>} full message text
  */
-export async function postStream(url, { headers = {}, body, label = 'AI', onDelta, onUsage = null, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null, rawErrors = false }) {
+export async function postStream(url, { headers = {}, body, label = 'AI', onDelta, onUsage = null, onReasoning = null, timeoutMs = DEFAULT_TIMEOUT_MS, signal = null, rawErrors = false }) {
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   const ctrl = new AbortController();
   // Reset the idle timer on every chunk so long answers don't trip it.
@@ -305,7 +323,7 @@ export async function postStream(url, { headers = {}, body, label = 'AI', onDelt
 
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  const sink = createSseSink({ label, onDelta, onUsage, rawErrors });
+  const sink = createSseSink({ label, onDelta, onUsage, onReasoning, rawErrors });
 
   try {
     for (;;) {

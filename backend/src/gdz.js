@@ -459,6 +459,16 @@ async function licenseBudgetKey(licenseKey) {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+// Did GDZ fail us, or did the caller pick a request that could only fail? Only
+// the former refunds the reserved slot. `network` is a thrown fetch; a 5xx/429
+// is upstream refusing to serve. Content-validation failures (`not_json`,
+// `not_image`) and 4xx statuses carry no such proof and are not credited back.
+function isUpstreamOutage(result) {
+  if (result?.reason === 'network') return true;
+  const status = Number(result?.status);
+  return Number.isInteger(status) && (status === 429 || status >= 500);
+}
+
 export async function handleGdzFetch(request, env, ctx) {
   try {
     return await handleGdzFetchInner(request, env, ctx);
@@ -524,11 +534,20 @@ async function handleGdzFetchInner(request, env, ctx) {
   }
 
   if (!result.ok) {
-    // Give the slot back. Unlike the AI proxy there is no upstream bill to
-    // protect here — the cap exists to stop scraping — so a GDZ outage must not
-    // burn a student's whole day of ГДЗ lookups on requests that returned
-    // nothing. Best-effort: a failed release just leaves the slot spent.
-    await releaseDailyBudget(env, day, scope, budgetKey, 1).catch(() => {});
+    // Give the slot back for a genuine GDZ outage: the cap exists to stop
+    // scraping, not to burn a student's whole day of ГДЗ lookups on requests
+    // that returned nothing. Best-effort: a failed release leaves it spent.
+    //
+    // Only an outage, though. Every other failure here is CALLER-SELECTABLE —
+    // aim `image` at an HTML page (`not_image`), point `json` at a challenge
+    // page (`not_json`), pick a path that 404s, or use a URL that redirects off
+    // the allowlist — and refunding those made each one a free upstream fetch.
+    // That is an uncapped proxy reachable with one licence key, i.e. exactly
+    // what this route must never become. Mirrors the AI proxy's discipline of
+    // classifying a failure before crediting it back (isNonBillableRejection).
+    if (isUpstreamOutage(result)) {
+      await releaseDailyBudget(env, day, scope, budgetKey, 1).catch(() => {});
+    }
     // Upstream detail goes to `wrangler tail`, never to the student: the reason
     // strings name hosts and status codes that mean nothing to them and would
     // only make a transient GDZ hiccup look like a broken license.

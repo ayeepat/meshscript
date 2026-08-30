@@ -76,7 +76,7 @@ function historyToMessage(m, capabilities) {
 }
 
 export async function askDeepseek(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null } = opts;
+  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null, onReasoning = null } = opts;
   // Key decides the message SHAPE, so resolve it before building.
   const key = await getByoKey();
   const capabilities = { allowImages: !key, allowPdf: !key };
@@ -108,7 +108,7 @@ export async function askDeepseek(systemPrompt, userText, files = [], history = 
       // even when an older client sends Auto=low. Either way postStream hides
       // reasoning_content and shows only the answer.
       const result = await askViaProxy('deepseek', messages, {
-        label: 'Auto', onDelta, onUsage, signal, reasoning,
+        label: 'Auto', onDelta, onUsage, onReasoning, signal, reasoning,
         responseFormat: wantJson ? 'json_object' : null
       });
       if (reservation) await commitOne(reservation);
@@ -127,7 +127,7 @@ export async function askDeepseek(systemPrompt, userText, files = [], history = 
     if (wantJson) body.response_format = { type: 'json_object' };
 
     const headers = { Authorization: `Bearer ${key}` };
-    const result = await postStream(ENDPOINT, { headers, body, label: 'DeepSeek', onDelta, onUsage, signal });
+    const result = await postStream(ENDPOINT, { headers, body, label: 'DeepSeek', onDelta, onUsage, onReasoning, signal });
     if (reservation) await commitOne(reservation);
     return result;
   } catch (e) {

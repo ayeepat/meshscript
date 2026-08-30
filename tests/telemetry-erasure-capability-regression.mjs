@@ -121,17 +121,29 @@ assert.deepEqual(await repeated.json(), { ok: true, deleted: false },
 
 // Fill this IP's 20/day allowance. The rejected 21st call must not consume a
 // global slot; otherwise one blocked source could exhaust erasure for everyone.
+const globalUsed = () => DB.db.prepare(
+  "SELECT count FROM telemetry_budget WHERE scope = 'erase_global' AND budget_key = 'all'"
+).get().count;
+
 for (let index = 0; index < 18; index += 1) {
   assert.equal((await erase(verdict.erasure_token)).status, 200);
 }
+// Only the single delete that actually erased something stays charged to the
+// SHARED allowance. Every repeat above erased nothing and handed its global
+// slot back — without that, ~100 sources replaying one long-lived capability
+// (the token lives 400 days and has no replay protection) would spend the whole
+// 2000/day budget and deny erasure to everyone else. The per-IP charge below
+// still stands, because that is the anti-abuse control.
+assert.equal(globalUsed(), 1,
+  'a delete that erased nothing must not keep a shared erasure slot charged');
+
+const beforeRejection = globalUsed();
 assert.equal((await erase(verdict.erasure_token)).status, 429);
 assert.equal(DB.db.prepare(
   "SELECT count FROM telemetry_budget WHERE scope = 'erase_ip' AND budget_key = ?"
 ).get('203.0.113.8').count, 20);
-assert.equal(DB.db.prepare(
-  "SELECT count FROM telemetry_budget WHERE scope = 'erase_global' AND budget_key = 'all'"
-).get().count, 20,
-'an IP-level rejection must happen before the global reservation');
+assert.equal(globalUsed(), beforeRejection,
+  'an IP-level rejection must happen before the global reservation');
 
 const issuedAt = 2_000_000_000_000;
 const longLived = await issueErasureToken(env, DEVICE, issuedAt);

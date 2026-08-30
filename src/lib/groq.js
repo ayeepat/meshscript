@@ -115,7 +115,7 @@ function historyToMessage(m) {
 }
 
 export async function askGroq(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, signal = null, onUsage = null } = opts;
+  const { onDelta = null, responseFormat = null, signal = null, onUsage = null, onReasoning = null } = opts;
   const key = await getKey();
   // Pick the vision model if EITHER the current message OR a replayed history
   // turn carries an image — otherwise a follow-up would route to the text model
@@ -160,7 +160,7 @@ export async function askGroq(systemPrompt, userText, files = [], history = [], 
   // parser salvages it.)
   const reservation = await reserveOne('groq');
   try {
-    const result = await postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, onUsage, signal });
+    const result = await postStream(ENDPOINT, { headers, body, label: 'Groq', onDelta, onUsage, onReasoning, signal });
     await commitOne(reservation);
     return result;
   } catch (e) {

@@ -10,6 +10,8 @@
  *   POST /referral/code      Get/create this device's referral code
  *   GET  /referral/check     Validate a code at checkout (before charging)
  *   POST /referral/status    Referral stats + reward key (device capability required)
+ *                            (all three answer `coming_soon` while the referral
+ *                            programme is switched off — see REFERRALS_ENABLED)
  *   GET  /admin/health       Readiness: bindings, schema, payment config
  *   POST /admin/issue        Manual issuance (testing, comp licenses)
  *   POST /admin/revoke       Revoke a key (refunds, fraud)
@@ -456,7 +458,20 @@ async function handleDeactivate(request, env) {
   if (!/^[A-Za-z0-9_-]{43}$/.test(activationToken)) {
     return error(403, 'bad_activation', VERIFY_CORS);
   }
+
+  // A random but well-formed capability still makes deactivateLicense perform
+  // an UPDATE plus a SELECT. Reserve from the same anonymous licence-credential
+  // budget as /verify before touching D1, otherwise this public endpoint is an
+  // unbounded write-amplification path. Successful and outage verdicts are not
+  // abuse and give the reservation back.
+  const ip = request.headers.get('cf-connecting-ip') || 'unknown';
+  const admission = await reserveVerifyLookup(env, ip);
+  if (admission.status === 'rate_limited') return error(429, 'rate_limited', VERIFY_CORS);
+  if (admission.status !== 'allowed') return error(503, 'service_unavailable', VERIFY_CORS);
   const result = await deactivateLicense(env, key, deviceId, activationToken);
+  if (result.ok || result.reason === 'service_unavailable') {
+    await refundVerifyLookup(env, admission);
+  }
   const status = result.ok ? 200 : (
     result.reason === 'service_unavailable' ? 503 :
     result.reason === 'activation_mismatch' ? 403 : 400
@@ -513,7 +528,33 @@ async function refundVerifyLookup(env, reservation) {
 // /referral/code writes (behind a per-IP daily budget). The real guarantee —
 // one payout per paid license — is enforced in the payment webhook.
 
+// «Пригласи друга» is switched OFF for everyone while the programme is
+// finished. This is the whole kill switch: the Worker is the only way in, so
+// refusing the three public routes here plus the checkout bonus below stops
+// every new referral effect. referrals.js, its storage layout and its payout
+// ledger are untouched, so switching back on restores the feature with no code
+// change at all — and the referral regression suite keeps covering those live
+// paths by opting in through this same binding.
+//
+// Unset means OFF: the programme must never come back by accident, and a
+// Worker deployed without the var is a Worker nobody meant to turn on.
+// wrangler.toml pins it to "false" so the deployed state is visible in git.
+//
+// Deliberately still ON: /admin/referral*, the pending-credit sweep and the
+// refund reversal. Days promised BEFORE the switch must still settle and still
+// unwind on a refund; only NEW referral value is refused.
+//
+// Keep in sync with src/lib/config.js REFERRALS_ENABLED, which hides the
+// extension's card. A live backend behind a hidden card promises days nobody
+// can find; a live card in front of a switched-off backend shows «нет связи».
+const referralsEnabled = (env) => /^(1|true|on|yes)$/i.test(String(env?.REFERRALS_ENABLED ?? '').trim());
+
+// One reason string across all three routes so the checkout page and the
+// extension can tell "not yet" apart from "your code is wrong".
+const REFERRALS_COMING_SOON = 'coming_soon';
+
 async function handleReferralCode(request, env) {
+  if (!referralsEnabled(env)) return error(503, REFERRALS_COMING_SOON, VERIFY_CORS);
   const parsed = await readJsonBounded(request, 4096);
   if (!parsed.ok) return error(parsed.status, parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json', VERIFY_CORS);
   const body = parsed.value;
@@ -553,6 +594,16 @@ async function admitReferralCheck(env, ip) {
 }
 
 async function handleReferralCheck(request, env) {
+  // The checkout page asks before charging. Answer without touching storage or
+  // the per-IP budget — there is nothing to look up — and say so explicitly:
+  // `enabled:false` lets the page show «скоро» instead of «неверный код», and
+  // a zero bonus stops it advertising days the webhook will not grant.
+  if (!referralsEnabled(env)) {
+    return json(
+      { ok: true, enabled: false, valid: false, reason: REFERRALS_COMING_SOON, buyer_bonus_pct: 0 },
+      { headers: VERIFY_CORS }
+    );
+  }
   const url = new URL(request.url);
   const rawCode = url.searchParams.get('code') || '';
   // Mirrors /verify's normalizeKey fast path: a malformed code is rejected by
@@ -572,6 +623,7 @@ async function handleReferralCheck(request, env) {
 }
 
 async function handleReferralStatus(request, env) {
+  if (!referralsEnabled(env)) return error(503, REFERRALS_COMING_SOON, VERIFY_CORS);
   const parsed = await readJsonBounded(request, 4096);
   if (!parsed.ok) return error(parsed.status, parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json', VERIFY_CORS);
   const body = parsed.value;
@@ -1079,12 +1131,20 @@ async function fulfillAuthorizedRobokassaOrder(env, ctx, order, n, fields) {
   // extends the buyer's OWN subscription by the buyer bonus, and — once the
   // license exists — credits the referrer. A bad/self/absent code is ignored
   // silently: a real payment must never fail over a referral.
-  const referral = await referrals.resolveReferral(env, {
-    code: order.referral_code,
-    buyerDeviceId: order.device_id,
-    buyerEmail: order.email,
-    buyerTelegramId: order.telegram_user_id
-  });
+  //
+  // While the referral switch is off the same "ignored silently" path handles a
+  // code typed into a checkout page that has not caught up yet: the claim
+  // freezes referral_code:null, so the buyer gets the plain plan and nobody is
+  // credited. Licenses issued BEFORE the switch keep their frozen code, and
+  // settleIssuedRobokassaPayment still pays those out on a redelivery.
+  const referral = referralsEnabled(env)
+    ? await referrals.resolveReferral(env, {
+        code: order.referral_code,
+        buyerDeviceId: order.device_id,
+        buyerEmail: order.email,
+        buyerTelegramId: order.telegram_user_id
+      })
+    : { valid: false, reason: REFERRALS_COMING_SOON };
   const baseDurationMs = plan.type === 'subscription'
     ? plan.subscription_days * 24 * 60 * 60 * 1000
     : null;
@@ -1734,26 +1794,49 @@ async function handleTelemetryDelete(request, env) {
     return error(429, 'rate_limited', VERIFY_CORS);
   }
   const result = await analytics.handleDeleteDevice(request, env, attestation.device_id);
+  // A delete that erased nothing (unknown device, or one already erased) used
+  // no erasure capacity, so the SHARED allowance must not stay charged for it.
+  // Erasure tokens live 400 days and carry no replay protection, so without
+  // this a single valid token replayed against an already-erased device could
+  // spend the whole global budget and 429 everyone else's right to erasure for
+  // the rest of the day. The per-IP charge deliberately stands — that is the
+  // anti-abuse control, and the replayer should still pay it.
+  if (result.ok && result.deleted === false) {
+    await analytics.releaseDailyBudget(env, day, 'erase_global', 'all', 1)
+      .catch(() => { /* over-counting the shared budget fails closed */ });
+  }
   return json(result, { status: result.status || (result.ok ? 200 : 400), headers: VERIFY_CORS });
 }
 
 /* --------------------------- /admin/stats/* --------------------------- */
 
+// Bound every reporting window before it reaches a date computation. `days` is
+// caller-supplied, and daysBack() runs it through Date#toISOString: an
+// unclamped `?days=1e12` left the Date range, threw RangeError out of a route
+// with no try/catch of its own, and answered 500 instead of a sane window.
+// Ten years already exceeds any question this dashboard asks. Mirrors the clamp
+// statsPurchases applies to the same parameter in purchaseListOptions.
+const STATS_MAX_DAYS = 3650;
+function statsDays(params, fallback = 0) {
+  const days = Math.trunc(Number(params.get('days')));
+  return Number.isFinite(days) && days > 0 ? Math.min(days, STATS_MAX_DAYS) : fallback;
+}
+
 const STATS_ROUTES = {
-  overview:   (env, q) => analytics.statsOverview(env, Number(q.get('days')) || 0),
-  timeseries: (env, q) => analytics.statsTimeseries(env, Number(q.get('days')) || 30),
-  users:      (env, q) => analytics.statsUsers(env, Object.fromEntries(q)),
+  overview:   (env, q) => analytics.statsOverview(env, statsDays(q)),
+  timeseries: (env, q) => analytics.statsTimeseries(env, statsDays(q, 30)),
+  users:      (env, q) => analytics.statsUsers(env, { ...Object.fromEntries(q), days: statsDays(q) }),
   user:       (env, q) => analytics.statsUserDetail(env, q.get('device_id') || ''),
-  subjects:   (env, q) => analytics.statsSubjects(env, Number(q.get('days')) || 0),
+  subjects:   (env, q) => analytics.statsSubjects(env, statsDays(q)),
   purchases:  (env, q) => analytics.statsPurchases(env, Object.fromEntries(q)),
   retention:  (env)    => analytics.statsRetention(env),
   referrals:  (env)    => analytics.statsReferrals(env),
-  errors:     (env, q) => analytics.statsErrors(env, Number(q.get('days')) || 0),
-  feedback:   (env, q) => analytics.statsFeedback(env, Number(q.get('days')) || 0),
+  errors:     (env, q) => analytics.statsErrors(env, statsDays(q)),
+  feedback:   (env, q) => analytics.statsFeedback(env, statsDays(q)),
   tickets:    (env, q) => analytics.statsTickets(env, Number(q.get('limit')) || 50),
   subscriptions: (env) => analytics.statsSubscriptions(env),
-  funnel:     (env, q) => analytics.statsFunnel(env, Number(q.get('days')) || 0),
-  margin:     (env, q) => analytics.statsMargin(env, Number(q.get('days')) || 0,
+  funnel:     (env, q) => analytics.statsFunnel(env, statsDays(q)),
+  margin:     (env, q) => analytics.statsMargin(env, statsDays(q),
     Number(q.get('limit')) || 100),
   worklists:  (env)    => analytics.statsWorklists(env, WORKLIST_THRESHOLDS),
   rate:       (env, q) => analytics.statsRate(env, q.get('force') === '1')
@@ -1940,6 +2023,18 @@ const HEALTH_REQUIRED_TABLE_SIGNATURES = {
   telemetry_budget: 'day:TEXT:1::1|scope:TEXT:1::2|budget_key:TEXT:1::3|count:INTEGER:1:0:0'
 };
 
+// The production database was adopted into numbered migrations after
+// `license_ref` had been appended to the existing devices table. Its columns
+// are therefore complete but retain the harmless historical order
+// `license_type, license_ref`; every runtime read/write names these columns.
+// Accept only that exact observed signature in addition to the canonical fresh
+// schema so readiness does not demand a risky table rebuild just for ordering.
+const HEALTH_ACCEPTED_LEGACY_TABLE_SIGNATURES = {
+  devices: [
+    'device_id:TEXT:0::1|first_seen:INTEGER:1::0|last_seen:INTEGER:1::0|browser:TEXT:0::0|ua:TEXT:0::0|version:TEXT:0::0|provider:TEXT:0::0|license_key:TEXT:0::0|license_type:TEXT:0::0|license_ref:TEXT:0::0'
+  ]
+};
+
 // Complete canonical sqlite_master DDL. Column PRAGMAs do not expose CHECKs,
 // table-level UNIQUE constraints, collations, generated expressions, foreign
 // keys, or STRICT/WITHOUT ROWID options. Requiring one known complete CREATE
@@ -1956,10 +2051,12 @@ const HEALTH_REQUIRED_TABLE_DDL = {
   ],
   devices: [
     'createtabledevices(device_idtextprimarykey,first_seenintegernotnull,--msepochlast_seenintegernotnull,--msepochbrowsertext,--chrome|yandex|opera|edge|firefox|otheruatext,--legacy,alwaysnullnow(rawuaisnotstored)versiontext,--extensionversionprovidertext,--lastselectedaiproviderlicense_keytext,--legacy,alwaysnullnowlicense_reftext,--legacypseudonym,nolongerwrittenlicense_typetext--lifetime|subscription|none)',
-    'createtabledevices(device_idtextprimarykey,first_seenintegernotnull,last_seenintegernotnull,browsertext,uatext,versiontext,providertext,license_keytext,license_reftext,license_typetext)'
+    'createtabledevices(device_idtextprimarykey,first_seenintegernotnull,last_seenintegernotnull,browsertext,uatext,versiontext,providertext,license_keytext,license_reftext,license_typetext)',
+    'createtabledevices(device_idtextprimarykey,first_seenintegernotnull,--msepochlast_seenintegernotnull,--msepochbrowsertext,--chrome|yandex|opera|edge|firefox|otheruatext,--rawua,fordebuggingoddbrowsersversiontext,--extensionversionprovidertext,--lastselectedaiproviderlicense_keytext,--lastknownkeyonthisdevice(maybenull)license_typetext--lifetime|subscription|none,license_reftext)'
   ],
   events: [
     'createtableevents(idintegerprimarykeyautoincrement,tsintegernotnull,--msepoch(client,server-clamped)daytextnotnull,--yyyy-mm-dd,moscowtimedevice_idtextnotnull,typetextnotnull,--install|update|heartbeat|solve|test_solve|test_requestion|gdz_pull|errorsubjecttext,--meshsubjectname(solves/gdz)providertext,--openrouter|groq|qwen|deepseekmodeltext,--exactmodelidtheproviderreportedtokens_inintegernotnulldefault0,tokens_outintegernotnulldefault0,cost_usdrealnotnulldefault0,--exactprovidercostwhenreported,elseestimatefiles_pdfintegernotnulldefault0,--pdfattachmentsonthissolvefiles_imgintegernotnulldefault0,--imageattachments(photos/screenshots)metatext--fixed-vocabulary,typedmetricsonly(seeanalytics.js))',
+    'createtableevents(idintegerprimarykeyautoincrement,tsintegernotnull,--msepoch(client,server-clamped)daytextnotnull,--yyyy-mm-dd,moscowtimedevice_idtextnotnull,typetextnotnull,--install|update|heartbeat|solve|test_solve|test_requestion|gdz_pull|errorsubjecttext,--meshsubjectname(solves/gdz)providertext,--openrouter|groq|qwen|deepseekmodeltext,--exactmodelidtheproviderreportedtokens_inintegernotnulldefault0,tokens_outintegernotnulldefault0,cost_usdrealnotnulldefault0,--exactprovidercostwhenreported,elseestimatefiles_pdfintegernotnulldefault0,--pdfattachmentsonthissolvefiles_imgintegernotnulldefault0,--imageattachments(photos/screenshots)metatext--smalljson:{mode,gdz_auto,refused,msg,...})',
     'createtableevents(idintegerprimarykeyautoincrement,tsintegernotnull,daytextnotnull,device_idtextnotnull,typetextnotnull,subjecttext,providertext,modeltext,tokens_inintegernotnulldefault0,tokens_outintegernotnulldefault0,cost_usdrealnotnulldefault0,files_pdfintegernotnulldefault0,files_imgintegernotnulldefault0,metatext)'
   ],
   kv_apply_locks: ['createtablekv_apply_locks(nametextprimarykey,lease_untilintegernotnull)'],
@@ -1987,6 +2084,7 @@ const HEALTH_REQUIRED_TABLE_DDL = {
   payment_refund_poll: ['createtablepayment_refund_poll(order_idintegerprimarykey,attemptsintegernotnulldefault0check(attempts>=0),next_poll_atintegernotnulldefault0,last_errortext,last_error_atinteger)'],
   payment_review: [
     'createtablepayment_review(gatewaytextnotnull,payment_idtextnotnull,invoice_idtext,amount_rubreal,reasontextnotnull,--invalid_plan_config|no_floor_configured|below_floor|no_contact|no_plan_matchedfields_jsontext,created_atintegernotnull,--msepochresolved_atinteger,environmenttext,amount_kopecksinteger,resolutiontext,resolution_notetext,primarykey(gateway,payment_id))',
+    'createtablepayment_review(gatewaytextnotnull,payment_idtextnotnull,invoice_idtext,amount_rubreal,reasontextnotnull,--no_floor_configured|below_floor|no_contact|no_plan_matchedfields_jsontext,created_atintegernotnull,--msepochresolved_atinteger,environmenttext,amount_kopecksinteger,resolutiontext,resolution_notetext,primarykey(gateway,payment_id))',
     'createtablepayment_review(gatewaytextnotnull,payment_idtextnotnull,invoice_idtext,amount_rubreal,reasontextnotnull,fields_jsontext,created_atintegernotnull,resolved_atinteger,environmenttext,amount_kopecksinteger,resolutiontext,resolution_notetext,primarykey(gateway,payment_id))'
   ],
   proxy_quota: [
@@ -2013,6 +2111,7 @@ const HEALTH_REQUIRED_TABLE_DDL = {
   telegram_updates: ['createtabletelegram_updates(update_idintegerprimarykey,claimed_atintegernotnull,lease_untilintegernotnull,completed_atinteger,result_kindtext,ticket_notext)'],
   telemetry_budget: [
     'createtabletelemetry_budget(daytextnotnull,scopetextnotnull,--ip|device|admin_fail|verify_failbudget_keytextnotnull,countintegernotnulldefault0,primarykey(day,scope,budget_key))',
+    'createtabletelemetry_budget(daytextnotnull,scopetextnotnull,--ip|devicebudget_keytextnotnull,countintegernotnulldefault0,primarykey(day,scope,budget_key))',
     'createtabletelemetry_budget(daytextnotnull,scopetextnotnull,budget_keytextnotnull,countintegernotnulldefault0,primarykey(day,scope,budget_key))'
   ]
 };
@@ -2248,7 +2347,11 @@ async function handleAdminHealth(request, env) {
           for (const column of signatureColumnNames(expectedSignature)) {
             if (!found.has(column)) missingColumns.push(`${table}.${column}`);
           }
-          if (tableColumnSignature(foundColumns) !== expectedSignature) {
+          const acceptedSignatures = [
+            expectedSignature,
+            ...(HEALTH_ACCEPTED_LEGACY_TABLE_SIGNATURES[table] || [])
+          ];
+          if (!acceptedSignatures.includes(tableColumnSignature(foundColumns))) {
             invalidTableShapes.push(table);
           }
           if (foundColumns.some((column) => Number(column.hidden) !== 0) ||
@@ -2332,12 +2435,10 @@ async function handleAdminHealth(request, env) {
     }
   }
 
-  const ok = checks.backup_maintenance && checks.write_fence &&
-    checks.kv && checks.db && checks.schema && checks.worklists &&
-    checks.payment_config && checks.checkout_config && checks.payment_refunds && checks.device_limit &&
-    checks.robokassa_password2 && checks.robokassa_hash &&
-    checks.delivery_channel && checks.support_owner &&
-    checks.ai_proxy_key && checks.ingest_key;
+  // Every named item above is a launch/readiness invariant. Derive the verdict
+  // from the collection itself so a newly added check cannot be displayed as
+  // false while the endpoint still reports HTTP 200.
+  const ok = Object.values(checks).every(Boolean);
   return json(
     {
       ok,

@@ -37,6 +37,15 @@
           <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span>История</span>
         </button>
+        <!-- Owner-only. Revealed by settings.js when the activated licence key
+             matches lib/dev-mode.js; kept out of the DOM's reach for everyone
+             else by `body:not(.dev-mode) .dev-only`, NOT by a `hidden`
+             attribute — `.tab` sets `display:flex`, which outranks the UA's
+             `[hidden]` reset (see tests/hidden-attribute-regression.mjs). -->
+        <button class="tab gated dev-only" data-tab="devtools" role="tab" aria-selected="false" type="button">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          <span>Диагностика</span>
+        </button>
       </nav>
 
       <div class="sidebar-foot">
@@ -126,8 +135,14 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 12 20 22 4 22 4 12"/><rect x="2" y="7" width="20" height="5"/><line x1="12" y1="22" x2="12" y2="7"/><path d="M12 7H7.5a2.5 2.5 0 0 1 0-5C11 2 12 7 12 7z"/><path d="M12 7h4.5a2.5 2.5 0 0 0 0-5C13 2 12 7 12 7z"/></svg></span>
             <div>
               <h3>Пригласи друга</h3>
-              <p>Друг вводит ваш код при оплате подписки — ему <strong>+10% дней</strong> (30 → 33 дня), а вам <strong>+7 дней</strong> подписки за каждого купившего.</p>
+              <!-- Ships in the «скоро» state and settings.js swaps in the live
+                   copy when config.REFERRALS_ENABLED is true, so the markup is
+                   honest on its own: a student can never see a promise of bonus
+                   days flash before the script decides the card is inert. -->
+              <p id="refSoonLede">Приглашения и бонусные дни за друзей ещё готовятся — добавлю их в одном из ближайших обновлений.</p>
+              <p id="refLiveLede" hidden>Друг вводит ваш код при оплате подписки — ему <strong>+10% дней</strong> (30 → 33 дня), а вам <strong>+7 дней</strong> подписки за каждого купившего.</p>
             </div>
+            <span class="licstatus" id="refSoon" data-state="idle">Скоро</span>
             <span class="licstatus" id="refDays" data-state="ok" hidden></span>
           </div>
 
@@ -136,6 +151,9 @@
             <button class="refbtn" id="refCopyCode" type="button" disabled>Скопировать код</button>
             <button class="refbtn accent" id="refCopyInvite" type="button" disabled>Скопировать приглашение</button>
           </div>
+
+          <!-- Revealed by the click that would have copied a code. -->
+          <p class="ref-soon-note" id="refSoonNote" role="status" hidden>Скоро :) Программа приглашений ещё в работе — я включу её в одном из ближайших обновлений, и код появится прямо здесь.</p>
 
           <div class="ref-stats" id="refStats" hidden>
             <span>Купили по вашему коду: <b id="refPurchases">0</b></span>
@@ -151,7 +169,8 @@
             <button class="refbtn" id="refRewardCopy" type="button">Скопировать</button>
           </div>
 
-          <p class="ref-hint">Код действует бесплатно и бессрочно. Бонусные дни начисляются автоматически после оплаты друга.</p>
+          <p class="ref-hint" id="refSoonHint">Ничего делать не нужно — когда программа заработает, код появится в этой карточке сам.</p>
+          <p class="ref-hint" id="refLiveHint" hidden>Код действует бесплатно и бессрочно. Бонусные дни начисляются автоматически после оплаты друга.</p>
         </section>
 
         <!-- Provider picker + BYO key fields. Hidden while
@@ -384,6 +403,24 @@
 
         <section class="panel">
           <div id="history" class="history"></div>
+        </section>
+      </section>
+
+      <section class="tabpanel dev-only" data-panel="devtools" role="tabpanel">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Только для разработчика</p>
+            <h2>Диагностика решения тестов</h2>
+            <p>Что расширение реально отправило модели и что она ответила. «Вход» — текст, считанный со страницы теста: если вопрос там искажён или отсутствует, дело в считывании, а не в модели.</p>
+          </div>
+          <div class="devtrace-actions">
+            <button id="devReload" class="ghostbtn" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>Обновить</button>
+            <button id="devClear" class="ghostbtn" type="button"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/></svg>Очистить</button>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div id="devTraces" class="devtraces"></div>
         </section>
       </section>
     </main>

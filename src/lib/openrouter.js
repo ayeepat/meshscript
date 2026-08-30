@@ -315,7 +315,7 @@ function historyToMessage(m) {
 }
 
 export async function askOpenRouter(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null } = opts;
+  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null, onReasoning = null } = opts;
   const key = await getKey();
 
   const content = buildContent(userText, files);
@@ -380,7 +380,7 @@ export async function askOpenRouter(systemPrompt, userText, files = [], history 
       try { onUsage?.(usage); } catch { /* usage observers never break the answer */ }
     };
     const result = await postStream(ENDPOINT, {
-      headers, body, label: 'OpenRouter', onDelta, onUsage: captureUsage, signal
+      headers, body, label: 'OpenRouter', onDelta, onUsage: captureUsage, onReasoning, signal
     });
     // Await the tiny storage write while the worker is alive. The recorder is
     // best-effort internally, so storage pressure cannot turn a good answer

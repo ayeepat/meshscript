@@ -380,7 +380,13 @@ async function deleteAllLocalDataHere() {
       chrome.storage.local.remove([
         STORAGE_KEY, 'weekHomework', 'pendingUpload', 'taskClassCache', 'gdzTaskCache', 'tmLastHb',
         'rateAttempts', 'rateUsage', 'rateHistory', 'rateReservations', 'orUsageSnap',
-        'smeshTranscriptCache', TEST_ANSWER_CACHE_KEY
+        'smeshTranscriptCache', TEST_ANSWER_CACHE_KEY,
+        // lib/dev-trace.js DEV_TRACE_KEY. Written as a literal on purpose:
+        // importing it would close the cycle history → dev-trace → dev-mode →
+        // license → history. Owner-only, but it holds verbatim scraped page
+        // text, so an explicit wipe must reach it like any other page content.
+        // tests/dev-diagnostics-regression.mjs pins the two spellings together.
+        'devTraces'
       ]),
       // Upgrade cleanup: old builds briefly kept transcripts in session.
       // Current builds use trusted-only local storage (removed above), but the

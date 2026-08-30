@@ -22,12 +22,14 @@ import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
 import { hasConsent, setConsent } from '../lib/consent.js';
 import { getDeviceId, deleteAllLocalData } from '../lib/history.js';
 import {
-  SUPPORT_BOT_URL, BACKEND_URL, SHOW_PROVIDER_UI, DEFAULT_PROVIDER
+  SUPPORT_BOT_URL, BACKEND_URL, SHOW_PROVIDER_UI, DEFAULT_PROVIDER, REFERRALS_ENABLED
 } from '../lib/config.js';
 import { isGdzCoverUrl } from '../lib/gdz-hosts.js';
 import { normalizeGdzApiUrl } from '../lib/gdz-api.js';
 import { fetchTextBounded } from '../lib/http.js';
 import { normalizeGdzBooks } from '../lib/gdz-books.js';
+import { isDevModeActive } from '../lib/dev-mode.js';
+import { clearDevTraces, readDevTraces } from '../lib/dev-trace.js';
 
 initTheme();
 
@@ -185,7 +187,10 @@ async function loadSecondaryUi() {
     refreshUsage(),
     loadConsentUi()
   ]);
-  loadReferralUi(); // network-backed, deliberately not awaited
+  // network-backed, deliberately not awaited. Skipped entirely while the
+  // programme is off: the backend refuses /referral/*, so the only thing a
+  // request could add is a «нет связи» in a card that already says «Скоро».
+  if (REFERRALS_ENABLED) loadReferralUi();
 }
 
 /* ---------- License key ---------- */
@@ -200,6 +205,10 @@ async function loadLicenseUi() {
 }
 
 function renderLicenseStatus(status) {
+  // The one funnel every licence transition passes through (load, save,
+  // deactivate), so the owner-only diagnostics tab follows the key without a
+  // reload. Fire-and-forget: the licence pill must never wait on a digest.
+  void applyDevMode();
   const pill = document.getElementById('licStatus');
   const input = document.getElementById('licenseKey');
   const deactivate = document.getElementById('deactivateLicense');
@@ -297,7 +306,43 @@ async function loadReferralUi() {
   } catch { /* stats are decorative — the code alone is enough to share */ }
 }
 
+/**
+ * The card while config.REFERRALS_ENABLED is false. Nothing here touches the
+ * network — there is no code to mint and the backend refuses the route anyway.
+ *
+ * The buttons are deliberately left clickable: a `disabled` button says nothing
+ * back, and a student who came to this card to find their invite code deserves
+ * an answer. The click IS the answer — it flashes «Скоро :)» where the user
+ * pressed and reveals the note explaining that the programme is coming.
+ */
+function wireReferralComingSoon() {
+  const note = document.getElementById('refSoonNote');
+  const announce = (btn) => {
+    note.hidden = false;
+    if (btn) flashButton(btn, 'Скоро :)');
+  };
+  for (const id of ['refCopyCode', 'refCopyInvite']) {
+    const btn = document.getElementById(id);
+    btn.disabled = false;
+    btn.classList.add('soon');
+    btn.setAttribute('aria-disabled', 'true'); // clickable, but not a live action
+    btn.onclick = () => announce(btn);
+  }
+  document.getElementById('refCode').onclick = () => announce(null);
+}
+
 function wireReferral() {
+  if (!REFERRALS_ENABLED) {
+    wireReferralComingSoon();
+    return;
+  }
+  // The live card: swap the shipped «скоро» copy for what the programme
+  // actually gives, then wire the real clipboard actions.
+  document.getElementById('refSoon').hidden = true;
+  document.getElementById('refSoonLede').hidden = true;
+  document.getElementById('refLiveLede').hidden = false;
+  document.getElementById('refSoonHint').hidden = true;
+  document.getElementById('refLiveHint').hidden = false;
   const copy = (getText) => async (e) => {
     const btn = e.currentTarget; // capture NOW — currentTarget is null after an await
     try {
@@ -1425,6 +1470,236 @@ function wireGdz() {
   });
 }
 
+/* ---------- Developer diagnostics (owner-only) ---------- */
+
+/**
+ * Reveal or hide the «Диагностика» tab for the currently activated key.
+ *
+ * Called from renderLicenseStatus, which is the single funnel every licence
+ * transition passes through (initial load, save, deactivate) — so pasting the
+ * owner key reveals the tab without a reload, and deactivating hides it again.
+ * Hiding also leaves the tab: an owner who deactivates must not be left staring
+ * at a panel that no longer refreshes.
+ */
+async function applyDevMode() {
+  const active = await isDevModeActive();
+  document.body.classList.toggle('dev-mode', active);
+  if (!active) {
+    devTracesLoaded = false;
+    if (activeSection === 'devtools' && showSection) showSection('general');
+  }
+}
+
+const DEV_TRACE_KIND_LABEL = {
+  test: 'Тест',
+  requestion: 'Перерешать',
+  cache: 'Из кэша',
+};
+
+function devTraceTime(at) {
+  const date = new Date(Number(at) || 0);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit' })
+    : '—';
+}
+
+/**
+ * One collapsible text field. `value` is scraped page content and model output —
+ * untrusted by definition — so it is only ever assigned through textContent.
+ * Nothing here goes near innerHTML or mdToHtml: this panel exists to show what
+ * the model literally received, and rendering it would both hide the answer and
+ * hand a Мэш page a script injection into the settings origin.
+ */
+function devTraceField(label, value, { mono = 'plain', always = false } = {}) {
+  const text = String(value ?? '');
+  // `always` is for the scraped input: an EMPTY capture is the single most
+  // important thing this panel can report, and silently omitting the section
+  // would hide the very failure the tab exists to surface.
+  if (!text && !always) return null;
+  const field = document.createElement('div');
+  field.className = 'devtrace-field';
+  const header = document.createElement('header');
+  const title = document.createElement('span');
+  title.textContent = `${label} · ${text.length.toLocaleString('ru-RU')} симв.`;
+  header.appendChild(title);
+  if (text) {
+    const copy = document.createElement('button');
+    copy.className = 'ghostbtn';
+    copy.type = 'button';
+    copy.textContent = 'Копировать';
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        flashButton(copy);
+      } catch { /* clipboard denied — the text is selectable by hand */ }
+    };
+    header.appendChild(copy);
+  }
+  field.appendChild(header);
+  if (!text) {
+    const empty = document.createElement('div');
+    empty.className = 'devtrace-error';
+    empty.textContent = 'Пусто — со страницы не считано ничего. Это и есть проблема считывания.';
+    field.appendChild(empty);
+    return field;
+  }
+  const pre = document.createElement('pre');
+  if (mono === 'reasoning') pre.className = 'reasoning';
+  pre.textContent = text;
+  field.appendChild(pre);
+  return field;
+}
+
+function devTraceCard(trace) {
+  const card = document.createElement('details');
+  card.className = 'devtrace';
+
+  const summary = document.createElement('summary');
+  const kind = document.createElement('span');
+  kind.className = 'devtrace-kind';
+  kind.dataset.kind = trace.kind || 'test';
+  if (trace.ok === false) kind.dataset.state = 'fail';
+  kind.textContent = trace.ok === false
+    ? 'Ошибка'
+    : (DEV_TRACE_KIND_LABEL[trace.kind] || trace.kind || 'Тест');
+  summary.appendChild(kind);
+
+  const title = document.createElement('span');
+  title.className = 'devtrace-title';
+  title.textContent = devTraceTime(trace.at);
+  summary.appendChild(title);
+
+  const meta = document.createElement('span');
+  meta.className = 'devtrace-meta';
+  const facts = [];
+  if (Number.isInteger(trace.questionCount)) facts.push(`${trace.questionCount} отв.`);
+  // Coverage at a glance. "0 исправлено" alone is ambiguous — it can mean
+  // "everything checked out" or "nothing was checkable" — so the header always
+  // reports how many answers the checker could actually verify.
+  if (Array.isArray(trace.checks) && trace.checks.length) {
+    const verified = trace.checks.filter((check) => check.status === 'verified').length;
+    const fixed = trace.checks.filter((check) => check.status === 'fixed').length;
+    facts.push(`проверено ${verified + fixed}/${trace.checks.length}`);
+  }
+  if (Number.isInteger(trace.pageTextChars)) facts.push(`вход ${trace.pageTextChars.toLocaleString('ru-RU')} симв.`);
+  if (trace.effort) facts.push(`effort ${trace.effort}`);
+  if (trace.screenshot) facts.push('+скриншот');
+  if (trace.model) facts.push(trace.model);
+  if (Number.isFinite(trace.durationMs)) facts.push(`${(trace.durationMs / 1000).toFixed(1)}s`);
+  if (trace.usage?.total) facts.push(`${trace.usage.total} tok`);
+  for (const fact of facts) {
+    const span = document.createElement('span');
+    span.textContent = fact;
+    meta.appendChild(span);
+  }
+  summary.appendChild(meta);
+  card.appendChild(summary);
+
+  const body = document.createElement('div');
+  body.className = 'devtrace-body';
+  if (trace.error) {
+    const error = document.createElement('div');
+    error.className = 'devtrace-error';
+    error.textContent = trace.error;
+    body.appendChild(error);
+  }
+  if (trace.url) {
+    const url = devTraceField('Страница', trace.url);
+    if (url) body.appendChild(url);
+  }
+  // Answers the arithmetic checker rewrote. Shown FIRST and loudly: each row is
+  // a case where the model showed correct working and typed a different number,
+  // which is the regression this whole checker exists to stop
+  // (lib/test-answer-arithmetic.js). An empty section here is the healthy state.
+  if (Array.isArray(trace.corrections) && trace.corrections.length) {
+    const fixed = document.createElement('div');
+    fixed.className = 'devtrace-field';
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.textContent = `Исправлена арифметика · ${trace.corrections.length}`;
+    header.appendChild(title);
+    fixed.appendChild(header);
+    for (const correction of trace.corrections) {
+      const row = document.createElement('div');
+      row.className = 'devtrace-fix';
+      row.textContent =
+        `№${correction.index}: модель написала «${correction.from}», ` +
+        `но её же выражение ${correction.work} даёт «${correction.to}» — подставлено ${correction.to}`;
+      fixed.appendChild(row);
+    }
+    body.appendChild(fixed);
+  }
+  // The answers nothing could check, with the reason. This is the honest half
+  // of the coverage story: these are the ones still riding on the model getting
+  // its own transcription right.
+  const skipped = Array.isArray(trace.checks)
+    ? trace.checks.filter((check) => check.status === 'unchecked')
+    : [];
+  if (skipped.length) {
+    const box = document.createElement('div');
+    box.className = 'devtrace-field';
+    const header = document.createElement('header');
+    const title = document.createElement('span');
+    title.textContent = `Не проверено автоматически · ${skipped.length}`;
+    header.appendChild(title);
+    box.appendChild(header);
+    for (const check of skipped) {
+      const row = document.createElement('div');
+      row.className = 'devtrace-skip';
+      row.textContent = `№${check.index}: ${check.reason || 'нечем проверить'}`;
+      box.appendChild(row);
+    }
+    body.appendChild(box);
+  }
+  // Ordered by what you check first when answers come back wrong: the scraped
+  // input, then what we asked, then how the model reasoned, then what it said.
+  const fields = [
+    devTraceField('Вход — текст со страницы (то, что «спарсилось»)', trace.pageText, { always: true }),
+    devTraceField('Полное сообщение пользователю модели', trace.userText),
+    devTraceField('Рассуждение модели', trace.reasoning, { mono: 'reasoning' }),
+    devTraceField('Сырой ответ модели', trace.rawAnswer),
+    devTraceField('Системный промпт', trace.systemPrompt),
+  ];
+  for (const field of fields) if (field) body.appendChild(field);
+  card.appendChild(body);
+  return card;
+}
+
+let devTracesLoaded = false;
+let devTraceGeneration = 0;
+
+async function loadDevTraces() {
+  const generation = ++devTraceGeneration;
+  const box = document.getElementById('devTraces');
+  if (!box) return;
+  const traces = await readDevTraces();
+  if (generation !== devTraceGeneration) return;
+  box.innerHTML = '';
+  if (!traces.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent =
+      'Пока пусто. Решите тест — здесь появится текст, который расширение считало со страницы, ' +
+      'рассуждение модели и её сырой ответ.';
+    box.appendChild(empty);
+    return;
+  }
+  for (const trace of traces) box.appendChild(devTraceCard(trace));
+}
+
+function wireDevTools() {
+  const reload = document.getElementById('devReload');
+  if (reload) reload.onclick = () => { devTracesLoaded = true; void loadDevTraces(); };
+  const clear = document.getElementById('devClear');
+  if (clear) {
+    clear.onclick = async () => {
+      await clearDevTraces();
+      devTracesLoaded = true;
+      void loadDevTraces();
+    };
+  }
+}
+
 /* ---------- Tabs ---------- */
 
 function wireTabs() {
@@ -1446,6 +1721,10 @@ function wireTabs() {
       historyLoaded = true;
       loadHistory();
     }
+    if (name === 'devtools' && !devTracesLoaded) {
+      devTracesLoaded = true;
+      void loadDevTraces();
+    }
   }
   showSection = show;
   for (const t of tabs) t.onclick = () => show(t.dataset.tab);
@@ -1463,6 +1742,8 @@ wireConsent();
 wirePrivacy();
 wireReferral();
 wireUsageDashboard();
+wireDevTools();
+void applyDevMode();
 const saveButton = document.getElementById('save');
 saveButton.onclick = () => { void handleSettingsSave(saveButton); };
 document.getElementById('aiProvider').addEventListener('change', syncProviderKeys);

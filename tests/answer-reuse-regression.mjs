@@ -361,7 +361,9 @@ function captureAs(principal, ...signatures) {
   const pageCapture = capture('pill-a:33');
 
   function runPill({ cached, licensed = true, consented = true }) {
-    const calls = { solveTest: 0, written: [], filled: 0, panel: 0, licence: 0, consent: 0 };
+    const calls = {
+      solveTest: 0, written: [], filled: 0, panel: 0, licence: 0, consent: 0, traced: []
+    };
     const context = {
       Error,
       capturedText: 'вопрос 1 …',
@@ -389,6 +391,12 @@ function captureAs(principal, ...signatures) {
         calls.filled = questions.length;
         return { filled: questions.map((q) => q.index), skipped: [] };
       },
+      // Owner-only diagnostics (lib/dev-trace.js). A no-op on every student
+      // install; stubbed here so the reuse path can be checked for the trace it
+      // must still leave behind — a cache hit that logged nothing would look
+      // like "no solve happened" in exactly the log used to debug wrong answers.
+      recordDevTrace(trace) { calls.traced.push(trace); return Promise.resolve(true); },
+      serializeTestAnswers: (questions) => JSON.stringify({ answers: questions }),
     };
     vm.createContext(context);
     vm.runInContext(`${pillSource}\nvar __run = pillSolveOnePage(7, 'deepseek', null);`, context);
@@ -410,6 +418,18 @@ function captureAs(principal, ...signatures) {
   assert.equal(hit.calls.panel, 1, 'the answer panel still appears');
   assert.equal(hit.calls.filled, 1, 'the form is still filled');
   assert.equal(hit.result.questions[0].answer, 'из истории');
+
+  // A reused page never calls the model, so the diagnostics log would otherwise
+  // have a hole exactly where a stale cache hit hides. The scraped text is
+  // recorded either way, which is what makes a wrong cache hit distinguishable
+  // from a wrong answer.
+  assert.equal(hit.calls.traced.length, 1, 'a reused page must still leave a trace');
+  assert.equal(hit.calls.traced[0].kind, 'cache');
+  assert.equal(hit.calls.traced[0].cached, true);
+  assert.equal(hit.calls.traced[0].pageText, 'вопрос 1 …',
+    'the trace must carry the text the cache key was derived from');
+  assert.deepEqual(miss.calls.traced, [],
+    'a fresh solve is traced inside solveTest, not a second time here');
 
   // Skipping solveTest must not skip solveTest's gates: filling a test is the
   // licensed action whether or not this page costs a completion.

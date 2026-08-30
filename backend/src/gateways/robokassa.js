@@ -318,8 +318,16 @@ export async function queryOperationState({
   url.searchParams.set('InvoiceID', invoice);
   url.searchParams.set('Signature', signature);
   return withProviderDeadline(timeoutMs, async (signal) => {
+    // `redirect: 'manual'`, never 'error': workerd rejects 'error' outright
+    // ("won't be implemented … does not make sense at the edge") and throws a
+    // TypeError before the request leaves the Worker, so every provider call
+    // failed as an unexplained transport error while the injected fetchers in
+    // tests — plain functions, which validate no init — kept passing. 'manual'
+    // surfaces a 3xx as a response carrying that status, and the `!response.ok`
+    // check below refuses it, which is the same "never follow a redirect"
+    // guarantee the original value was reaching for.
     const response = await fetcher(url.toString(), {
-      method: 'GET', headers: { Accept: 'application/xml' }, redirect: 'error', signal
+      method: 'GET', headers: { Accept: 'application/xml' }, redirect: 'manual', signal
     });
     if (!response.ok) throw new Error(`operation-state http ${response.status}`);
     const body = await readBodyBounded(response, MAX_PROVIDER_RESPONSE_BYTES);
@@ -357,7 +365,8 @@ export async function createRefund({
       method: 'POST',
       headers: { 'Content-Type': 'text/plain; charset=utf-8', Accept: 'application/json' },
       body: token,
-      redirect: 'error',
+      // See queryOperationState: 'error' is not implemented in workerd.
+      redirect: 'manual',
       signal
     });
     if (!response.ok) throw new Error(`refund-create http ${response.status}`);
@@ -378,8 +387,9 @@ export async function queryRefundState({
   const url = new URL(REFUND_STATE_URL);
   url.searchParams.set('id', id);
   return withProviderDeadline(timeoutMs, async (signal) => {
+    // See queryOperationState: 'error' is not implemented in workerd.
     const response = await fetcher(url.toString(), {
-      method: 'GET', headers: { Accept: 'application/json' }, redirect: 'error', signal
+      method: 'GET', headers: { Accept: 'application/json' }, redirect: 'manual', signal
     });
     if (!response.ok) throw new Error(`refund-state http ${response.status}`);
     const parsed = await readProviderJson(response);

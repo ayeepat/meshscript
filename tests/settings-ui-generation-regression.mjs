@@ -658,6 +658,11 @@ function createSaveHarness({
         }
       }
     },
+    // config.REFERRALS_ENABLED as the flipped-on build sees it. The programme
+    // currently ships off (that path is covered by
+    // tests/referral-disabled-regression.mjs); this block exists to prove the
+    // durable retry machinery still holds the day it is switched back on.
+    REFERRALS_ENABLED: true,
     setLicenseKey: async () => ({ ok: true, key: 'LICENSE-NEW' }),
     getMyReferralCode: () => {
       const request = deferred();

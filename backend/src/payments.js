@@ -47,10 +47,22 @@ export function robokassaCredential(env, slot) {
   return String(env[`ROBOKASSA_PASSWORD${slot}_${suffix}`] || '');
 }
 
+// Accepts the SAME spellings as robokassa.js normalizeResult, deliberately:
+// this parser reads provider API money (OpStateExt OutSum, RefundService
+// GetState amount) as well as operator price config, and Robokassa spells
+// production sums with six fractional digits. Rejecting `199.000000` here did
+// not read as "retry" — it returned null, and `null !== 19900` made every
+// caller conclude the provider had reported a DIFFERENT amount: reconciliation
+// parked paid orders in manual review, and a finished refund took the
+// `finished_mismatch` branch, so finalizeRobokassaRefund — and with it
+// revokeLicenseDurable — never ran, leaving refunded buyers a working licence.
+// RUB is still accounted in kopecks, so a real sub-kopeck remainder is refused.
 export function rublesToKopecks(raw) {
-  const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(String(raw ?? ''));
+  const match = /^(\d+)(?:\.(\d{1,6}))?$/.exec(String(raw ?? ''));
   if (!match) return null;
-  const kopecks = Number(match[1]) * 100 + Number((match[2] || '').padEnd(2, '0'));
+  const fractional = (match[2] || '').padEnd(6, '0');
+  if (fractional.slice(2) !== '0000') return null;
+  const kopecks = Number(match[1]) * 100 + Number(fractional.slice(0, 2));
   return Number.isSafeInteger(kopecks) && kopecks > 0 ? kopecks : null;
 }
 
@@ -1108,12 +1120,26 @@ export async function reconcileRobokassaOrder(env, orderId, fetcher = fetch) {
         `UPDATE payment_orders SET status = 'review', reconciled_at = ?2
          WHERE order_id = ?1 AND status NOT IN ('refunded', 'refund_pending')`
       ).bind(String(order.order_id), now),
+      // Re-open a resolved review rather than ignoring the conflict. payment_review
+      // is keyed (gateway, payment_id), and no worklist counts
+      // payment_orders.status='review' — so INSERT OR IGNORE left an operator's
+      // earlier resolution in place and this brand-new mismatch appeared on NO
+      // queue at all. Same reasoning, and same shape, as the refund path below.
       env.DB.prepare(
-        `INSERT OR IGNORE INTO payment_review
+        `INSERT INTO payment_review
            (gateway, payment_id, invoice_id, amount_rub, reason, fields_json,
             created_at, environment, amount_kopecks)
          VALUES ('robokassa', ?1, ?1, ?2, 'reconciliation_mismatch', ?3, ?4,
-                 ?5, ?6)`
+                 ?5, ?6)
+         ON CONFLICT(gateway, payment_id) DO UPDATE SET
+           reason = 'reconciliation_mismatch',
+           fields_json = ?3,
+           created_at = ?4,
+           amount_rub = ?2,
+           amount_kopecks = ?6,
+           resolved_at = NULL,
+           resolution = NULL,
+           resolution_note = NULL`
       ).bind(
         String(order.order_id), providerKopecks == null ? null : providerKopecks / 100,
         JSON.stringify({

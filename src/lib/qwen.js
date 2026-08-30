@@ -108,7 +108,7 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   // and its only knobs are enable_thinking/thinking_budget, which don't map to
   // medium/high effort. The solver's effort setting is already honored where a
   // real knob exists: OpenRouter (body.reasoning) and DeepSeek (reasoning_effort).
-  const { onDelta = null, responseFormat = null, signal = null, onUsage = null } = opts;
+  const { onDelta = null, responseFormat = null, signal = null, onUsage = null, onReasoning = null } = opts;
   // Vision if EITHER the current message OR a replayed history turn carries an
   // image, so a follow-up doesn't lose the original photo's context.
   const hasImages = files.some(isImageFile) ||
@@ -144,7 +144,7 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
   try {
     if (!key) {
       const result = await askViaProxy('qwen', messages, {
-        label: 'Qwen', onDelta, onUsage, signal,
+        label: 'Qwen', onDelta, onUsage, onReasoning, signal,
         responseFormat: wantJson ? 'json_object' : null
       });
       if (reservation) await commitOne(reservation);
@@ -160,7 +160,7 @@ export async function askQwen(systemPrompt, userText, files = [], history = [], 
     if (wantJson) body.response_format = { type: 'json_object' };
 
     const headers = { Authorization: `Bearer ${key}` };
-    const result = await postStream(ENDPOINT, { headers, body, label: 'Qwen', onDelta, onUsage, signal });
+    const result = await postStream(ENDPOINT, { headers, body, label: 'Qwen', onDelta, onUsage, onReasoning, signal });
     if (reservation) await commitOne(reservation);
     return result;
   } catch (e) {

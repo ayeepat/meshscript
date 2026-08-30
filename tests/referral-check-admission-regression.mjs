@@ -51,7 +51,12 @@ class FakeD1 {
 
 const db = new FakeD1();
 const kv = new FakeKV();
-const env = { DB: db, LICENSES: kv };
+// The programme ships switched off (wrangler.toml REFERRALS_ENABLED="false"),
+// and a disabled route answers `coming_soon` without touching storage at all.
+// Opt this fixture in: the admission budget is what protects the endpoint the
+// day it is switched back on, so it must keep being exercised.
+// tests/referral-disabled-regression.mjs covers the shipped default.
+const env = { DB: db, LICENSES: kv, REFERRALS_ENABLED: 'true' };
 const ctx = { waitUntil() {} };
 const ip = '198.51.100.10';
 const check = (code, requestIp = ip, requestEnv = env) => worker.fetch(

@@ -1076,8 +1076,8 @@ export async function verifyLicense(
   // Operator bypass: a single server-side secret the operator types into their
   // own Settings, letting them keep using the app without a real purchase. Set
   // via `wrangler secret put OWNER_LICENSE_KEY`. Empty/unset env disables it.
-  // Deliberately return the same public shape as a lifetime license so the
-  // client UI/network response does not fingerprint this as an owner key.
+  // The successful response carries only a boolean diagnostics marker; the
+  // owner credential itself and any offline verifier remain server-side.
   const ownerLicense = env.OWNER_LICENSE_KEY && key === normalizeKey(env.OWNER_LICENSE_KEY);
   let license;
   if (ownerLicense) {
@@ -1177,6 +1177,10 @@ export async function verifyLicense(
     ok: true,
     type: license.type,
     expires_at: license.expires_at,
+    // Developer diagnostics are authorized by the server-side owner secret,
+    // never by a verifier embedded in the publicly shipped extension. Only a
+    // caller that has already proved the owner key can receive this marker.
+    ...(ownerLicense ? { developer_mode: true } : {}),
     ...(activation.activation_token ? { activation_token: activation.activation_token } : {})
   };
 }

@@ -429,11 +429,15 @@ for (const [label, stop] of [
   );
   assert.match(workerSource, /if \(id && preCancelledPillOps\.delete\(id\)\) return null;/,
     'a cancel that arrives before the solve message must block that operation');
+  // Matched field-wise rather than as one exact literal: the argument object
+  // also carries the owner-diagnostics `pageUrl`, which never reaches a
+  // provider. What must not drift is that the media and cancellation signals
+  // are still handed down.
   assert.match(workerSource,
-    /const answer = await solveTest\(\{ text: pageText, hasVisualMedia, provider, signal \}\);/,
+    /const answer = await solveTest\(\{\s*text: pageText, hasVisualMedia, provider, signal[,\s}]/,
     'the pill solve must hand its media signal and cancellation signal to solveTest');
   assert.match(workerSource,
-    /async function solveTest\(\{ text, screenshot, hasVisualMedia = false, provider, signal = null \} = \{\}\)/,
+    /async function solveTest\(\{ text, screenshot, hasVisualMedia = false, provider, signal = null[,\s}]/,
     'solveTest must accept a signal');
   const askOpts = workerSource.slice(
     workerSource.indexOf('const askOpts = {'),

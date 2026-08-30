@@ -1,6 +1,11 @@
 /**
  * Referral client. Talks to the license backend's /referral/* endpoints.
  *
+ * Dormant while config.REFERRALS_ENABLED is false: Settings shows a «Скоро»
+ * card without calling any of this, the service worker stops queueing pointer
+ * syncs, and the backend refuses the routes anyway. Nothing below changes for
+ * the flip — it is kept whole so the programme can launch with a flag.
+ *
  * The extension only plays the REFERRER role: this device mints one stable
  * invite code and shows its stats in Settings. The reward is earned entirely
  * at the friend's CHECKOUT — the friend types the code into the pay page

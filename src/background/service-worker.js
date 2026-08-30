@@ -25,6 +25,7 @@ import {
 } from '../lib/test-answer-cache.js';
 import { ensureLicensed, setLicenseKey, deactivateCurrentLicense } from '../lib/license.js';
 import { getMyReferralCode } from '../lib/referral.js';
+import { REFERRALS_ENABLED } from '../lib/config.js';
 import { claimTour, releaseTourClaim } from '../lib/onboarding.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
@@ -52,6 +53,9 @@ import {
 } from '../lib/dashboard-launch.js';
 import { addGdzBook, removeGdzBook } from '../lib/gdz-books.js';
 import { capturePillDomText, captureTestVisualMedia } from '../lib/pill-dom-capture.js';
+import { createReasoningCollector, recordDevTrace } from '../lib/dev-trace.js';
+import { isDevModeActive } from '../lib/dev-mode.js';
+import { reconcileAnswer } from '../lib/test-answer-arithmetic.js';
 import {
   executeScriptInCapturedDocuments,
   isTestCaptureContext,
@@ -210,6 +214,11 @@ function restorePendingReferralPointerRetry() {
   const run = (async () => {
     const intent = await loadReferralPointerIntent();
     if (!intent) return;
+    // An install that activated a license under an earlier build can still be
+    // carrying a durable intent. With the programme off the backend refuses
+    // /referral/code, so retrying it would only rebuild the alarm forever on a
+    // request that can never succeed. Drop the intent and its alarm instead.
+    if (!REFERRALS_ENABLED) return clearReferralPointerIntent(intent.id);
     scheduleReferralPointerRetry(intent.attempts);
     return retryPendingReferralPointer(intent);
   })();
@@ -229,7 +238,10 @@ async function syncReferralPointer() {
 
 async function setLicenseKeyAndSyncReferral(key) {
   const status = await setLicenseKey(key);
-  if (status?.ok) {
+  // The pointer only exists so a future referral reward lands on the license
+  // this device just activated. While the programme is off there is no reward
+  // to aim, so activation stays a purely local, network-free step.
+  if (status?.ok && REFERRALS_ENABLED) {
     // Persist the intent before replying, then detach the unreliable network
     // hop. The named alarm plus startup reconstruction retries until the backend
     // confirms; a 15-second referral outage no longer stalls activation.
@@ -747,7 +759,7 @@ async function solve(
  * the same completion twice. This function neither reads nor writes that cache —
  * SOLVE_TEST and pillSolveOnePage do, on either side of the call.
  */
-async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null } = {}) {
+async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null, pageUrl = null } = {}) {
   await ensureLicensed();
   // Same privacy backstop as solve(): no consent → no provider call. Thrown so
   // the popup's requestSolve surfaces it as a clear error instead of a "result".
@@ -799,11 +811,73 @@ async function solveTest({ text, screenshot, hasVisualMedia = false, provider, s
   const shot = hasVisualMedia === true && screenshot
     ? (await compressImageFiles([screenshot]))[0]
     : null;
-  const answer = await askAI(systemPrompt, userText, shot ? [shot] : [], [], askOpts);
-  // An empty completion is a retryable provider failure, not a solved test.
-  if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
-    throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  // Owner-only diagnostics (lib/dev-trace.js). Subscribing to the reasoning
+  // channel is what makes the model's thinking recordable at all, so only
+  // attach the collector when a trace will actually be written — on every other
+  // install this stays null and the sink drops the deltas as it always has.
+  const tracing = await isDevModeActive();
+  const reasoning = tracing ? createReasoningCollector() : null;
+  if (reasoning) askOpts.onReasoning = (chunk) => reasoning.push(chunk);
+  const startedAt = Date.now();
+  // Recording the INPUT is the whole point: a wrong answer is either a bad
+  // model or bad scraping, and only the verbatim page text tells them apart.
+  const trace = tracing ? {
+    kind: 'test',
+    url: pageUrl,
+    systemPrompt,
+    userText,
+    pageText: text || '',
+    pageTextChars: String(text || '').length,
+    effort: testEffort,
+    hasVisualMedia: hasVisualMedia === true,
+    screenshot: !!shot,
+  } : null;
+  let answer;
+  try {
+    answer = await askAI(systemPrompt, userText, shot ? [shot] : [], [], askOpts);
+  } catch (e) {
+    // A failed solve is exactly the run worth inspecting, so trace it too.
+    if (trace) {
+      void recordDevTrace({
+        ...trace,
+        ok: false,
+        error: String(e?.message || e),
+        durationMs: Date.now() - startedAt,
+        reasoning: reasoning.value(),
+        provider: usedProvider,
+        model: usage?.model || null,
+      });
+    }
+    throw e;
   }
+  // An empty completion is a retryable provider failure, not a solved test.
+  const empty = !answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER;
+  if (trace) {
+    // Re-parsing here is deliberate: parseTestAnswers is pure, so the
+    // corrections it reports are exactly the ones the real parse downstream
+    // will apply. Surfacing them is what lets a wrong-number regression be
+    // spotted again instead of silently absorbed.
+    const checks = [];
+    const questions = empty ? [] : parseTestAnswers(answer, {
+      onCheck: (check) => checks.push(check),
+    });
+    const corrections = checks.filter((check) => check.status === 'fixed');
+    void recordDevTrace({
+      ...trace,
+      ok: !empty,
+      error: empty ? 'Пустой ответ от ИИ.' : null,
+      durationMs: Date.now() - startedAt,
+      reasoning: reasoning.value(),
+      rawAnswer: answer,
+      questionCount: questions.length,
+      corrections,
+      checks,
+      provider: usedProvider,
+      model: usage?.model || null,
+      usage,
+    });
+  }
+  if (empty) throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
   track('test_solve', {
     ...usageFields(usedProvider, usage),
     files_img: shot ? 1 : 0,
@@ -857,19 +931,55 @@ async function resolveOneQuestion(
     `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (${sources}).` +
     (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
     (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
-    ` Верни JSON {"answers":[{"n":"${n}","a":"…"}]} ровно с одним элементом для этого вопроса` +
-    ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).\n\n' +
+    ` Верни JSON {"answers":[{"n":"${n}","s":"…","a":"…"}]} ровно с одним элементом для этого вопроса` +
+    ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).' +
+    // Same reason as the bulk prompt: without the arithmetic written out first,
+    // the re-solve can reason correctly and still transcribe a wrong number.
+    // See lib/test-answer-arithmetic.js.
+    ' Если ответ вычисляется — обязательно заполни "s" (арифметика с подставленными числами) ПЕРЕД "a".\n\n' +
     'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
     (pageText || (shot ? '(текст не извлечён, смотри скриншот)' : '(текст со страницы не извлечён)'));
+  const tracing = await isDevModeActive();
+  const reasoning = tracing ? createReasoningCollector() : null;
+  const startedAt = Date.now();
   const answer = await askAI(systemPrompt, focus, shot ? [shot] : [], [], {
     responseFormat: 'json_object',
     reasoning: { effort: 'high' },
     visionPreferred: hasVisualMedia,
+    ...(reasoning ? { onReasoning: (chunk) => reasoning.push(chunk) } : {}),
     onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   });
-  if (!answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER) {
-    throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  const empty = !answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER;
+  if (tracing) {
+    const checks = [];
+    const questions = empty ? [] : parseTestAnswers(answer, {
+      onCheck: (check) => checks.push(check),
+    });
+    const corrections = checks.filter((check) => check.status === 'fixed');
+    void recordDevTrace({
+      kind: 'requestion',
+      url: capture?.url || null,
+      ok: !empty,
+      error: empty ? 'Пустой ответ от ИИ.' : null,
+      durationMs: Date.now() - startedAt,
+      systemPrompt,
+      userText: focus,
+      pageText,
+      pageTextChars: String(pageText || '').length,
+      effort: 'high',
+      hasVisualMedia,
+      screenshot: !!shot,
+      reasoning: reasoning.value(),
+      rawAnswer: answer,
+      questionCount: questions.length,
+      corrections,
+      checks,
+      provider: usedProvider,
+      model: usage?.model || null,
+      usage,
+    });
   }
+  if (empty) throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
   track('test_requestion', { ...usageFields(usedProvider, usage), files_img: shot ? 1 : 0 });
   const parsed = parseTestAnswers(answer);
   const match = parsed.find((q) => String(q.index) === n) || parsed[0];
@@ -906,18 +1016,38 @@ function normalizeParts(p) {
 }
 
 /**
- * Map the model's {answers:[{n,a}]} reply to the panel's {index, text, answer}
+ * Map the model's {answers:[{n,s,a}]} reply to the panel's {index, text, answer}
  * shape. Tiered like the popup's formatter so a truncated reply still surfaces
  * what arrived: whole JSON → embedded JSON → loose "n"/"a" pair regex.
  * The TEST_ANSWER prompt doesn't return per-question text, so `text` is "".
+ *
+ * This is also where the model's shown arithmetic ("s") is re-computed and, on
+ * a mismatch, allowed to correct "a" — see lib/test-answer-arithmetic.js for
+ * the bug that made that necessary. Doing it HERE and nowhere else matters:
+ * every consumer (popup, in-page panel, autofill, the reuse cache, the
+ * per-question «перерешать») funnels through this one function, so a corrected
+ * answer is the only answer that exists downstream. "s" itself is dropped —
+ * it is scaffolding for generation, not something any consumer should see.
+ *
+ * @param {string} raw the model's reply
+ * @param {{onCheck?: (check: object) => void}} [options] observer receiving one
+ *   record per answer ('verified' | 'fixed' | 'unchecked') for the owner-only
+ *   diagnostics trace; never affects the returned questions.
  */
-function parseTestAnswers(raw) {
+function parseTestAnswers(raw, { onCheck = null } = {}) {
   if (!raw || typeof raw !== 'string') return [];
-  const make = (n, a, c, p) => {
+  const make = (n, a, c, p, s) => {
+    const stated = String(a ?? '').trim();
+    const { answer, ...check } = reconcileAnswer(stated, s);
+    if (onCheck) {
+      try {
+        onCheck({ ...check, index: typeof n === 'number' ? n : String(n ?? '').trim() });
+      } catch { /* an observer must never break a solve */ }
+    }
     const q = {
       index: typeof n === 'number' ? n : (String(n).trim() || ''),
       text: '',
-      answer: String(a ?? '').trim()
+      answer
     };
     // Optional option letter/number for choice questions — a fill-only hint the
     // matcher (scraper.js) uses to break ties when option text is ambiguous.
@@ -935,7 +1065,7 @@ function parseTestAnswers(raw) {
     if (!obj || !Array.isArray(obj.answers)) return null;
     const out = obj.answers
       .filter((x) => x && x.a != null && x.n != null)
-      .map((x) => make(x.n, x.a, x.c, x.p));
+      .map((x) => make(x.n, x.a, x.c, x.p, x.s));
     return out.length ? out : null;
   };
   try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
@@ -944,13 +1074,18 @@ function parseTestAnswers(raw) {
     try { const r = fromObj(JSON.parse(embedded[0])); if (r) return r; } catch { /* embedded failed */ }
   }
   const out = [];
-  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
+  // Last-resort salvage for a reply that never closed its JSON. The optional
+  // "s" group is NOT cosmetic: the prompt now puts "s" between "n" and "a", so
+  // without it this tier would match nothing on exactly the truncated replies
+  // it exists to rescue.
+  const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*(?:"s"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*)?"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
   let m;
   while ((m = re.exec(raw)) !== null) {
     const n = (m[1] ?? m[2] ?? '').trim();
-    let a = m[3];
+    const s = m[3];
+    let a = m[4];
     try { a = JSON.parse('"' + a + '"'); } catch { /* keep raw escapes */ }
-    out.push(make(n, a));
+    out.push(make(n, a, null, null, s));
   }
   return out;
 }
@@ -2240,10 +2375,28 @@ async function pillSolveOnePage(tabId, provider, signal = null) {
   let questions;
   if (reused) {
     questions = reused.questions;
+    // A reused page never calls the model, so without this the diagnostics log
+    // would show a gap exactly where a stale cached answer would hide. The
+    // scraped text is still recorded — it is what the cache key was derived
+    // from, and comparing it against the fresh solve above is how you tell a
+    // wrong cache hit from a wrong answer.
+    void recordDevTrace({
+      kind: 'cache',
+      url: capture.url,
+      ok: true,
+      pageText,
+      pageTextChars: pageText.length,
+      hasVisualMedia,
+      cached: true,
+      questionCount: questions.length,
+      rawAnswer: serializeTestAnswers(questions),
+    });
   } else {
     // Last gate before the PAID call.
     throwIfPillCancelled(signal);
-    const answer = await solveTest({ text: pageText, hasVisualMedia, provider, signal });
+    const answer = await solveTest({
+      text: pageText, hasVisualMedia, provider, signal, pageUrl: capture.url
+    });
     questions = parseTestAnswers(answer);
     // Remember the page BEFORE filling it: the fill mutates the student's form,
     // and only the answers themselves are worth another attempt's money.
@@ -2706,7 +2859,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, status: await deactivateCurrentLicense() });
           break;
         case 'SYNC_REFERRAL_POINTER':
-          sendResponse({ ok: true, code: await syncReferralPointer() });
+          sendResponse(REFERRALS_ENABLED
+            ? { ok: true, code: await syncReferralPointer() }
+            : { ok: false, error: 'referrals_disabled' });
           break;
         case 'DELETE_LOCAL_DATA':
           await deleteAllLocalData();
@@ -2739,8 +2894,24 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             // fresh solve the RAW reply still goes back to the popup — its
             // formatter has salvage tiers for truncated and free-text replies
             // that a re-serialised answer list would throw away.
-            const solved = reused ? '' : await solveTest(msg.payload);
+            const solved = reused ? '' : await solveTest({ ...msg.payload, pageUrl: capture?.url });
             const parsed = reused ? reused.questions : parseTestAnswers(solved);
+            // See pillSolveOnePage: keep the owner's diagnostics log gapless so
+            // a stale cache hit is visible rather than looking like no solve.
+            if (reused) {
+              void recordDevTrace({
+                kind: 'cache',
+                url: capture?.url || null,
+                ok: true,
+                pageText: msg.payload.text || '',
+                pageTextChars: String(msg.payload.text || '').length,
+                hasVisualMedia: msg.payload.hasVisualMedia === true,
+                screenshot: withImage,
+                cached: true,
+                questionCount: parsed.length,
+                rawAnswer: serializeTestAnswers(parsed),
+              });
+            }
             if (!reused && parsed.length) {
               await writeCachedTestAnswers(capture, parsed, { image: withImage });
             }

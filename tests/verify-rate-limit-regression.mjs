@@ -16,6 +16,7 @@ class FakeKV {
 class FakeD1 {
   budgets = new Map();
   statements = 0;
+  deactivationUpdates = 0;
   prepare(sql) {
     this.statements += 1;
     return {
@@ -38,7 +39,13 @@ class FakeD1 {
           }
           return column === 'count' ? count : { count };
         },
-        run: async () => ({ meta: { changes: 1 } })
+        run: async () => {
+          if (sql.includes('UPDATE license_activations')) {
+            this.deactivationUpdates += 1;
+            return { meta: { changes: 0 } };
+          }
+          return { meta: { changes: 1 } };
+        }
       })
     };
   }
@@ -120,7 +127,10 @@ boundarySqlite.close();
 // not consume the anonymous-failure budget under ordinary traffic.
 const validBeforeLimit = await verify('SMESH-OWNER-VALID-KEY');
 assert.equal(validBeforeLimit.status, 200);
-assert.equal((await validBeforeLimit.json()).ok, true);
+const validBeforeLimitBody = await validBeforeLimit.json();
+assert.equal(validBeforeLimitBody.ok, true);
+assert.equal(validBeforeLimitBody.developer_mode, true,
+  'only a backend-confirmed owner key may receive the diagnostics marker');
 assert.equal([...db.budgets.values()].reduce((sum, count) => sum + count, 0), 0);
 
 await kv.put('SMESH-EXPIRED-TEST-KEY', JSON.stringify({
@@ -149,7 +159,10 @@ const thrown = await verify(
   { DB: db, LICENSES: throwingKv }
 );
 assert.equal(thrown.status, 200);
-assert.equal((await thrown.json()).ok, true);
+const thrownBody = await thrown.json();
+assert.equal(thrownBody.ok, true);
+assert.equal(Object.hasOwn(thrownBody, 'developer_mode'), false,
+  'ordinary valid licences must not receive the owner diagnostics marker');
 const thrownBudget = [...db.budgets.entries()].find(([id]) => id.endsWith(`|${thrownIp}`));
 assert.equal(thrownBudget?.[1] ?? 0, 0,
   'a recognized activation with a failed audit mirror must refund its lookup reservation');
@@ -189,6 +202,32 @@ const otherIpValid = await verify(
 );
 assert.equal(otherIpValid.status, 200);
 assert.equal((await otherIpValid.json()).ok, true);
+
+// /deactivate is a public credential boundary too. A syntactically valid but
+// random capability reaches an UPDATE plus a SELECT, so anonymous failures must
+// share the same fail-closed budget rather than exposing unlimited D1 work.
+const deactivateIp = '203.0.113.203';
+const deactivate = () => worker.fetch(new Request('https://api.example/deactivate', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json', 'CF-Connecting-IP': deactivateIp },
+  body: JSON.stringify({
+    key: 'SMESH-MISSING-DEACTIVATE',
+    device_id: '33333333-3333-4333-8333-333333333333',
+    activation_token: 'z'.repeat(43)
+  })
+}), env, ctx);
+for (let i = 0; i < 200; i++) {
+  const response = await deactivate();
+  assert.equal(response.status, 403);
+  assert.equal((await response.json()).reason, 'activation_mismatch');
+}
+assert.equal(db.deactivationUpdates, 200,
+  'the configured allowance must correspond to exactly 200 deactivation writes');
+const deactivateLimited = await deactivate();
+assert.equal(deactivateLimited.status, 429);
+assert.deepEqual(await deactivateLimited.json(), { ok: false, reason: 'rate_limited' });
+assert.equal(db.deactivationUpdates, 200,
+  'the first over-limit deactivation must be rejected before its D1 update');
 
 // If D1 cannot make an authoritative reservation, fail closed before KV
 // instead of silently reopening unlimited anonymous entitlement reads.

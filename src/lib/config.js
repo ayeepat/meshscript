@@ -32,6 +32,21 @@
 // manifest ever disagree.
 export const SHOW_PROVIDER_UI = false;
 
+// «Пригласи друга» is not live yet. While this is false the Settings card
+// stays visible but inert — it shows a «Скоро» pill and answers a click with
+// "coming soon" instead of a code — and every referral network call is skipped:
+// the stats fetch, the code minting, and the pointer sync the service worker
+// otherwise queues after each license activation (that durable intent is
+// cleared instead of retried, so no install keeps hammering a switched-off
+// endpoint). Every path behind the flag is intact and still tested.
+//
+// Must flip together with the backend's own switch (the REFERRALS_ENABLED var
+// in backend/wrangler.toml, read by referralsEnabled() in worker.js), which
+// refuses /referral/* and drops the checkout bonus. A card in front of a
+// switched-off backend can only show «нет связи»; a live backend behind a
+// hidden card promises days nobody can find.
+export const REFERRALS_ENABLED = false;
+
 // What actually answers while the picker is hidden. DeepSeek is the cheapest
 // per text solve; askAI() auto-upgrades to Qwen the moment a request carries an
 // image or PDF (both ride the same Model Studio key through the proxy), so

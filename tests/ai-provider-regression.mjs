@@ -393,8 +393,10 @@ assertContains('../src/content/test-pill.js', "payload: { provider: providerId, 
 
 // solveTest also takes the pill's cancellation signal and hands it to askAI, so
 // closing the pill stops the PAID provider call — see test-pill-lifecycle.
+// `pageUrl` is diagnostics-only (owner-gated dev traces) and never reaches the
+// provider; the signal contract this line exists to pin is unchanged.
 assertContains('../src/background/service-worker.js',
-  'async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null } = {})');
+  'async function solveTest({ text, screenshot, hasVisualMedia = false, provider, signal = null, pageUrl = null } = {})');
 assertContains('../src/background/service-worker.js', 'const providerOverride = normalizeAIProvider(provider, null);');
 assertContains('../src/background/service-worker.js', 'if (providerOverride) askOpts.provider = providerOverride;');
 assertContains('../src/background/service-worker.js', 'visionPreferred: hasVisualMedia === true,');

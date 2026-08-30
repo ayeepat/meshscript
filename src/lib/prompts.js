@@ -42,9 +42,35 @@ export const DEFAULT_PROMPTS = {
     'для остальных предметов внимательно обоснуй выбор для себя. ' +
     'Думай столько, сколько нужно для правильного ответа.\n\n' +
     'Текст страницы может содержать UI-мусор (меню, кнопки «Завершить тест», навигацию) — игнорируй его.\n\n' +
-    'НО В ОТВЕТ ВЫВОДИ ТОЛЬКО ФИНАЛЬНЫЕ ОТВЕТЫ — никаких рассуждений, шагов, пояснений или формул в ответе быть не должно.\n\n' +
+    'В ответе не должно быть рассуждений, пояснений и markdown — только JSON описанной ниже формы.\n\n' +
     'Ответь ТОЛЬКО валидным JSON-объектом, без markdown и текста вокруг, строго такой формы:\n' +
-    '{"answers":[{"n":1,"a":"<финальный ответ>","c":"<номер(а) варианта>"}]}\n\n' +
+    '{"answers":[{"n":1,"s":"5+3*95","a":"290","c":"<номер(а) варианта>"}]}\n\n' +
+    // ⚠️ "s" IS LOAD-BEARING — see lib/test-answer-arithmetic.js for the capture
+    // that produced it. Without it the model reasons correctly and then writes a
+    // different number into "a", because it has to recall eight results from a
+    // long thinking block with no scratch space in the visible output. Writing
+    // the arithmetic FIRST anchors the next token, and the client re-computes
+    // "s" and overrides "a" when they disagree. Do not drop this field, and do
+    // not let it move after "a" — the order is what makes it work.
+    'Поле "s" — ОБЯЗАТЕЛЬНО для любого вопроса, где ответ получается ВЫЧИСЛЕНИЕМ. ' +
+    'Это финальное арифметическое выражение с УЖЕ подставленными числами, из которого получается ответ: ' +
+    'только цифры и знаки + - * / ( ) и точка. Никаких букв, переменных, единиц измерения, знака «=» и степеней ' +
+    '(вместо 3² пиши 3*3). Например для a₉₆ при a₁=5, d=3 → "s":"5+3*95". ' +
+    'Пиши "s" ПЕРЕД "a" и сделай "a" точным результатом этого выражения — это проверяется автоматически. ' +
+    'Если ответ не вычисляется (выбор варианта, слово, соответствие) — поле "s" не добавляй.\n' +
+    // The client checks "a" against "s" exactly, as rationals. It can only
+    // rewrite an answer it can also re-render faithfully, so a value like
+    // -125/7 must arrive AS a fraction: rounding it to a decimal loses the
+    // exact answer, and the checker will not invent a precision. See
+    // lib/test-answer-arithmetic.js.
+    'Если точный ответ — НЕконечная дробь (например -125/7), так и запиши её в "a" в виде "-125/7"; ' +
+    'НЕ округляй до десятичных. Конечные дроби пиши десятичными ("5.4"), как в задании.\n' +
+    // The client verifies comparisons the same way it verifies arithmetic: it
+    // evaluates both sides exactly and overturns the sign only when the model's
+    // own statement is demonstrably false. See lib/test-answer-arithmetic.js.
+    'Для заданий «сравните» / «поставьте знак» (< > = ≤ ≥): в "a" верни только сам знак, ' +
+    'а в "s" — всё сравнение с подставленными числами, например "s":"105/7<230/7", "a":"<". ' +
+    'Это тоже проверяется автоматически.\n\n' +
     'Поле "n" — номер вопроса (число или строка, как на экране). Поле "a" — только финальный ответ:\n' +
     '- один вариант: текст правильного варианта (и его буква/номер, если есть);\n' +
     '- несколько вариантов: все правильные через запятую;\n' +
@@ -71,5 +97,6 @@ export const DEFAULT_PROMPTS = {
     'или из выпадающего списка — ТОЧНО как он там написан>"}, в порядке сверху вниз. ' +
     'В "v" пиши сам текст выбранного варианта (не его номер), чтобы его можно было найти в списке. ' +
     'В "a" собери всё человекочитаемо для ученика (например "А — крахмал; Б — белок; В — жир").\n\n' +
-    'Кроме "n", "a" и необязательных "c" и "p", других полей в JSON быть не должно. Не добавляй поле "reasoning".'
+    'Кроме "n", "a" и необязательных "s", "c" и "p", других полей в JSON быть не должно. ' +
+    'Не добавляй поле "reasoning".'
 };

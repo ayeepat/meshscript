@@ -120,7 +120,13 @@ badge.
 
 **alarms**
 
-> Runs local retention cleanup for 7-day history, 24-hour week scans, and 1-hour pending file handoffs. It also retries a pending referral-code sync after a transient failure.
+> Runs local retention cleanup for 7-day history, 24-hour week scans, and 1-hour pending file handoffs.
+
+Restore the second sentence — “It also retries a pending referral-code sync
+after a transient failure.” — in the same release that flips
+`src/lib/config.js` `REFERRALS_ENABLED` back to `true`. While the referral
+programme is switched off the build never schedules that alarm, and a
+justification has to describe what the submitted package actually does.
 
 **Host permissions**
 
