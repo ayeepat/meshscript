@@ -93,6 +93,17 @@ const BrowserCard = ({x, y, width, height, opacity = 1, scale = 1, rotate = 0, c
   </div>
 );
 
+// The source recordings show the journal provider's wordmark in the fixed
+// header. Keep the real interface footage, but neutralise only that small
+// rectangle in the public ad so the provider is not presented as part of the
+// product brand.
+const JournalBrandMask = ({left, top = 0, width, height, color, opacity = 1}) => (
+  <div
+    aria-hidden="true"
+    style={{position: 'absolute', zIndex: 4, left, top, width, height, background: color, opacity}}
+  />
+);
+
 const SceneCopy = ({frame, start, eyebrow, title, accent, subtitle, className = ''}) => {
   const enter = ip(frame, [start, start + 24], [0, 1], Easing.out(Easing.cubic));
   return (
@@ -206,7 +217,7 @@ const TestScene = ({frame}) => {
       <SceneCopy
         frame={frame}
         start={188}
-        eyebrow="РАБОТАЕТ ПРЯМО В МЭШ"
+        eyebrow="РАБОТАЕТ В ЭЛЕКТРОННОМ ЖУРНАЛЕ"
         title="ВИДИТ"
         accent="ТЕСТ."
         subtitle={<>Сканирует страницу<br />и понимает задания.</>}
@@ -223,6 +234,7 @@ const TestScene = ({frame}) => {
           asset={RELEASE_ASSETS.testScan}
           style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover'}}
         />
+        <JournalBrandMask left={130} width={105} height={44} color="#2d3956" />
         <div className="scan-line" style={{top: `${8 + scan * 82}%`, opacity: scanOpacity}} />
         <div className="scan-label" style={{top: `${5 + scan * 82}%`, opacity: scanOpacity}}>сканирую</div>
       </BrowserCard>
@@ -251,6 +263,7 @@ const AnswerScene = ({frame}) => {
           asset={RELEASE_ASSETS.testAnswers}
           style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover'}}
         />
+        <JournalBrandMask left={175} width={120} height={50} color="#2d3956" />
         <div className="proof-pill" style={{opacity: proof, transform: `translateY(${(1 - proof) * 16}px)`}}>ответы готовы <span>✓</span></div>
       </BrowserCard>
       <div className="answer-copy-panel">
@@ -281,6 +294,7 @@ const AutofillScene = ({frame}) => {
           asset={RELEASE_ASSETS.testFill}
           style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover'}}
         />
+        <JournalBrandMask left={175} width={120} height={50} color="#2d3956" />
       </BrowserCard>
       {ticks.map((tick, index) => {
         const p = spring({frame: frame - tick.at, fps: 60, config: {damping: 17, stiffness: 150, mass: .65}});
@@ -329,6 +343,7 @@ const PdfScene = ({frame}) => {
           asset={RELEASE_ASSETS.homeworkPopup}
           style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover'}}
         />
+        <JournalBrandMask left={85} top={8} width={95} height={48} color="#fff" />
         <Img
           src={staticFile(RELEASE_ASSETS.pdfDone.path)}
           style={{position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover', opacity: result}}

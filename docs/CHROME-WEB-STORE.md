@@ -24,20 +24,20 @@ only `manifest.json`, the extension runtime, bundled fonts, and icons.
 
 **Name:** СМЭШ AI
 
-**Summary (from the manifest, 86 characters):**
+**Summary (from the manifest, 75 characters):**
 
-> Личный ИИ-помощник по домашним заданиям для электронного дневника МЭШ (school.mos.ru).
+> Личный ИИ-помощник по домашним заданиям для электронного журнала школьника.
 
 **Detailed description:**
 
-> СМЭШ AI читает домашнее задание на открытой странице электронного дневника МЭШ и показывает ответ в отдельной вкладке. Условие не нужно копировать вручную.
+> СМЭШ AI читает домашнее задание на открытой странице электронного журнала и показывает ответ в отдельной вкладке. Условие не нужно копировать вручную.
 >
 > Что умеет расширение:
 >
 > • собирает домашние задания за видимую неделю и группирует их по дням;
 > • объясняет решение или даёт короткий ответ;
 > • работает с прикреплёнными файлами, изображениями и PDF;
-> • помогает с тестами МЭШ: распознаёт видимый вопрос, показывает ответы и может заполнить поля по команде пользователя;
+> • помогает с тестами в электронном журнале: распознаёт видимый вопрос, показывает ответы и может заполнить поля по команде пользователя;
 > • хранит историю решений локально в браузере в течение 7 дней;
 > • подбирает готовые ответы из добавленных пользователем учебников и рабочих тетрадей.
 >
@@ -69,7 +69,7 @@ badge.
 
 ⚠️ **Three asset problems are still open and must be resolved before upload:**
 
-- `02-test-answers.png` shows a live МЭШ account identifier («Личный кабинет
+- `02-test-answers.png` shows a live electronic-journal account identifier («Личный кабинет
   ID: …») in the top-right corner. Redact it — it is another person's account
   number on a public listing.
 - `04-gdz-solution.png` reproduces a watermarked gdz.ru answer scan of a
@@ -94,7 +94,7 @@ badge.
 
 **Single purpose:**
 
-> Помогать пользователю решать домашние задания и тесты на открытых им страницах электронного дневника МЭШ с помощью ИИ.
+> Помогать пользователю решать домашние задания и тесты на открытых им страницах электронного журнала с помощью ИИ.
 
 **Remote code:**
 
@@ -112,11 +112,11 @@ badge.
 
 **activeTab**
 
-> After the user presses “Решить тест”, captures only the active school.mos.ru or uchebnik.mos.ru test tab. Code rejects every other origin before capture.
+> After the user presses “Решить тест”, captures only the active test tab on one of the two declared electronic-journal origins. Code rejects every other origin before capture.
 
 **scripting**
 
-> Reads visible homework/test content and fills test fields only on the two declared МЭШ origins, after a user action. It never submits a test.
+> Reads visible homework/test content and fills test fields only on the two declared electronic-journal origins, after a user action. It never submits a test.
 
 **alarms**
 
@@ -130,7 +130,7 @@ justification has to describe what the submitted package actually does.
 
 **Host permissions**
 
-> school.mos.ru and uchebnik.mos.ru are the two diary surfaces the user asks the extension to read. smeshapi.site verifies licenses, proxies textbook answers, and receives content-free telemetry covered by the same acceptance that gates every AI request. ai.smeshapi.site is the only origin that answers AI requests. smeshai.xyz serves a signed, data-only runtime configuration over a single GET. The extension requests no AI-vendor origins: every model call is proxied.
+> The two declared journal origins are the surfaces the user asks the extension to read. smeshapi.site verifies licenses, proxies textbook answers, and receives content-free telemetry covered by the same acceptance that gates every AI request. ai.smeshapi.site is the only origin that answers AI requests. smeshai.xyz serves a signed, data-only runtime configuration over a single GET. The extension requests no AI-vendor origins: every model call is proxied.
 
 **Optional host permissions (`http://*/*`, `https://*/*`)**
 
@@ -169,7 +169,7 @@ sold, used for advertising, or used for credit decisions.
 ## Reviewer instructions
 
 This item needs test instructions because the main features require both a
-valid СМЭШ license and access to a МЭШ diary/test page.
+valid СМЭШ license and access to an electronic-journal diary/test page.
 
 **Steps:**
 
@@ -180,10 +180,10 @@ valid СМЭШ license and access to a МЭШ diary/test page.
    the extension afterwards goes straight to the popup.
 2. Open the toolbar popup. It shows the consent and license screen.
 3. Enter the reviewer license below, accept the disclosure, and press «Начать».
-4. Sign in with the reviewer МЭШ account below and open
-   `https://school.mos.ru/diary/homeworks/homeworks`.
+4. Sign in with the reviewer electronic-journal account below and open its
+   homework section.
 5. Open the extension, select a homework row, and press «Решить».
-6. For the test flow, open a test on school.mos.ru or uchebnik.mos.ru, choose
+6. For the test flow, open a test in the electronic journal, choose
    «Тест» in the popup, and press «Решить тест». The extension will not submit.
 7. Open Settings → «Конфиденциальность и данные» to inspect consent withdrawal,
    statistics withdrawal, and local-data deletion.
@@ -191,12 +191,12 @@ valid СМЭШ license and access to a МЭШ diary/test page.
 **REQUIRED BEFORE SUBMISSION — replace these lines in the dashboard, not in the extension package:**
 
 - Reviewer license: `[ISSUE A LONG-LIVED REVIEW-ONLY SMESH KEY]`
-- Reviewer МЭШ login: `[PROVIDE A NON-PERSONAL TEST ACCOUNT — SEE THE WARNING BELOW]`
-- Reviewer МЭШ password: `[PROVIDE THE TEST ACCOUNT PASSWORD]`
+- Reviewer electronic-journal login: `[PROVIDE A NON-PERSONAL TEST ACCOUNT — SEE THE WARNING BELOW]`
+- Reviewer electronic-journal password: `[PROVIDE THE TEST ACCOUNT PASSWORD]`
 - Any extra navigation note: `[ADD ONLY IF THE TEST CONTENT IS NOT IMMEDIATELY VISIBLE]`
 
-⚠️ **Steps 4–6 depend on a МЭШ account, and those are issued by the Moscow
-Department of Education to enrolled pupils.** There may be no account you can
+⚠️ **Steps 4–6 depend on an electronic-journal account issued to enrolled
+pupils.** There may be no account you can
 lawfully hand to a Google reviewer, and an item a reviewer cannot exercise is
 commonly rejected as unverifiable. Decide this before submitting, not after the
 first rejection. In order of preference:
@@ -204,10 +204,10 @@ first rejection. In order of preference:
 1. Obtain a genuine non-personal demo/teacher account if the department issues
    one, and say in the notes that it contains no real pupil data.
 2. Otherwise, host an unlisted screen recording that walks all seven steps
-   end to end, link it in the reviewer notes, and state plainly that МЭШ
+   end to end, link it in the reviewer notes, and state plainly that journal
    credentials cannot be shared because they identify a real minor.
    Steps 1–3 and 7 (install, welcome page, consent, licence, privacy controls)
-   still work with no МЭШ account at all — say so explicitly, so the reviewer
+   still work with no journal account at all — say so explicitly, so the reviewer
    knows how much they can verify directly.
 
 ## Russian-market compliance sign-off
@@ -253,7 +253,7 @@ what is actually deployed.
       `/ready` is the gate, because it is the endpoint a stale build lacks.
 - [ ] **Optional: publish the signed runtime config.** Not a launch blocker —
       `getRuntimeConfig()` is fail-open, so a 404 changes nothing for users. It
-      buys the ability to fix a МЭШ DOM change, post a notice, or set
+      buys the ability to fix an electronic-journal DOM change, post a notice, or set
       `minExtensionVersion` *without* waiting on a store review. Publish at the
       **apex** (`www.` 301s there and the fetch refuses redirects). Signed
       envelopes expire after 7 days, so only turn this on alongside a re-signing
@@ -268,10 +268,10 @@ what is actually deployed.
 - [ ] Verify ownership of `smeshai.xyz` in Google Search Console.
 - [ ] Clear the production prerequisites above.
 - [ ] Resolve the three open screenshot/promo problems listed under "Graphic assets".
-- [ ] Decide the reviewer-access plan for the МЭШ-dependent steps (see the warning in "Reviewer instructions").
+- [ ] Decide the reviewer-access plan for the journal-dependent steps (see the warning in "Reviewer instructions").
 - [ ] Confirm the live privacy and terms URLs match the disclosures above.
 - [ ] Complete the Russian-market compliance sign-off above with counsel and the accountant.
-- [ ] Issue the review-only license and non-personal МЭШ test account.
+- [ ] Issue the review-only license and non-personal electronic-journal test account.
 - [ ] Upload the verified ZIP and the store assets listed above.
 - [ ] Paste the listing, permission, data-use, and reviewer text from this file.
 - [ ] Choose Russian, Education, and the intended distribution regions.

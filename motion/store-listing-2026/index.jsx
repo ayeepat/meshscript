@@ -25,7 +25,7 @@ const shots = [
   },
   {
     id: '02-test-fill',
-    eyebrow: 'ТЕСТЫ МЭШ',
+    eyebrow: 'ТЕСТЫ В ЖУРНАЛЕ',
     title: ['ЗАПОЛНЯЕТ', 'ПОЛЯ ТЕСТА'],
     accentLine: 1,
     description: 'Ответы остаётся проверить. Кнопку сдачи нажимаете вы.',
@@ -160,7 +160,7 @@ const PromoMarquee = () => (
       <BrandBackground strong />
       <div className="marquee-copy">
         <BrandLockup large />
-        <h1>Домашка<br />прямо из МЭШ</h1>
+        <h1>Домашка<br />из электронного журнала</h1>
         <p>Тесты, файлы и ГДЗ в одном расширении</p>
       </div>
       <div className="marquee-frame">

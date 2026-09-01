@@ -33,7 +33,7 @@ output file.
 
 The only accepted `homeworkAnchorSelector` values are the exact strings in
 `APPROVED_HOMEWORK_SELECTORS` in `src/lib/remote-config.js`. Supporting a new
-Mesh DOM shape requires reviewing and shipping that selector in the extension
+An electronic-journal DOM change requires reviewing and shipping that selector in the extension
 before remote config can select it.
 
 Notice links are limited to `smeshai.xyz`, `www.smeshai.xyz`, and the Chrome

@@ -6,14 +6,14 @@ each point maps to code in this repo.
 
 ## What the extension does
 
-A personal homework/test assistant for the Moscow school diary **МЭШ**
-(`school.mos.ru`). Users activate a purchased СМЭШ license, which routes every
+A personal homework/test assistant for an electronic school journal. Users
+activate a purchased СМЭШ license, which routes every
 AI request through our own proxy. The extension reads the homework on the page
 the user is already viewing, sends it to an AI provider, and shows the answer.
 It never logs into anything on the user's behalf and never submits a test.
 
 It is an independent product and is not affiliated with, endorsed by, or
-operated by МЭШ, mos.ru, or the Moscow Department of Education. The extension
+operated by the electronic-journal provider or any government body. The extension
 only reads pages the signed-in user opens themselves.
 
 **Provider selection is not exposed, and this build ships no direct-to-vendor
@@ -59,14 +59,14 @@ when consent is withdrawn. Consent is reviewable and revocable in Settings →
 |---|---|
 | `storage`, `unlimitedStorage` | All local: settings, API keys, the GDZ catalog cache, a **7-day** solve history and a **7-day** cache of already-solved test pages (kept so reopening the same questions does not re-bill the same completion). `unlimitedStorage` because a cached textbook catalog and inlined answer images can exceed the default quota. Nothing is synced. `chrome.storage.local` is locked to trusted contexts (`setAccessLevel`) so content scripts cannot read keys. |
 | `activeTab` | On an explicit user click, screenshot the visible test page and read its text to solve it. |
-| `scripting` | Inject the content script that reads the user's homework cards and fills test answers into the form fields on the Mesh page. |
+| `scripting` | Inject the content script that reads the user's homework cards and fills test answers into the form fields in the electronic journal. |
 | `alarms` | A periodic local-data retention sweep (history 7 d, solved-test cache 7 d, week scan 24 h, pending file handoffs 1 h). No network involved. |
 
 ## Host permissions
 
 | Host | Why |
 |---|---|
-| `https://school.mos.ru/*`, `https://uchebnik.mos.ru/*` | Read the user's **own** diary/homework/test player and download attachments from the two exact Mesh origins, inside the user's already-authenticated session. Scripted child-frame capture additionally requires a positively identified test-player document; unrelated MOS frames are excluded. |
+| Two declared electronic-journal origins | Read the user's **own** journal/homework/test player and download attachments inside the user's already-authenticated session. Scripted child-frame capture additionally requires a positively identified test-player document; unrelated frames are excluded. |
 | `https://ai.smeshapi.site/*` | Our AI proxy for licensed users, and **the only origin any AI request reaches**. Requests require the license, anonymous device id and the random one-device activation bearer; the key and public UUID alone are insufficient. The VPS sends consent-gated task content to 302.AI using its currently saved model chain. |
 | `https://smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. Apex only — the site 301s `www.` to apex and the fetch refuses redirects. Normal links to the public site do not need host access. |
 | `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body), the GDZ proxy (`POST /gdz/fetch`, see below) and, **only if the user opts in**, anonymous usage statistics (see below). |
@@ -75,7 +75,7 @@ when consent is withdrawn. Consent is reviewable and revocable in Settings →
 
 | Optional host | Why |
 |---|---|
-| `http://*/*`, `https://*/*` | Requested **one site at a time**, never at install, so a student can also solve a quiz or an exercise that is not on Mesh. |
+| `http://*/*`, `https://*/*` | Requested **one site at a time**, never at install, so a student can also solve a quiz or an exercise outside the electronic journal. |
 
 This is the only broad pattern in the manifest and it is deliberately
 `optional_host_permissions`: **nothing is granted at install time**, the install
@@ -100,7 +100,7 @@ How it works, and the limits that are enforced in code (see
   taken on this path** — an in-page click confers no `activeTab`.
 - The floating button does not appear on every page of a granted site: a scored
   heuristic has to recognise a question or an answer form first.
-- Mesh and our own hosts are excluded from this machinery entirely, so the
+- The electronic journal and our own hosts are excluded from this machinery entirely, so the
   school flow cannot be redirected through it.
 - These pages are answered on the cheaper model chain at low reasoning effort;
   the school allowance is not spent on them.
@@ -151,9 +151,9 @@ Homework text never enters this path.
   decided on-device by regex heuristics (`src/lib/task-classifier.js`), and the
   first network request for a row happens only after the user presses «Решить»
   on that row.
-- **The Mesh session token** is read from the page's own `localStorage` solely
+- **The electronic-journal session token** is read from the page's own `localStorage` solely
   to download the user's own attachments. Downloads are restricted to an
-  explicit `school.mos.ru`/`uchebnik.mos.ru` allowlist (HTTPS only, redirects
+  explicit two-origin allowlist (HTTPS only, redirects
   re-validated hop by hop) and the token is never sent anywhere else.
 - **Pseudonymous usage statistics are covered by the single consent tick.** The
   separate «Анонимная статистика» toggle was removed: accepting the terms and

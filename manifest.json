@@ -4,7 +4,7 @@
   "name": "СМЭШ AI",
   "short_name": "СМЭШ AI",
   "version": "1.0.0",
-  "description": "Личный ИИ-помощник по домашним заданиям для электронного дневника школьника (school.mos.ru).",
+  "description": "Личный ИИ-помощник по домашним заданиям для электронного журнала школьника.",
   "homepage_url": "https://smeshai.xyz/",
   "permissions": ["storage", "unlimitedStorage", "activeTab", "scripting", "alarms"],
   "host_permissions": [

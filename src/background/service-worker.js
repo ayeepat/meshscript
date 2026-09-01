@@ -2431,7 +2431,7 @@ function isMeshTestTab(tab) {
 
 function requireMeshTestTab(tab) {
   if (!isMeshTestTab(tab)) {
-    throw new Error('Для решения теста откройте тест на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+    throw new Error('Для решения теста откройте его в электронном журнале. Другие вкладки расширение не снимает и не отправляет ИИ.');
   }
 }
 

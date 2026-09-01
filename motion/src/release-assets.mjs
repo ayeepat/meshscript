@@ -39,7 +39,7 @@ export const RELEASE_ASSETS = Object.freeze({
   ),
   store: image(
     'assets/v3/store.png', 3344, 1882,
-    'e6874c114d479020e330637eedeb9294da1b6ed208af8eb90ce775ce7b537b69'
+    '80593dc88ee82fc7c64fc2383b2a08156f6cc32c0f0b0a613ac42f2cfa5f1843'
   ),
   soundtrack: Object.freeze({
     type: 'audio',

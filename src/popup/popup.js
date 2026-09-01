@@ -122,7 +122,7 @@ function isMeshTestTab(tab) {
 function requireMeshTestTab(tab) {
   if (!tab?.id) throw new Error('Не удалось определить активную вкладку.');
   if (!isMeshTestTab(tab)) {
-    throw new Error('Для решения теста откройте тест на school.mos.ru или uchebnik.mos.ru. Другие вкладки расширение не снимает и не отправляет ИИ.');
+    throw new Error('Для решения теста откройте его в электронном журнале. Другие вкладки расширение не снимает и не отправляет ИИ.');
   }
 }
 
@@ -1197,7 +1197,7 @@ async function renderTestTabForActiveTab() {
   if (!pattern) {
     // chrome://, a PDF viewer, the store — nothing here can be granted.
     lede.textContent = 'Эту страницу расширение открыть не может. Откройте обычный сайт с заданием ' +
-      'или тест на school.mos.ru.';
+      'или тест в электронном журнале.';
     action.hidden = true;
     note.textContent = '';
     return;
@@ -1256,12 +1256,12 @@ async function scanHomework() {
     return;
   }
   if (!/^https:\/\/school\.mos\.ru\/diary\//.test(tab.url || '')) {
-    showMessage('<p class="muted">Откройте страницу электронного дневника (school.mos.ru/diary/...) и нажмите на иконку снова. Для теста откройте вкладку «Тест».</p>');
+    showMessage('<p class="muted">Откройте страницу электронного журнала и нажмите на иконку снова. Для теста откройте вкладку «Тест».</p>');
     return;
   }
   const resp = await sendScan(tab.id);
   if (!resp.ok) {
-    showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите страницу Mesh (F5) и попробуйте снова.<br><small>' + escapeHtml(resp.error || '') + '</small></p>');
+    showMessage('<p class="muted">Не удалось сканировать страницу. Перезагрузите электронный журнал (F5) и попробуйте снова.<br><small>' + escapeHtml(resp.error || '') + '</small></p>');
     return;
   }
   render(resp.data, crypto.randomUUID(), tab.id);

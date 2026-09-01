@@ -218,7 +218,7 @@ async function loadGrantedSitesUi() {
   if (!patterns.length) {
     const empty = document.createElement('p');
     empty.className = 'field-hint';
-    empty.textContent = 'Пока ни одного сайта. Расширение работает только на school.mos.ru и uchebnik.mos.ru.';
+    empty.textContent = 'Пока ни одного дополнительного сайта. Электронный журнал доступен по умолчанию.';
     list.appendChild(empty);
     return;
   }

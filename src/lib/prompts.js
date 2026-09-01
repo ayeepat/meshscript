@@ -18,7 +18,7 @@ export const PROMPT_CATEGORIES = {
 // The opening sentence of TEST_ANSWER. Split out only so the generic-page
 // prompt can replace it without copying the rest.
 const MESH_TEST_INTRO =
-  'Ты решаешь онлайн-тест МЭШ по скриншоту экрана и тексту страницы.\n\n';
+  'Ты решаешь онлайн-тест в электронном журнале по скриншоту экрана и тексту страницы.\n\n';
 
 export const DEFAULT_PROMPTS = {
   [PROMPT_CATEGORIES.WORKED_SOLUTION]:
@@ -142,7 +142,7 @@ export const DEFAULT_PROMPTS = {
  * and tests/web-solve-regression.mjs fails so the wording is fixed here too.
  */
 const WEB_ANSWER_INTRO =
-  'Ты решаешь задание на обычной веб-странице (не МЭШ) по её тексту.\n\n' +
+  'Ты решаешь задание на обычной веб-странице по её тексту.\n\n' +
   'Тебе дают заголовок страницы, её основное содержимое и, если на странице есть поля ' +
   'для ответа, их пронумерованный список. Работай так:\n' +
   '- если список полей ЕСТЬ — на каждое поле верни ровно один объект ответа, и поле "n" ' +
