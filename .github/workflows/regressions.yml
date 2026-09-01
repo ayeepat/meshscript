@@ -36,6 +36,10 @@ jobs:
           npm --prefix motion ci
       - name: Install locked motion-audio dependencies
         run: python -m pip install --disable-pip-version-check --require-hashes -r motion/requirements.txt
+      - name: Install FFmpeg for motion verification
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
       - name: Check source and run regression suite
         run: npm run verify
       - name: Validate VPS readiness, durable quota, and installer configuration
