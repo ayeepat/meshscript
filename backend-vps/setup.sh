@@ -1553,7 +1553,11 @@ if (!quotaLoadBlocked) {
 // caller-selected qwen/deepseek id chooses the frontier experience; once the
 // combined frontier allowance is consumed, both experiences continue on the
 // standard chain.
-function chargeQuota(licenseKey, providerId, provider) {
+//
+// `requestStandard` is the client's downgrade-only hint (any-site solving). It
+// can force the standard tier but never the frontier one, so the worst a
+// hostile client achieves is spending its own cheap bucket.
+function chargeQuota(licenseKey, providerId, provider, requestStandard = false) {
   if (!QUOTA_CONFIG_VALID || !modelConfigHealthy) {
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
@@ -1575,7 +1579,8 @@ function chargeQuota(licenseKey, providerId, provider) {
   const frontierUsed = qwenUsed > Number.MAX_SAFE_INTEGER - deepseekUsed
     ? Number.MAX_SAFE_INTEGER
     : qwenUsed + deepseekUsed;
-  const tier = limits.force_standard || frontierUsed >= limits.frontier_per_license
+  const tier = requestStandard === true || limits.force_standard ||
+    frontierUsed >= limits.frontier_per_license
     ? 'standard'
     : 'frontier';
   const bucket = tier === 'frontier' ? providerId : 'standard';
@@ -2435,6 +2440,13 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
   if (REASONING_EFFORTS.has(body.reasoning_effort)) {
     requestOptions.reasoning_effort = body.reasoning_effort;
   }
+  // DOWNGRADE-only route hint. The extension sends it for pages solved outside
+  // МЭШ (any-site solving — see src/lib/web-solve.js): answer them on the cheap
+  // standard chain and charge the standard bucket, leaving the frontier
+  // allowance for the schoolwork the licence is actually sold for. 'standard'
+  // is the ONLY accepted value, so the field can never buy a better model than
+  // the quota state already allows.
+  if (body.tier === 'standard') requestOptions.tier = 'standard';
 
   return {
     provider, providerId, body: requestOptions, messages,
@@ -2525,8 +2537,16 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
     if (hasPdfs || QWEN_MODEL.test(model)) {
       // no effort knob to send
     } else if (GLM_53_FLASH.test(model)) {
+      // GLM has to be told to think at all. The EFFORT, though, depends on who
+      // asked: an already-installed Auto client sends 'low' as a generic cost
+      // hint and would be left shallow on real schoolwork, so it is overridden
+      // to max. A client that explicitly asked for the standard tier is the
+      // any-site path — it MEANT cheap, and honouring its effort is the whole
+      // point of the hint.
       upstreamBody.thinking = { type: 'enabled' };
-      upstreamBody.reasoning_effort = 'max';
+      upstreamBody.reasoning_effort = body.tier === 'standard' && REASONING_EFFORTS.has(body.reasoning_effort)
+        ? body.reasoning_effort
+        : 'max';
     } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
@@ -2732,7 +2752,9 @@ function admitJobStart(reservation, prep) {
 
   // Quota and sliding-window admission are committed together with no await,
   // so a rejected burst neither slips through nor consumes extra daily quota.
-  const q = chargeQuota(prep.licenseKey, prep.providerId, prep.provider);
+  const q = chargeQuota(
+    prep.licenseKey, prep.providerId, prep.provider, prep.body?.tier === 'standard'
+  );
   if (!q.ok) return { err: { status: q.status || 503, message: q.message } };
   const route = routeForRequest(
     prep.providerId, q.tier, prep.hasImages, prep.hasPdfs, q.routingState

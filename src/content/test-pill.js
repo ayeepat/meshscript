@@ -71,6 +71,167 @@
     } catch { /* no iframe access / malformed DOM — treat as absent */ }
     return '';
   }
+  /* ---------- Generic sites (non-МЭШ) ---------- */
+  // The same pill also runs on ordinary web pages, but ONLY on origins the user
+  // explicitly granted (see lib/web-solve.js — the manifest ships no broad host
+  // permission, so this script is registered per granted origin at runtime).
+  //
+  // The host is read out of location.href with a regex rather than `new URL`
+  // so this file stays evaluable in a bare JS realm, which is how its detection
+  // is regression-tested.
+  const MESH_HOSTS = ['school.mos.ru', 'uchebnik.mos.ru'];
+  function currentHost() {
+    const m = /^https?:\/\/([^/?#]+)/i.exec(String(location.href || ''));
+    return m ? m[1].toLowerCase().replace(/:\d+$/, '') : '';
+  }
+  const IS_MESH = MESH_HOSTS.includes(currentHost());
+
+  // Cheap "is there something to solve here?" score. This runs on the poll, on
+  // every page of every granted site, so it is bounded everywhere and cached
+  // for a beat. It deliberately lives here and not in scraper.js: that file is
+  // 180 KB and is only injected once a solve actually begins.
+  //
+  // Scored, not boolean, because either half alone is wrong — a lone search box
+  // is not a quiz, and a printed exercise with no form is still worth solving.
+  // A line that STARTS like a task, after an optional «3.» / «№3» ordinal.
+  // Anchoring is the whole point: an unanchored word list matches «Несколько»
+  // as «сколько», «задача которых» as «задач» and «сравнительно» as «сравните»
+  // — measured on a real Wikipedia article, which then looked like a quiz.
+  const WEB_TASK_LINE =
+    /^\s*(?:[№#]?\s*\d{1,3}\s*[.)]\s*)?(?:задани|вопрос|задач|упражнени|викторин|тест\b|решите|реши\b|вычислите|найдите|укажите|выберите|определите|объясните|перечислите|сравните|докажите|заполните|соотнесите|составьте|запишите|прочитайте|переведите|question|exercise|problem|quiz|solve|calculate|explain|choose|select|fill in|match the|translate)/i;
+  const WEB_SEL = {
+    choice: 'input[type=radio], input[type=checkbox], [role="radio"]',
+    list: 'select, [role="listbox"], [role="combobox"]',
+    area: 'textarea',
+    // An omitted type is HTML's most common shorthand for a text box and is
+    // already handled by scraper.js's native filler.
+    text: 'input[type=text], input[type=number], input:not([type])'
+  };
+  // Site chrome is FULL of form controls that are not questions: hamburger and
+  // dropdown toggles, cookie switches, shop filters, newsletter boxes, search
+  // fields. Observed on ru.wikipedia.org — eight visible checkboxes, all of
+  // them menu toggles, which is exactly a "quiz" by a naive count. Controls
+  // under any of these never count toward the score.
+  const WEB_FURNITURE_SEL =
+    'nav, header, footer, aside, form[role="search"], [role="navigation"], [role="banner"], ' +
+    '[role="contentinfo"], [role="complementary"], [role="search"], [role="menu"], ' +
+    '[role="menubar"], [role="toolbar"], [role="dialog"], [role="alertdialog"]';
+  const WEB_FURNITURE_WORDS = [
+    'nav', 'navbar', 'navigation', 'menu', 'submenu', 'header', 'masthead', 'footer',
+    'sidebar', 'topbar', 'bottombar', 'toolbar', 'breadcrumb', 'cookie', 'cookies',
+    'consent', 'gdpr', 'banner', 'modal', 'popup', 'overlay', 'newsletter', 'subscribe',
+    'search', 'searchbox', 'searchform', 'filter', 'filters', 'facet', 'facets',
+    'sort', 'login', 'signin', 'signup', 'share', 'social'
+  ];
+  function inWebFurniture(element) {
+    try {
+      if (element.closest && element.closest(WEB_FURNITURE_SEL)) return true;
+      let node = element;
+      for (let depth = 0; node && node.nodeType === 1 && depth < 10; depth++, node = node.parentElement) {
+        const attribute = (name) => node.getAttribute ? (node.getAttribute(name) || '') : '';
+        const names = [
+          attribute('class'), node.id || '', attribute('name'), attribute('placeholder'),
+          attribute('aria-label'), attribute('role'),
+        ].join(' ');
+        if (!names.trim()) continue;
+        for (const token of names.toLowerCase().split(/[^a-z0-9а-яё]+/i)) {
+          if (token && WEB_FURNITURE_WORDS.indexOf(token) !== -1) return true;
+        }
+      }
+    } catch { /* detached / exotic node — treat as page content */ }
+    return false;
+  }
+  function countUpTo(selector, cap) {
+    try {
+      const found = document.querySelectorAll(selector) || [];
+      // Two caps: stop once the score is decided, and never walk more than a
+      // fixed number of matches — a filter sidebar can hold hundreds.
+      const limit = Math.min(found.length, 200);
+      let n = 0;
+      for (let i = 0; i < limit && n < cap; i++) {
+        if (!inWebFurniture(found[i])) n++;
+      }
+      return n;
+    } catch { return 0; }
+  }
+  /**
+   * Bounded text-node sweep for two precise shapes:
+   *   questions — a short line that ENDS in «?». Testing for a «?» anywhere
+   *               matched URLs (`?title=…&oldid=…`) on every wiki page.
+   *   tasks     — a line that STARTS like an instruction («Решите…», «Задание 4»).
+   * Exits as soon as the score is settled, so a real quiz costs almost nothing;
+   * a miss is bounded by the node cap, not by page size.
+   */
+  function webTextSignals() {
+    let questions = 0;
+    let tasks = 0;
+    let visited = 0;
+    let walker;
+    try {
+      if (!document.body || typeof document.createTreeWalker !== 'function') return { questions, tasks };
+      walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null);
+    } catch { return { questions, tasks }; }
+    let node;
+    while ((node = walker.nextNode())) {
+      if (++visited > 4000 || tasks >= 1 || questions >= 2) break;
+      const raw = node.nodeValue;
+      if (!raw || raw.length < 10 || raw.length > 400) continue;
+      const line = raw.trim();
+      if (line.length < 10 || line.length > 300) continue;
+      if (line.charAt(line.length - 1) === '?') questions++;
+      else if (WEB_TASK_LINE.test(line)) tasks++;
+    }
+    return { questions, tasks };
+  }
+  // The score is re-taken every 2.5 s while a page still looks like it might
+  // become solvable (an SPA quiz loads late), then backs off to 15 s. Without
+  // the backoff, a granted all-sites install would walk up to 4 000 text nodes
+  // every few seconds on every tab, forever — a homework helper has no business
+  // costing a browser that much on a page it has already judged twice.
+  const WEB_SCORE_TTL_MS = 2500;
+  const WEB_SCORE_IDLE_TTL_MS = 15000;
+  const WEB_SCORE_IDLE_AFTER = 8;
+  let webScoreCache = { at: 0, value: false };
+  let webScoreMisses = 0;
+  function resetWebScore() {
+    webScoreCache = { at: 0, value: false };
+    webScoreMisses = 0;
+  }
+  function looksLikeWebQuestionPage() {
+    const now = Date.now();
+    const ttl = webScoreMisses >= WEB_SCORE_IDLE_AFTER ? WEB_SCORE_IDLE_TTL_MS : WEB_SCORE_TTL_MS;
+    if (now - webScoreCache.at < ttl) return webScoreCache.value;
+    let score = 0;
+    try {
+      if (countUpTo(WEB_SEL.choice, 4) >= 2) score += 2;
+      if (score < 2 && countUpTo(WEB_SEL.list, 1) >= 1) score += 1;
+      if (score < 2 && countUpTo(WEB_SEL.area, 1) >= 1) score += 1;
+      // One ordinary answer box is enough when the text sweep also finds its
+      // question. Search/filter boxes are excluded by inWebFurniture above.
+      if (score < 2 && countUpTo(WEB_SEL.text, 1) >= 1) score += 1;
+      if (score < 2) {
+        const { questions, tasks } = webTextSignals();
+        // Either shape on its own is enough — a printed exercise («Решите
+        // уравнение…») has no question mark, and a list of questions has no
+        // imperative — but ONE stray question mark is not a quiz.
+        if (tasks >= 1 || questions >= 2) score += 2;
+        else if (questions >= 1) score += 1;
+      }
+    } catch { score = 0; }
+    webScoreCache = { at: now, value: score >= 2 };
+    webScoreMisses = webScoreCache.value ? 0 : webScoreMisses + 1;
+    return webScoreCache.value;
+  }
+
+  // The popup can force the pill onto a granted page the score missed — the
+  // student asked for it explicitly, which outranks any heuristic.
+  let forced = false;
+
+  function shouldShowPill() {
+    if (IS_MESH) return looksLikeTest();
+    return forced || looksLikeWebQuestionPage();
+  }
+
   function looksLikeTest() {
     const { pathname, search } = location;
     const iframe = iframeSignal();
@@ -570,10 +731,11 @@
             <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 14.5l.8 2.2L22 17.5l-2.2.8L19 20.5l-.8-2.2L16 17.5l2.2-.8z"/></svg>
             <span>Решить</span>
           </button>
+          ${IS_MESH ? `
           <button class="act-all" title="Решить каждую страницу по очереди и переходить «Далее». Отправку не нажимаю.">
             <svg class="i" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="13 17 18 12 13 7"/><polyline points="6 17 11 12 6 7"/></svg>
             <span>все страницы</span>
-          </button>
+          </button>` : ''}
         </div>
         ${SHOW_PROVIDER_UI ? `<span class="prov" title="Активный ИИ-сервис">${providerAbbr}</span>` : ''}
         <div class="status" aria-live="polite">
@@ -814,16 +976,29 @@
     // Generous cap: a full page of hard problems can take a couple of minutes to
     // solve + fill. The worker keeps the SW alive via the streaming call, so this
     // only bounds a genuinely stuck run, not a slow-but-progressing one.
-    const r = await send('PILL_SOLVE_PAGE', 240000);
+    const r = await send(IS_MESH ? 'PILL_SOLVE_PAGE' : 'WEB_SOLVE_PAGE', 240000);
     if (gen !== runGen || !shadow) return;
     busy = false;
     if (!r.ok) { showResult(errText(r.error), true); return; }
-    if (!r.count) { showResult('Вопросы не распознаны. Проверьте, что тест на экране.', true); return; }
-    const filled = (r.summary && r.summary.filled ? r.summary.filled.length : 0);
+    if (!r.count) {
+      showResult(IS_MESH
+        ? 'Вопросы не распознаны. Проверьте, что тест на экране.'
+        : 'Не нашёл на странице вопроса. Прокрутите к заданию и попробуйте снова.', true);
+      return;
+    }
     // `cached` means these answers came from this device's own earlier solve of
     // the SAME questions in the same order — say so, so an instant result reads
     // as reuse rather than as a suspiciously fast model.
-    showResult(`${r.cached ? 'Из истории' : 'Готово'} · заполнено ${filled} из ${r.count}`);
+    const head = r.cached ? 'Из истории' : 'Готово';
+    // Off Mesh a page can legitimately have no answer boxes (an exercise printed
+    // as prose). Reporting «заполнено 0 из 3» there would read as a failure when
+    // the answers are sitting in the panel exactly as intended.
+    if (!IS_MESH && r.fillable === false) {
+      showResult(`${head} · ответов: ${r.count} — смотрите панель`);
+      return;
+    }
+    const filled = (r.summary && r.summary.filled ? r.summary.filled.length : 0);
+    showResult(`${head} · заполнено ${filled} из ${r.count}`);
   }
 
   async function solveAll() {
@@ -861,7 +1036,9 @@
       if (!event.isTrusted) return;
       solvePage();
     });
-    pill.querySelector('.act-all').addEventListener('click', (event) => {
+    // The multi-page autopilot is МЭШ-only: off Mesh a «Далее» control can be
+    // any of a hundred things, so the button is not rendered there at all.
+    pill.querySelector('.act-all')?.addEventListener('click', (event) => {
       if (!event.isTrusted) return;
       solveAll();
     });
@@ -879,7 +1056,7 @@
     // A boolean alone is insufficient here: the SPA can leave and re-enter a
     // test while this build is awaiting storage, making `built` true again for
     // a NEW build. Only this exact lifecycle generation may mount/render.
-    if (gen !== runGen || !built || dismissed || !looksLikeTest()) return;
+    if (gen !== runGen || !built || dismissed || !shouldShowPill()) return;
     ensureHost();
     render();
   }
@@ -979,23 +1156,41 @@
     invalidatePillLifecycle({ dismiss: true, hidePanel: true });
   }
 
-  window.__smeshPill = { build, hide: panicHide, looksLikeTest, evaluate };
+  /**
+   * Show the pill even when the generic score missed this page. The student
+   * asked for it from the toolbar, which outranks any heuristic — and, unlike
+   * the score, it also clears a previous Esc/× on this page.
+   */
+  function forceShow() {
+    forced = true;
+    dismissed = false;
+    resetWebScore();
+    evaluate();
+  }
+
+  window.__smeshPill = {
+    build, hide: panicHide, looksLikeTest, evaluate,
+    shouldShowPill, looksLikeWebQuestionPage, show: forceShow, isMesh: IS_MESH,
+  };
 
   /* ---------- Detection watcher (poll-based; survives SPA navigation) ---------- */
   // A content script lives in an ISOLATED world, so it CANNOT hook the page's
   // history.pushState — the МЭШ React app routes into a test client-side, which
   // fires no event we can hear. So we poll location.href (cheap string compare)
   // and re-evaluate. This also catches the test player loading its iframe a beat
-  // after navigation. The poll is gentle and only runs on МЭШ hosts.
+  // after navigation. The poll is gentle; off Mesh it is slower still, because
+  // it runs on every page of every granted site.
   let lastHref = location.href;
   function evaluate() {
     if (location.href !== lastHref) {
       lastHref = location.href;
       dismissed = false; // a new route may show the pill again
+      forced = false;    // ...and a forced showing does not follow the student
+      resetWebScore();   // a new route deserves a fresh look, not a backed-off one
       invalidatePillLifecycle({ hidePanel: true });
     }
     if (dismissed) return;
-    if (!looksLikeTest()) {
+    if (!shouldShowPill()) {
       // Detection can disappear while storage is loading or a solve is pending.
       // Both states belong to the old page and must be invalidated immediately;
       // waiting for `busy` to clear kept the pill alive on unrelated SPA pages.
@@ -1011,9 +1206,21 @@
     }
   }
 
-  log('loaded', location.href, '· isTest=' + looksLikeTest());
+  // Registered eagerly, NOT inside wireGlobalsOnce: on a granted site the pill
+  // usually has not been built (the score said no), and "show it anyway" is
+  // exactly the case where the popup needs to reach us.
+  if (!IS_MESH) {
+    try {
+      chrome.runtime.onMessage.addListener((msg) => {
+        if (msg?.type === 'SHOW_WEB_PILL') forceShow();
+        return false; // fire-and-forget; never hold the channel open
+      });
+    } catch { /* messaging unavailable */ }
+  }
+
+  log('loaded', location.href, '· show=' + shouldShowPill());
   evaluate();
-  setInterval(evaluate, 1200);
+  setInterval(evaluate, IS_MESH ? 1200 : 2500);
   window.addEventListener('popstate', evaluate);
   window.addEventListener('hashchange', evaluate);
 })();

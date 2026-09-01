@@ -5,8 +5,9 @@
  * so the host page's CSS and scripts cannot reach it. Idempotent: re-injecting the
  * script (e.g. service worker calls executeScript every solve) is a no-op.
  *
- * Persists {x, y, minimized} to chrome.storage.session so a soft refresh
- * inside the same browser session restores the same panel position.
+ * Persists {x, y, minimized, explain} to chrome.storage.session so a soft
+ * refresh inside the same browser session restores the same panel position and
+ * whether the per-question «разбор» was unfolded.
  */
 (() => {
   if (window.__smeshPanel) return;
@@ -15,6 +16,7 @@
   const DEFAULT_W = 400;
   const AI_NOTICE_URL = 'https://smeshai.xyz/ai';
   const LONG_THINKING_NOTICE = 'Thinking longer for a more accurate response.';
+  const MISSING_EXPLANATION = 'Пояснение для этого ответа не получено.';
   // The worker's fill runs three passes across every frame — native inputs, the
   // MathQuill main-world pass, then the ASYNC interactive pass that opens each
   // custom dropdown (~0.7s per dropdown). A matching question with several
@@ -64,7 +66,10 @@
   // show(), hide() and pagehide; a cancelled old gesture must never persist its
   // detached coordinates over the replacement panel's state.
   let activeDragCleanup = null;
-  let state = { x: null, y: null, minimized: false };
+  // `explain` is the «разбор» chevron: collapsed by default (the panel's job is
+  // the answers), and remembered like the position and the minimised state so a
+  // student who wants the reasoning gets it on every solve without re-clicking.
+  let state = { x: null, y: null, minimized: false, explain: false };
 
   // Theme follows the user's extension preference ('system' | 'light' | 'dark'),
   // stored in chrome.storage.local by src/common/theme.js. The panel lives in a
@@ -137,6 +142,11 @@
     return (q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
   }
 
+  function explanationText(q) {
+    const text = typeof q?.explain === 'string' ? q.explain.trim() : '';
+    return text || MISSING_EXPLANATION;
+  }
+
   function questionLine(q, i) {
     const num = q.index != null ? q.index : i + 1;
     const qid = escapeHtml(questionId(q, i));
@@ -145,14 +155,24 @@
     const inner = text
       ? `<span class="num">${escapeHtml(num)}.</span> <span class="q">${escapeHtml(text)}</span><span class="a">${ans}</span>`
       : `<span class="num">№${escapeHtml(num)}</span><span class="a">${ans}</span>`;
+    // Always reserve a truthful row. Old cache entries and malformed/probabilistic
+    // model replies may lack `e`; a short fallback keeps the control stable and
+    // avoids fabricating reasoning or spending tokens on an automatic retry.
+    const why = `<span class="why">${escapeHtml(explanationText(q))}</span>`;
     // The «↻» re-asks just THIS question (re-captures the page + solves one),
     // so a single doubtful answer doesn't need a full-page re-solve. data-qi
     // carries the array index back to the handler.
     return `<li data-qid="${qid}">` +
-      `<span class="qline">${inner}<span class="long-think-note" role="status" aria-live="polite" hidden>${LONG_THINKING_NOTICE}</span></span>` +
+      `<span class="qline">${inner}<span class="long-think-note" role="status" aria-live="polite" hidden>${LONG_THINKING_NOTICE}</span>${why}</span>` +
       `<button class="btn-resolve" type="button" data-qi="${i}" title="Перерешать этот вопрос" aria-label="Перерешать этот вопрос">↻</button>` +
       `</li>`;
   }
+
+  // Wording for the «разбор» chevron, shared by the initial render and the click
+  // handler so a panel rebuilt with the toggle already on never ships the
+  // collapsed label.
+  const whyTitle = (expanded) => (expanded ? 'Скрыть разбор' : 'Показать разбор по каждому вопросу');
+  const whyLabel = (expanded) => (expanded ? 'Скрыть разбор' : 'Показать разбор');
 
   function isPanelCurrent(generation, panelNonce, panel = null) {
     return generation === panelGeneration && panelNonce === activePanelNonce &&
@@ -171,7 +191,6 @@
       panelNonce,
       generation,
     };
-
     shadow.innerHTML = `
       <style>
         ${fontFaceCss()}
@@ -229,7 +248,7 @@
 
         .panel {
           position: fixed;
-          width: ${DEFAULT_W}px;
+          width: min(${DEFAULT_W}px, calc(100vw - 24px));
           max-height: 70vh;
           background: var(--p-bg);
           color: var(--p-text);
@@ -260,6 +279,10 @@
         .titlebar.dragging { cursor: grabbing; }
         .title {
           flex: 1;
+          /* The titlebar now carries five controls; the title yields first
+             rather than pushing the chevron off the edge on a narrow zoom. */
+          min-width: 0;
+          overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
           font-family: "SmeshUnbounded", "SmeshManrope", -apple-system, sans-serif;
           font-weight: 700; font-size: 12.5px; letter-spacing: -0.2px;
           color: var(--p-text);
@@ -315,6 +338,35 @@
         }
         li .q + .a::before { content: " → "; color: var(--p-arrow); font-weight: normal; margin-right: 4px; }
         .empty { color: var(--p-muted); font-style: italic; padding: 6px 0; }
+
+        /* «Разбор» — the model's one-sentence reason for each answer, folded
+           away behind the titlebar chevron. Indented to 26px so it hangs under
+           the question text rather than the number, matching .long-think-note.
+           Quiet by construction: secondary colour and smaller than the answer. */
+        .why {
+          display: none;
+          margin: 5px 0 1px 26px;
+          /* --p-q, not --p-muted: this is prose meant to be read, and the muted
+             token lands at ~4.2:1 on the dark card at this size. The question
+             colour is the panel's existing secondary-text token and clears AA
+             in both themes. */
+          color: var(--p-q);
+          font-size: 11.5px;
+          line-height: 1.45;
+        }
+        .panel.explain .why { display: block; }
+        /* While its answer is being re-solved the sentence still argues for the
+           old one, so it fades with the «…» rather than reading as current. */
+        .a.resolving ~ .why { opacity: 0.4; }
+        /* The chevron itself: quiet like the other titlebar buttons, tinted to
+           the accent while open so the expanded state is readable at a glance. */
+        .btn-why {
+          display: inline-flex; align-items: center; justify-content: center;
+          padding: 5px 7px;
+        }
+        .btn-why svg { display: block; transition: transform 0.18s cubic-bezier(0.22, 0.61, 0.36, 1); }
+        .panel.explain .btn-why { color: var(--p-accent); border-color: var(--p-accent); }
+        .panel.explain .btn-why svg { transform: rotate(180deg); }
         .ai-note {
           display: flex;
           align-items: center;
@@ -384,20 +436,38 @@
         @keyframes smesh-resolve-spin { to { transform: rotate(360deg); } }
         @media (prefers-reduced-motion: reduce) {
           button { transition: none; }
+          .btn-why svg { transition: none; }
           .btn-resolve.spinning { animation-duration: 1.6s; }
         }
+        @media (pointer: coarse) {
+          .titlebar button, .btn-resolve { min-width: 44px; min-height: 44px; }
+          .btn-resolve { opacity: 0.75; }
+        }
+        @media (max-width: 380px) {
+          .title { display: none; }
+          .titlebar { gap: 4px; padding: 6px; }
+          .btn-fill { flex: 1; }
+        }
       </style>
-      <div class="panel${state.minimized ? ' minimized' : ''}" data-theme="${resolveTheme()}">
+      <div class="panel${state.minimized ? ' minimized' : ''}${questions.length && state.explain ? ' explain' : ''}" data-theme="${resolveTheme()}">
         <div class="titlebar" data-drag>
           <div class="title">Ответы на тест<span class="count"> · ${questions.length}</span></div>
           <button class="btn-fill" title="Заполнить форму теста ответами" aria-label="Заполнить">Заполнить</button>
           <button class="btn-copy" title="Скопировать все ответы" aria-label="Скопировать">Copy</button>
+          ${questions.length
+            ? `<button class="btn-why" type="button" title="${whyTitle(state.explain)}"` +
+              ` aria-label="${whyLabel(state.explain)}" aria-expanded="${state.explain ? 'true' : 'false'}"` +
+              ' aria-controls="smesh-answer-list">' +
+              '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" ' +
+              'stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+              '<polyline points="6 9 12 15 18 9"/></svg></button>'
+            : ''}
           <button class="btn-toggle" title="Свернуть / развернуть" aria-label="Свернуть">${state.minimized ? '▢' : '–'}</button>
           <button class="btn-close" title="Закрыть" aria-label="Закрыть">×</button>
         </div>
         <div class="body">
           ${questions.length
-            ? `<ol>${questions.map(questionLine).join('')}</ol>`
+            ? `<ol id="smesh-answer-list">${questions.map(questionLine).join('')}</ol>`
             : '<div class="empty">Ответы не распознаны.</div>'}
           <div class="ai-note">
             <span class="dot" aria-hidden="true"></span>
@@ -416,13 +486,14 @@
 
   function positionPanel(panel) {
     if (state.x != null && state.y != null) {
-      panel.style.left = clamp(state.x, 0, Math.max(0, innerWidth - 80)) + 'px';
+      const panelWidth = panel.offsetWidth || Math.min(DEFAULT_W, Math.max(0, innerWidth - 24));
+      panel.style.left = clamp(state.x, 0, Math.max(0, innerWidth - panelWidth)) + 'px';
       panel.style.top = clamp(state.y, 0, Math.max(0, innerHeight - 50)) + 'px';
       panel.style.right = 'auto';
       panel.style.bottom = 'auto';
     } else {
-      panel.style.right = '20px';
-      panel.style.bottom = '20px';
+      panel.style.right = '12px';
+      panel.style.bottom = '12px';
     }
   }
 
@@ -651,6 +722,13 @@
     // worker returns null `parts` for single-box questions — clear stale ones then.
     const nextQuestion = { ...q, answer: r.answer };
     if ('parts' in r) nextQuestion.parts = r.parts || undefined;
+    // Same rule for the «разбор»: the sentence must belong to the answer above
+    // it, so a re-solve that returned none clears the one that explained the
+    // answer the student just rejected.
+    if ('explain' in r) {
+      if (r.explain) nextQuestion.explain = r.explain;
+      else delete nextQuestion.explain;
+    }
     // Best-effort: push only this answer into the form and re-mark the line.
     // Pin `index` to the line's qid so scraper.js targets this exact question
     // by number/position — identical to the full-page fill — even when the
@@ -675,6 +753,12 @@
     // answer text before teardown.
     q.answer = nextQuestion.answer;
     if ('parts' in r) q.parts = nextQuestion.parts;
+    if ('explain' in r) {
+      if (nextQuestion.explain) q.explain = nextQuestion.explain;
+      else delete q.explain;
+      const whyEl = li.querySelector('.why');
+      if (whyEl) whyEl.textContent = explanationText(nextQuestion);
+    }
     aEl.textContent = nextQuestion.answer;
     aEl.classList.remove('resolving');
     btn.classList.remove('spinning');
@@ -741,6 +825,22 @@
         fillBtn.classList.remove('copied');
       }, 1600);
     });
+
+    // «Разбор»: one chevron unfolds every question's explanation at once. Pure
+    // presentation — the sentences are already here, so this costs no call and
+    // needs no capture revalidation beyond the usual panel-currency check.
+    const whyBtn = panel.querySelector('.btn-why');
+    if (whyBtn) {
+      whyBtn.addEventListener('click', () => {
+        if (!isPanelCurrent(generation, panelNonce, panel)) return;
+        state.explain = !state.explain;
+        panel.classList.toggle('explain', state.explain);
+        whyBtn.setAttribute('aria-expanded', state.explain ? 'true' : 'false');
+        whyBtn.title = whyTitle(state.explain);
+        whyBtn.setAttribute('aria-label', whyLabel(state.explain));
+        saveState();
+      });
+    }
 
     toggleBtn.addEventListener('click', () => {
       if (!isPanelCurrent(generation, panelNonce, panel)) return;

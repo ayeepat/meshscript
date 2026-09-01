@@ -18,6 +18,7 @@ import {
 } from '../lib/license.js';
 import { isVersionBelow } from '../lib/remote-config.js';
 import { DEFAULT_PROVIDER, SHOW_PROVIDER_UI, SUPPORT_BOT_URL } from '../lib/config.js';
+import { webOriginPattern } from '../lib/web-solve.js';
 import { assertUploadAllowed } from '../lib/upload-limits.js';
 import { filesLabel, pluralRu } from '../common/plural.js';
 import { awaitStablePendingRead } from '../lib/pending-read.js';
@@ -1158,6 +1159,94 @@ function showTab(which) {
   document.getElementById('tabTest').classList.toggle('active', isTest);
   // Shrink the popup on the test tab so it covers less of the page underneath.
   document.body.classList.toggle('compact', isTest);
+  if (isTest) void renderTestTabForActiveTab();
+}
+
+/* ---------- Any-site solving (optional host permission) ---------- */
+
+/**
+ * The Тест tab shows ONE of two things, decided by the active tab:
+ *   • МЭШ  → the existing screenshot solve + multi-page autopilot;
+ *   • any other http(s) page → the any-site card, which either asks Chrome for
+ *     this one origin or (once granted) puts the solve pill on the page.
+ *
+ * The permission prompt has to happen HERE: chrome.permissions.request needs a
+ * user gesture in an extension page, which a content script cannot provide.
+ * Asking per site — not for all sites — is deliberate: a homework helper has no
+ * business reading a bank page it was never pointed at.
+ */
+async function renderTestTabForActiveTab() {
+  const card = document.getElementById('webSite');
+  const lede = document.getElementById('webSiteLede');
+  const note = document.getElementById('webSiteNote');
+  const action = document.getElementById('webAction');
+  const label = document.getElementById('webActionLabel');
+  const meshOnly = [
+    document.getElementById('testLede'),
+    document.getElementById('solveTest'),
+    document.getElementById('solveAllPages'),
+  ];
+
+  const tab = await getActiveTab();
+  const mesh = isMeshTestTab(tab);
+  card.hidden = mesh;
+  for (const element of meshOnly) if (element) element.hidden = !mesh;
+  if (mesh) return;
+
+  const pattern = webOriginPattern(tab?.url || '');
+  if (!pattern) {
+    // chrome://, a PDF viewer, the store — nothing here can be granted.
+    lede.textContent = 'Эту страницу расширение открыть не может. Откройте обычный сайт с заданием ' +
+      'или тест на school.mos.ru.';
+    action.hidden = true;
+    note.textContent = '';
+    return;
+  }
+  action.hidden = false;
+  const host = new URL(tab.url).hostname;
+  const granted = await chrome.permissions.contains({ origins: [pattern] });
+  if (granted) {
+    lede.innerHTML = 'Сайт <span class="websitehost"></span> разрешён. Кнопка «Решить» появляется ' +
+      'на страницах с вопросами сама — или вызовите её отсюда.';
+    lede.querySelector('.websitehost').textContent = host;
+    label.textContent = 'Показать кнопку «Решить»';
+    note.textContent = 'Отозвать доступ можно в настройках расширения.';
+  } else {
+    lede.innerHTML = 'Решать задания на <span class="websitehost"></span>? ' +
+      'Я прочитаю текст страницы, отвечу на вопросы и заполню поля.';
+    lede.querySelector('.websitehost').textContent = host;
+    label.textContent = 'Разрешить на этом сайте';
+    note.textContent = 'Доступ выдаётся только этому сайту и отзывается в любой момент. ' +
+      'Другие сайты расширение не читает.';
+  }
+  action.dataset.pattern = pattern;
+  action.dataset.granted = granted ? '1' : '';
+  // Resolved here, not in the click handler: chrome.permissions.request must be
+  // reached from the user gesture, and an `await` before it can lose that.
+  action.dataset.tabId = Number.isSafeInteger(tab?.id) ? String(tab.id) : '';
+}
+
+async function onWebActionClick(event) {
+  const action = event.currentTarget;
+  const pattern = action.dataset.pattern;
+  const tabId = Number(action.dataset.tabId);
+  if (!pattern || !Number.isSafeInteger(tabId)) return;
+  // Fire the permission prompt FIRST, still inside the gesture.
+  const request = action.dataset.granted
+    ? Promise.resolve(true)
+    : chrome.permissions.request({ origins: [pattern] });
+  action.disabled = true;
+  try {
+    // Chrome shows its own consent dialog. A refusal is a normal answer, not an
+    // error: leave the card exactly as it was.
+    if (!(await request)) return;
+    // Registration covers future loads; this tab needs the pill injected now.
+    await sendToBackground({ type: 'ACTIVATE_WEB_SITE', payload: { tabId } });
+    await sendToContent(tabId, { type: 'SHOW_WEB_PILL' });
+    window.close();
+  } finally {
+    action.disabled = false;
+  }
 }
 
 async function scanHomework() {
@@ -1407,6 +1496,7 @@ async function init() {
   document.getElementById('tabTest').onclick = () => showTab('test');
   document.getElementById('solveTest').onclick = solveTestOnScreen;
   document.getElementById('solveAllPages').onclick = solveAllPages;
+  document.getElementById('webAction').onclick = onWebActionClick;
   document.getElementById('diagBtn').onclick = (e) => runFetchDiag(e.currentTarget);
   mountProviderBadge('provBadge'); // tiny "which AI" tag on the test tab
   wireOnboarding();

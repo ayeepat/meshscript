@@ -71,6 +71,40 @@ when consent is withdrawn. Consent is reviewable and revocable in Settings →
 | `https://smeshai.xyz/*` | One-way `GET` of a small, P-256-signed static config envelope (`extension-config.json`) used to select a pre-approved scrape selector or show an "update available" notice without a re-publish. The signature is rechecked on network and cache reads; no user data is sent. Apex only — the site 301s `www.` to apex and the fetch refuses redirects. Normal links to the public site do not need host access. |
 | `https://smeshapi.site/*` | License check (`POST /verify`, with credentials in a bounded JSON body), the GDZ proxy (`POST /gdz/fetch`, see below) and, **only if the user opts in**, anonymous usage statistics (see below). |
 
+## Optional host permissions — solving on other sites
+
+| Optional host | Why |
+|---|---|
+| `http://*/*`, `https://*/*` | Requested **one site at a time**, never at install, so a student can also solve a quiz or an exercise that is not on Mesh. |
+
+This is the only broad pattern in the manifest and it is deliberately
+`optional_host_permissions`: **nothing is granted at install time**, the install
+prompt is unchanged, and the extension has no access to any site the user has
+not personally approved in Chrome's own dialog.
+
+How it works, and the limits that are enforced in code (see
+`src/lib/web-solve.js` and `tests/web-solve-regression.mjs`):
+
+- The student opens a page, clicks the toolbar icon and presses «Разрешить на
+  этом сайте». The extension requests **that one origin** (`https://host/*`),
+  not the broad pattern. Granting an origin is what registers the in-page
+  «Решить» button there (`chrome.scripting.registerContentScripts`); revoking it
+  unregisters it. Every granted site is listed, and revocable, in Settings →
+  «Решение на других сайтах».
+- Only the **top-level document** of a granted page is ever read or filled.
+  Child frames are excluded by construction, so a third-party iframe on a
+  granted page can neither contribute text to a request nor receive an autofill,
+  and cannot send the extension any privileged message.
+- The page is read through a bounded content extractor that keeps the question
+  and drops site furniture, capped at ~10 000 characters. **No screenshot is
+  taken on this path** — an in-page click confers no `activeTab`.
+- The floating button does not appear on every page of a granted site: a scored
+  heuristic has to recognise a question or an answer form first.
+- Mesh and our own hosts are excluded from this machinery entirely, so the
+  school flow cannot be redirected through it.
+- These pages are answered on the cheaper model chain at low reasoning effort;
+  the school allowance is not spent on them.
+
 ## GDZ textbook answers (no host permission, no declarativeNetRequest)
 
 When the user pins a textbook, common exercises are answered from published

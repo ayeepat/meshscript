@@ -52,17 +52,31 @@ import {
   cleanupDashboardLaunches
 } from '../lib/dashboard-launch.js';
 import { addGdzBook, removeGdzBook } from '../lib/gdz-books.js';
-import { capturePillDomText, captureTestVisualMedia } from '../lib/pill-dom-capture.js';
+import { capturePillDomText, captureTestVisualMedia, captureWebDomText } from '../lib/pill-dom-capture.js';
 import { createReasoningCollector, recordDevTrace } from '../lib/dev-trace.js';
 import { isDevModeActive } from '../lib/dev-mode.js';
 import { reconcileAnswer } from '../lib/test-answer-arithmetic.js';
 import {
+  CAPTURE_MODE_WEB,
   executeScriptInCapturedDocuments,
   isTestCaptureContext,
+  isWebCapture,
   TEST_CAPTURE_CHANGED,
   testCaptureChangedError,
   withMatchingTestCapture,
 } from '../lib/test-capture-context.js';
+import {
+  expectedWebPrincipal,
+  isWebSolvableUrl,
+  webOriginPattern,
+  webPillExcludeMatches,
+  webPillMatchPatterns,
+  WEB_PILL_FILES,
+  WEB_PILL_SCRIPT_ID,
+  WEB_SOLVE_EFFORT,
+  WEB_SOLVE_PROVIDER,
+  WEB_SOLVE_TIER,
+} from '../lib/web-solve.js';
 import { classifyAutopilotFill, resolvePaginationTarget } from '../lib/test-autopilot.js';
 import { isHomeworkScanId, principalBindingMatches } from '../lib/principal-binding.js';
 import {
@@ -920,7 +934,14 @@ async function resolveOneQuestion(
     { allowThinText: !!panelScreenshot },
   );
   await withMatchingTestCapture(panelCapture, async () => capture, async () => undefined);
-  const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER];
+  // Off Mesh this re-solve obeys the same cost rule as the first answer: cheap
+  // chain, low effort (see lib/web-solve.js). Mesh keeps 'high' — that is what
+  // makes «перерешать» worth pressing on a graded test.
+  const web = isWebCapture(capture);
+  const systemPrompt = DEFAULT_PROMPTS[
+    web ? PROMPT_CATEGORIES.WEB_ANSWER : PROMPT_CATEGORIES.TEST_ANSWER
+  ];
+  const effort = web ? WEB_SOLVE_EFFORT : 'high';
   const n = String(index ?? '').trim();
   let usage = null, usedProvider = null;
   const shot = panelScreenshot ? (await compressImageFiles([panelScreenshot]))[0] : null;
@@ -928,24 +949,33 @@ async function resolveOneQuestion(
   // that was not attached is an invitation to answer from imagination.
   const sources = shot ? 'текст страницы ниже + скриншот' : 'текст страницы ниже';
   const focus =
-    `Перепроверь и реши ТОЛЬКО вопрос №${n} этого теста (${sources}).` +
+    `Перепроверь и реши ТОЛЬКО вопрос №${n} ${web ? 'на этой странице' : 'этого теста'} (${sources}).` +
     (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
     (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
-    ` Верни JSON {"answers":[{"n":"${n}","s":"…","a":"…"}]} ровно с одним элементом для этого вопроса` +
+    ` Верни JSON {"answers":[{"n":"${n}","s":"…","a":"…","e":"…"}]} ровно с одним элементом для этого вопроса` +
     ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).' +
+    // The panel line keeps its «разбор» in step with the answer above it: a
+    // re-solved question that returned no new sentence clears the old one
+    // rather than leaving it explaining a number that changed.
+    ' Поле "e" ОБЯЗАТЕЛЬНО: то же короткое пояснение (одно предложение), ' +
+    'последним полем, после "a".' +
     // Same reason as the bulk prompt: without the arithmetic written out first,
     // the re-solve can reason correctly and still transcribe a wrong number.
     // See lib/test-answer-arithmetic.js.
     ' Если ответ вычисляется — обязательно заполни "s" (арифметика с подставленными числами) ПЕРЕД "a".\n\n' +
-    'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n' +
+    (web
+      ? 'Текст страницы (может содержать посторонний текст сайта — игнорируй его):\n\n'
+      : 'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n') +
     (pageText || (shot ? '(текст не извлечён, смотри скриншот)' : '(текст со страницы не извлечён)'));
   const tracing = await isDevModeActive();
   const reasoning = tracing ? createReasoningCollector() : null;
   const startedAt = Date.now();
   const answer = await askAI(systemPrompt, focus, shot ? [shot] : [], [], {
     responseFormat: 'json_object',
-    reasoning: { effort: 'high' },
+    reasoning: { effort },
     visionPreferred: hasVisualMedia,
+    ...(web ? { tier: WEB_SOLVE_TIER } : {}),
+    ...(web ? { provider: WEB_SOLVE_PROVIDER, proxyOnly: true } : {}),
     ...(reasoning ? { onReasoning: (chunk) => reasoning.push(chunk) } : {}),
     onUsage: (u, prov) => { usage = u; usedProvider = prov; }
   });
@@ -966,7 +996,7 @@ async function resolveOneQuestion(
       userText: focus,
       pageText,
       pageTextChars: String(pageText || '').length,
-      effort: 'high',
+      effort,
       hasVisualMedia,
       screenshot: !!shot,
       reasoning: reasoning.value(),
@@ -980,14 +1010,19 @@ async function resolveOneQuestion(
     });
   }
   if (empty) throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
-  track('test_requestion', { ...usageFields(usedProvider, usage), files_img: shot ? 1 : 0 });
+  track('test_requestion', {
+    ...usageFields(usedProvider, usage),
+    files_img: shot ? 1 : 0,
+    meta: { effort, ...(web ? { web: 1 } : {}) },
+  });
   const parsed = parseTestAnswers(answer);
   const match = parsed.find((q) => String(q.index) === n) || parsed[0];
   // Return parts too so a re-solved multi-field question (x & y, x₁ & x₂) still
-  // fills every box, not just the first.
+  // fills every box, not just the first — and the fresh «разбор», so the panel
+  // line's explanation belongs to the answer printed above it.
   const resolved = match
-    ? { answer: match.answer, parts: match.parts || null }
-    : { answer: '', parts: null };
+    ? { answer: match.answer, parts: match.parts || null, explain: match.explain || '' }
+    : { answer: '', parts: null, explain: '' };
   return withMatchingTestCapture(capture, readTestCaptureContext, async () => resolved);
 }
 
@@ -1015,9 +1050,16 @@ function normalizeParts(p) {
   return out;
 }
 
+// The model is asked for one short sentence per question (see the "e" field in
+// lib/prompts.js). This bounds what a model that ignored the cap can put on a
+// panel line — and keeps the field well inside the privileged-message limit
+// that validQuestion enforces on the way back in.
+const MAX_EXPLANATION_CHARS = 240;
+
 /**
- * Map the model's {answers:[{n,s,a}]} reply to the panel's {index, text, answer}
- * shape. Tiered like the popup's formatter so a truncated reply still surfaces
+ * Map the model's {answers:[{n,s,a,e}]} reply to the panel's
+ * {index, text, answer, explain} shape.
+ * Tiered like the popup's formatter so a truncated reply still surfaces
  * what arrived: whole JSON → embedded JSON → loose "n"/"a" pair regex.
  * The TEST_ANSWER prompt doesn't return per-question text, so `text` is "".
  *
@@ -1036,7 +1078,7 @@ function normalizeParts(p) {
  */
 function parseTestAnswers(raw, { onCheck = null } = {}) {
   if (!raw || typeof raw !== 'string') return [];
-  const make = (n, a, c, p, s) => {
+  const make = (n, a, c, p, s, e) => {
     const stated = String(a ?? '').trim();
     const { answer, ...check } = reconcileAnswer(stated, s);
     if (onCheck) {
@@ -1059,13 +1101,22 @@ function parseTestAnswers(raw, { onCheck = null } = {}) {
     // carries the combined human-readable string for the panel/copy.
     const parts = normalizeParts(p);
     if (parts.length) q.parts = parts;
+    // The one-sentence «разбор» the answer panel reveals behind its chevron.
+    // Dropped outright when the checker OVERTURNED the answer: that sentence
+    // explains the number the model wrote, not the corrected one the student
+    // now sees, and a confident explanation of a replaced value is worse than
+    // no explanation at all.
+    const explain = check.status === 'fixed'
+      ? ''
+      : String(e ?? '').trim().slice(0, MAX_EXPLANATION_CHARS);
+    if (explain) q.explain = explain;
     return q;
   };
   const fromObj = (obj) => {
     if (!obj || !Array.isArray(obj.answers)) return null;
     const out = obj.answers
       .filter((x) => x && x.a != null && x.n != null)
-      .map((x) => make(x.n, x.a, x.c, x.p, x.s));
+      .map((x) => make(x.n, x.a, x.c, x.p, x.s, x.e));
     return out.length ? out : null;
   };
   try { const r = fromObj(JSON.parse(raw)); if (r) return r; } catch { /* not pure JSON */ }
@@ -1077,7 +1128,10 @@ function parseTestAnswers(raw, { onCheck = null } = {}) {
   // Last-resort salvage for a reply that never closed its JSON. The optional
   // "s" group is NOT cosmetic: the prompt now puts "s" between "n" and "a", so
   // without it this tier would match nothing on exactly the truncated replies
-  // it exists to rescue.
+  // it exists to rescue. "e" is deliberately NOT rescued here — it trails "a"
+  // behind the optional "c"/"p", and a pattern loose enough to skip those is
+  // loose enough to pick up the neighbouring answer's. A truncated reply
+  // surfaces its answers without the «разбор»; the answers are the point.
   const re = /"n"\s*:\s*(?:"([^"]*)"|([^\s,}]+))\s*,\s*(?:"s"\s*:\s*"((?:[^"\\]|\\.)*)"\s*,\s*)?"a"\s*:\s*"((?:[^"\\]|\\.)*)"/g;
   let m;
   while ((m = re.exec(raw)) !== null) {
@@ -1104,6 +1158,12 @@ function serializeTestAnswers(questions) {
       if (question.choice != null && String(question.choice).trim() !== '') wire.c = question.choice;
       if (Array.isArray(question.parts) && question.parts.length) {
         wire.p = question.parts.map((part) => ({ l: part.label, v: part.value }));
+      }
+      // Last, exactly as the prompt orders it — a cached page must round-trip
+      // to the identical question objects, «разбор» included, or reopening a
+      // solved test would silently lose the explanations it was solved with.
+      if (question.explain != null && String(question.explain).trim() !== '') {
+        wire.e = question.explain;
       }
       return wire;
     })
@@ -1857,6 +1917,10 @@ async function fillAllFrames(tabId, questions, capture) {
   if (!tabId || !Array.isArray(questions) || !questions.length) {
     return { filled: [], skipped: [], coverage: { exact: false, units: [] } };
   }
+  // A generic page is one document and one merged control list, so it takes the
+  // single-pass filler instead of the Mesh cross-frame passes. Routing it here
+  // is what makes the answer panel's «Заполнить» work off Mesh too.
+  if (isWebCapture(capture)) return fillWebAnswersInTab(capture, questions);
   const idFor = (q, i) =>
     (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
   const expectedDocuments = Object.fromEntries(
@@ -2063,13 +2127,23 @@ async function testPageSig(tabId) {
   return documents.map((document) => `${document.frameId}:${document.signature}`).join('||');
 }
 
-async function captureTestDocuments(tabId) {
+/**
+ * @param {number} tabId
+ * @param {{mode?: string}} [options] 'mesh' (default) captures every frame that
+ *   identifies itself as a Mesh assessment document; 'web' captures ONLY the
+ *   top document of an eligible generic page (see lib/web-solve.js). The web
+ *   mode never descends into child frames on purpose: off Mesh an iframe is an
+ *   ad or a widget, and neither may feed a prompt or receive an autofill.
+ */
+async function captureTestDocuments(tabId, { mode = 'mesh' } = {}) {
+  const web = mode === CAPTURE_MODE_WEB;
+  const target = web ? { tabId, frameIds: [0] } : { tabId, allFrames: true };
   try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['src/content/scraper.js'] });
+    await chrome.scripting.executeScript({ target, files: ['src/content/scraper.js'] });
   } catch { /* inaccessible frames are absent from the capture */ }
   try {
     const results = await chrome.scripting.executeScript({
-      target: { tabId, allFrames: true },
+      target,
       func: () => {
         const key = '__smeshCaptureDocumentId';
         const observerKey = '__smeshCaptureObserver';
@@ -2100,14 +2174,26 @@ async function captureTestDocuments(tabId) {
         const url = String(location.href || '').slice(0, 4096);
         const isTestDocument = typeof window.__smeshIsTestDocument === 'function' &&
           window.__smeshIsTestDocument() === true;
-        return { pageId: window[key], signature, principal, url, isTestDocument };
+        const isWebDocument = typeof window.__smeshIsWebDocument === 'function' &&
+          window.__smeshIsWebDocument() === true;
+        return { pageId: window[key], signature, principal, url, isTestDocument, isWebDocument };
       },
     });
+    const eligible = web
+      // The document must agree it is a generic page, its URL must pass the
+      // same rule the tab URL did, and its principal must be the origin-scoped
+      // web identity — so a Mesh document can never enter a web capture even if
+      // the tab URL check were somehow bypassed.
+      ? (entry) => entry.frameId === 0 &&
+        isWebSolvableUrl(entry.result?.url) &&
+        entry.result?.isWebDocument === true &&
+        entry.result?.principal === expectedWebPrincipal(entry.result?.url)
+      : (entry) => isMeshContentUrl(entry.result?.url) &&
+        (entry.frameId === 0 || entry.result?.isTestDocument === true);
     return (results || [])
       .filter((entry) => Number.isInteger(entry?.frameId) && entry.documentId &&
         entry.result?.pageId && entry.result?.signature && entry.result?.principal &&
-        isMeshContentUrl(entry.result?.url) &&
-        (entry.frameId === 0 || entry.result?.isTestDocument === true))
+        eligible(entry))
       .map((entry) => ({
         frameId: entry.frameId,
         documentId: entry.documentId,
@@ -2123,13 +2209,40 @@ async function captureTestDocuments(tabId) {
   }
 }
 
+/**
+ * Does the user's own permission grant currently cover this page?
+ *
+ * Generic solving is gated on an OPTIONAL host permission the student granted
+ * per site (see lib/web-solve.js). Chrome would refuse the injection anyway,
+ * but asking first turns an opaque scripting error into an actionable sentence
+ * and keeps the "never touch a site nobody approved" rule visible in one place.
+ */
+async function hasWebSolvePermission(url) {
+  const origins = webOriginPattern(url);
+  if (!origins) return false;
+  try {
+    return await chrome.permissions.contains({ origins: [origins] });
+  } catch {
+    return false;
+  }
+}
+
 // A solve target is the exact tab URL + top-level document + question/control
 // signature. URL catches normal navigation, documentId catches reloads and
 // leave-then-return races, and signature catches same-document/SPAs.
+//
+// The MODE is decided by the tab URL and by nothing else: a Mesh tab always
+// produces a Mesh capture, a granted generic tab always produces a web capture,
+// and sameTestCaptureContext() refuses to match one against the other. That is
+// what lets every existing revalidation site keep calling this one function.
 async function readTestCaptureContext(tabId) {
   const before = await chrome.tabs.get(tabId);
-  requireMeshTestTab(before);
-  const documents = await captureTestDocuments(tabId);
+  const mode = isMeshTestTab(before) ? 'mesh' : CAPTURE_MODE_WEB;
+  if (mode === CAPTURE_MODE_WEB) {
+    if (!isWebSolvableUrl(before?.url)) requireMeshTestTab(before);
+    if (!(await hasWebSolvePermission(before.url))) throw webPermissionRequiredError();
+  }
+  const documents = await captureTestDocuments(tabId, { mode });
   const after = await chrome.tabs.get(tabId);
   const top = documents.find((document) => document.frameId === 0);
   const signature = documents.map((document) => `${document.frameId}:${document.signature}`).join('||');
@@ -2139,6 +2252,9 @@ async function readTestCaptureContext(tabId) {
     documentId: top?.documentId || '',
     signature,
     documents,
+    // Mesh captures keep exactly the shape they always had; only the new path
+    // carries the discriminator.
+    ...(mode === CAPTURE_MODE_WEB ? { mode: CAPTURE_MODE_WEB } : {}),
   };
   if (before?.url !== after?.url || !isTestCaptureContext(capture)) {
     throw testCaptureChangedError();
@@ -2329,6 +2445,13 @@ function requireMeshTestTab(tab) {
  */
 async function capturePageForPill(tabId, { allowThinText = false } = {}) {
   const captured = await readTestCaptureContext(tabId);
+  // Off Mesh the same call has to read the page through the generic reader —
+  // otherwise the panel's «перерешать» would re-solve from raw body innerText,
+  // i.e. from strictly worse material than the answer it is replacing.
+  if (isWebCapture(captured)) {
+    const { pageText, capture, unitCount } = await capturePageForWeb(tabId, { allowThinText, captured });
+    return { pageText, capture, hasVisualMedia: false, unitCount, web: true };
+  }
   const [pageText, hasVisualMedia] = await Promise.all([
     capturePillDomText(captured),
     captureTestVisualMedia(captured),
@@ -2529,6 +2652,331 @@ try {
   });
 } catch { /* tabs events unavailable in a test harness */ }
 
+/* ---------- Generic web pages (any site the user granted) ---------- */
+/**
+ * The "solve a question on any web page" flow.
+ *
+ * It reuses the primitives that were already site-agnostic — pageSignature for
+ * capture identity, the answer panel, parseTestAnswers (with its arithmetic
+ * check), the reuse cache — and adds only what a non-Mesh page needs: a reader
+ * that strips site furniture, a merged single-pass fill, and the cheap model
+ * route. What it deliberately does NOT reuse is the multi-page autopilot: on an
+ * arbitrary site a "Далее" button can be a checkout step, so this path solves
+ * exactly the page in front of the student and clicks nothing.
+ *
+ * Cost: every request here is pinned to the standard chain at low effort (see
+ * lib/web-solve.js). Mesh keeps the frontier route and its own effort policy.
+ */
+
+const WEB_PERMISSION_REQUIRED = 'WEB_PERMISSION_REQUIRED';
+const MAX_WEB_PROMPT_CHARS = 10000;
+const MIN_WEB_PAGE_CHARS = 40;
+
+function webPermissionRequiredError() {
+  const error = new Error(
+    'Этот сайт ещё не разрешён. Нажмите на значок СМЭШ AI на панели браузера и выберите ' +
+    '«Разрешить на этом сайте» — после этого я смогу прочитать страницу.'
+  );
+  error.code = WEB_PERMISSION_REQUIRED;
+  return error;
+}
+
+function webUnreadableError() {
+  return new Error(
+    'Не удалось прочитать текст задания на этой странице. Прокрутите к заданию, дождитесь ' +
+    'загрузки и попробуйте ещё раз.'
+  );
+}
+
+/**
+ * Read a generic page and prove the capture still describes it.
+ * `captured` lets a caller that already read the context reuse it instead of
+ * paying for a second cross-document round trip.
+ */
+async function capturePageForWeb(tabId, { allowThinText = false, captured = null } = {}) {
+  if (!captured) captured = await readTestCaptureContext(tabId);
+  // Belt and braces: readTestCaptureContext picks the mode from the tab URL, so
+  // a Mesh tab can never land here — but this path must never run against a
+  // Mesh capture, so say so rather than assume it.
+  if (!isWebCapture(captured)) throw testCaptureChangedError();
+  const { text, unitCount, bodyChars } = await captureWebDomText(captured);
+  // Measured on the TRANSCRIPT, not on the assembled prompt: the title/URL
+  // header is always present, so checking `text` would clear this guard on a
+  // page with nothing readable at all. A page that exposes answer controls is
+  // still worth solving even when its prose is thin — the control inventory
+  // carries the question there.
+  if (!allowThinText && !unitCount && bodyChars < MIN_WEB_PAGE_CHARS) throw webUnreadableError();
+  const capture = await withMatchingTestCapture(
+    captured,
+    readTestCaptureContext,
+    async (current) => current,
+  );
+  return { pageText: text.slice(0, MAX_WEB_PROMPT_CHARS), capture, unitCount };
+}
+
+/**
+ * Ask the model to answer a generic page. Same JSON contract as the Mesh test
+ * solve (so parseTestAnswers and its arithmetic check apply unchanged), same
+ * licence/consent gates, but pinned to the cheap route.
+ */
+async function solveWebPage({ text, signal = null, pageUrl = null } = {}) {
+  await ensureLicensed();
+  if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
+  const systemPrompt = DEFAULT_PROMPTS[PROMPT_CATEGORIES.WEB_ANSWER];
+  const userText = 'Страница с заданием:\n\n' + (text || '(текст страницы не извлечён)');
+  let usage = null, usedProvider = null;
+  const askOpts = {
+    responseFormat: 'json_object',
+    reasoning: { effort: WEB_SOLVE_EFFORT },
+    // Downgrade-only hint: the proxy may refuse to honour it, never upgrade on it.
+    tier: WEB_SOLVE_TIER,
+    // Generic pages always use the licensed proxy. In particular, an old
+    // stored Groq/OpenRouter selection or hidden Alibaba key must not bypass
+    // the GLM-5.3-Flash route promised for this feature.
+    provider: WEB_SOLVE_PROVIDER,
+    proxyOnly: true,
+    signal,
+    onUsage: (u, prov) => { usage = u; usedProvider = prov; },
+  };
+  const tracing = await isDevModeActive();
+  const reasoning = tracing ? createReasoningCollector() : null;
+  if (reasoning) askOpts.onReasoning = (chunk) => reasoning.push(chunk);
+  const startedAt = Date.now();
+  const trace = tracing ? {
+    kind: 'web',
+    url: pageUrl,
+    systemPrompt,
+    userText,
+    pageText: text || '',
+    pageTextChars: String(text || '').length,
+    effort: WEB_SOLVE_EFFORT,
+    hasVisualMedia: false,
+    screenshot: false,
+  } : null;
+  let answer;
+  try {
+    answer = await askAI(systemPrompt, userText, [], [], askOpts);
+  } catch (e) {
+    if (trace) {
+      void recordDevTrace({
+        ...trace,
+        ok: false,
+        error: String(e?.message || e),
+        durationMs: Date.now() - startedAt,
+        reasoning: reasoning.value(),
+        provider: usedProvider,
+        model: usage?.model || null,
+      });
+    }
+    throw e;
+  }
+  const empty = !answer || answer.trim() === '' || answer.trim() === EMPTY_ANSWER;
+  if (trace) {
+    const checks = [];
+    const questions = empty ? [] : parseTestAnswers(answer, { onCheck: (check) => checks.push(check) });
+    void recordDevTrace({
+      ...trace,
+      ok: !empty,
+      error: empty ? 'Пустой ответ от ИИ.' : null,
+      durationMs: Date.now() - startedAt,
+      reasoning: reasoning.value(),
+      rawAnswer: answer,
+      questionCount: questions.length,
+      corrections: checks.filter((check) => check.status === 'fixed'),
+      checks,
+      provider: usedProvider,
+      model: usage?.model || null,
+      usage,
+    });
+  }
+  if (empty) throw new Error('Пустой ответ от ИИ. Попробуйте ещё раз.');
+  // Reported as a test solve with a `web` marker: the dashboard's usage and cost
+  // rollups already treat test_solve as real usage, and a brand-new event type
+  // would be dropped by the ingest allowlist until the backend ships.
+  track('test_solve', {
+    ...usageFields(usedProvider, usage),
+    files_img: 0,
+    meta: { effort: WEB_SOLVE_EFFORT, web: 1 },
+  });
+  return answer;
+}
+
+/**
+ * Fill a generic page. ONE pass over the merged native+custom control list in
+ * the single captured document — see scraper.js fillWebAnswers for why the
+ * Mesh two-pass design is not reused off Mesh.
+ */
+async function fillWebAnswersInTab(capture, questions) {
+  const idFor = (q, i) =>
+    (q && q.index != null && String(q.index).trim() !== '') ? q.index : i + 1;
+  const emptyCoverage = { exact: false, units: [] };
+  if (!Array.isArray(questions) || !questions.length) {
+    return { filled: [], skipped: [], coverage: emptyCoverage };
+  }
+  const document0 = capture.documents[0];
+  if (!document0) throw testCaptureChangedError();
+  const expected = { signature: document0.signature, principal: document0.principal };
+
+  try {
+    await executeScriptInCapturedDocuments(capture, { files: ['src/content/scraper.js'] });
+  } catch {
+    throw testCaptureChangedError();
+  }
+  // The injection above is read-only; revalidate immediately before the first
+  // mutation of the student's form.
+  await withMatchingTestCapture(capture, readTestCaptureContext, async () => undefined);
+
+  let results = [];
+  try {
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (qs, expectedDocument) => {
+        try {
+          const signature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const principal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (expectedDocument.signature !== signature || expectedDocument.principal !== principal) {
+            return { stale: true };
+          }
+          return (typeof window.__smeshWebFill === 'function')
+            ? window.__smeshWebFill(qs, signature, principal)
+            : null;
+        } catch {
+          return null;
+        }
+      },
+      args: [questions, expected],
+    });
+  } catch (e) {
+    return {
+      filled: [],
+      skipped: questions.map(idFor),
+      coverage: emptyCoverage,
+      error: String(e),
+    };
+  }
+  if (results.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
+  const summary = results[0]?.result || null;
+  const filled = new Set((summary?.filled || []).map(String));
+  const filledIds = [];
+  const skipped = [];
+  questions.forEach((question, index) => {
+    const id = idFor(question, index);
+    (filled.has(String(id)) ? filledIds : skipped).push(id);
+  });
+  return { filled: filledIds, skipped, coverage: emptyCoverage };
+}
+
+/**
+ * Solve the page in front of the student: capture → (cache or model) → panel →
+ * autofill. Mirrors pillSolveOnePage, minus the screenshot and the pagination.
+ */
+async function webSolveOnePage(tabId, provider, signal = null) {
+  throwIfPillCancelled(signal);
+  const { pageText, capture, unitCount } = await capturePageForWeb(tabId);
+  const reused = await readCachedTestAnswers(capture);
+  // Reuse skips solveWebPage's gates; run them here for the same reason the
+  // Mesh path does — filling is the licensed action whether or not this
+  // particular page costs a completion.
+  if (reused) {
+    await ensureLicensed();
+    if (!(await hasConsent())) throw new Error(CONSENT_REQUIRED_MESSAGE);
+  }
+  throwIfPillCancelled(signal);
+  let questions;
+  if (reused) {
+    questions = reused.questions;
+    void recordDevTrace({
+      kind: 'cache',
+      url: capture.url,
+      ok: true,
+      pageText,
+      pageTextChars: pageText.length,
+      hasVisualMedia: false,
+      cached: true,
+      questionCount: questions.length,
+      rawAnswer: serializeTestAnswers(questions),
+    });
+  } else {
+    throwIfPillCancelled(signal); // last gate before the PAID call
+    const answer = await solveWebPage({
+      text: pageText, signal, pageUrl: capture.url,
+    });
+    questions = parseTestAnswers(answer);
+    if (questions.length) await writeCachedTestAnswers(capture, questions);
+  }
+  throwIfPillCancelled(signal);
+  return withMatchingTestCapture(capture, readTestCaptureContext, async () => {
+    if (!questions.length) {
+      return { questions, cached: false, unitCount, summary: { filled: [], skipped: [] } };
+    }
+    throwIfPillCancelled(signal);
+    await showAnswersInTab(tabId, questions, capture);
+    throwIfPillCancelled(signal);
+    // A page with no answer boxes (an exercise printed as prose) is answered in
+    // the panel and nothing is written to the page.
+    const summary = unitCount
+      ? await fillAllFrames(tabId, questions, capture)
+      : { filled: [], skipped: [], coverage: { exact: false, units: [] } };
+    return { questions, cached: !!reused, unitCount, summary };
+  });
+}
+
+/**
+ * Keep the generic pill registered for exactly the origins the user granted.
+ *
+ * The manifest ships no broad host permission, so this is the ONLY way the pill
+ * reaches a non-Mesh site — grant an origin and it appears there, revoke it and
+ * it stops loading. `permissions.getAll()` also returns the manifest's required
+ * hosts, which webPillMatchPatterns() drops so Mesh keeps its static script and
+ * our own site never gets a pill.
+ */
+async function syncWebPillRegistration() {
+  let granted = null;
+  try { granted = await chrome.permissions.getAll(); } catch { return; }
+  const matches = webPillMatchPatterns(granted?.origins);
+  let existing = [];
+  try {
+    existing = await chrome.scripting.getRegisteredContentScripts({ ids: [WEB_PILL_SCRIPT_ID] });
+  } catch { existing = []; }
+  if (!matches.length) {
+    if (existing.length) {
+      try { await chrome.scripting.unregisterContentScripts({ ids: [WEB_PILL_SCRIPT_ID] }); }
+      catch { /* already gone */ }
+    }
+    return;
+  }
+  const script = {
+    id: WEB_PILL_SCRIPT_ID,
+    matches,
+    excludeMatches: webPillExcludeMatches(),
+    js: [...WEB_PILL_FILES],
+    runAt: 'document_idle',
+    allFrames: false,
+    persistAcrossSessions: true,
+  };
+  try {
+    if (existing.length) await chrome.scripting.updateContentScripts([script]);
+    else await chrome.scripting.registerContentScripts([script]);
+  } catch (e) {
+    // A pattern Chrome refuses must not leave a half-registered script behind.
+    dbg('[СМЭШ AI] web pill registration failed', String(e));
+    try { await chrome.scripting.unregisterContentScripts({ ids: [WEB_PILL_SCRIPT_ID] }); }
+    catch { /* nothing registered */ }
+  }
+}
+
+try {
+  chrome.permissions.onAdded.addListener(() => { void syncWebPillRegistration(); });
+  chrome.permissions.onRemoved.addListener(() => { void syncWebPillRegistration(); });
+} catch { /* permissions events unavailable in a test harness */ }
+
+// Reconcile the registration with the permissions actually held, on every
+// worker spin-up. registerContentScripts is persistent, so this is normally a
+// no-op — it exists so a permission revoked while the worker was asleep (or a
+// registration lost to a profile repair) cannot leave the pill on a site nobody
+// approved, or off one they did.
+void syncWebPillRegistration();
+
 /* ---------- Runtime message trust boundary ---------- */
 
 const EXTENSION_PAGE_PREFIX = `chrome-extension://${chrome.runtime.id}/`;
@@ -2539,11 +2987,15 @@ const MAX_ARRAY_ITEMS = 100;
 const MAX_BASE64_CHARS = 40 * 1024 * 1024;
 const MAX_FILES_TOTAL_CHARS = 100 * 1024 * 1024;
 
+// Every action that costs money or mutates a page, and therefore needs a
+// single-use capability token. Which SENDER may ask for which of them is
+// decided by SENDER_MESSAGE_TYPES below, not by membership here.
 const CONTENT_ACTIONS = new Set([
   'FILL_ANSWERS_ALL',
   'PILL_SOLVE_PAGE',
   'PILL_SOLVE_ALL',
-  'RESOLVE_QUESTION'
+  'RESOLVE_QUESTION',
+  'WEB_SOLVE_PAGE'
 ]);
 const PANEL_ACTIONS = new Set(['FILL_ANSWERS_ALL', 'RESOLVE_QUESTION']);
 
@@ -2552,14 +3004,25 @@ const PANEL_ACTIONS = new Set(['FILL_ANSWERS_ALL', 'RESOLVE_QUESTION']);
 const SENDER_MESSAGE_TYPES = {
   // PILL_CANCEL is deliberately outside CONTENT_ACTIONS: it only stops the
   // sender tab's own run, so it must not require an action token.
-  content: new Set(['GET_ACTION_TOKEN', 'PILL_CANCEL', ...CONTENT_ACTIONS]),
+  content: new Set([
+    'GET_ACTION_TOKEN', 'PILL_CANCEL',
+    'FILL_ANSWERS_ALL', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'RESOLVE_QUESTION'
+  ]),
+  // A granted generic page (lib/web-solve.js). Strictly narrower than Mesh: it
+  // may solve the one page in front of it, fill it and re-solve one question —
+  // and can never reach the multi-page autopilot, which clicks through a test.
+  web: new Set([
+    'GET_ACTION_TOKEN', 'PILL_CANCEL',
+    'WEB_SOLVE_PAGE', 'FILL_ANSWERS_ALL', 'RESOLVE_QUESTION'
+  ]),
   extension: new Set([
     'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
     'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG',
     'GET_DEVICE_ID', 'SET_LICENSE_KEY', 'DEACTIVATE_LICENSE', 'SYNC_REFERRAL_POINTER', 'DELETE_LOCAL_DATA',
     'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LESSON_HISTORY', 'LIST_SESSIONS', 'LIST_MESSAGES',
     'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_COVER', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
-    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY', 'OPEN_ONBOARDING'
+    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY', 'OPEN_ONBOARDING',
+    'ACTIVATE_WEB_SITE'
   ])
 };
 
@@ -2592,19 +3055,22 @@ function validPart(part) {
 }
 
 function validQuestion(q) {
-  return hasOnlyKeys(q, ['index', 'text', 'answer', 'choice', 'parts']) &&
+  // `explain` rides along because the panel hands whole question objects back
+  // for filling. Bounded well above MAX_EXPLANATION_CHARS so the worker's own
+  // trim, not this schema, is what a long sentence hits.
+  return hasOnlyKeys(q, ['index', 'text', 'answer', 'choice', 'parts', 'explain']) &&
     (q.index == null || isSafeId(q.index) || isString(q.index, 512)) &&
     isOptionalString(q.text) && isOptionalString(q.answer) &&
-    isOptionalString(q.choice, 512) &&
+    isOptionalString(q.choice, 512) && isOptionalString(q.explain, 1024) &&
     (q.parts == null || validArray(q.parts, validPart));
 }
 
 const validQuestions = (v) => validArray(v, validQuestion);
 
 function validTestCapture(capture, tabId) {
-  return hasOnlyKeys(capture, ['tabId', 'url', 'documentId', 'signature', 'documents']) &&
+  return hasOnlyKeys(capture, ['tabId', 'url', 'documentId', 'signature', 'documents', 'mode']) &&
     isTestCaptureContext(capture) && capture.tabId === tabId &&
-    isMeshContentUrl(capture.url);
+    (isWebCapture(capture) ? isWebSolvableUrl(capture.url) : isMeshContentUrl(capture.url));
 }
 
 const GDZ_BOOK_KEYS = [
@@ -2693,6 +3159,9 @@ const MESSAGE_SCHEMAS = {
   PILL_SOLVE_ALL: (msg) => payloadRecord(msg, ['provider', 'opId']) &&
     isOptionalString(msg.payload.provider, 64) && isOptionalString(msg.payload.opId, 128),
   PILL_CANCEL: (msg) => payloadRecord(msg, ['opId']) && isOptionalString(msg.payload.opId, 128),
+  WEB_SOLVE_PAGE: (msg) => payloadRecord(msg, ['provider', 'opId']) &&
+    isOptionalString(msg.payload.provider, 64) && isOptionalString(msg.payload.opId, 128),
+  ACTIVATE_WEB_SITE: (msg) => payloadRecord(msg, ['tabId']) && isSafeId(msg.payload.tabId),
   RESOLVE_QUESTION: (msg) => payloadRecord(msg, ['index', 'prevAnswer', 'questionText', 'panelNonce']) &&
     (isSafeId(msg.payload.index) || isString(msg.payload.index, 512)) &&
     isOptionalString(msg.payload.prevAnswer) && isOptionalString(msg.payload.questionText) &&
@@ -2746,6 +3215,10 @@ function isMeshContentUrl(url) {
   }
 }
 
+function sameOrigin(a, b) {
+  try { return new URL(a).origin === new URL(b).origin; } catch { return false; }
+}
+
 function classifyMessageSender(sender) {
   if (sender?.id !== chrome.runtime.id) return null;
   // Dashboard pages have sender.tab too, so the extension origin must win first.
@@ -2755,6 +3228,12 @@ function classifyMessageSender(sender) {
   // authority and request content-script capabilities.
   if (sender.tab && isSafeId(sender.tab.id) &&
       isMeshContentUrl(sender.tab.url) && isMeshContentUrl(sender.url)) return 'content';
+  // A granted generic page. Only the TOP frame speaks for it: off Mesh a
+  // subframe is a third party, and the whole point of the single-document web
+  // capture is that no such frame can read the page or write into it.
+  if (sender.tab && isSafeId(sender.tab.id) && sender.frameId === 0 &&
+      isWebSolvableUrl(sender.tab.url) && isWebSolvableUrl(sender.url) &&
+      sameOrigin(sender.tab.url, sender.url)) return 'web';
   return null;
 }
 
@@ -2818,6 +3297,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     return false;
   }
   if (msg.type === 'GET_ACTION_TOKEN') {
+    // A token may only be minted for an action this sender class is allowed to
+    // send. Without this, the schema's CONTENT_ACTIONS check alone would let a
+    // Mesh page mint a WEB_SOLVE_PAGE capability (and vice versa) — refused
+    // later by the capture reader, but refused here is where it belongs.
+    if (!SENDER_MESSAGE_TYPES[senderClass]?.has(msg.action)) {
+      sendResponse({ ok: false, error: 'Действие недоступно для этого источника.' });
+      return false;
+    }
     if (PANEL_ACTIONS.has(msg.action)) {
       try {
         matchingAnswerPanelContext(sender.tab.id, msg.panelNonce);
@@ -2830,7 +3317,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     sendResponse({ ok: true, ...grant });
     return false;
   }
-  if (senderClass === 'content' && CONTENT_ACTIONS.has(msg.type) &&
+  if ((senderClass === 'content' || senderClass === 'web') && CONTENT_ACTIONS.has(msg.type) &&
       !consumeActionToken(
         msg.token,
         sender.tab.id,
@@ -3024,6 +3511,55 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           break;
         }
+        case 'WEB_SOLVE_PAGE': {
+          // The generic pill's only action: solve, show and fill THIS page on a
+          // site the user granted. No screenshot (a page click confers no
+          // activeTab) and no pagination — see the section header.
+          const tabId = sender?.tab?.id;
+          if (!tabId) { sendResponse({ ok: false, error: 'no tab' }); break; }
+          const signal = beginPillOperation(tabId, msg.payload?.opId);
+          if (!signal) { sendResponse({ ok: false, cancelled: true, error: 'отменено' }); break; }
+          try {
+            const { questions, summary, cached, unitCount } = await withTabSolveLock(tabId, () =>
+              withKeepAlive(() => webSolveOnePage(tabId, msg.payload?.provider, signal)));
+            sendResponse({
+              ok: true,
+              count: questions.length,
+              summary,
+              cached: !!cached,
+              fillable: unitCount > 0,
+            });
+          } catch (e) {
+            if (!isPillCancellation(e)) throw e;
+            sendResponse({ ok: false, cancelled: true, error: e.message });
+          } finally {
+            endPillOperation(tabId, signal);
+          }
+          break;
+        }
+        case 'ACTIVATE_WEB_SITE': {
+          // The popup has just obtained the optional host permission for this
+          // tab's origin. Registration covers future page loads; the tab the
+          // student is looking at needs the pill injected now.
+          const { tabId } = msg.payload || {};
+          await syncWebPillRegistration();
+          const tab = await chrome.tabs.get(tabId);
+          if (!isWebSolvableUrl(tab?.url) || !(await hasWebSolvePermission(tab.url))) {
+            sendResponse({ ok: false, error: 'Сайт не разрешён.' });
+            break;
+          }
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId, frameIds: [0] },
+              files: [...WEB_PILL_FILES],
+            });
+          } catch {
+            // Already injected, or the page forbids scripting. The registration
+            // above still covers the next load, so this is not a failure.
+          }
+          sendResponse({ ok: true });
+          break;
+        }
         case 'PILL_CANCEL': {
           // De-escalation only: it can stop the sender tab's own run and
           // nothing else, so unlike the solve actions it needs no capability
@@ -3070,7 +3606,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
                 },
               );
             }));
-          sendResponse({ ok: true, answer: resolved.answer, parts: resolved.parts });
+          sendResponse({
+            ok: true,
+            answer: resolved.answer,
+            parts: resolved.parts,
+            explain: resolved.explain,
+          });
           break;
         }
         case 'GET_RUNTIME_CONFIG':

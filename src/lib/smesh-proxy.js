@@ -402,7 +402,7 @@ async function createUploadTicket(licenseKey, deviceId, activationToken, size, s
   return ticket;
 }
 
-export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, onReasoning = null, signal = null, responseFormat = null, reasoning = null } = {}) {
+export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, onReasoning = null, signal = null, responseFormat = null, reasoning = null, tier = null } = {}) {
   // The proxy requires both the public key and the per-installation bearer
   // capability. Keep this defensive check even though normal callers already
   // pass through ensureLicensed(): no direct caller may emit an unauthenticated
@@ -450,6 +450,12 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   // example, Qwen thinks by default and is sent no effort at all, while
   // GLM-5.3-Flash is forced to thinking=max).
   if (reasoning?.effort) body.reasoning_effort = reasoning.effort;
+  // Optional DOWNGRADE-only route hint. 'standard' asks the proxy to answer on
+  // the cheap chain (GLM-5.3-Flash) and to charge the standard bucket, leaving
+  // the frontier allowance for МЭШ. The proxy is free to ignore it — a server
+  // that predates this field simply answers on the ordinary route, which costs
+  // more but is never wrong. It can never REQUEST the frontier chain.
+  if (tier === 'standard') body.tier = 'standard';
 
   // The WHOLE /ai/start body must fit under the per-connection allowance —
   // an attachment, a long system prompt or replayed history can all blow it.

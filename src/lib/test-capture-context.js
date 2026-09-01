@@ -69,7 +69,46 @@ function isHttpUrl(value) {
   }
 }
 
+/**
+ * Capture modes.
+ *
+ * 'mesh' (the default, and what an absent field means) is the МЭШ assessment
+ * flow: many frames, an xAPI/child principal, pagination. 'web' is the generic
+ * any-site flow (see lib/web-solve.js) and is deliberately far narrower — ONE
+ * top-level document, no child frames, no pagination — because on an arbitrary
+ * page a third-party iframe is an ad or a widget, never part of the question.
+ */
+export const CAPTURE_MODE_MESH = 'mesh';
+export const CAPTURE_MODE_WEB = 'web';
+
+export function captureMode(value) {
+  return value?.mode === CAPTURE_MODE_WEB ? CAPTURE_MODE_WEB : CAPTURE_MODE_MESH;
+}
+
+export function isWebCapture(value) {
+  return captureMode(value) === CAPTURE_MODE_WEB;
+}
+
+/**
+ * A generic capture's principal must be the origin-scoped web identity that
+ * scraper.js mints off Mesh. Checking the SHAPE here (not just "some identity
+ * exists") is what stops a Mesh document whose account signals happened to be
+ * unreadable from being laundered into a web capture, and vice versa.
+ */
+function isWebPrincipal(value) {
+  try {
+    const parts = JSON.parse(value);
+    return Array.isArray(parts) && parts[0] === 'v2' && parts[4] === 'web' &&
+      typeof parts[1] === 'string' && parts[1].length > 0;
+  } catch {
+    return false;
+  }
+}
+
 export function isTestCaptureContext(value) {
+  if (value?.mode != null && value.mode !== CAPTURE_MODE_MESH && value.mode !== CAPTURE_MODE_WEB) {
+    return false;
+  }
   if (!value
       || !Number.isInteger(value.tabId)
       || value.tabId < 0
@@ -95,14 +134,21 @@ export function isTestCaptureContext(value) {
     pageIds.add(document.pageId);
   }
   const top = value.documents.find((document) => document.frameId === 0);
+  if (!top || top.documentId !== value.documentId) return false;
+
+  if (isWebCapture(value)) {
+    // Exactly the visible top document of an eligible generic page, identified
+    // by its origin. No child frames means no ad iframe can contribute text to
+    // a prompt or receive an autofill.
+    return value.documents.length === 1 && top.url === value.url && isWebPrincipal(top.principal);
+  }
+
   // Individual cross-origin frames may have no local identity signals. The
   // capture remains usable when at least one captured document (normally the
   // top Mesh wrapper or the XAPI iframe) supplies an account/child/attempt
   // binding; an all-unknown capture fails closed instead of treating
   // unknown-account A as equal to unknown-account B.
-  const hasCaptureIdentity = value.documents.some((document) =>
-    principalCarriesIdentity(document.principal));
-  return Boolean(top && top.documentId === value.documentId && hasCaptureIdentity);
+  return value.documents.some((document) => principalCarriesIdentity(document.principal));
 }
 
 function sameCapturedDocuments(expected, current) {
@@ -122,6 +168,9 @@ function sameCapturedDocuments(expected, current) {
 export function sameTestCaptureContext(expected, current) {
   return isTestCaptureContext(expected)
     && isTestCaptureContext(current)
+    // A Mesh capture and a web capture of the same tab are never the same
+    // target, even if every other field lined up.
+    && captureMode(expected) === captureMode(current)
     && expected.tabId === current.tabId
     && expected.url === current.url
     && expected.documentId === current.documentId

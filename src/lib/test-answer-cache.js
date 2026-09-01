@@ -204,7 +204,7 @@ export function writeCachedTestAnswers(capture, questions, { image = false } = {
  * to be image-backed, or that text answer would later be served to a screenshot
  * request the guard exists to protect.
  */
-export function patchCachedTestAnswer(capture, index, { answer, parts, image = false } = {}) {
+export function patchCachedTestAnswer(capture, index, { answer, parts, explain, image = false } = {}) {
   const key = testAnswerCacheKey(capture);
   if (!key || typeof answer !== 'string' || !answer.trim()) return Promise.resolve(false);
   return mutateCache((cache) => {
@@ -218,6 +218,11 @@ export function patchCachedTestAnswer(capture, index, { answer, parts, image = f
       const patched = { ...question, answer };
       if (Array.isArray(parts) && parts.length) patched.parts = parts;
       else delete patched.parts;
+      // The stored «разбор» was written for the answer it replaced. Keep the
+      // fresh one, and when the re-solve brought none, drop the old one rather
+      // than let the next visit explain a number that is no longer there.
+      if (typeof explain === 'string' && explain.trim()) patched.explain = explain.trim();
+      else delete patched.explain;
       return patched;
     });
     if (!matched) return false;

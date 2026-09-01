@@ -30,6 +30,7 @@ import { fetchTextBounded } from '../lib/http.js';
 import { normalizeGdzBooks } from '../lib/gdz-books.js';
 import { isDevModeActive } from '../lib/dev-mode.js';
 import { clearDevTraces, readDevTraces } from '../lib/dev-trace.js';
+import { webPillMatchPatterns } from '../lib/web-solve.js';
 
 initTheme();
 
@@ -185,12 +186,85 @@ async function loadSecondaryUi() {
   // default-value saves after the persisted form itself hydrated correctly.
   await Promise.allSettled([
     refreshUsage(),
-    loadConsentUi()
+    loadConsentUi(),
+    loadGrantedSitesUi()
   ]);
   // network-backed, deliberately not awaited. Skipped entirely while the
   // programme is off: the backend refuses /referral/*, so the only thing a
   // request could add is a «нет связи» in a card that already says «Скоро».
   if (REFERRALS_ENABLED) loadReferralUi();
+}
+
+/* ---------- Sites granted for generic solving ---------- */
+
+/**
+ * The optional host permissions the student has actually granted (see
+ * lib/web-solve.js). Chrome's own extension page can revoke these too, but a
+ * student who granted a site from the popup should be able to take it back
+ * where they granted it — and, just as importantly, SEE the full list.
+ *
+ * The manifest's required Mesh/СМЭШ hosts also come back from getAll(); they
+ * are filtered out because they are not revocable and are not "other sites".
+ */
+async function loadGrantedSitesUi() {
+  const list = document.getElementById('sitesList');
+  const revokeAll = document.getElementById('revokeAllSites');
+  if (!list) return;
+  let granted = null;
+  try { granted = await chrome.permissions.getAll(); } catch { granted = null; }
+  const patterns = webPillMatchPatterns(granted?.origins);
+  list.textContent = '';
+  revokeAll.hidden = patterns.length === 0;
+  if (!patterns.length) {
+    const empty = document.createElement('p');
+    empty.className = 'field-hint';
+    empty.textContent = 'Пока ни одного сайта. Расширение работает только на school.mos.ru и uchebnik.mos.ru.';
+    list.appendChild(empty);
+    return;
+  }
+  for (const pattern of patterns) {
+    const row = document.createElement('div');
+    row.className = 'siterow';
+    const name = document.createElement('span');
+    name.className = 'sitehost';
+    // `*://*​/*` is the all-sites grant. Naming it plainly matters: it is the
+    // one entry whose scope is not obvious from the pattern.
+    name.textContent = pattern === '*://*/*' || pattern === 'http://*/*' || pattern === 'https://*/*'
+      ? 'Все сайты'
+      : pattern.replace(/^\*?:?\/*/, '').replace(/^https?:\/\//, '').replace(/\/\*$/, '');
+    const revoke = document.createElement('button');
+    revoke.type = 'button';
+    revoke.className = 'resetbtn';
+    revoke.textContent = 'Отозвать';
+    revoke.onclick = () => revokeSites([pattern], revoke);
+    row.append(name, revoke);
+    list.appendChild(row);
+  }
+  revokeAll.onclick = () => revokeSites(patterns, revokeAll);
+}
+
+async function revokeSites(origins, button) {
+  const status = document.getElementById('sitesStatus');
+  button.disabled = true;
+  try {
+    await chrome.permissions.remove({ origins });
+    // The worker unregisters the pill on permissions.onRemoved; this only
+    // repaints the list the student is looking at.
+    await loadGrantedSitesUi();
+    if (status) {
+      status.textContent = 'Доступ отозван';
+      status.dataset.state = 'ok';
+      status.hidden = false;
+    }
+  } catch {
+    if (status) {
+      status.textContent = 'Не удалось отозвать доступ';
+      status.dataset.state = 'err';
+      status.hidden = false;
+    }
+  } finally {
+    button.disabled = false;
+  }
 }
 
 /* ---------- License key ---------- */
@@ -1494,6 +1568,10 @@ const DEV_TRACE_KIND_LABEL = {
   test: 'Тест',
   requestion: 'Перерешать',
   cache: 'Из кэша',
+  // Any-site solving (lib/web-solve.js). Distinguishing it matters here: it runs
+  // a different prompt on a different model chain, so a wrong answer has to be
+  // attributable to the right path.
+  web: 'Сайт',
 };
 
 function devTraceTime(at) {

@@ -4,6 +4,12 @@ import {
 } from './test-capture-context.js';
 
 const MAX_PILL_TEXT_CHARS = 15000;
+// Generic pages get a much smaller budget than МЭШ. They are answered on the
+// cheap chain, the reader already strips site furniture, and an arbitrary site
+// can be arbitrarily large — an unbounded scrape is how "works on any page"
+// turns into "costs the same as a textbook".
+const MAX_WEB_BODY_CHARS = 6000;
+const MAX_WEB_TEXT_CHARS = 10000;
 
 function expectedCaptureDocuments(capture) {
   return Object.fromEntries(
@@ -68,6 +74,62 @@ export async function capturePillDomText(capture, scripting = chrome.scripting) 
     if (pageText.length >= MAX_PILL_TEXT_CHARS) break;
   }
   return pageText;
+}
+
+/**
+ * Read a GENERIC page (any site the user granted) through scraper.js's web
+ * reader: main content only, site furniture stripped, plus an inventory of the
+ * answer controls so the model can address them by number.
+ *
+ * Bound to the exact captured document the same way the Mesh reader is, so a
+ * navigation between capture and read fails closed instead of scraping a page
+ * nobody asked about.
+ *
+ * @returns {Promise<{text: string, unitCount: number}>}
+ */
+export async function captureWebDomText(capture, scripting = chrome.scripting) {
+  const expectedDocuments = expectedCaptureDocuments(capture);
+  let results;
+  try {
+    results = await executeScriptInCapturedDocuments(capture, {
+      func: (expected, bodyChars, totalChars) => {
+        try {
+          const pageId = window.__smeshCaptureDocumentId;
+          const expectedDocument = pageId && expected[pageId];
+          const signature = (typeof window.__smeshPageSig === 'function') ? window.__smeshPageSig() : '';
+          const principal = (typeof window.__smeshCurrentPrincipal === 'function')
+            ? window.__smeshCurrentPrincipal() : '';
+          if (!expectedDocument || expectedDocument.signature !== signature ||
+              expectedDocument.principal !== principal ||
+              expectedDocument.url !== String(location.href || '')) {
+            return { stale: true, text: '', unitCount: 0 };
+          }
+          if (typeof window.__smeshWebContent !== 'function') {
+            return { stale: false, text: '', unitCount: 0, bodyChars: 0 };
+          }
+          const content = window.__smeshWebContent(bodyChars);
+          return {
+            stale: false,
+            text: String(content?.text || '').slice(0, totalChars),
+            unitCount: Number(content?.unitCount) || 0,
+            bodyChars: Number(content?.bodyChars) || 0,
+          };
+        } catch {
+          return { stale: false, text: '', unitCount: 0, bodyChars: 0 };
+        }
+      },
+      args: [expectedDocuments, MAX_WEB_BODY_CHARS, MAX_WEB_TEXT_CHARS],
+    }, scripting);
+  } catch {
+    throw testCaptureChangedError();
+  }
+  if (results.some((entry) => entry?.result?.stale)) throw testCaptureChangedError();
+  const result = results[0]?.result;
+  return {
+    text: String(result?.text || '').slice(0, MAX_WEB_TEXT_CHARS),
+    unitCount: Number(result?.unitCount) || 0,
+    bodyChars: Number(result?.bodyChars) || 0,
+  };
 }
 
 /**

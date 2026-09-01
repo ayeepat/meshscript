@@ -132,6 +132,10 @@ justification has to describe what the submitted package actually does.
 
 > school.mos.ru and uchebnik.mos.ru are the two diary surfaces the user asks the extension to read. smeshapi.site verifies licenses, proxies textbook answers, and receives content-free telemetry covered by the same acceptance that gates every AI request. ai.smeshapi.site is the only origin that answers AI requests. smeshai.xyz serves a signed, data-only runtime configuration over a single GET. The extension requests no AI-vendor origins: every model call is proxied.
 
+**Optional host permissions (`http://*/*`, `https://*/*`)**
+
+> Nothing is granted at install: this pattern is declared only under optional_host_permissions. A student who wants to solve an exercise that is not on the school diary opens that page, clicks the toolbar icon and approves that ONE origin in Chrome's own dialog; the extension requests https://thatsite/* and never the broad pattern. Granting a site is what registers the in-page solve button on it, and revoking the site removes it — every approved site is listed and revocable in the extension's settings. Only the top-level document of an approved page is read, and only its visible text and form labels; child frames are excluded, no screenshot is taken on this path, and sites the user has not approved are never accessed.
+
 ### Data-use disclosures
 
 Select the dashboard categories that correspond to these flows:

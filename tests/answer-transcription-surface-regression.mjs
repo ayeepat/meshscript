@@ -14,6 +14,7 @@
  *
  *   solveTest()          json_object, answers-only  → AT RISK → has "s" + checker
  *   resolveOneQuestion() json_object, answers-only  → AT RISK → has "s" + checker
+ *   solveWebPage()       json_object, answers-only  → AT RISK → has "s" + checker
  *   solve()              free prose, steps required → NOT at risk
  *
  * solve() is the homework path — PDFs, photos, text, follow-ups. It is safe
@@ -27,6 +28,7 @@
 
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import * as promptModule from '../src/lib/prompts.js';
 
 const source = (path) => readFileSync(new URL(path, import.meta.url), 'utf8');
 const worker = source('../src/background/service-worker.js');
@@ -38,7 +40,7 @@ const worker = source('../src/background/service-worker.js');
 // classified here deliberately rather than inheriting whatever it happens to do.
 const callSites = [...worker.matchAll(/await askAI\(/g)];
 assert.equal(
-  callSites.length, 3,
+  callSites.length, 4,
   'a new askAI() call site appeared in the worker — decide whether it constrains ' +
   'the visible answer, and if so give it the "s" field + lib/test-answer-arithmetic.js'
 );
@@ -75,6 +77,26 @@ assert.ok(
   worker.includes("import { reconcileAnswer } from '../lib/test-answer-arithmetic.js';"),
   'the worker must import the answer checker'
 );
+
+// The any-site path (lib/web-solve.js) is answers-only for the same reason the
+// Mesh test path is — it fills a form — so it is at risk for the same reason.
+// It gets the mitigation by DERIVING its prompt from TEST_ANSWER rather than
+// restating the contract; section 5 pins that the derivation still carries "s".
+{
+  const webBody = bodyOf('async function solveWebPage(', 'async function fillWebAnswersInTab(');
+  assert.ok(
+    webBody.includes("responseFormat: 'json_object'"),
+    'solveWebPage must still be a JSON path'
+  );
+  assert.ok(
+    webBody.includes('DEFAULT_PROMPTS[PROMPT_CATEGORIES.WEB_ANSWER]'),
+    'solveWebPage must use the WEB_ANSWER prompt'
+  );
+  assert.ok(
+    webBody.includes('parseTestAnswers('),
+    'solveWebPage must go through parseTestAnswers, which is where reconcileAnswer runs'
+  );
+}
 
 /* ---------- 3. The homework path must stay unconstrained ---------- */
 
@@ -139,6 +161,18 @@ assert.ok(
     testPrompt.includes('ПЕРЕД "a"'),
     'the test prompt must keep requiring "s" before "a" — the ordering IS the fix'
   );
+  // WEB_ANSWER is TEST_ANSWER with its МЭШ intro swapped out. Assert on the
+  // BUILT prompt, not the source: if the derivation ever stops stripping the
+  // intro (or stops carrying the contract), that shows up here.
+  {
+    const web = promptModule.DEFAULT_PROMPTS[promptModule.PROMPT_CATEGORIES.WEB_ANSWER];
+    assert.ok(web.includes('ПЕРЕД "a"'),
+      'the any-site prompt must inherit the "s"-before-"a" contract verbatim');
+    assert.ok(web.includes('Поле "e" ОБЯЗАТЕЛЬНО для КАЖДОГО'),
+      'the any-site prompt must inherit the explanation contract');
+    assert.ok(!web.includes('онлайн-тест МЭШ'),
+      'the any-site prompt must not tell the model it is looking at a МЭШ test');
+  }
 
   // The worked-solution prompt (maths, physics, chemistry — the homework that
   // would be most damaged by a silent transcription slip) must keep demanding

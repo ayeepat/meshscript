@@ -373,6 +373,28 @@ body.consent-missing .consent-panel { border-color: var(--warn); }
   margin-top: 12px;
 }
 
+/* Granted-sites list (generic solving). One row per revocable origin. */
+.siteslist {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+}
+.siterow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border-strong);
+}
+.siterow:last-child { border-bottom: none; }
+.sitehost {
+  font-size: 13px;
+  font-weight: 600;
+  word-break: break-all;
+}
+
 /* ---------- Provider and support ---------- */
 .providerhints {
   display: flex;
@@ -1194,6 +1216,7 @@ body:not(.dev-mode) .dev-only { display: none; }
   text-transform: uppercase;
 }
 .devtrace-kind[data-kind="cache"] { background: var(--hover); color: var(--secondary); }
+.devtrace-kind[data-kind="web"] { background: var(--hover); color: var(--text); }
 .devtrace-kind[data-state="fail"] { background: var(--warn-soft); color: var(--warn); }
 .devtrace-title { color: var(--text); font-weight: 700; }
 .devtrace-meta {

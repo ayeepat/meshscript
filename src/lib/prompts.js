@@ -9,8 +9,16 @@ export const PROMPT_CATEGORIES = {
   PARAGRAPH_SUMMARY: 'paragraph_summary',
   RUSSIAN_FULL: 'russian_full',
   LITERATURE: 'literature',
-  TEST_ANSWER: 'test_answer'
+  TEST_ANSWER: 'test_answer',
+  // Generic pages on any granted site (see lib/web-solve.js). Derived from
+  // TEST_ANSWER below — same JSON contract, different framing.
+  WEB_ANSWER: 'web_answer'
 };
+
+// The opening sentence of TEST_ANSWER. Split out only so the generic-page
+// prompt can replace it without copying the rest.
+const MESH_TEST_INTRO =
+  'Ты решаешь онлайн-тест МЭШ по скриншоту экрана и тексту страницы.\n\n';
 
 export const DEFAULT_PROMPTS = {
   [PROMPT_CATEGORIES.WORKED_SOLUTION]:
@@ -35,16 +43,19 @@ export const DEFAULT_PROMPTS = {
     'анализ эпизодов, ответы на вопросы. НИКОГДА не проси прислать текст параграфа или главы, ' +
     'если произведение классическое и названо. Проси текст только если задание по незнакомому отрывку из учебника.',
   [PROMPT_CATEGORIES.TEST_ANSWER]:
-    'Ты решаешь онлайн-тест МЭШ по скриншоту экрана и тексту страницы.\n\n' +
+    MESH_TEST_INTRO +
     'Прорешай КАЖДЫЙ видимый вопрос ПОЛНОСТЬЮ в уме (в своих внутренних рассуждениях): ' +
     'для математики/физики/химии запиши формулы, подставь числа и вычисли по шагам, ' +
     'обязательно перепроверь арифметику — без тщательного разбора модель часто ошибается; ' +
     'для остальных предметов внимательно обоснуй выбор для себя. ' +
     'Думай столько, сколько нужно для правильного ответа.\n\n' +
     'Текст страницы может содержать UI-мусор (меню, кнопки «Завершить тест», навигацию) — игнорируй его.\n\n' +
-    'В ответе не должно быть рассуждений, пояснений и markdown — только JSON описанной ниже формы.\n\n' +
+    // "Вне JSON", not "в ответе": the "e" field below IS a short explanation,
+    // and it lives inside the JSON. What must never appear is loose reasoning
+    // prose around the object — that is what truncates the answers array.
+    'Вне JSON не должно быть рассуждений, пояснений и markdown — только JSON описанной ниже формы.\n\n' +
     'Ответь ТОЛЬКО валидным JSON-объектом, без markdown и текста вокруг, строго такой формы:\n' +
-    '{"answers":[{"n":1,"s":"5+3*95","a":"290","c":"<номер(а) варианта>"}]}\n\n' +
+    '{"answers":[{"n":1,"s":"5+3*95","a":"290","c":"<номер(а) варианта>","e":"формула n-го члена: a₁+d(n-1)"}]}\n\n' +
     // ⚠️ "s" IS LOAD-BEARING — see lib/test-answer-arithmetic.js for the capture
     // that produced it. Without it the model reasons correctly and then writes a
     // different number into "a", because it has to recall eight results from a
@@ -97,6 +108,56 @@ export const DEFAULT_PROMPTS = {
     'или из выпадающего списка — ТОЧНО как он там написан>"}, в порядке сверху вниз. ' +
     'В "v" пиши сам текст выбранного варианта (не его номер), чтобы его можно было найти в списке. ' +
     'В "a" собери всё человекочитаемо для ученика (например "А — крахмал; Б — белок; В — жир").\n\n' +
-    'Кроме "n", "a" и необязательных "s", "c" и "p", других полей в JSON быть не должно. ' +
+    // The one-line «разбор» the answer panel reveals behind its chevron. Two
+    // properties of this field are deliberate and load-bearing:
+    //   • it is written LAST, after "a". Generation is left-to-right, so a
+    //     field that comes after the answer cannot disturb the s→a anchoring
+    //     that lib/test-answer-arithmetic.js depends on. Moving "e" earlier
+    //     would put prose between the arithmetic and the number it anchors —
+    //     which is exactly the 2026-08-29 transcription bug.
+    //   • it is capped at one short sentence. The short prompt limits expected
+    //     output, while the parser's character cap is a rendering/message safety
+    //     bound; neither is misrepresented as a provider-side billing guarantee.
+    'Поле "e" ОБЯЗАТЕЛЬНО для КАЖДОГО объекта ответа. ' +
+    'Это короткое пояснение для ученика: ОДНО предложение, не длиннее 12 слов. ' +
+    'Назови правило, формулу или ключевой факт, из которого следует ответ. ' +
+    'Без markdown, без вводных слов и без повторения самого ответа. ' +
+    'Пиши "e" САМЫМ ПОСЛЕДНИМ полем объекта, строго ПОСЛЕ "a".\n\n' +
+    'Поля "n", "a" и "e" обязательны. ' +
+    'Поля "s", "c" и "p" добавляй только по правилам выше. ' +
+    'Других полей в JSON быть не должно. ' +
     'Не добавляй поле "reasoning".'
 };
+
+/**
+ * Generic-page prompt: the МЭШ framing swapped out, the ENTIRE JSON contract
+ * kept byte-identical.
+ *
+ * Derived rather than copied on purpose. That contract carries the "s" → "a" →
+ * "e" ordering that fixed the 2026-08 transcription bug (see
+ * lib/test-answer-arithmetic.js); a second hand-maintained copy of it would
+ * drift, and the first symptom would be wrong answers on the new path only.
+ * If the intro above is ever reworded the derivation degrades to "reuse the
+ * whole test prompt" — still correct, just says «МЭШ» on a non-Mesh page —
+ * and tests/web-solve-regression.mjs fails so the wording is fixed here too.
+ */
+const WEB_ANSWER_INTRO =
+  'Ты решаешь задание на обычной веб-странице (не МЭШ) по её тексту.\n\n' +
+  'Тебе дают заголовок страницы, её основное содержимое и, если на странице есть поля ' +
+  'для ответа, их пронумерованный список. Работай так:\n' +
+  '- если список полей ЕСТЬ — на каждое поле верни ровно один объект ответа, и поле "n" ' +
+  'должно совпадать с номером поля из этого списка (не придумывай свою нумерацию, ' +
+  'не пропускай номера и не добавляй лишних);\n' +
+  '- если полей НЕТ — найди в тексте вопрос(ы) или задачу и ответь на них, нумеруя ' +
+  'ответы по порядку: 1, 2, 3…;\n' +
+  '- на странице почти наверняка есть посторонний текст (меню, реклама, комментарии, ' +
+  'кнопки) — игнорируй его и решай только само задание;\n' +
+  '- если задание невозможно прочитать целиком (нужна картинка, которой нет в тексте), ' +
+  'верни для него "a": "не видно, нужен скриншот" вместо выдуманного ответа.\n\n';
+
+DEFAULT_PROMPTS[PROMPT_CATEGORIES.WEB_ANSWER] =
+  WEB_ANSWER_INTRO + (
+    DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER].startsWith(MESH_TEST_INTRO)
+      ? DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER].slice(MESH_TEST_INTRO.length)
+      : DEFAULT_PROMPTS[PROMPT_CATEGORIES.TEST_ANSWER]
+  );

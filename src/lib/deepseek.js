@@ -76,9 +76,12 @@ function historyToMessage(m, capabilities) {
 }
 
 export async function askDeepseek(systemPrompt, userText, files = [], history = [], opts = {}) {
-  const { onDelta = null, responseFormat = null, reasoning = null, signal = null, onUsage = null, onReasoning = null } = opts;
+  const {
+    onDelta = null, responseFormat = null, reasoning = null, signal = null,
+    onUsage = null, onReasoning = null, tier = null, proxyOnly = false,
+  } = opts;
   // Key decides the message SHAPE, so resolve it before building.
-  const key = await getByoKey();
+  const key = proxyOnly ? null : await getByoKey();
   const capabilities = { allowImages: !key, allowPdf: !key };
 
   // See qwen.js: a known missing/invalid proxy credential must fail before it
@@ -108,7 +111,7 @@ export async function askDeepseek(systemPrompt, userText, files = [], history = 
       // even when an older client sends Auto=low. Either way postStream hides
       // reasoning_content and shows only the answer.
       const result = await askViaProxy('deepseek', messages, {
-        label: 'Auto', onDelta, onUsage, onReasoning, signal, reasoning,
+        label: 'Auto', onDelta, onUsage, onReasoning, signal, reasoning, tier,
         responseFormat: wantJson ? 'json_object' : null
       });
       if (reservation) await commitOne(reservation);

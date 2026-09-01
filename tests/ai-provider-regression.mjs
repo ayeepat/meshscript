@@ -114,6 +114,32 @@ assert.equal(routeVisionPreferredProvider('deepseek', false), 'deepseek',
 assert.equal(routeVisionPreferredProvider('groq', true), 'groq',
   'a grandfathered explicit BYO provider must remain selected');
 
+// Generic-page screenshot re-solves must stay on the licensed Auto proxy even
+// on an old install that still carries the hidden Alibaba key. Without both
+// proxyOnly gates this attempts a direct Qwen/DeepSeek network request.
+{
+  const previousFetch = globalThis.fetch;
+  let directFetches = 0;
+  globalThis.fetch = async () => {
+    directFetches++;
+    throw new Error('unexpected direct BYO request');
+  };
+  store.qwenApiKey = 'sk-test-hidden-byo';
+  delete store.licenseStatus;
+  try {
+    await expectQwenPath('proxy-only generic vision route', () =>
+      askAI('system', 'user', [], [], {
+        provider: 'deepseek', proxyOnly: true, visionPreferred: true,
+      })
+    );
+    assert.equal(directFetches, 0,
+      'proxyOnly must prevent a hidden BYO key from making a direct request');
+  } finally {
+    delete store.qwenApiKey;
+    globalThis.fetch = previousFetch;
+  }
+}
+
 // The default has to be a provider the СМЭШ license can actually reach. With
 // the picker hidden there is no way to enter a BYO key, so defaulting to one
 // would dead-end every fresh install on «ключ не задан».

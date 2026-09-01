@@ -660,13 +660,70 @@ function currentTestSessionIdentity() {
   return hashCaptureIdentity([...new Set(signals)].sort().join('|'));
 }
 
+// Hosts whose pages go through the МЭШ flow. Everything else that the user has
+// granted is a generic web page (see lib/web-solve.js) and is identified by its
+// ORIGIN instead of by a signed-in child.
+const MESH_ORIGIN_HOSTS = ['school.mos.ru', 'uchebnik.mos.ru'];
+const SMESH_SERVICE_ORIGIN_HOSTS = ['smeshai.xyz', 'smeshapi.site', 'ai.smeshapi.site'];
+
+function isMeshOrigin() {
+  try {
+    const url = new URL(location.href);
+    return url.protocol === 'https:' && MESH_ORIGIN_HOSTS.includes(url.hostname);
+  } catch {
+    // An opaque location (sandboxed/about:blank frame) is never a generic page
+    // we may read on its own account — fail closed onto the Mesh predicate,
+    // which then finds no Mesh signals either.
+    return true;
+  }
+}
+
+/**
+ * ⚠️ Mirrors lib/web-solve.js isWebSolvableUrl(). The worker enforces the same
+ * rule on the tab URL before it ever injects here; this is the in-document half
+ * of that check, so a capture can never be built from a document that is not
+ * itself an eligible generic page.
+ */
+function isWebSolvableDocument() {
+  try {
+    const url = new URL(location.href);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return false;
+    return !MESH_ORIGIN_HOSTS.includes(url.hostname) &&
+      !SMESH_SERVICE_ORIGIN_HOSTS.includes(url.hostname);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Identity of a captured GENERIC page.
+ *
+ * ⚠️ Mirrors lib/web-solve.js webCapturePrincipal() verbatim — a classic content
+ * script cannot import it. tests/web-solve-regression.mjs fails on any drift.
+ *
+ * There is no "which child" question on an arbitrary site, so the origin is the
+ * isolation unit: it keeps the answer-reuse cache scoped per site and gives the
+ * capture validator a principal that carries real identity, without inventing a
+ * Mesh account that does not exist.
+ */
+function webCapturePrincipalIdentity() {
+  let origin = '';
+  try { origin = String(new URL(location.href).origin || ''); } catch { origin = ''; }
+  return JSON.stringify(['v2', origin.slice(0, 128), '', '', 'web', '']);
+}
+
 /**
  * Stable, bounded identity for the account/child whose page is being captured.
  * Never include the bearer token itself: only its stable local account claim
  * and Mesh's explicit current-student selection participate. The explicit
  * `none`/`ambiguous` state also makes a later selection change observable.
+ *
+ * Off Mesh there is no such account, so the origin-scoped web identity above is
+ * returned instead. Mesh captures cannot reach that branch: the worker's Mesh
+ * frame filter already drops every non-Mesh document before it is captured.
  */
 function currentPrincipalIdentity() {
+  if (!isMeshOrigin()) return webCapturePrincipalIdentity();
   let student = null;
   let account = '';
   let subject = '';
@@ -3853,11 +3910,516 @@ function clickDiscoveredPagination(expectedSignature = '', expectedPrincipal = '
   return { status: activatePaginationControl(nextEl) ? 'clicked' : 'none' };
 }
 
+/* =====================================================================
+ * GENERIC WEB PAGES (everything that is NOT МЭШ)
+ * ---------------------------------------------------------------------
+ * The extension can also answer an ordinary web page with a question or an
+ * exercise on it, on origins the user explicitly granted (see lib/web-solve.js
+ * for the permission model). МЭШ keeps its own path untouched; this section is
+ * purely additive and is never reached from a Mesh document.
+ *
+ * Two jobs, both read-only until the worker asks for a fill (the "is there a
+ * question here?" detection that decides whether the pill appears lives in
+ * test-pill.js — it must run on every page of every granted site, and this
+ * 180 KB file is only injected once a solve actually starts):
+ *   __smeshWebContent  — the scrape. Picks the region that actually holds the
+ *                        question, strips site furniture (nav/footer/cookie
+ *                        bars/comments) and emits a compact transcript plus an
+ *                        explicit inventory of the answer controls. Bounded on
+ *                        purpose: these pages are answered on the cheap model
+ *                        chain and every character is paid for.
+ *   __smeshWebFill     — one fill pass over native AND custom controls merged
+ *                        into a single numbered list, so the numbers the model
+ *                        was shown are exactly the numbers the fill resolves.
+ *                        (The Mesh flow runs two independent passes, each with
+ *                        its own numbering — safe there because both see the
+ *                        same «ЗАДАНИЕ №N» headings, ambiguous on a random
+ *                        site that numbers nothing.)
+ * ===================================================================== */
+
+const MAX_WEB_UNITS = 60;              // answer controls we will describe/fill
+const MAX_WEB_OPTIONS = 24;            // options listed per control
+const MAX_WEB_TEXT_CHARS = 7000;       // page transcript budget (≈2k tokens)
+const MAX_WEB_INVENTORY_CHARS = 3000;
+const MAX_WEB_NODES = 20000;           // hard bound on the extraction walk
+const MAX_WEB_STYLE_READS = 800;       // bound on getComputedStyle during it
+const MAX_WEB_DEPTH = 40;
+
+/* ---------- shared unit list (native + custom, one numbering) ---------- */
+
+const MAX_WEB_FURNITURE_DEPTH = 12;
+
+/**
+ * Is this control part of the SITE rather than part of a question?
+ *
+ * Found on a real page: ru.wikipedia.org ships eight visible `input[type=
+ * checkbox]` elements — the dropdown toggles for the main menu, appearance,
+ * language list and table of contents. collectUnits() cannot tell them from a
+ * multiple-choice question, so without this an encyclopedia article looked like
+ * a four-question quiz and an autofill could have flipped the site's own menus.
+ * Every one of them sits inside a <nav> or <header> within a few levels, which
+ * is what this checks.
+ */
+function webInFurniture(element) {
+  let node = element;
+  for (let depth = 0; node && node.nodeType === 1 && depth < MAX_WEB_FURNITURE_DEPTH; depth++) {
+    if (webLooksLikeFurniture(node)) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+function webQuestionUnits() {
+  let native = [];
+  let interactive = [];
+  try { native = collectUnits(); } catch { native = []; }
+  try { interactive = collectInteractiveUnits(); } catch { interactive = []; }
+  const units = [];
+  const usable = (unit) => {
+    try { return !!unit.anchor && !webInFurniture(unit.anchor); } catch { return false; }
+  };
+  for (const unit of native) if (usable(unit)) units.push({ kind: 'native', unit, anchor: unit.anchor });
+  for (const unit of interactive) if (usable(unit)) units.push({ kind: 'interactive', unit, anchor: unit.anchor });
+  try { units.sort((a, b) => domOrderCompare(a.anchor, b.anchor)); } catch { /* detached anchor */ }
+  return units.slice(0, MAX_WEB_UNITS);
+}
+
+/**
+ * Identifiers for the merged unit list.
+ *
+ * Either the page numbers EVERY control unambiguously («Вопрос 1…5») and we use
+ * those on-screen numbers, or we number 1..N positionally. A mixed or repeated
+ * set is deliberately discarded: the fill matches an answer to a control by this
+ * id, and a half-numbered page is exactly how an answer lands on the wrong box.
+ */
+function webUnitIds(units) {
+  const numbers = units.map((entry) => (entry.unit.number == null ? '' : String(entry.unit.number)));
+  const named = numbers.filter(Boolean);
+  const unique = new Set(named).size === named.length;
+  if (named.length === units.length && unique && units.length) {
+    return { ids: numbers, numbered: true };
+  }
+  return { ids: units.map((_, index) => String(index + 1)), numbered: false };
+}
+
+const WEB_UNIT_KIND_TEXT = {
+  radio: 'один вариант из списка',
+  checkbox: 'несколько вариантов (галочки)',
+  select: 'выпадающий список',
+  text: 'ввод текста',
+  dropdown: 'выпадающий список',
+  'aria-radio': 'один вариант из списка',
+  toggle: 'кнопки-варианты'
+};
+
+function webUnitOptions(entry) {
+  const unit = entry.unit;
+  const out = [];
+  try {
+    if (entry.kind === 'native') {
+      if (unit.type === 'select') {
+        const options = Array.from(unit.inputs[0]?.options || []).slice(0, MAX_WEB_OPTIONS);
+        for (const option of options) out.push(normalize(option.textContent));
+      } else if (unit.type === 'radio' || unit.type === 'checkbox') {
+        for (const input of unit.inputs.slice(0, MAX_WEB_OPTIONS)) out.push(normalize(controlLabelText(input)));
+      }
+    } else if (unit.type === 'dropdown') {
+      // A custom dropdown keeps its options in a popper that only opens on
+      // click. Showing the trigger's current text is honest; the fill matches
+      // the model's answer against the real options once the menu is open.
+      for (const element of unit.els.slice(0, MAX_WEB_OPTIONS)) {
+        out.push(normalize(element.getAttribute?.('aria-label') || precedingFieldText(element) || element.textContent));
+      }
+    } else {
+      for (const element of unit.els.slice(0, MAX_WEB_OPTIONS)) {
+        out.push(normalize(controlLabelText(element) || element.textContent));
+      }
+    }
+  } catch { /* unreadable control — describe it without options */ }
+  return out.map((text) => text.slice(0, 160)).filter(Boolean);
+}
+
+function webUnitFields(entry) {
+  if (entry.kind !== 'native' || entry.unit.type !== 'text') return [];
+  try {
+    return entry.unit.inputs
+      .slice(0, 12)
+      .map((input) => normalize(fieldLabel(input)).slice(0, 80))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * The answer-control inventory handed to the model. This is what makes generic
+ * autofill work at all: the model is told the exact number, kind and options of
+ * every box, and answers against those numbers.
+ */
+function webInventoryText(units, ids) {
+  const lines = [];
+  let used = 0;
+  units.forEach((entry, index) => {
+    if (used >= MAX_WEB_INVENTORY_CHARS) return;
+    const kind = WEB_UNIT_KIND_TEXT[entry.unit.type] || 'поле ответа';
+    const options = webUnitOptions(entry);
+    const fields = webUnitFields(entry);
+    let line = `№${ids[index]} · ${kind}`;
+    if (options.length) {
+      line += ' · варианты: ' + options.map((text, i) => `${i + 1}) ${text}`).join('  ');
+    } else if (fields.length > 1) {
+      line += ` · ${fields.length} поля: ` + fields.join(', ');
+    } else if (fields.length === 1) {
+      line += ` · подпись: ${fields[0]}`;
+    }
+    line = line.slice(0, 600);
+    used += line.length + 1;
+    lines.push(line);
+  });
+  return lines.join('\n');
+}
+
+/* ---------- readable content extraction ---------- */
+
+const WEB_SKIP_TAGS = new Set([
+  'SCRIPT', 'STYLE', 'NOSCRIPT', 'TEMPLATE', 'HEAD', 'LINK', 'META', 'TITLE',
+  'SVG', 'CANVAS', 'IFRAME', 'VIDEO', 'AUDIO', 'OBJECT', 'EMBED', 'MAP', 'AREA',
+  'PICTURE', 'SOURCE', 'TRACK', 'PARAM'
+]);
+const WEB_BOILERPLATE_TAGS = new Set(['NAV', 'HEADER', 'FOOTER', 'ASIDE', 'DIALOG']);
+const WEB_BOILERPLATE_ROLES = new Set([
+  'navigation', 'banner', 'contentinfo', 'complementary', 'search', 'menu',
+  'menubar', 'toolbar', 'tablist', 'dialog', 'alertdialog', 'tooltip', 'log',
+  'status', 'marquee', 'presentation'
+]);
+// Matched against TOKENS of class/id, never against the raw string: `subheader`
+// is one token and stays, `page-header` splits and goes. Anything that holds a
+// question control or a «Вопрос N» heading is protected from this list anyway
+// (see webProtectedAncestors) — the words below are only allowed to remove
+// furniture that carries no answerable material.
+const WEB_BOILERPLATE_WORDS = new Set([
+  'nav', 'navbar', 'navigation', 'menu', 'submenu', 'megamenu', 'header',
+  'masthead', 'footer', 'sidebar', 'breadcrumb', 'breadcrumbs', 'comment',
+  'comments', 'disqus', 'banner', 'advert', 'advertisement', 'ads',
+  'adsbygoogle', 'cookie', 'cookies', 'consent', 'gdpr', 'promo', 'social',
+  'share', 'sharing', 'related', 'recommended', 'recommendations', 'newsletter',
+  'subscribe', 'popup', 'modal', 'overlay', 'pagination', 'pager', 'copyright',
+  'sponsor', 'sponsored', 'paywall', 'skiplink', 'offcanvas', 'hamburger',
+  'topbar', 'bottombar', 'toolbar', 'searchform', 'searchbox', 'sitemap'
+]);
+const WEB_INLINE_TAGS = new Set([
+  'A', 'ABBR', 'B', 'BDI', 'BDO', 'CITE', 'CODE', 'DATA', 'DFN', 'EM', 'FONT',
+  'I', 'KBD', 'MARK', 'Q', 'RUBY', 'RT', 'RP', 'S', 'SAMP', 'SMALL', 'SPAN',
+  'STRONG', 'SUB', 'SUP', 'TIME', 'U', 'VAR', 'WBR', 'BR', 'IMG'
+]);
+
+function webTokens(value) {
+  return String(value || '').toLowerCase().split(/[^a-z0-9а-яё]+/i);
+}
+
+function webLooksLikeFurniture(element) {
+  if (WEB_BOILERPLATE_TAGS.has(element.tagName)) return true;
+  let role = '';
+  try { role = String(element.getAttribute('role') || '').toLowerCase(); } catch { role = ''; }
+  if (role && WEB_BOILERPLATE_ROLES.has(role)) return true;
+  let names = '';
+  try { names = `${element.getAttribute('class') || ''} ${element.getAttribute('id') || ''}`; } catch { names = ''; }
+  if (!names.trim()) return false;
+  for (const token of webTokens(names)) if (WEB_BOILERPLATE_WORDS.has(token)) return true;
+  return false;
+}
+
+/**
+ * Every ancestor of every question anchor. A subtree on this list is never
+ * pruned as furniture — a real quiz inside `<div class="widget">` outranks a
+ * class-name heuristic, always.
+ */
+function webProtectedAncestors(units, markers) {
+  const protectedNodes = new Set();
+  const add = (node) => {
+    let current = node;
+    for (let depth = 0; current && depth < 60; depth++, current = current.parentElement) {
+      if (protectedNodes.has(current)) break;
+      protectedNodes.add(current);
+    }
+  };
+  for (const entry of units) add(entry.anchor);
+  for (const marker of markers.slice(0, 60)) if (marker.node) add(marker.node);
+  return protectedNodes;
+}
+
+/**
+ * The region that actually holds the question.
+ *
+ * Anchored on the answer controls and the «Вопрос N» headings when there are
+ * any — far more reliable on a quiz page than article heuristics — then climbed
+ * a few levels so the prompt text ABOVE the first control comes along. Falls
+ * back to the page's main/article landmark, then to <body> (which the furniture
+ * pruning below already handles).
+ */
+function webContentRoot(units, markers) {
+  const anchors = units.map((entry) => entry.anchor).filter(Boolean).slice(0, 40);
+  for (const marker of markers.slice(0, 40)) if (marker.node) anchors.push(marker.node);
+  const body = document.body || document.documentElement;
+  if (anchors.length) {
+    let root = null;
+    try { root = commonAncestor(anchors); } catch { root = null; }
+    if (root && root.nodeType === 1) {
+      for (let step = 0; step < 6; step++) {
+        const parent = root.parentElement;
+        if (!parent || parent === body || parent === document.documentElement) break;
+        const grown = (parent.textContent || '').length;
+        const current = (root.textContent || '').length;
+        // A lone input has no text of its own, so its immediate parent may be a
+        // long reading-comprehension passage rather than the page shell. Let
+        // that first meaningful context in, within a strict bound; after that,
+        // retain the tighter same-order-of-magnitude rule.
+        if (current < 200) {
+          if (grown > MAX_WEB_TEXT_CHARS * 2) break;
+        } else if (grown > Math.max(1500, current * 3)) break;
+        root = parent;
+      }
+      return root;
+    }
+  }
+  let best = null;
+  let bestLength = 0;
+  try {
+    for (const candidate of Array.from(document.querySelectorAll('main, [role="main"], article')).slice(0, 20)) {
+      const length = (candidate.textContent || '').length;
+      if (length > bestLength) { best = candidate; bestLength = length; }
+    }
+  } catch { /* landmarks unreadable */ }
+  return bestLength >= 200 ? best : body;
+}
+
+/**
+ * Depth-first transcript of `root`: one line per block, site furniture pruned,
+ * hard-bounded in nodes, style reads and characters. Deliberately NOT innerText
+ * on the whole page — that is what makes a generic scrape expensive and noisy.
+ */
+function webBlockText(root, budget, protectedNodes) {
+  const lines = [];
+  let used = 0;
+  let nodes = 0;
+  let styleReads = 0;
+
+  const hidden = (element) => {
+    try {
+      if (element.hidden) return true;
+      if (element.getAttribute('aria-hidden') === 'true') return true;
+    } catch { return false; }
+    if (styleReads >= MAX_WEB_STYLE_READS) return false;
+    styleReads++;
+    try {
+      const style = window.getComputedStyle(element);
+      return style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+    } catch {
+      return false;
+    }
+  };
+
+  const push = (text) => {
+    const line = normalize(text);
+    if (!line) return;
+    const room = budget - used;
+    if (room <= 0) return;
+    const clipped = line.length > room ? line.slice(0, room) : line;
+    lines.push(clipped);
+    used += clipped.length + 1;
+  };
+
+  const inlineText = (element) => {
+    if (element.tagName === 'IMG') {
+      let alt = '';
+      try { alt = element.getAttribute('alt') || ''; } catch { alt = ''; }
+      return alt ? ` ${alt} ` : '';
+    }
+    if (element.tagName === 'BR') return ' ';
+    return element.textContent || '';
+  };
+
+  const controlMarker = (element) => {
+    const tag = element.tagName;
+    if (tag === 'TEXTAREA') return ' [поле для ответа] ';
+    if (tag === 'SELECT') return ' [выпадающий список] ';
+    if (tag !== 'INPUT') return '';
+    let type = '';
+    try { type = String(element.getAttribute('type') || 'text').toLowerCase(); } catch { type = 'text'; }
+    if (type === 'radio') return ' ( ) ';
+    if (type === 'checkbox') return ' [ ] ';
+    if (['hidden', 'submit', 'button', 'reset', 'image', 'file'].includes(type)) return '';
+    return ' [___] ';
+  };
+
+  const walk = (element, depth) => {
+    if (used >= budget || nodes >= MAX_WEB_NODES || depth > MAX_WEB_DEPTH) return;
+    nodes++;
+    let buffer = '';
+    let children = [];
+    try { children = Array.from(element.childNodes); } catch { children = []; }
+    for (const node of children) {
+      if (used >= budget || nodes >= MAX_WEB_NODES) break;
+      if (node.nodeType === 3) { buffer += node.nodeValue || ''; continue; }
+      if (node.nodeType !== 1) continue;
+      nodes++;
+      const tag = node.tagName;
+      if (WEB_SKIP_TAGS.has(tag)) continue;
+      const isProtected = protectedNodes.has(node);
+      if (!isProtected && webLooksLikeFurniture(node)) continue;
+      if (hidden(node)) continue;
+      if (WEB_INLINE_TAGS.has(tag)) { buffer += inlineText(node); continue; }
+      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'OPTION') {
+        // OPTION text is inventoried separately; inline it would duplicate the
+        // whole dropdown into the transcript.
+        if (tag !== 'OPTION') buffer += controlMarker(node);
+        continue;
+      }
+      push(buffer);
+      buffer = '';
+      walk(node, depth + 1);
+    }
+    push(buffer);
+  };
+
+  try { walk(root, 0); } catch { /* torn-down DOM — return what we have */ }
+
+  // NOTE: repeated lines are deliberately NOT collapsed. An earlier version
+  // deduplicated short ones to squeeze out echoed navigation, which also ate a
+  // true/false quiz's fifth «Да» and shifted every option after it. Dropping
+  // page content on a repetition heuristic buys a few tokens and risks a wrong
+  // answer; the furniture pruning above is the real defence, and the budget
+  // already caps the cost.
+  return lines.join('\n').slice(0, budget);
+}
+
+/**
+ * Everything the worker sends to the model for a generic page.
+ *
+ * `bodyChars` counts ONLY the page transcript, not the title/URL header the
+ * worker's "is this page readable at all?" check would otherwise always clear.
+ *
+ * @returns {{text:string, unitCount:number, chars:number, bodyChars:number}}
+ */
+function readWebPageContent(maxChars = MAX_WEB_TEXT_CHARS) {
+  const budget = Math.max(500, Math.min(MAX_WEB_TEXT_CHARS, Number(maxChars) || MAX_WEB_TEXT_CHARS));
+  const units = webQuestionUnits();
+  const { ids } = webUnitIds(units);
+  // One marker sweep for the whole read. collectQuestionMarkers walks every
+  // text node in the document, and this function used to trigger it four times
+  // on pages that can be megabytes.
+  let markers = [];
+  try { markers = collectQuestionMarkers(); } catch { markers = []; }
+  const protectedNodes = webProtectedAncestors(units, markers);
+  const root = webContentRoot(units, markers);
+  const body = webBlockText(root, budget, protectedNodes);
+  const parts = [];
+  const title = normalize(document.title).slice(0, 200);
+  if (title) parts.push(`Заголовок страницы: ${title}`);
+  // Origin + path only. The query string can carry session material and adds
+  // nothing a model needs; the path usually names the topic and does.
+  try {
+    const url = new URL(location.href);
+    parts.push(`Адрес: ${url.origin}${url.pathname}`.slice(0, 300));
+  } catch { /* opaque location */ }
+  parts.push('\n=== Содержимое страницы ===\n' + (body || '(не удалось прочитать текст страницы)'));
+  if (units.length) {
+    parts.push('\n=== Поля для ответа на странице ===\n' + webInventoryText(units, ids));
+  }
+  const text = parts.join('\n');
+  return {
+    text,
+    unitCount: units.length,
+    chars: text.length,
+    bodyChars: body.trim().length,
+  };
+}
+
+/* ---------- single-pass fill for generic pages ---------- */
+
+/**
+ * Fill a generic page from the model's answers.
+ *
+ * One list, one numbering, one match — see the section header for why the Mesh
+ * two-pass design is not reused here. Native units are written synchronously and
+ * verified after a settle window (identical to fillTestAnswers); custom widgets
+ * go through the async interactive filler, which verifies itself. Never submits.
+ */
+async function fillWebAnswers(questions, expectedSignature = '', expectedPrincipal = '') {
+  const summary = { filled: [], skipped: [] };
+  if (!Array.isArray(questions) || !questions.length) return summary;
+  const guard = { signature: expectedSignature, principal: expectedPrincipal, stale: false };
+  if (!interactiveGuardCurrent(guard)) return { ...summary, stale: true };
+
+  const idFor = (question, index) =>
+    (question && question.index != null && String(question.index).trim() !== '') ? question.index : index + 1;
+
+  const units = webQuestionUnits();
+  const { ids, numbered } = webUnitIds(units);
+  if (!units.length) {
+    questions.forEach((question, index) => summary.skipped.push(idFor(question, index)));
+    return summary;
+  }
+  const byId = new Map();
+  ids.forEach((id, index) => { if (!byId.has(id)) byId.set(id, index); });
+  const used = new Set();
+  // When the page numbers its questions we trust those numbers absolutely: a
+  // numbered control may only receive the answer carrying its own number. This
+  // is the same rule the Mesh fill applies, and for the same reason — a missed
+  // control must not shift every later answer onto its neighbour.
+  const acceptable = (index, id) =>
+    index >= 0 && index < units.length && !used.has(index) && (!numbered || ids[index] === String(id));
+
+  const pendingVerify = [];
+  for (let questionIndex = 0; questionIndex < questions.length; questionIndex++) {
+    if (!interactiveGuardCurrent(guard)) return { ...summary, stale: true };
+    const question = questions[questionIndex];
+    const id = idFor(question, questionIndex);
+    let index = byId.has(String(id)) ? byId.get(String(id)) : -1;
+    if (!acceptable(index, id)) {
+      const positional = /^\d+$/.test(String(id)) ? parseInt(id, 10) - 1 : questionIndex;
+      index = acceptable(positional, id) ? positional
+        : (acceptable(questionIndex, id) ? questionIndex : -1);
+    }
+    if (index < 0) { summary.skipped.push(id); continue; }
+
+    const entry = units[index];
+    let ok = false;
+    if (entry.kind === 'native') {
+      const writes = [];
+      try { ok = fillUnit(entry.unit, question, writes, guard); } catch { ok = false; }
+      if (ok && writes.length) pendingVerify.push({ id, writes });
+    } else {
+      try { ok = await fillInteractiveUnit(entry.unit, question, guard); } catch { ok = false; }
+    }
+    if (guard.stale) return { ...summary, stale: true };
+    if (ok) { used.add(index); summary.filled.push(id); }
+    else summary.skipped.push(id);
+  }
+
+  if (pendingVerify.length) {
+    await __smeshSleep(80);
+    if (!interactiveGuardCurrent(guard)) return { ...summary, stale: true };
+    const demoted = pendingVerify
+      .filter((group) => !group.writes.every(pendingWriteTook))
+      .map((group) => group.id);
+    for (const id of demoted) {
+      const at = summary.filled.indexOf(id);
+      if (at !== -1) summary.filled.splice(at, 1);
+      if (!summary.skipped.includes(id)) summary.skipped.push(id);
+    }
+  }
+  return summary;
+}
+
 window.__smeshHasVisualMedia = testPageHasVisualMedia;
 window.__smeshPageSig = pageSignature;
 window.__smeshCurrentPrincipal = currentPrincipalIdentity;
 window.__smeshNextDiscovery = discoverPagination;
 window.__smeshNextClick = clickDiscoveredPagination;
+window.__smeshWebContent = readWebPageContent;
+window.__smeshWebFill = fillWebAnswers;
+window.__smeshIsWebDocument = isWebSolvableDocument;
 
 // A SHOW_ANSWERS message is itself the worker's privileged replacement action.
 // If its capture is already stale before panel.show() can mint the new local

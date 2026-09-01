@@ -90,7 +90,7 @@ const META_STRING_VALUES = {
   engine: new Set(['auto', 'think']),
   category: new Set([
     'worked_solution', 'direct_answer', 'paragraph_summary',
-    'russian_full', 'literature', 'test_answer'
+    'russian_full', 'literature', 'test_answer', 'web_answer'
   ]),
   effort: new Set(['low', 'medium', 'high']),
   effort_reason: new Set(['engine_auto', 'easy', 'chatty', 'followup']),
@@ -108,12 +108,16 @@ const META_STRING_VALUES = {
     'CLASSIFY_TASKS', 'OPENROUTER_CREDITS', 'DOWNLOAD_FILES',
     'LIST_SESSIONS', 'LIST_MESSAGES', 'GDZ_CATALOG', 'GDZ_SEARCH',
     'GDZ_RESOLVE', 'GDZ_FOR_TASK', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
-    'GDZ_SELFTEST', 'solve_stream'
+    'GDZ_SELFTEST', 'solve_stream', 'WEB_SOLVE_PAGE', 'ACTIVATE_WEB_SITE'
   ])
 };
 const META_BOOLEAN_KEYS = new Set(['ok', 'est_rates']);
 const META_NUMBER_FIELDS = {
   followup: { min: 0, max: 1, integer: true },
+  // 1 when a test_solve/test_requestion came from the any-site path rather than
+  // from МЭШ. Those run on the cheap chain, so without this marker the two
+  // would be averaged together and the cost per solve would read as noise.
+  web: { min: 0, max: 1, integer: true },
   gdz_auto: { min: 0, max: 100, integer: true },
   images: { min: 0, max: 100, integer: true },
   books: { min: 0, max: 100, integer: true },

@@ -85,7 +85,11 @@ export async function askAI(systemPrompt, userText, files = [], history = [], op
       history.some((m) => m.role !== 'assistant' && m.files?.some(isPdfFile));
     const needsVisionFallback = opts.visionPreferred === true || hasImages || hasPdfs;
     if (needsVisionFallback) {
-      chosen = routeVisionPreferredProvider(chosen, true, Boolean(await getByoKey()));
+      // `proxyOnly` is used by generic-page solves whose cost/model contract
+      // must not be bypassed by a hidden legacy Alibaba key. The licensed Auto
+      // proxy is multimodal, so it needs no direct-BYO vision fallback.
+      const legacyDeepseekByo = opts.proxyOnly ? false : Boolean(await getByoKey());
+      chosen = routeVisionPreferredProvider(chosen, true, legacyDeepseekByo);
     }
   }
   // Tag the usage frame with the provider we actually routed to, so callers
