@@ -53,16 +53,24 @@
     </div>
 
     <div class="ob-step">
-      <div class="ob-h">2 · Согласие</div>
+      <div class="ob-h">2 · Ваш выбор</div>
       <label class="ob-consent">
-        <input id="obConsent" type="checkbox" />
-        <!-- One acceptance, no enumeration: what is sent, to whom, and the
-             usage statistics that used to have their own checkbox all live in
-             the two linked documents. They are the only disclosure surface
-             left, so they have to actually describe those flows. -->
+        <input id="obTerms" type="checkbox" />
         <span>Я принимаю
-          <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a> и
-          <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a>.</span>
+          <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a>.</span>
+      </label>
+      <label class="ob-consent">
+        <input id="obAiProcessing" type="checkbox" />
+        <span>Я разрешаю передавать выбранные задания и вложения облачным ИИ-сервисам, указанным в
+          <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политике конфиденциальности</a>, чтобы получить ответ.</span>
+      </label>
+      <label class="ob-consent">
+        <input id="obTelemetry" type="checkbox" />
+        <span>Я разрешаю отправлять обезличенную техническую статистику. Необязательно; по умолчанию выключено.</span>
+      </label>
+      <label class="ob-consent">
+        <input id="obEligibility" type="checkbox" />
+        <span>Я подтверждаю, что вправе пользоваться сервисом и, когда это требуется, получил(а) разрешение родителя или законного представителя.</span>
       </label>
     </div>
 

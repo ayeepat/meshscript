@@ -7,6 +7,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import vm from 'node:vm';
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from '../../tests/helpers/vps-entitlement.mjs';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const serverPath = fileURLToPath(new URL('../server.js', import.meta.url));
@@ -194,6 +195,7 @@ async function startProxy({ quotaPath, upstreamKey, mockPort, deepProbeMs }) {
     cwd: repoRoot,
     env: {
       ...process.env,
+      ...TEST_VPS_SECURITY_ENV,
       HOST: '127.0.0.1',
       PORT: String(port),
       AI_PROXY_API_KEY: upstreamKey,
@@ -230,14 +232,23 @@ async function json(response) {
 }
 
 function solveBody(label) {
+  const licenseKey = `SMESH-READY-${label}`;
+  const deviceId = '00000000-0000-4000-8000-000000000071';
   return JSON.stringify({
     provider: 'qwen',
-    license_key: `SMESH-READY-${label}`,
-    device_id: '00000000-0000-4000-8000-000000000071',
-    activation_token: 'a'.repeat(43),
+    ...entitlementBody({ licenseKey, deviceId }),
     messages: [{ role: 'user', content: label }]
   });
 }
+
+const readinessChecks = (upstreamKey, quotaStore) => ({
+  upstream_key: upstreamKey,
+  entitlement_secret: true,
+  runtime_signing_key: true,
+  quota_config: true,
+  quota_store: quotaStore,
+  model_config: true
+});
 
 function mskDay() {
   return new Date(Date.now() + 3 * 3600 * 1000).toISOString().slice(0, 10);
@@ -282,7 +293,7 @@ try {
   }, 'liveness must stay available for process supervision');
   assert.deepEqual(await json(await fetch(`${missingKey.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: false, quota_config: true, quota_store: true, model_config: true } }
+    body: { ok: false, checks: readinessChecks(false, true) }
   }, 'readiness must reject an instance without its paid-provider key');
   await stopProxy(missingKey.proc);
   processes.delete(missingKey.proc);
@@ -296,20 +307,20 @@ try {
   processes.add(healthy.proc);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
+    body: { ok: true, checks: readinessChecks(true, true) }
   });
   await assert.rejects(access(healthyPath), { code: 'ENOENT' },
     'a readiness probe must not create authoritative quota state before admission');
   await mkdir(healthyPath);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false, model_config: true } }
+    body: { ok: false, checks: readinessChecks(true, false) }
   }, 'readiness must detect post-start loss of the exact quota target before admission');
   const healthyBlocker = path.join(temp, 'healthy-target-blocker');
   await rename(healthyPath, healthyBlocker);
   assert.deepEqual(await json(await fetch(`${healthy.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
+    body: { ok: true, checks: readinessChecks(true, true) }
   }, 'an unused quota store may recover without inventing authoritative state');
   await assert.rejects(access(healthyPath), { code: 'ENOENT' });
   await stopProxy(healthy.proc);
@@ -325,7 +336,7 @@ try {
   processes.add(corrupt.proc);
   assert.deepEqual(await json(await fetch(`${corrupt.base}/ready`)), {
     status: 503,
-    body: { ok: false, checks: { upstream_key: true, quota_config: true, quota_store: false, model_config: true } }
+    body: { ok: false, checks: readinessChecks(true, false) }
   }, 'corrupt persisted accounting must never be replaced with empty counters');
   const callsBeforeBlockedStart = upstreamCalls;
   const blockedStart = await startSolve(corrupt.base, 'CORRUPT');
@@ -338,7 +349,7 @@ try {
   await writeFile(corruptPath, JSON.stringify({ day: '2026-07-26', counts: {} }), { mode: 0o600 });
   assert.deepEqual(await json(await fetch(`${corrupt.base}/ready`)), {
     status: 200,
-    body: { ok: true, checks: { upstream_key: true, quota_config: true, quota_store: true, model_config: true } }
+    body: { ok: true, checks: readinessChecks(true, true) }
   }, 'readiness should recover only after a valid durable quota store is restored');
   const recoveredStart = await startSolve(corrupt.base, 'RECOVERED');
   assert.equal(recoveredStart.status, 200, await recoveredStart.clone().text());

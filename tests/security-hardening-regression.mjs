@@ -99,6 +99,7 @@ globalThis.fetch = async () => { throw new Error('offline'); };
 const {
   APPROVED_HOMEWORK_SELECTORS,
   sanitizeRuntimeConfig,
+  sameRuntimePolicy,
   verifySignedConfigEnvelope,
   getRuntimeConfig
 } = await import('../src/lib/remote-config.js');
@@ -138,6 +139,38 @@ assert.deepEqual(verifiedEnvelope.notice, { text: 'Обновление' },
 const tampered = { ...envelope, payload: b64url(new TextEncoder().encode('{"configVersion":10}')) };
 assert.equal(await verifySignedConfigEnvelope(tampered, { publicJwk }), null);
 
+const signedConfig = async (raw) => {
+  const bytes = new TextEncoder().encode(JSON.stringify(raw));
+  const signed = new Uint8Array(await crypto.subtle.sign(
+    { name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, bytes
+  ));
+  return verifySignedConfigEnvelope(
+    { payload: b64url(bytes), signature: b64url(signed) },
+    { publicJwk, now: signedNow }
+  );
+};
+const bootstrap = await signedConfig({
+  configVersion: 0,
+  issuedAt: signedNow - 2_000,
+  expiresAt: signedNow + 60_000,
+  features: { telemetry: false }
+});
+assert.equal(bootstrap.configVersion, 0,
+  'a signed bootstrap revision must work before the first dashboard save');
+const renewed = await signedConfig({
+  configVersion: 9,
+  issuedAt: signedNow,
+  expiresAt: signedNow + 2 * 24 * 60 * 60 * 1000,
+  homeworkAnchorSelector: APPROVED_HOMEWORK_SELECTORS[0],
+  notice: { text: 'Обновление', url: 'https://evil.example/phishing' }
+});
+assert.equal(sameRuntimePolicy(verifiedEnvelope, renewed), true,
+  'renewing signed timestamps must not require a fake config revision');
+assert.equal(sameRuntimePolicy(
+  verifiedEnvelope,
+  { ...renewed, features: { ...renewed.features, telemetry: false } }
+), false, 'same-revision feature changes must remain equivocation');
+
 const timelessBytes = new TextEncoder().encode(JSON.stringify({ configVersion: 10 }));
 const timelessSignature = new Uint8Array(await crypto.subtle.sign(
   { name: 'ECDSA', hash: 'SHA-256' }, keys.privateKey, timelessBytes
@@ -156,6 +189,15 @@ localStore.runtimeConfig = {
 const fromLegacyCache = await getRuntimeConfig();
 assert.equal(fromLegacyCache.configVersion, 0);
 assert.equal(localStore.runtimeConfig, undefined, 'unsigned legacy cache must be evicted');
+// The switches are remote kill switches, not permissions: an evicted or absent
+// policy leaves the shipped capabilities on, and the VPS still re-checks every
+// AI job against the same switches, so this cannot re-enable a disabled one.
+assert.ok(Object.values(fromLegacyCache.features).every((enabled) => enabled === true),
+  'a rejected runtime policy must leave shipped capabilities usable');
+assert.equal(bootstrap.features.telemetry, false,
+  'only an authentic signed false may take a capability down');
+assert.equal(bootstrap.features.ai_text, true,
+  'a switch omitted from a signed payload keeps its shipped default');
 
 /* The privileged message surface is the extension's trust boundary. Every type
  * the worker accepts must have a real caller: a routable handler nobody sends

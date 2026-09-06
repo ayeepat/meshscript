@@ -10,7 +10,7 @@ import { classifyTask, needsAudio } from '../lib/task-classifier.js';
 import { iconSvg } from '../common/icons.js';
 import { startThinking } from '../common/thinking.js';
 import { mountProviderBadge, PROVIDER_ABBR } from '../common/provider-badge.js';
-import { hasConsent, setConsent } from '../lib/consent.js';
+import { hasConsent, setConsentChoices } from '../lib/consent.js';
 import { getTourRecord, hasSeenTour } from '../lib/onboarding.js';
 import {
   getLicenseStatus, isUsableLicenseStatus, licenseUsabilityReason,
@@ -146,9 +146,8 @@ function sendToBackground(msg) {
 
 /**
  * Pull files attached to a homework straight from the logged-in Mesh session.
- * Two steps, split for MV3 reasons (see scraper listMaterialUrls):
- *  1. the content script discovers the file URLs (same-origin API call);
- *  2. the service worker downloads them (cross-origin, host_permissions).
+ * The content script discovers the URLs and hands any one-time MESH token
+ * straight to the service worker. The popup receives only finished files.
  * On success the drop shows the file as already attached, so the user never
  * leaves the page to download it.
  */
@@ -193,6 +192,7 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     homeworkId,
     homeworkItemId,
     rowToken: card.rowToken,
+    scanId: card.scanId,
     task: card.task,
     principal: card.principal,
     principalError: card.principalError,
@@ -205,33 +205,12 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
   });
   if (!bindingCheck?.ok || bindingCheck.matches !== true) {
     card.candidates = [];
-    card.candidateAuth = null;
     autoFetchFailures.set(upKey, 'профиль или список дневника изменился');
     if (!quiet) showStoredAutoFetchFailure(card);
     return false;
   }
   card.candidates = Array.isArray(found?.candidates) ? found.candidates : [];
-  card.candidateAuth = found && found.stage !== 'binding_changed' &&
-      (found.headers || found.token) ? {
-    headers: found?.headers || null,
-    token: found?.token || null,
-    binding: attachmentBindingPayload(card),
-  } : null;
-  // Same-origin attachments are already downloaded by the content script; any
-  // cross-origin URLs come back for the service worker to fetch.
-  let files = found?.files || [];
-  if (found?.urls?.length) {
-    const dl = await sendToBackground({
-      type: 'DOWNLOAD_FILES',
-      payload: {
-        urls: found.urls,
-        headers: found.headers,
-        token: found.token,
-        ...attachmentBindingPayload(card),
-      }
-    });
-    if (dl?.ok && dl.files?.length) files = files.concat(dl.files);
-  }
+  const files = found?.files || [];
 
   if (files.length) {
     if (uploads[upKey]?.length) return true;
@@ -258,6 +237,7 @@ async function tryAutoFetch(card, { quiet = false } = {}) {
     no_urls: 'файла нет в задании',
     auth_redirect: 'нужна авторизация',
     download_failed: 'не скачалось',
+    disabled: 'вложения временно отключены',
     binding_changed: 'профиль или список дневника изменился',
     exception: 'ошибка запроса'
   }[found?.stage] || 'не найдено';
@@ -286,14 +266,10 @@ async function chooseCandidateForCard(card) {
   }
   if (index < 0) return;
   setDropLoading(card.drop, 'Скачиваю выбранный файл…');
-  const dl = await sendToBackground({
-    type: 'DOWNLOAD_FILES',
-    payload: {
-      urls: [card.candidates[index].url],
-      headers: card.candidateAuth?.headers,
-      token: card.candidateAuth?.token,
-      ...(card.candidateAuth?.binding || attachmentBindingPayload(card)),
-    }
+  const dl = await sendToContent(card.tabId, {
+    type: 'MESH_DOWNLOAD_CANDIDATE',
+    url: card.candidates[index].url,
+    ...attachmentBindingPayload(card)
   });
   if (dl?.ok && dl.files?.length) {
     uploads[card.upKey] = dl.files;
@@ -516,7 +492,6 @@ function buildCard(day, item, scanContext) {
     fileGen: 0,
     readPromise: null,
     candidates: [],
-    candidateAuth: null,
     launching: false,
     launched: false
   };
@@ -1318,9 +1293,17 @@ function showOnboarding(show) {
 }
 
 async function finishOnboarding() {
-  const consent = document.getElementById('obConsent').checked;
+  const choices = {
+    terms: document.getElementById('obTerms').checked,
+    ai_processing: document.getElementById('obAiProcessing').checked,
+    telemetry: document.getElementById('obTelemetry').checked,
+    eligibility: document.getElementById('obEligibility').checked
+  };
   const typed = document.getElementById('obKey').value.trim();
-  if (!consent) { showObError('Поставьте галочку согласия, чтобы продолжить.'); return; }
+  if (!choices.terms || !choices.ai_processing || !choices.eligibility) {
+    showObError('Подтвердите три обязательных пункта. Статистика остаётся необязательной.');
+    return;
+  }
   // Freeze the provider for the WHOLE validation. obProvider is mutable UI
   // state: a switch during the awaits below must not let one provider be
   // validated and a different one persisted (e.g. Groq checked, Qwen saved
@@ -1380,7 +1363,7 @@ async function finishOnboarding() {
     const data = { aiProvider: provider };
     if (field && typed) data[field] = typed;
     await chrome.storage.local.set(data);
-    await setConsent(true);
+    await setConsentChoices(choices);
   } catch {
     // Storage/runtime promises can still reject even though the normal
     // background-message wrapper converts transport failures to a null reply.
@@ -1409,34 +1392,14 @@ function wireOnboarding() {
   document.getElementById('obSettings').onclick = () => chrome.runtime.openOptionsPage();
 }
 
-// Ready = consent given AND the selected provider has a WORKING credential (an
-// API key, or for Qwen/DeepSeek a valid license / hidden BYO key). Otherwise
-// show onboarding so the very first "Решить" can never dead-end on a bare
-// credential error.
+// Ready = mandatory consent plus a currently usable licensed entitlement.
+// Legacy vendor keys never bypass this gate.
 async function isReadyToSolve() {
   if (!(await hasConsent())) return false;
-  const stored = await chrome.storage.local.get(
-    ['aiProvider', 'qwenApiKey', ...Object.values(PROVIDER_KEY_FIELD)]
-  );
-  // Same grandfathering rule as ai.resolveStoredProvider: a BYO value with no
-  // stored key can't answer and can't be fixed, so it counts as the licensed
-  // default and the license gate below decides readiness.
-  const byoField = PROVIDER_KEY_FIELD[stored.aiProvider];
-  const provider = (!SHOW_PROVIDER_UI && byoField && !stored[byoField])
-    ? DEFAULT_PROVIDER
-    : (stored.aiProvider || DEFAULT_PROVIDER);
-  if (provider === 'qwen' || provider === 'deepseek') {
-    // Hidden BYO Model Studio key bypasses the license entirely.
-    if (stored.qwenApiKey) return true;
-    // Read through license.js rather than trusting the raw storage row: that
-    // rejects obsolete generations and applies the same capability/expiry
-    // contract used at the network boundary. A genuine offline soft failure
-    // keeps the prior usable row, so it still passes here.
-    return isUsableLicenseStatus(await getLicenseStatus());
-  }
-  // Fall back to OpenRouter's key field for any unknown/legacy provider value.
-  const field = PROVIDER_KEY_FIELD[provider] || 'openrouterApiKey';
-  return !!stored[field];
+  // Read through license.js rather than trusting the raw storage row: that
+  // rejects obsolete generations and applies the same capability/expiry
+  // contract used at the network boundary.
+  return isUsableLicenseStatus(await getLicenseStatus());
 }
 
 /* ---------- Hand-off to the full-screen onboarding tour ---------- */

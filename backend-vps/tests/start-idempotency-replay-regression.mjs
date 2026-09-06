@@ -6,6 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from '../../tests/helpers/vps-entitlement.mjs';
 
 /* Idempotent /ai/start must never hand back a job that no longer exists.
  * handleAiCancel and the job GC delete jobs without touching the idempotency
@@ -95,6 +96,7 @@ const proc = spawn(process.execPath, [acceleratedServerPath], {
   cwd: repoRoot,
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     AI_PROXY_API_KEY: 'test-key',
@@ -108,11 +110,13 @@ let stderr = '';
 proc.stderr.on('data', (chunk) => { stderr += chunk; });
 
 // One frozen body string: an idempotent retry must resend the exact bytes.
+const identity = {
+  licenseKey: 'SMESH-IDEM-01-TEST',
+  deviceId: '00000000-0000-4000-8000-000000000001'
+};
 const startBody = JSON.stringify({
   provider: 'qwen',
-  license_key: 'SMESH-IDEM-01-TEST',
-  device_id: '00000000-0000-4000-8000-000000000001',
-  activation_token: 'b'.repeat(43),
+  ...entitlementBody(identity),
   idempotency_key: 'idem-replay-key-01',
   messages: [{ role: 'user', content: 'idempotent replay probe' }]
 });
@@ -167,9 +171,7 @@ try {
   // conflict, not a silent wrong-job answer.
   const divergent = await start(JSON.stringify({
     provider: 'qwen',
-    license_key: 'SMESH-IDEM-01-TEST',
-    device_id: '00000000-0000-4000-8000-000000000001',
-    activation_token: 'b'.repeat(43),
+    ...entitlementBody(identity),
     idempotency_key: 'idem-replay-key-01',
     messages: [{ role: 'user', content: 'different content entirely' }]
   }));

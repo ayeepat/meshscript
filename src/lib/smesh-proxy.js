@@ -1,8 +1,9 @@
 /**
  * Client for the СМЭШ AI proxy (ai.smeshapi.site) — stable Think (`qwen`) and
  * Auto (`deepseek`, legacy id) routes for licensed users. The СМЭШ license
- * key + device id are the credentials; the server holds the real API key,
- * re-verifies the license per request and enforces daily quotas server-side
+ * license Worker issues a short-lived entitlement capability; the raw license
+ * key and activation token never enter the inference flow. The proxy verifies
+ * the capability locally and enforces daily quotas server-side
  * (the caps in rate-limit.js remain as client UX; the server is
  * authoritative). Runs ONLY in the background service worker.
  *
@@ -51,9 +52,9 @@ import { hasConsent } from './consent.js';
 import { createSseSink, readResponseTextBounded } from './http.js';
 import { AI_BACKEND_URL } from './config.js';
 import {
-  getLicenseStatus, isUsableLicenseStatus, licenseUsabilityReason, reasonMessage
+  ensureLicensed, getLicenseStatus, hasFreshEntitlement,
+  isUsableLicenseStatus, licenseUsabilityReason, reasonMessage
 } from './license.js';
-import { getDeviceId } from './history.js';
 import { validateProxyMessagesBudget } from './upload-limits.js';
 
 const START_URL = `${AI_BACKEND_URL}/ai/start`;
@@ -376,16 +377,14 @@ export async function uploadBlob(text, mime, name, opts) {
 // Blob chunks are intentionally tiny and numerous, so they cannot each afford
 // a remote /verify request. Obtain one short-lived, license-bound capability
 // first; the VPS binds every chunk and the final /ai/start to it.
-async function createUploadTicket(licenseKey, deviceId, activationToken, size, signal) {
+async function createUploadTicket(entitlementToken, size, signal) {
   let res;
   try {
     res = await fetchText(UPLOAD_TICKET_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        license_key: licenseKey,
-        device_id: deviceId,
-        activation_token: activationToken,
+        entitlement_token: entitlementToken,
         size
       })
     }, signal, START_TIMEOUT_MS);
@@ -403,10 +402,9 @@ async function createUploadTicket(licenseKey, deviceId, activationToken, size, s
 }
 
 export async function askViaProxy(provider, messages, { label = 'AI', onDelta = null, onUsage = null, onReasoning = null, signal = null, responseFormat = null, reasoning = null, tier = null } = {}) {
-  // The proxy requires both the public key and the per-installation bearer
-  // capability. Keep this defensive check even though normal callers already
-  // pass through ensureLicensed(): no direct caller may emit an unauthenticated
-  // paid request while the UI claims the installation is active.
+  // Refresh the short-lived entitlement even for direct callers. Raw license
+  // credentials remain confined to license.js and its /verify request.
+  await ensureLicensed();
   const status = await getLicenseStatus();
   if (!status?.key) {
     throw new Error(
@@ -417,12 +415,10 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   if (!isUsableLicenseStatus(status)) {
     throw new Error(reasonMessage(licenseUsabilityReason(status)));
   }
+  if (!hasFreshEntitlement(status)) throw new Error(reasonMessage('bad_entitlement'));
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-  const t0 = Date.now();
-  const dbg = (...a) => console.log('[smesh-poll]', '+' + (Date.now() - t0) + 'ms', ...a);
-
-  const deviceId = await getDeviceId();
+  const dbg = null;
   // Server-side usage reporting follows the same explicit opt-in as client
   // telemetry. Treat every missing, malformed, or unreadable value as false.
   let telemetryOptIn = false;
@@ -437,9 +433,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   const idempotencyKey = crypto.randomUUID();
   const body = {
     provider,
-    license_key: status.key,
-    device_id: deviceId,
-    activation_token: status.activation_token,
+    entitlement_token: status.entitlement_token,
     telemetry_opt_in: telemetryOptIn,
     idempotency_key: idempotencyKey,
     messages
@@ -473,7 +467,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
     let blobId;
     try {
       const ticket = await createUploadTicket(
-        status.key, deviceId, status.activation_token, messagesJson.length, signal
+        status.entitlement_token, messagesJson.length, signal
       );
       blobId = await uploadBlob(messagesJson, 'application/json', 'messages', {
         signal, dbg, blobId: ticket.blob_id, uploadToken: ticket.upload_token

@@ -3,10 +3,7 @@
  * Orchestrates the AI provider call and local solve-history persistence.
  * All API keys live here / in storage, never in content scripts.
  */
-import { askAI, normalizeAIProvider, resolveStoredProvider } from '../lib/ai.js';
-import { getByoKey } from '../lib/qwen.js';
-import { fetchOpenRouterCredits, getSpendHistory, verifyOpenRouterKey } from '../lib/openrouter.js';
-import { verifyGroqKey } from '../lib/groq.js';
+import { askAI, normalizeAIProvider } from '../lib/ai.js';
 import { buildSystemPrompt, categoryForSubject } from '../lib/subject-router.js';
 import { DEFAULT_PROMPTS, PROMPT_CATEGORIES } from '../lib/prompts.js';
 import {
@@ -25,12 +22,12 @@ import {
 } from '../lib/test-answer-cache.js';
 import { ensureLicensed, setLicenseKey, deactivateCurrentLicense } from '../lib/license.js';
 import { getMyReferralCode } from '../lib/referral.js';
-import { REFERRALS_ENABLED } from '../lib/config.js';
+import { DEFAULT_PROVIDER, REFERRALS_ENABLED } from '../lib/config.js';
 import { claimTour, releaseTourClaim } from '../lib/onboarding.js';
 import { hasConsent, CONSENT_REQUIRED_MESSAGE } from '../lib/consent.js';
 import { getRuntimeConfig } from '../lib/remote-config.js';
 import { isBareTextbookRef, classifyTask, needsAudio, isEasyTask, isChatty, isLightFollowup, testPageEffort } from '../lib/task-classifier.js';
-import { isReadableFile, hasPdf, isAudioFile, isPdfFile, isImageFile } from '../lib/file-kinds.js';
+import { isReadableFile, isAudioFile, isPdfFile, isImageFile } from '../lib/file-kinds.js';
 import { track, heartbeat, usageFields, errorCode } from '../lib/telemetry.js';
 import { EMPTY_ANSWER } from '../lib/http.js';
 import {
@@ -44,7 +41,6 @@ import {
 import { isGdzCoverUrl } from '../lib/gdz-hosts.js';
 import { mapSubjectToId } from '../lib/gdz-match.js';
 import { prepareFiles } from '../lib/extract.js';
-import { transcribeAudioFiles } from '../lib/transcribe.js';
 import { compressImageFiles } from '../lib/image-compress.js';
 import {
   storeDashboardLaunch,
@@ -294,9 +290,9 @@ try {
     );
   } else {
     chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' })
-      ?.catch?.((error) => console.error('failed to restrict local storage access', String(error)));
+      ?.catch?.((error) => console.error('failed to restrict local storage access', errorCode(error)));
   }
-} catch (error) { console.error('failed to restrict local storage access', String(error)); }
+} catch (error) { console.error('failed to restrict local storage access', errorCode(error)); }
 try {
   chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_AND_UNTRUSTED_CONTEXTS' });
 } catch { /* old Chrome — content script falls back to defaults each time */ }
@@ -392,21 +388,18 @@ function handleExtensionInstalled(details) {
 
 chrome.runtime.onInstalled.addListener(handleExtensionInstalled);
 
-// NaraRouter was removed (replaced by Qwen/DeepSeek). An install that still has
-// it selected would fall through to the dispatcher's OpenRouter default and
-// dead-end on "ключ не задан" — instead, move the selection to a provider the
-// user actually has a key for, and drop the orphaned key from storage.
+// Remove provider secrets from legacy builds. Current builds send all AI
+// content through the licensed gateway and never need user-supplied vendor
+// credentials. Keeping them would create an undocumented dormant egress path.
 async function migrateNararouter() {
-  const { aiProvider, nararouterApiKey, openrouterApiKey } =
-    await chrome.storage.local.get(['aiProvider', 'nararouterApiKey', 'openrouterApiKey']);
-  if (aiProvider === 'nararouter') {
-    // Prefer OpenRouter if its key exists, else Groq. If neither key exists the
-    // popup's isReadyToSolve() gate reopens onboarding — the right recovery path.
-    await chrome.storage.local.set({ aiProvider: openrouterApiKey ? 'openrouter' : 'groq' });
+  const { aiProvider } = await chrome.storage.local.get('aiProvider');
+  if (!['qwen', 'deepseek'].includes(aiProvider)) {
+    await chrome.storage.local.set({ aiProvider: DEFAULT_PROVIDER });
   }
-  if (nararouterApiKey !== undefined) {
-    await chrome.storage.local.remove(['nararouterApiKey', 'nararouterModelsCache']);
-  }
+  await chrome.storage.local.remove([
+    'nararouterApiKey', 'nararouterModelsCache',
+    'openrouterApiKey', 'groqApiKey', 'qwenApiKey'
+  ]);
 }
 
 // Open the full-window dashboard when the popup asks to "Solve". Encrypted
@@ -450,10 +443,8 @@ function missingInputGate(category, task, files, { canTranscribe = false } = {})
   const audio = needsAudio(task);
 
   // An audio file IS attached but still isn't readable — a successful
-  // transcription would have replaced it with a text/plain file (see
-  // transcribeAudioFiles). So it's here means Whisper didn't run or returned
-  // nothing. Point at the likely cause instead of telling the user to attach a
-  // file they already attached.
+  // No licensed transcription processor is configured, so point at the usable
+  // fallback instead of telling the user to attach a file they already did.
   if (files.some(isAudioFile) && !hasReadable) {
     // NOTE: transcription runs on a BYO Groq key only (lib/transcribe.js). With
     // the provider UI hidden there is no licensed Whisper path, so a licensed
@@ -575,13 +566,9 @@ async function solve(
   // them and lets the gate below see them as readable material.
   files = await prepareFiles(files);
 
-  // Listening (аудирование) clips can't be read by the solver model, so
-  // transcribe any attached audio to text via Groq Whisper FIRST. After this an
-  // audio attachment counts as readable material, so the gate below stops
-  // refusing it and the normal solve path answers the listening task. On any
-  // failure (no Groq key, daily cap, bad codec) the audio passes through
-  // unchanged and the gate's "send a transcript" refusal still applies.
-  files = await transcribeAudioFiles(files);
+  // Audio is not sent to an undeclared direct transcription provider. Until a
+  // licensed transcription processor is added to the gateway registry, the
+  // deterministic input gate below asks for a transcript.
 
   // Hard refusal gate — runs in CODE, before any model call, only on the first
   // turn (later turns may carry a clarification or a just-attached file). A soft
@@ -596,10 +583,7 @@ async function solve(
   // way (a reshebnik has no listening answers), so we skip GDZ for those.
   let gdzAttached = 0;
   if (history.length === 0) {
-    const { groqApiKey } = needsAudio(task)
-      ? await chrome.storage.local.get('groqApiKey')
-      : { groqApiKey: '' };
-    const gate = missingInputGate(category, task, files, { canTranscribe: !!groqApiKey });
+    const gate = missingInputGate(category, task, files, { canTranscribe: false });
     if (gate) {
       const audioGap = needsAudio(task) && !files.some(isReadableFile);
       const gdzFiles = audioGap ? [] : await fetchGdzMaterial(subject, task);
@@ -623,8 +607,7 @@ async function solve(
       preparedHistory.push(m);
       continue;
     }
-    let historyFiles = await prepareFiles(m.files);
-    historyFiles = await transcribeAudioFiles(historyFiles);
+    const historyFiles = await prepareFiles(m.files);
     // Image decoding is intentionally sequential across history messages too:
     // parallel 25-megapixel bitmaps can multiply peak memory and kill the MV3
     // worker before the request is sent.
@@ -642,35 +625,7 @@ async function solve(
   // auto → legacy wire id `deepseek`, currently Qwen 3.7 Plus via live model
   // control; think → Qwen. Absent/unknown values keep the stored provider.
   const engineProvider = engine === 'think' ? 'qwen' : engine === 'auto' ? 'deepseek' : null;
-  // PDFs require a PDF-capable backend. The licensed СМЭШ proxy routes handle
-  // them server-side when there is no hidden BYO Alibaba key — it sends the job
-  // to its Gemini chain server-side — so those requests pass through
-  // untouched. Everyone else (Groq, OpenRouter, BYO DashScope) is forced to
-  // OpenRouter, whose Gemini reads PDFs natively.
-  let provider = engineProvider || undefined;
-  const requestHasPdf = hasPdf(files) || history.some((m) => m?.files?.some(isPdfFile));
-  if (requestHasPdf) {
-    const { aiProvider } = await chrome.storage.local.get('aiProvider');
-    // resolveStoredProvider, not a bare normalize: a legacy install still
-    // pointing at a BYO provider it has no key for resolves to the licensed
-    // default, whose proxy reads PDFs. Otherwise those users would be sent to
-    // OpenRouter and dead-end below on a key they can no longer enter.
-    const chosen = engineProvider || await resolveStoredProvider(aiProvider);
-    const proxyReadsPdf = (chosen === 'qwen' || chosen === 'deepseek') && !(await getByoKey());
-    if (!proxyReadsPdf) {
-      provider = 'openrouter';
-      // Only reachable for a grandfathered BYO install (see above). Explain WHY
-      // a key is suddenly needed instead of a bare "key not set" error.
-      const { openrouterApiKey } = await chrome.storage.local.get('openrouterApiKey');
-      if (!openrouterApiKey) {
-        return {
-          answer: 'В задании есть PDF, а он читается только по лицензии СМЭШ. Активируйте ключ доступа ' +
-            'в настройках расширения — либо пришлите это задание фотографиями страниц или текстом.',
-          sessionId
-        };
-      }
-    }
-  }
+  const provider = engineProvider || undefined;
   // When we auto-attached GDZ answer images above, tell the model what they are
   // so it transcribes/adapts the worked solution rather than treating them as a
   // fresh problem photo (and ignores any image whose number doesn't match).
@@ -1378,7 +1333,7 @@ async function readBoundedBody(response, maxBytes, controller) {
 
 async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
   const original = parseAttachmentUrl(rawUrl);
-  if (!original) { dbg('[СМЭШ AI] rejected attachment URL', rawUrl); return null; }
+  if (!original) { dbg('[СМЭШ AI] rejected attachment URL'); return null; }
   let current = original;
   const ctrl = new AbortController();
   // One deadline covers every redirect, response headers and the full streamed
@@ -1410,13 +1365,13 @@ async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
         continue;
       }
       if (!res.ok) {
-        dbg('[СМЭШ AI] download http', res.status, current.href);
+        dbg('[СМЭШ AI] download http', res.status);
         try { await res.body?.cancel('error response discarded'); } catch { /* already closed */ }
         return null;
       }
       const ct = (res.headers.get('content-type') || '').toLowerCase();
       if (ct.includes('text/html') || ct.includes('text/xml')) {
-        dbg('[СМЭШ AI] download got HTML (auth redirect?)', current.href);
+        dbg('[СМЭШ AI] download got HTML (auth redirect?)');
         try { await res.body?.cancel('non-file response discarded'); } catch { /* already closed */ }
         return null;
       }
@@ -1427,13 +1382,13 @@ async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
         : MAX_STANDARD_UPLOAD_BYTES;
       const maxBytes = Math.min(typeMaxBytes, maxBytesCap);
       const bytes = await readBoundedBody(res, maxBytes, ctrl);
-      if (!bytes) { dbg('[СМЭШ AI] download size limit skip', current.href); return null; }
-      if (!bytes.byteLength) { dbg('[СМЭШ AI] download empty file skip', current.href); return null; }
-      dbg('[СМЭШ AI] downloaded', name, mimeType, bytes.byteLength + 'b');
+      if (!bytes) { dbg('[СМЭШ AI] download size limit skip'); return null; }
+      if (!bytes.byteLength) { dbg('[СМЭШ AI] download empty file skip'); return null; }
+      dbg('[СМЭШ AI] attachment downloaded', bytes.byteLength + 'b');
       return { mimeType, dataBase64: abToBase64(bytes), name, byteLength: bytes.byteLength };
     }
   } catch (e) {
-    dbg('[СМЭШ AI] download exception', String(e), current.href);
+    dbg('[СМЭШ AI] download exception', e?.name || 'Error');
     return null;
   } finally {
     clearTimeout(timer);
@@ -1442,10 +1397,8 @@ async function downloadFile(rawUrl, headers, maxBytesCap = Infinity) {
   return null;
 }
 
-// Reconstruct Mesh's required family-web headers from a bare token. Mirrors the
-// content script's meshHeaders() so the backward-compat (token-only) download
-// path still carries the X-mes-* set the API and file store expect — Authorization
-// alone gets bounced to the auth page on some endpoints.
+// Reconstruct the fixed MESH header set from the one-time token. Arbitrary
+// caller-controlled headers are never accepted at this privileged boundary.
 function meshHeadersFromToken(token) {
   return {
     Accept: 'application/json, text/plain, */*',
@@ -1454,12 +1407,6 @@ function meshHeadersFromToken(token) {
     'X-Mes-RoleId': '1',
     Authorization: 'Bearer ' + token
   };
-}
-
-function attachmentHeaders(headers) {
-  const allowed = new Set(['accept', 'authorization', 'x-mes-subsystem', 'x-mes-role', 'x-mes-roleid']);
-  return Object.fromEntries(Object.entries(headers || {}).filter(([key, value]) =>
-    allowed.has(key.toLowerCase()) && typeof value === 'string'));
 }
 
 async function verifyHomeworkDownloadBinding({
@@ -1498,12 +1445,11 @@ async function verifyHomeworkDownloadBinding({
   }
 }
 
-// `headers` come straight from the content script's discovery (Bearer token +
-// Mesh's X-mes-* set). Every fetch is additionally bound to the exact scan,
-// live tab principal and opaque row that authorized discovery.
+// Only the MESH content script can call this. The token is used in memory for
+// this bounded download and is never returned, persisted or logged.
 async function downloadFiles(payload = {}) {
-  const { urls = [], headers = null, token = null } = payload;
-  const hdrs = attachmentHeaders(headers || (token ? meshHeadersFromToken(token) : {}));
+  const { urls = [], token = null } = payload;
+  const hdrs = meshHeadersFromToken(token);
   const files = [];
   let totalBytes = 0;
   await verifyHomeworkDownloadBinding(payload);
@@ -2995,7 +2941,8 @@ const CONTENT_ACTIONS = new Set([
   'PILL_SOLVE_PAGE',
   'PILL_SOLVE_ALL',
   'RESOLVE_QUESTION',
-  'WEB_SOLVE_PAGE'
+  'WEB_SOLVE_PAGE',
+  'DOWNLOAD_FILES'
 ]);
 const PANEL_ACTIONS = new Set(['FILL_ANSWERS_ALL', 'RESOLVE_QUESTION']);
 
@@ -3005,8 +2952,9 @@ const SENDER_MESSAGE_TYPES = {
   // PILL_CANCEL is deliberately outside CONTENT_ACTIONS: it only stops the
   // sender tab's own run, so it must not require an action token.
   content: new Set([
-    'GET_ACTION_TOKEN', 'PILL_CANCEL',
-    'FILL_ANSWERS_ALL', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'RESOLVE_QUESTION'
+    'GET_ACTION_TOKEN', 'GET_RUNTIME_CONFIG', 'PILL_CANCEL',
+    'FILL_ANSWERS_ALL', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'RESOLVE_QUESTION',
+    'DOWNLOAD_FILES'
   ]),
   // A granted generic page (lib/web-solve.js). Strictly narrower than Mesh: it
   // may solve the one page in front of it, fill it and re-solve one question —
@@ -3019,9 +2967,9 @@ const SENDER_MESSAGE_TYPES = {
     'OPEN_DASHBOARD', 'SOLVE', 'SOLVE_TEST', 'FILL_ANSWERS_TAB',
     'TEST_PAGE_SIG', 'TEST_NEXT_PAGE', 'GET_RUNTIME_CONFIG',
     'GET_DEVICE_ID', 'SET_LICENSE_KEY', 'DEACTIVATE_LICENSE', 'SYNC_REFERRAL_POINTER', 'DELETE_LOCAL_DATA',
-    'OPENROUTER_CREDITS', 'DOWNLOAD_FILES', 'LESSON_HISTORY', 'LIST_SESSIONS', 'LIST_MESSAGES',
+    'LESSON_HISTORY', 'LIST_SESSIONS', 'LIST_MESSAGES',
     'GDZ_SEARCH', 'GDZ_FOR_TASK', 'GDZ_COVER', 'GDZ_BOOK_ADD', 'GDZ_BOOK_REMOVE',
-    'CONSUME_DASH_LAUNCH', 'VERIFY_PROVIDER_KEY', 'OPEN_ONBOARDING',
+    'CONSUME_DASH_LAUNCH', 'OPEN_ONBOARDING',
     'ACTIVATE_WEB_SITE'
   ])
 };
@@ -3103,11 +3051,6 @@ function validHistoryMessage(item) {
     isOptionalBoolean(item.needsUpload) && isOptionalBoolean(item.error);
 }
 
-function validHeaders(headers) {
-  return headers == null || (isRecord(headers) && Object.keys(headers).length <= 50 &&
-    Object.entries(headers).every(([k, v]) => isString(k, 256) && isString(v, 8192)));
-}
-
 const noPayload = (msg) => msg.payload == null;
 const payloadRecord = (msg, keys) => hasOnlyKeys(msg.payload, keys);
 
@@ -3170,16 +3113,13 @@ const MESSAGE_SCHEMAS = {
     (payloadRecord(msg, ['force']) && isOptionalBoolean(msg.payload.force)),
   CONSUME_DASH_LAUNCH: (msg) => payloadRecord(msg, ['id']) &&
     isString(msg.payload.id, 128) && /^[0-9a-f-]{36}$/i.test(msg.payload.id),
-  OPENROUTER_CREDITS: noPayload,
-  VERIFY_PROVIDER_KEY: (msg) => payloadRecord(msg, ['provider', 'apiKey']) &&
-    isString(msg.payload.provider, 32) && isString(msg.payload.apiKey, 512),
   DOWNLOAD_FILES: (msg) => payloadRecord(msg, [
-    'urls', 'headers', 'token', 'tabId', 'scanId', 'principal',
+    'urls', 'token', 'scanId', 'principal',
     'principalError', 'rowToken'
   ]) &&
-    validArray(msg.payload.urls, isAllowedAttachmentUrl) && validHeaders(msg.payload.headers) &&
-    isOptionalString(msg.payload.token, 8192) &&
-    isSafeId(msg.payload.tabId) && isHomeworkScanId(msg.payload.scanId) &&
+    validArray(msg.payload.urls, isAllowedAttachmentUrl) &&
+    isString(msg.payload.token, 8192) &&
+    isHomeworkScanId(msg.payload.scanId) &&
     isString(msg.payload.principal, 512) &&
     isOptionalString(msg.payload.principalError, 1024) &&
     isHomeworkScanId(msg.payload.rowToken),
@@ -3260,6 +3200,30 @@ function validateMessage(senderClass, msg) {
   return null;
 }
 
+function blockedFeature(msg, config) {
+  const features = config?.features || {};
+  if (msg.type === 'DOWNLOAD_FILES' && features.mesh_attachments === false) return 'Вложения из дневника временно отключены.';
+  // The pill/web commands perform their own fill internally, so they belong
+  // to the autofill switch too. Otherwise disabling direct FILL_* messages
+  // would leave the one-click/autopilot paths able to mutate the page.
+  if (['FILL_ANSWERS_ALL', 'FILL_ANSWERS_TAB', 'TEST_NEXT_PAGE',
+    'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'WEB_SOLVE_PAGE'].includes(msg.type) &&
+      features.autofill === false) return 'Автозаполнение временно отключено.';
+  if (['WEB_SOLVE_PAGE', 'ACTIVATE_WEB_SITE'].includes(msg.type) &&
+      features.other_sites === false) return 'Работа на других сайтах временно отключена.';
+  if (msg.type.startsWith('GDZ_') && features.gdz === false) return 'ГДЗ временно отключено.';
+  if (['SOLVE', 'SOLVE_TEST', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'RESOLVE_QUESTION', 'WEB_SOLVE_PAGE']
+      .includes(msg.type) && features.ai_text === false) return 'Ответы ИИ временно отключены.';
+  const files = msg.type === 'SOLVE' ? (msg.payload?.files || []) : [];
+  if ((msg.type === 'SOLVE_TEST' && msg.payload?.screenshot) || files.some(isImageFile)) {
+    if (features.ai_images === false) return 'Обработка изображений временно отключена.';
+  }
+  if (files.some(isPdfFile) && features.ai_documents === false) {
+    return 'Обработка документов временно отключена.';
+  }
+  return null;
+}
+
 function clearExpiredActionTokens(now = Date.now()) {
   for (const [token, grant] of actionTokens) if (grant.expiresAt <= now) actionTokens.delete(token);
 }
@@ -3329,6 +3293,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   (async () => {
     try {
+      const featureError = blockedFeature(msg, await getRuntimeConfig());
+      if (featureError) {
+        sendResponse({ ok: false, error: featureError });
+        return;
+      }
       switch (msg?.type) {
         case 'GET_DEVICE_ID':
           sendResponse({ ok: true, deviceId: await getDeviceId() });
@@ -3628,27 +3597,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true, payload: await consumeDashboardLaunch(msg.payload?.id) });
           break;
         }
-        case 'OPENROUTER_CREDITS': {
-          // Settings usage dashboard: OpenRouter balance (+ a daily spend
-          // snapshot recorded as a side effect) and the derived spend history.
-          const credits = await fetchOpenRouterCredits();
-          const spendHistory = await getSpendHistory();
-          sendResponse({ ...credits, spendHistory });
-          break;
-        }
-        case 'VERIFY_PROVIDER_KEY': {
-          // Popup onboarding checks a typed Groq/OpenRouter key BEFORE it is
-          // persisted, so the first «Решить» can't dead-end on a bad key. The
-          // provider libraries stay service-worker-only; the popup just asks.
-          const verify = msg.payload.provider === 'groq'
-            ? verifyGroqKey
-            : (msg.payload.provider === 'openrouter' ? verifyOpenRouterKey : null);
-          if (!verify) { sendResponse({ ok: false, reason: 'bad_provider' }); break; }
-          sendResponse(await verify(msg.payload.apiKey));
-          break;
-        }
         case 'DOWNLOAD_FILES':
-          sendResponse({ ok: true, files: await downloadFiles(msg.payload || {}) });
+          sendResponse({
+            ok: true,
+            files: await downloadFiles({ ...msg.payload, tabId: sender.tab.id })
+          });
           break;
         case 'LESSON_HISTORY':
           // The dashboard asks this before opening a lesson: if this exact
@@ -3849,7 +3802,10 @@ chrome.runtime.onConnect.addListener((port) => {
       console.log('[solve] done +' + (Date.now() - t0) + 'ms');
       safePost({ type: 'done', result });
     } catch (e) {
-      console.log('[solve] threw +' + (Date.now() - t0) + 'ms:', e?.name, String(e?.message || e), 'aborted=' + ctrl.signal.aborted);
+      // Provider errors may quote upstream response text, file names, or other
+      // task-derived material. Keep operational console output content-free;
+      // the caller still receives the user-facing message below.
+      console.log('[solve] failed +' + (Date.now() - t0) + 'ms:', errorCode(e), 'aborted=' + ctrl.signal.aborted);
       // Caller-initiated abort: the port is already gone, no point posting.
       if (e?.name !== 'AbortError' && !ctrl.signal.aborted) {
         track('error', { meta: { code: errorCode(e), op: 'solve_stream' } });

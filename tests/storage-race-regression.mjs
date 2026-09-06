@@ -383,7 +383,9 @@ function keyedSlowFetch(slowKey) {
     const body = JSON.parse(init.body);
     if (body.key === slowKey) { markStarted(); await released; }
     return new Response(JSON.stringify({
-      ok: true, type: 'lifetime', expires_at: null, activation_token: 'B'.repeat(43)
+      ok: true, type: 'lifetime', expires_at: null, activation_token: 'B'.repeat(43),
+      entitlement_token: 'et1.test.signature',
+      entitlement_token_expires_at: Date.now() + 10 * 60 * 1000
     }), {
       status: 200,
       headers: { 'Content-Type': 'application/json' }

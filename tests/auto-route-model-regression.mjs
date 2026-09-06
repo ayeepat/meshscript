@@ -15,15 +15,15 @@ globalThis.chrome = {
 const { routeVisionPreferredProvider } = await import('../src/lib/ai.js');
 assert.equal(routeVisionPreferredProvider('deepseek', true), 'deepseek',
   'licensed Auto images must stay on the multimodal live route');
-assert.equal(routeVisionPreferredProvider('deepseek', true, true), 'qwen',
-  'only hidden BYO DeepSeek images may upgrade to BYO Qwen');
+assert.equal(routeVisionPreferredProvider('deepseek', true, true), 'deepseek',
+  'legacy BYO flags cannot divert the licensed Auto route');
 
 const autoWrapper = readFileSync(new URL('../src/lib/deepseek.js', import.meta.url), 'utf8');
-assert.match(autoWrapper, /if \(allowImages && isImageFile\(f\)\)/,
+assert.match(autoWrapper, /if \(isImageFile\(f\)\)/,
   'the licensed Auto wrapper must serialize image attachments');
 assert.match(autoWrapper, /type: 'image_url'/);
-assert.match(autoWrapper, /allowImages: !key/,
-  'direct BYO DeepSeek must remain text-only');
+assert.doesNotMatch(autoWrapper, /getByoKey|dashscope-intl|Authorization:\s*`Bearer/,
+  'Auto must have no direct BYO transport');
 
 const worker = readFileSync(new URL('../src/background/service-worker.js', import.meta.url), 'utf8');
 const effortStart = worker.indexOf('const askOpts =');

@@ -63,6 +63,7 @@ function makeContext({ fetchImpl, models = ['qwen-test'], sleepImpl = async () =
     upstreamUrl: () => 'https://provider.invalid/v1/chat/completions',
     modelChoices: () => models,
     isUnpurchased: (text) => /No available models|"err_code"\s*:\s*-10008/i.test(text || ''),
+    safeErrorCode: () => 'Error:TEST',
     readResponseTextBounded: async (response) => response.__text,
     fetch: async (...args) => { calls.push(args); return fetchImpl(calls.length); }
   };

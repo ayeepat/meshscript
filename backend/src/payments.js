@@ -1,5 +1,16 @@
 import * as robokassa from './gateways/robokassa.js';
 
+function safeErrorCode(errorValue) {
+  const name = typeof errorValue?.name === 'string' &&
+    /^(?:Error|TypeError|RangeError|SyntaxError|AbortError|TimeoutError)$/.test(errorValue.name)
+    ? errorValue.name
+    : 'Error';
+  const code = typeof errorValue?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(errorValue.code)
+    ? errorValue.code
+    : 'UNCLASSIFIED';
+  return `${name}:${code}`;
+}
+
 const ORDER_TTL_MS = 30 * 60 * 1000;
 const ROBOKASSA_PRODUCTION_INVOICE_BASE = 7_000_000_000_000_000n;
 const ROBOKASSA_TEST_INVOICE_BASE = 8_000_000_000_000_000n;
@@ -389,7 +400,7 @@ async function chargeMalformedOrderAttempt(env, ip) {
     ).bind(moscowDay(), key, ORDER_MALFORMED_DAILY_LIMIT).run();
   } catch (e) {
     // Never turn a rejected malformed request into a 500.
-    console.error('malformed order budget write failed', String(e));
+    console.error('malformed order budget write failed', safeErrorCode(e));
   }
 }
 
@@ -1311,7 +1322,7 @@ export async function inspectPendingRefunds(env, limit = 20, fetcher = fetch) {
       // One unreachable provider call, one malformed response, one row. The
       // rest of the queue still drains this run, and this row comes back after
       // its backoff instead of blocking the head of the queue forever.
-      console.error('refund poll failed', order.order_id, String(e));
+      console.error('refund poll failed', safeErrorCode(e));
       await recordRefundPollFailure(env, order.order_id, e);
     }
   }
@@ -1514,7 +1525,7 @@ export async function reconcileDueRobokassaOrders(env, limit = 10, now = Date.no
       else if (!result.ok) failed += 1;
     } catch (error) {
       failed += 1;
-      console.error('automatic payment reconciliation failed', row.order_id, String(error));
+      console.error('automatic payment reconciliation failed', safeErrorCode(error));
     }
   }
   return { checked, paid, failed };
@@ -1578,7 +1589,7 @@ export async function pruneExpiredPaymentOrders(env, limit = 100, now = Date.now
         { contact_erased: true }, now
       );
     } catch (e) {
-      console.error('order expiry failed', order.order_id, String(e));
+      console.error('order expiry failed', safeErrorCode(e));
     }
   }
 
@@ -1600,7 +1611,7 @@ export async function pruneExpiredPaymentOrders(env, limit = 100, now = Date.now
     ).bind(now - ORDER_CONTACT_RETENTION_MS, bounded, ...SETTLED_ORDER_STATUSES).run();
     anonymized = Number(result?.meta?.changes || 0);
   } catch (e) {
-    console.error('order contact retention sweep failed', String(e));
+    console.error('order contact retention sweep failed', safeErrorCode(e));
   }
   return { expired, anonymized };
 }
@@ -1706,7 +1717,7 @@ export async function recordRefundPollFailure(env, orderId, error, now = Date.no
     ).bind(String(orderId), now + refundPollBackoffMs(attempts)).run();
     return attempts;
   } catch (e) {
-    console.error('refund poll backoff write failed', String(e));
+    console.error('refund poll backoff write failed', safeErrorCode(e));
     return 0;
   }
 }
@@ -1717,7 +1728,7 @@ export async function clearRefundPollState(env, orderId) {
     await env.DB.prepare('DELETE FROM payment_refund_poll WHERE order_id = ?1')
       .bind(String(orderId)).run();
   } catch (e) {
-    console.error('refund poll state cleanup failed', String(e));
+    console.error('refund poll state cleanup failed', safeErrorCode(e));
   }
 }
 

@@ -59,6 +59,7 @@ const db = new FakeD1();
 const env = {
   DB: db,
   INGEST_KEY: SECRET,
+  ENTITLEMENT_SECRET: 'telemetry-test-entitlement-secret-at-least-32-bytes',
   OWNER_LICENSE_KEY: OWNER_KEY
 };
 

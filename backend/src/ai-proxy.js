@@ -237,7 +237,7 @@ export async function handleAiChat(request, env) {
   try {
     return await handleAiChatInner(request, env);
   } catch (e) {
-    console.error('ai-proxy: unexpected error', e?.stack || String(e));
+    console.error('ai-proxy: unexpected error', e?.name || 'Error');
     return errResponse(503, UNAVAILABLE);
   }
 }
@@ -345,7 +345,7 @@ async function handleAiChatInner(request, env) {
       // TypeError — a DNS miss, a refused connection and a reset that dropped
       // an already-delivered POST body are indistinguishable here. Since the
       // request may have reached 302.AI in full, the reservation STAYS.
-      console.error('ai-proxy: upstream fetch failed (quota retained, dispatch unknown)', String(e));
+      console.error('ai-proxy: upstream fetch failed (quota retained, dispatch unknown)', e?.name || 'Error');
       return errResponse(502, `${provider.name}: не удалось связаться с ИИ-сервисом. Попробуйте ещё раз через минуту.`);
     }
 
@@ -502,7 +502,7 @@ export async function releaseQuota(env, day, licenseKey, providerId) {
     if (total?.count != null) clearQuotaBlocked(day, '*', 'all');
     return true;
   } catch (e) {
-    console.error('ai-proxy: quota release failed', String(e));
+    console.error('ai-proxy: quota release failed', e?.name || 'Error');
     return false;
   }
 }

@@ -297,11 +297,11 @@ assert.doesNotMatch(historyPipeline, /Promise\.all\(history\.map/,
   'history image preprocessing must not decode several large bitmaps concurrently');
 assert.ok(
   historyPipeline.indexOf('prepareFiles(m.files)') <
-    historyPipeline.indexOf('transcribeAudioFiles(historyFiles)') &&
-    historyPipeline.indexOf('transcribeAudioFiles(historyFiles)') <
     historyPipeline.indexOf('compressImageFiles(historyFiles)'),
-  'history attachments must run prepare → transcribe → compress before final deduplication'
+  'history attachments must run local prepare → compress before final deduplication'
 );
+assert.doesNotMatch(historyPipeline, /transcribeAudioFiles/,
+  'history audio must not reach an undeclared direct transcription processor');
 
 const solveTestBody = worker.slice(
   worker.indexOf('async function solveTest('),
@@ -373,7 +373,10 @@ assert.match(popup, /вопросы не распознаны — проверь
 // Groq Whisper; if the cache misses twice, the second call increments fetches.
 const localStore = {
   groqApiKey: 'test-key',
-  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
+  aiConsent: {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }
 };
 const sessionStore = {};
 const storageArea = (store) => ({
@@ -442,7 +445,10 @@ assert.equal(whisperCalls, 3);
 // still replaces the audio, exactly as it did before caching existed.
 const cacheFailureStore = {
   groqApiKey: 'test-key',
-  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
+  aiConsent: {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }
 };
 chrome.storage.local = {
   async get(keys) {

@@ -76,19 +76,24 @@
             <span class="panel-ic"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></span>
             <div>
               <h3>Конфиденциальность и данные</h3>
-              <!-- Deliberately a pointer, not an enumeration: what is sent,
-                   to whom and for how long — including usage statistics — is
-                   described in the linked terms and privacy policy, which is
-                   what the single checkbox below accepts. -->
               <p>Что расширение отправляет, кому и на какой срок — в <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условиях использования</a> и <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политике конфиденциальности</a>.</p>
             </div>
           </div>
           <label class="consent-row">
-            <input id="consentToggle" type="checkbox" />
-            <span>Я принимаю
-              <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a> и
-              <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политику конфиденциальности</a>.
-              Остальные разделы настроек откроются после подтверждения.</span>
+            <input id="consentTerms" type="checkbox" />
+            <span>Я принимаю <a href="https://smeshai.xyz/terms" target="_blank" rel="noopener noreferrer">условия использования</a>.</span>
+          </label>
+          <label class="consent-row">
+            <input id="consentAiProcessing" type="checkbox" />
+            <span>Я разрешаю передавать выбранные задания и вложения облачным ИИ-сервисам из <a href="https://smeshai.xyz/privacy" target="_blank" rel="noopener noreferrer">политики конфиденциальности</a>, чтобы получить ответ.</span>
+          </label>
+          <label class="consent-row">
+            <input id="consentTelemetry" type="checkbox" />
+            <span>Я разрешаю отправлять обезличенную техническую статистику. Необязательно; по умолчанию выключено.</span>
+          </label>
+          <label class="consent-row">
+            <input id="consentEligibility" type="checkbox" />
+            <span>Я подтверждаю, что вправе пользоваться сервисом и, когда это требуется, получил(а) разрешение родителя или законного представителя.</span>
           </label>
           <div class="consent-actions">
             <button id="deleteStats" class="resetbtn" type="button">Удалить статистику и отключить сбор</button>

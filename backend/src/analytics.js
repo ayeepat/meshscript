@@ -32,6 +32,17 @@ const MAX_DELETE_BODY_BYTES = 4 * 1024;
 const INGEST_IP_DAILY_LIMIT = 500;
 const INGEST_DEVICE_DAILY_LIMIT = 300;
 
+function safeErrorCode(errorValue) {
+  const name = typeof errorValue?.name === 'string' &&
+    /^(?:Error|TypeError|RangeError|SyntaxError|AbortError|TimeoutError)$/.test(errorValue.name)
+    ? errorValue.name
+    : 'Error';
+  const code = typeof errorValue?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(errorValue.code)
+    ? errorValue.code
+    : 'UNCLASSIFIED';
+  return `${name}:${code}`;
+}
+
 export function mskDay(ts = Date.now()) {
   return new Date(ts + MSK_OFFSET_MS).toISOString().slice(0, 10);
 }
@@ -878,7 +889,7 @@ async function revenueRollup(env, fromTs, toTs = null) {
       // Older deployments (and unit fixtures) predate the payment authority
       // tables. Gross revenue is still the truth then; say the net is unknown
       // rather than quietly presenting gross as net.
-      console.error('refund rollup unavailable', String(e));
+      console.error('refund rollup unavailable', safeErrorCode(e));
       return null;
     })
   ]);
@@ -1115,7 +1126,14 @@ export async function statsUsers(env, p) {
     total: num(total?.n),
     limit,
     offset,
-    users: (rows?.results || []).map((r) => ({ ...r, cost_usd: num(r.cost_usd) }))
+    // `devices.license_key` is NULL for current clients, but old rows can still
+    // contain a bearer credential. A read-only analytics capability must never
+    // become a credential-export API, even during an incomplete migration.
+    users: (rows?.results || []).map(({ license_key, ...r }) => ({
+      ...r,
+      key_hint: maskLicenseKey(license_key),
+      cost_usd: num(r.cost_usd)
+    }))
   };
 }
 
@@ -1158,7 +1176,19 @@ export async function statsUserDetail(env, deviceId) {
   // The full license row lives in KV (device caps, revoke reason, …).
   let license = null;
   if (row.license_key) {
-    try { license = await getLicense(env, row.license_key); } catch { /* KV hiccup — skip */ }
+    try {
+      const full = await getLicense(env, row.license_key);
+      // Return only fields the dashboard renders. The KV row also contains the
+      // bearer key, device ids and operational metadata that a stats reader
+      // does not need.
+      if (full) {
+        license = {
+          type: full.type || null,
+          status: full.status || null,
+          expires_at: full.expires_at || null
+        };
+      }
+    } catch { /* KV hiccup — skip */ }
   }
   let referral_code = null;
   try { referral_code = await env.LICENSES.get(`refowner:${device}`); } catch { /* optional */ }
@@ -1167,7 +1197,10 @@ export async function statsUserDetail(env, deviceId) {
   for (const k of Object.keys(lifetime || {})) lt[k] = num(lifetime[k]);
   return {
     ok: true,
-    device: row,
+    device: {
+      ...Object.fromEntries(Object.entries(row).filter(([key]) => key !== 'license_key')),
+      key_hint: maskLicenseKey(row.license_key)
+    },
     lifetime: lt,
     daily: daily?.results || [],
     subjects: subjects?.results || [],
@@ -1810,7 +1843,7 @@ export async function statsWorklists(env, thresholds) {
     };
   } catch (e) {
     // "I could not check" must never render as "nothing is stuck".
-    console.error('worklists unavailable', String(e));
+    console.error('worklists unavailable', safeErrorCode(e));
     return { ok: true, worklists: null, total: null, unavailable: true };
   }
 }
@@ -1846,7 +1879,7 @@ export async function statsFeedback(env, days) {
   // could not read, so each source fails on its own and is reported.
   const unavailable = [];
   const source = (name, query) => query.catch((e) => {
-    console.error(`stats feedback source ${name} unavailable`, String(e));
+    console.error(`stats feedback source ${name} unavailable`, safeErrorCode(e));
     unavailable.push(name);
     return null;
   });

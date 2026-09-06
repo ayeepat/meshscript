@@ -176,17 +176,22 @@ function deferred() {
     '/* ---------- Privacy: data deletion'
   );
   const consentRead = deferred();
-  const consentToggle = { id: 'consentToggle', checked: true, onchange: null };
+  const consentControls = {
+    consentTerms: { id: 'consentTerms', checked: true, onchange: null },
+    consentAiProcessing: { id: 'consentAiProcessing', checked: true, onchange: null },
+    consentTelemetry: { id: 'consentTelemetry', checked: false, onchange: null },
+    consentEligibility: { id: 'consentEligibility', checked: true, onchange: null },
+  };
   const touchedControls = new Set();
   const renders = [];
   const context = {
     Promise,
     touchedControls,
-    document: { getElementById: () => consentToggle },
-    hasConsent: () => consentRead.promise,
-    async setConsent() {},
+    document: { getElementById: (id) => consentControls[id] },
+    getConsent: () => consentRead.promise,
+    async setConsentChoices() {},
     setCheckedUnlessTouched(id, checked) {
-      if (!touchedControls.has(id)) consentToggle.checked = !!checked;
+      if (!touchedControls.has(id)) consentControls[id].checked = !!checked;
     },
     renderConsentStatus(value) { renders.push(value); }
   };
@@ -197,32 +202,35 @@ function deferred() {
   );
   const loading = context.__consentApi.loadConsentUi();
   context.__consentApi.wireConsent();
-  touchedControls.add('consentToggle');
-  consentToggle.checked = true;
-  await consentToggle.onchange({ target: consentToggle });
-  consentRead.resolve(false);
+  touchedControls.add('consentTelemetry');
+  consentControls.consentTelemetry.checked = true;
+  await consentControls.consentTelemetry.onchange({ target: consentControls.consentTelemetry });
+  consentRead.resolve({ terms: true, ai_processing: true, telemetry: false, eligibility: true });
   await loading;
-  assert.equal(consentToggle.checked, true, 'a stale consent snapshot must not undo a user toggle');
+  assert.equal(consentControls.consentTelemetry.checked, true,
+    'a stale consent snapshot must not undo a newer statistics choice');
   assert.deepEqual(renders, [true], 'only the current user consent state may paint status');
 
   renders.length = 0;
   const firstWrite = deferred();
   const secondWrite = deferred();
   const consentWrites = [];
-  context.setConsent = (value) => {
+  context.setConsentChoices = (value) => {
     consentWrites.push(value);
     return consentWrites.length === 1 ? firstWrite.promise : secondWrite.promise;
   };
-  consentToggle.checked = false;
-  const selectingFalse = consentToggle.onchange({ target: consentToggle });
-  consentToggle.checked = true;
-  const selectingTrue = consentToggle.onchange({ target: consentToggle });
+  consentControls.consentTerms.checked = false;
+  const selectingFalse = consentControls.consentTerms.onchange({ target: consentControls.consentTerms });
+  consentControls.consentTerms.checked = true;
+  const selectingTrue = consentControls.consentTerms.onchange({ target: consentControls.consentTerms });
   await Promise.resolve();
-  assert.deepEqual(consentWrites, [false], 'consent writes must start in click order, one at a time');
+  assert.equal(consentWrites.length, 1, 'consent writes must start in click order, one at a time');
+  assert.equal(consentWrites[0].terms, false);
   firstWrite.resolve();
   await selectingFalse;
   await Promise.resolve();
-  assert.deepEqual(consentWrites, [false, true]);
+  assert.equal(consentWrites.length, 2);
+  assert.equal(consentWrites[1].terms, true);
   assert.deepEqual(renders, [], 'an older completed consent write must not repaint');
   secondWrite.resolve();
   await selectingTrue;
@@ -253,9 +261,9 @@ function deferred() {
   assert.deepEqual(rendered, [], 'a late license snapshot must not repaint status after key editing');
 }
 
-// Statistics no longer have a checkbox to go stale against — they ride the one
-// consent tick — but «Удалить статистику» still writes the flag through this
-// queue, and an older write must never land after a newer one.
+// The separate statistics choice shares the consent receipt writer. The
+// privacy-erasure action uses the same serialized path, so an older write must
+// never land after a newer one.
 {
   const privacySource = sourceSection(
     settingsSource,
@@ -263,10 +271,13 @@ function deferred() {
     '\nfunction privacyFlash'
   );
   const writes = [];
+  let current = { terms: true, ai_processing: true, telemetry: false, eligibility: true };
   const context = {
-    chrome: { storage: { local: {
-      set(value) { writes.push(value.telemetryEnabled); return Promise.resolve(); }
-    } } }
+    getConsent: async () => current,
+    async setConsentChoices(value) {
+      current = { ...value };
+      writes.push(value.telemetry);
+    }
   };
   vm.runInNewContext(
     `${privacySource}\nglobalThis.__privacyApi = { setTelemetryPreference };`,

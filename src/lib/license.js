@@ -9,6 +9,7 @@
  * Cache shape (chrome.storage.local.licenseStatus):
  *   { key, ok, type, expires_at, reason, checkedAt, lastVerifiedAt,
  *     activation_token,
+ *     entitlement_token, entitlement_token_expires_at,
  *     telemetry_token, telemetry_token_expires_at, softError, generation }
  *
  * `reason` is set only when `ok === false`. We surface its Russian translation
@@ -20,6 +21,7 @@ import {
 } from './config.js';
 import { getDeviceId } from './history.js';
 import { readResponseTextBounded } from './http.js';
+import { flushPendingConsentReceipt } from './consent.js';
 
 const STORAGE_KEY = 'licenseStatus';
 const GENERATION_KEY = 'licenseGeneration';
@@ -113,6 +115,15 @@ function statusNotExpired(status, now) {
 }
 
 const ACTIVATION_TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
+const ENTITLEMENT_TOKEN_RE = /^et1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
+const ENTITLEMENT_MIN_VALIDITY_MS = 30 * 1000;
+
+export function hasFreshEntitlement(status, now = Date.now()) {
+  const expiresAt = Number(status?.entitlement_token_expires_at);
+  return ENTITLEMENT_TOKEN_RE.test(status?.entitlement_token || '') &&
+    status.entitlement_token.length <= 2048 &&
+    Number.isSafeInteger(expiresAt) && expiresAt > now + ENTITLEMENT_MIN_VALIDITY_MS;
+}
 
 /**
  * A positive license verdict is useful only when the client also holds the
@@ -140,6 +151,7 @@ export const REASON_MESSAGES = {
   device_limit: 'Этот ключ уже используется на устройстве №1. Сначала деактивируйте его там.',
   bad_device: 'Не удалось подтвердить устройство. Переустановите расширение и попробуйте снова.',
   bad_activation: 'Не удалось подтвердить активацию этого устройства. Деактивируйте ключ или напишите в поддержку.',
+  bad_entitlement: 'Сервер не выдал безопасный доступ к ИИ. Попробуйте ещё раз позже.',
   activation_mismatch: 'Ключ активирован на другом устройстве. Сначала деактивируйте его на устройстве №1.',
   released_remotely: 'Ключ отвязан от этого устройства через Telegram-бота. Чтобы снова пользоваться им здесь, вставьте ключ в поле выше ещё раз.',
   service_unavailable: 'Сервер лицензий временно недоступен. Попробуйте ещё раз позже.',
@@ -214,6 +226,7 @@ export async function verifyKey(
       if (!current?.key || current.key !== status.key) return false;
     }
     await saveStatus(status, startedUnder);
+    if (status.ok && hasFreshEntitlement(status)) void flushPendingConsentReceipt();
     return true;
   };
   const currentOrNoKey = async (status) => {
@@ -273,6 +286,10 @@ export async function verifyKey(
       /^te1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(result.erasure_token) &&
       result.erasure_token.length <= 1024 ? result.erasure_token : null;
     const erasureExpiresAt = Number(result?.erasure_token_expires_at);
+    const entitlementToken = typeof result?.entitlement_token === 'string' &&
+      ENTITLEMENT_TOKEN_RE.test(result.entitlement_token) &&
+      result.entitlement_token.length <= 2048 ? result.entitlement_token : null;
+    const entitlementExpiresAt = Number(result?.entitlement_token_expires_at);
     const returnedActivationToken = typeof result?.activation_token === 'string' &&
       ACTIVATION_TOKEN_RE.test(result.activation_token)
       ? result.activation_token
@@ -304,6 +321,14 @@ export async function verifyKey(
     if (status.ok && unusableReason) {
       status.ok = false;
       status.reason = unusableReason;
+    }
+    if (status.ok && entitlementToken && Number.isSafeInteger(entitlementExpiresAt) &&
+        entitlementExpiresAt > verdictAt + ENTITLEMENT_MIN_VALIDITY_MS) {
+      status.entitlement_token = entitlementToken;
+      status.entitlement_token_expires_at = entitlementExpiresAt;
+    } else if (status.ok) {
+      status.ok = false;
+      status.reason = 'bad_entitlement';
     }
     // The capability is deliberately coupled to a fresh successful verify.
     // Never cache a malformed, expired, or error-response token, and never
@@ -466,20 +491,22 @@ export async function ensureLicensed() {
   }
   const now = Date.now();
   const lastVerifiedAt = Number(status.lastVerifiedAt) || 0;
-  if (isUsableLicenseStatus(status, now) && now - lastVerifiedAt < VERIFY_CACHE_MS) return;
+  if (isUsableLicenseStatus(status, now) && hasFreshEntitlement(status, now) &&
+      now - lastVerifiedAt < VERIFY_CACHE_MS) return;
 
   const prior = status;
   status = await verifyKey(status.key, { onlyIfCurrent: true });
   if (status.softError !== 'network') {
     const reason = licenseUsabilityReason(status);
-    if (!reason) return;
+    if (!reason && hasFreshEntitlement(status)) return;
+    if (!reason) throw new Error(reasonMessage('bad_entitlement'));
     throw new Error(reasonMessage(reason));
   }
 
   // Legacy rows deliberately have lastVerifiedAt=0: checkedAt was renewed by
   // the old fail-open path and is not trustworthy migration evidence.
   const priorVerifiedAt = Number(prior.lastVerifiedAt) || 0;
-  if (isUsableLicenseStatus(prior) &&
+  if (isUsableLicenseStatus(prior) && hasFreshEntitlement(prior) &&
       statusNotExpired(prior, Date.now()) && Date.now() - priorVerifiedAt < LICENSE_OFFLINE_GRACE_MS) return;
   throw new Error(reasonMessage('network'));
 }

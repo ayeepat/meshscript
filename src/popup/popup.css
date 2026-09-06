@@ -307,6 +307,7 @@ body.compact .answer .ai-notice { font-size: 11px; }
 .ob-consent span { font-size: 12px; line-height: 1.5; color: var(--secondary); }
 .ob-consent a { color: var(--accent); text-decoration: none; }
 .ob-consent a:hover { text-decoration: underline; }
+.ob-consent + .ob-consent { margin-top: 9px; }
 .ob-error {
   margin: 0 0 10px; padding: 9px 11px; font-size: 12px; line-height: 1.4;
   color: var(--danger); background: var(--danger-soft); border-radius: var(--r-md);

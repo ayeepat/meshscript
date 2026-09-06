@@ -6,6 +6,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from '../../tests/helpers/vps-entitlement.mjs';
 
 const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
 const serverPath = fileURLToPath(new URL('../server.js', import.meta.url));
@@ -150,6 +151,8 @@ async function expectLimited(base, job, ip, status, message) {
 }
 
 async function startJob(base, index) {
+  const licenseKey = `SMESH-POLL-${String(index + 1).padStart(2, '0')}-TEST`;
+  const deviceId = `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`;
   const response = await fetch(`${base}/ai/start`, {
     method: 'POST',
     headers: {
@@ -158,9 +161,7 @@ async function startJob(base, index) {
     },
     body: JSON.stringify({
       provider: 'qwen',
-      license_key: `SMESH-POLL-${String(index + 1).padStart(2, '0')}-TEST`,
-      device_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
-      activation_token: 'a'.repeat(43),
+      ...entitlementBody({ licenseKey, deviceId }),
       messages: [{ role: 'user', content: `held poll ${index + 1}` }]
     })
   });
@@ -196,6 +197,7 @@ const proc = spawn(process.execPath, [serverPath], {
   cwd: repoRoot,
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     AI_PROXY_API_KEY: 'test-key',

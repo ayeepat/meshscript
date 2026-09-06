@@ -5,8 +5,7 @@ import { access, mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-
-const ACTIVATION_TOKEN = 'A'.repeat(43);
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -22,17 +21,8 @@ async function waitFor(url) {
   throw new Error('proxy did not start');
 }
 
-let verifyCalls = 0;
 let upstreamCalls = 0;
 const mock = http.createServer((req, res) => {
-  if (req.url === '/verify') {
-    verifyCalls += 1;
-    setTimeout(() => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, type: 'lifetime', expires_at: null }));
-    }, 700);
-    return;
-  }
   if (req.url === '/v1/chat/completions') {
     upstreamCalls += 1;
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -50,6 +40,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
@@ -62,33 +53,40 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
 
 try {
   await waitFor(`${base}/health`);
-  const pendingStart = fetch(`${base}/ai/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      provider: 'qwen',
-      license_key: 'SMESH-SHUTDOWN-PENDING-KEY',
-      device_id: '00000000-0000-4000-8000-000000000065',
-      activation_token: ACTIVATION_TOKEN,
-      messages: [{ role: 'user', content: 'must not launch during shutdown' }]
-    })
-  }).catch(() => null);
-  for (let i = 0; i < 80 && verifyCalls === 0; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(verifyCalls, 1, 'the probe must be waiting inside verification');
+  const body = JSON.stringify({
+    provider: 'qwen',
+    ...entitlementBody({
+      licenseKey: 'SMESH-SHUTDOWN-PENDING-KEY',
+      deviceId: '00000000-0000-4000-8000-000000000065'
+    }),
+    messages: [{ role: 'user', content: 'must not launch during shutdown' }]
+  });
+  let resolveResponse;
+  const responsePromise = new Promise((resolve) => { resolveResponse = resolve; });
+  const pending = http.request({
+    host: '127.0.0.1', port: proxyPort, path: '/ai/start', method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) }
+  }, (response) => {
+    response.resume();
+    response.on('end', () => resolveResponse(response.statusCode));
+  });
+  pending.on('error', () => resolveResponse(null));
+  const split = Math.floor(body.length / 2);
+  pending.write(body.slice(0, split));
+  await new Promise((resolve) => setTimeout(resolve, 50));
 
   const exited = once(proc, 'exit');
   proc.kill('SIGTERM');
-  const response = await pendingStart;
-  if (response) assert.equal(response.status, 503);
+  pending.end(body.slice(split));
+  const status = await responsePromise;
+  if (status != null) assert.equal(status, 503);
   await Promise.race([
     exited,
     new Promise((_, reject) => setTimeout(() => reject(new Error('proxy did not stop')), 3000))
   ]);
 
   assert.equal(upstreamCalls, 0,
-    'a verification completing after shutdown begins must not create new paid work');
+    'a request body completing after shutdown begins must not create new paid work');
   await assert.rejects(access(quotaPath), { code: 'ENOENT' },
     'a shutdown-rejected start must not charge or persist daily quota');
 

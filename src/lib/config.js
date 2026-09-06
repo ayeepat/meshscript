@@ -11,8 +11,9 @@
 // OpenRouter / Qwen / DeepSeek in the UI only invites support questions we
 // don't want and pins us to vendors we may swap. Flipping this back to true
 // restores the Settings picker, the BYO key fields, the per-provider limits,
-// the usage chart switcher and the GRQ/OPR/QWN/DSK badge — every code path
-// behind them is intact and still tested.
+// the usage chart switcher and the GRQ/OPR/QWN/DSK badge in a separate
+// developer build. Release builds neither hydrate nor persist those fields and
+// the AI dispatcher accepts only the licensed qwen/deepseek route ids.
 //
 // This hides the vendor NAMES from the product surface only. The consent
 // screen still discloses that homework content goes to third-party AI
@@ -20,14 +21,13 @@
 // them. Hiding a picker must not turn into hiding the actual data recipients,
 // especially when the audience is schoolchildren.
 //
-// ⚠️ FLIPPING THIS BACK TO true ALSO REQUIRES restoring the BYO provider host
+// ⚠️ FLIPPING THIS BACK TO true ALSO REQUIRES a separate privacy/security
+// review and restoring the BYO provider host
 // permissions in manifest.json (`https://openrouter.ai/*`,
 // `https://api.groq.com/*`, `https://dashscope-intl.aliyuncs.com/*`). They were
 // dropped for the Chrome Web Store release because no shipped UI path could
 // reach them, and an unreachable host permission is a review risk. Without them
-// every BYO request — including the hidden `qwenApiKey` owner escape hatch and
-// Groq Whisper transcription — fails at fetch() with an opaque CORS error
-// instead of the adapter's own message.
+// every legacy direct request fails at the browser boundary.
 // tests/byo-provider-surface-regression.mjs fails the build if the flag and the
 // manifest ever disagree.
 export const SHOW_PROVIDER_UI = false;
@@ -94,21 +94,15 @@ export const VERIFY_CACHE_MS = 24 * 60 * 60 * 1000;
 // window survives an outage; after it expires the license gate fails closed.
 export const LICENSE_OFFLINE_GRACE_MS = 48 * 60 * 60 * 1000;
 
-// Remote runtime config (see lib/remote-config.js). A small JSON file you host
-// yourself, fetched + cached so you can hot-fix a Mesh DOM change (the subject
-// vocabulary, the homework-anchor selector) or push an "update required" notice
-// WITHOUT shipping a new build through store review. Everything has a built-in
-// fallback, so a 404 / unreachable host changes nothing. Point this at a static
-// file on your site; the expected shape is documented in remote-config.js.
-// NOTE: apex, NOT `www.`. The site 301s every `www.smeshai.xyz` request to the
-// apex host, and fetchFresh() uses `redirect: 'error'` on purpose — so a `www.`
-// URL here can never resolve, no matter what is published. The host permission
-// in manifest.json must keep matching this origin exactly.
-export const RUNTIME_CONFIG_URL = 'https://smeshai.xyz/extension-config.json';
+// Signed runtime policy published by the same VPS configuration that the owner
+// controls from the dashboard. A missing/unreachable policy leaves the local
+// safe defaults in place; an invalid signature is ignored.
+export const RUNTIME_CONFIG_URL = 'https://ai.smeshapi.site/public/runtime-config';
 
-// Refresh the cached runtime config at most this often (6h). Long enough to be
-// nearly free, short enough that a hot-fix reaches users the same day.
-export const RUNTIME_CONFIG_TTL_MS = 6 * 60 * 60 * 1000;
+// Feature switches are an operational safety control, so a dashboard change
+// must reach an online extension promptly. A five-minute refresh remains tiny
+// traffic while bounding normal propagation delay.
+export const RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
 
 // P-256 verification key for signed runtime-config envelopes. The matching
 // private key is deployment-only and is ignored under .secrets/; never copy it

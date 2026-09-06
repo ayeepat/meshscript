@@ -38,6 +38,17 @@ const SINGLE_DEVICE_LIMIT = 1;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const MAX_SUBSCRIPTION_DAYS = 3650;
 
+function safeErrorCode(errorValue) {
+  const name = typeof errorValue?.name === 'string' &&
+    /^(?:Error|TypeError|RangeError|SyntaxError|AbortError|TimeoutError)$/.test(errorValue.name)
+    ? errorValue.name
+    : 'Error';
+  const code = typeof errorValue?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(errorValue.code)
+    ? errorValue.code
+    : 'UNCLASSIFIED';
+  return `${name}:${code}`;
+}
+
 // How long a device released from the Telegram bot stays barred from silently
 // re-claiming its own seat. The window exists because the release is remote:
 // the released installation still holds the key and keeps re-verifying, so
@@ -377,7 +388,7 @@ export async function findByPayment(env, gateway, paymentId) {
         if (snapshot?.key) return (await preferLivePaymentLicense(env, snapshot)).license;
       }
     } catch (e) {
-      console.warn('payment issuance lookup failed', String(e));
+      console.warn('payment issuance lookup failed', safeErrorCode(e));
     }
   }
   const key = await env.LICENSES.get(`payment:${gateway}:${paymentId}`);
@@ -608,7 +619,7 @@ export async function getRevocation(env, key) {
     ).bind(key).first() || null;
     return { ok: true, revocation };
   } catch (e) {
-    console.warn('license revocation registry unavailable', String(e));
+    console.warn('license revocation registry unavailable', safeErrorCode(e));
     return { ok: false, revocation: null };
   }
 }

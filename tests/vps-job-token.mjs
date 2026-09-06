@@ -5,8 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-
-const ACTIVATION_TOKEN = 'A'.repeat(43);
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -59,6 +58,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
@@ -74,9 +74,10 @@ try {
 
   const started = await post(`${base}/ai/start`, {
     provider: 'qwen',
-    license_key: 'SMESH-TEST-TEST-TEST',
-    device_id: '00000000-0000-4000-8000-000000000063',
-    activation_token: ACTIVATION_TOKEN,
+    ...entitlementBody({
+      licenseKey: 'SMESH-TEST-TEST-TEST',
+      deviceId: '00000000-0000-4000-8000-000000000063'
+    }),
     messages: [{ role: 'user', content: 'hi' }]
   });
   assert.equal(started.status, 200);

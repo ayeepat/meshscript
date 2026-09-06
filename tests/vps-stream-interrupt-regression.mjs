@@ -5,8 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-
-const ACTIVATION_TOKEN = 'A'.repeat(43);
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -28,10 +27,15 @@ async function waitFor(url) {
 }
 
 async function post(url, body) {
+  let requestBody = body;
+  if (body?.license_key) {
+    const { license_key: licenseKey, device_id: deviceId, activation_token: _unused, ...rest } = body;
+    requestBody = { ...rest, ...entitlementBody({ licenseKey, deviceId }) };
+  }
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body)
+    body: JSON.stringify(requestBody)
   });
 }
 
@@ -95,6 +99,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
@@ -113,7 +118,6 @@ async function runPollJob(content) {
     provider: 'qwen',
     license_key: 'SMESH-TEST-TEST-TEST',
     device_id: '00000000-0000-4000-8000-000000000067',
-    activation_token: ACTIVATION_TOKEN,
     messages: [{ role: 'user', content }]
   });
   assert.equal(started.status, 200, await started.clone().text() + '\n' + proxyLogs);

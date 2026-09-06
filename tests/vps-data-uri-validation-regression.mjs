@@ -5,8 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-
-const ACTIVATION_TOKEN = 'A'.repeat(43);
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -50,6 +49,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1', PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
     AI_PROXY_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
@@ -59,13 +59,17 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
 });
 
 let requestDeviceSequence = 0;
-const request = (content, suffix) => ({
-  provider: 'qwen',
-  license_key: `SMESH-DATA-${suffix}-KEY`,
-  device_id: `00000000-0000-4000-8000-${String(++requestDeviceSequence).padStart(12, '0')}`,
-  activation_token: ACTIVATION_TOKEN,
-  messages: [{ role: 'user', content }]
-});
+const request = (content, suffix) => {
+  const identity = {
+    licenseKey: `SMESH-DATA-${suffix}-KEY`,
+    deviceId: `00000000-0000-4000-8000-${String(++requestDeviceSequence).padStart(12, '0')}`,
+  };
+  return {
+    provider: 'qwen',
+    ...entitlementBody(identity),
+    messages: [{ role: 'user', content }]
+  };
+};
 
 try {
   await waitFor(`${base}/health`);

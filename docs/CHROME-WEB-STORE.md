@@ -1,279 +1,199 @@
 # Chrome Web Store submission — СМЭШ AI 1.0.0
 
-This file is the copy-and-paste source for the Chrome Developer Dashboard. It
-matches `manifest.json`, the consent screen, and `docs/STORE-REVIEW.md`.
+Copy source for the Chrome Developer Dashboard. It must be rechecked against
+manifest.json, docs/STORE-REVIEW.md and the live legal pages before submission.
 
 ## Package
 
-Run:
-
-```sh
+~~~sh
 npm run verify
 npm run package:extension
 npm run verify:package
-```
+~~~
 
-Upload `smesh-ai-chrome-v1.0.0.zip`. The package is deterministic and contains
-only `manifest.json`, the extension runtime, bundled fonts, and icons.
+Upload smesh-ai-chrome-v1.0.0.zip.
 
 ## Product details
 
-**Language:** Russian
+Language: Russian
 
-**Category:** Education
+Category: Education
 
-**Name:** СМЭШ AI
+Name: СМЭШ AI
 
-**Summary (from the manifest, 75 characters):**
+Summary:
 
 > Личный ИИ-помощник по домашним заданиям для электронного журнала школьника.
 
-**Detailed description:**
+Detailed description:
 
-> СМЭШ AI читает домашнее задание на открытой странице электронного журнала и показывает ответ в отдельной вкладке. Условие не нужно копировать вручную.
+> СМЭШ AI читает выбранное домашнее задание или тест на открытой пользователем
+> странице электронного журнала и показывает разбор в отдельной вкладке.
 >
-> Что умеет расширение:
+> Расширение собирает задания за видимую неделю, объясняет решения, работает с
+> выбранными изображениями, PDF и вложениями, предлагает ответы на видимый тест
+> и может заполнить поля только по команде пользователя. Оно не нажимает кнопку
+> отправки. История решений хранится только в браузере 7 дней.
 >
-> • собирает домашние задания за видимую неделю и группирует их по дням;
-> • объясняет решение или даёт короткий ответ;
-> • работает с прикреплёнными файлами, изображениями и PDF;
-> • помогает с тестами в электронном журнале: распознаёт видимый вопрос, показывает ответы и может заполнить поля по команде пользователя;
-> • хранит историю решений локально в браузере в течение 7 дней;
-> • подбирает готовые ответы из добавленных пользователем учебников и рабочих тетрадей.
+> Расширение работает внутри уже открытой сессии: оно не получает логин или
+> пароль и не входит в аккаунт. Вложение загружается только после выбора
+> задания; сессионный токен используется один раз в памяти и не отправляется
+> серверам СМЭШ или AI-провайдерам.
 >
-> Задания на аудирование расширение не решает по звуку: пришлите расшифровку записи текстом.
+> Перед первым AI-запросом пользователь отдельно подтверждает условия,
+> AI-обработку и правомерность использования сервиса. Необязательная телеметрия
+> без содержимого выключена по умолчанию и не влияет на доступ к функциям.
 >
-> Расширение работает внутри уже открытой сессии электронного дневника. Оно не получает логин или пароль, не входит в аккаунт и не нажимает кнопку отправки теста.
+> Выбранный текст, снимок или файл передаётся через защищённый прокси СМЭШ к
+> одному из публично зарегистрированных AI-процессоров. Для ответов нужен ключ
+> доступа СМЭШ. СМЭШ AI — независимый продукт и не является официальным
+> сервисом электронного журнала.
 >
-> СМЭШ AI — независимый продукт. Он не связан ни с одним электронным журналом и не является чьим-либо официальным сервисом.
->
-> Перед первым запросом СМЭШ AI просит принять условия использования и политику конфиденциальности. Только после этого текст задания, скриншот или выбранный файл отправляется ИИ-сервису через сервер СМЭШ. Тем же согласием покрывается анонимная статистика без содержимого заданий; отключить её и удалить собранные данные можно кнопкой в настройках.
->
-> Для ответов нужен ключ доступа СМЭШ. Тарифы, инструкция и поддержка: https://smeshai.xyz/
->
-> Ответы создаёт ИИ. Проверяйте важные вычисления и формулировки по учебнику или у преподавателя.
-
-## Graphic assets
-
-- Store icon: `assets/icons/icon128.png` — 128×128 PNG.
-- Screenshot 1: `store-assets/screenshots/01-homework-popup.png` — 1280×800.
-- Screenshot 2: `store-assets/screenshots/02-test-answers.png` — 1280×800.
-- Screenshot 3: `store-assets/screenshots/03-pdf-solution.png` — 1280×800.
-- Screenshot 4: `store-assets/screenshots/04-gdz-solution.png` — 1280×800.
-- Small promo tile: `store-assets/promo/small-tile-440x280.png`.
-- Marquee promo tile: `store-assets/promo/marquee-1400x560.png` (optional).
-
-The screenshots are frames from the real product recordings in `motion/public`.
-They contain no invented review score, install count, testimonial, or store
-badge.
-
-⚠️ **Three asset problems are still open and must be resolved before upload:**
-
-- `02-test-answers.png` shows a live electronic-journal account identifier («Личный кабинет
-  ID: …») in the top-right corner. Redact it — it is another person's account
-  number on a public listing.
-- `04-gdz-solution.png` reproduces a watermarked gdz.ru answer scan of a
-  copyrighted textbook. Using a publisher's page as our own marketing image
-  invites a takedown; replace or drop the screenshot.
-- `03-pdf-solution.png` opens with «Не могу прослушать аудио…», so the first
-  line a shopper reads is a limitation. Recapture or drop it.
-- The promo tiles read «СМЭШ · Помощник электронного журнала», which matches
-  neither the listing name («СМЭШ AI») nor the manifest summary. Align the
-  wording when the tiles are redrawn.
+> Ответ создаёт искусственный интеллект и он может ошибаться. Проверяйте важные
+> вычисления и формулировки.
 
 ## URLs
 
-- Homepage: `https://smeshai.xyz/`
-- Privacy policy: `https://smeshai.xyz/privacy`
-- Support: `https://t.me/smeshaibot?start=support`
-- Terms: `https://smeshai.xyz/terms`
-- Official URL: verify `smeshai.xyz` in Google Search Console, then select it
-  in the dashboard.
+- Homepage: https://smeshai.xyz/
+- Privacy: https://smeshai.xyz/privacy/
+- Terms: https://smeshai.xyz/agreement/
+- AI processors: https://smeshai.xyz/processors/
+- Support: https://t.me/smeshaibot?start=support
 
-## Privacy practices
+## Assets
 
-**Single purpose:**
+- Icon: assets/icons/icon128.png
+- Screenshots: store-assets/screenshots/
+- Promo tiles: store-assets/promo/
 
-> Помогать пользователю решать домашние задания и тесты на открытых им страницах электронного журнала с помощью ИИ.
+Publish only images captured from the current product, with no real account
+identifiers, personal data, misleading metrics or third-party copyrighted
+answer scans. Product name and claims must match the listing.
 
-**Remote code:**
+## Single purpose
 
-> No, this extension does not use remote code. All executable JavaScript and CSS is included in the submitted package. The extension downloads only data: AI responses, licensed API responses, and a signed configuration envelope whose values are restricted to compiled allowlists.
+> Помогать пользователю разбирать домашние задания и тесты на открытых им
+> страницах с помощью искусственного интеллекта.
 
-### Permission justifications
+## Remote code
 
-**storage**
+Select No.
 
-> Stores the user's settings, consent, license state, selected textbooks, short-lived attachment handoffs, and 7-day solution history locally. The extension does not use sync storage.
+> All executable JavaScript and CSS is packaged with the extension. Network
+> responses are data only: license/API results, AI output and a signed runtime
+> configuration restricted to compiled feature fields. No remote script is
+> evaluated.
 
-**unlimitedStorage**
+## Permission justifications
 
-> The local textbook catalog and solution history can contain inlined answer images and exceed Chrome storage.local's ordinary quota. This permission prevents silent loss of user-requested local data.
+storage / unlimitedStorage:
 
-**activeTab**
+> Stores local settings, independent consent choices, license state, selected
+> textbooks, temporary attachment handoffs and 7-day solution history. Sync is
+> not used. Images can exceed the ordinary local-storage quota.
 
-> After the user presses “Решить тест”, captures only the active test tab on one of the two declared electronic-journal origins. Code rejects every other origin before capture.
+activeTab:
 
-**scripting**
+> After an explicit user action, captures the visible electronic-journal test
+> tab. Other origins are rejected before capture.
 
-> Reads visible homework/test content and fills test fields only on the two declared electronic-journal origins, after a user action. It never submits a test.
+scripting:
 
-**alarms**
+> Reads visible homework/test fields and fills suggested answers only after a
+> user action. The extension never submits the test.
 
-> Runs local retention cleanup for 7-day history, 24-hour week scans, and 1-hour pending file handoffs.
+alarms:
 
-Restore the second sentence — “It also retries a pending referral-code sync
-after a transient failure.” — in the same release that flips
-`src/lib/config.js` `REFERRALS_ENABLED` back to `true`. While the referral
-programme is switched off the build never schedules that alarm, and a
-justification has to describe what the submitted package actually does.
+> Runs local retention cleanup for history, week scans and temporary handoffs.
 
-**Host permissions**
+Host permissions:
 
-> The two declared journal origins are the surfaces the user asks the extension to read. smeshapi.site verifies licenses, proxies textbook answers, and receives content-free telemetry covered by the same acceptance that gates every AI request. ai.smeshapi.site is the only origin that answers AI requests. smeshai.xyz serves a signed, data-only runtime configuration over a single GET. The extension requests no AI-vendor origins: every model call is proxied.
+> The declared journal origins let the extension read the user's open page and
+> download a selected attachment inside the existing session. smeshapi.site
+> verifies licenses, receives minimal consent receipts, proxies allowlisted GDZ
+> references and receives optional content-free telemetry. ai.smeshapi.site is
+> the only AI gateway and receives a short-lived entitlement instead of a raw
+> license key. smeshai.xyz hosts product/legal pages.
 
-**Optional host permissions (`http://*/*`, `https://*/*`)**
+Optional host permissions:
 
-> Nothing is granted at install: this pattern is declared only under optional_host_permissions. A student who wants to solve an exercise that is not on the school diary opens that page, clicks the toolbar icon and approves that ONE origin in Chrome's own dialog; the extension requests https://thatsite/* and never the broad pattern. Granting a site is what registers the in-page solve button on it, and revoking the site removes it — every approved site is listed and revocable in the extension's settings. Only the top-level document of an approved page is read, and only its visible text and form labels; child frames are excluded, no screenshot is taken on this path, and sites the user has not approved are never accessed.
+> Nothing is granted at install. If the user wants help on another site, Chrome
+> asks them to approve that one exact origin. The extension reads bounded
+> top-level visible text only, excludes child frames, takes no screenshot on
+> this path, never submits the form and lets the user revoke access.
 
-### Data-use disclosures
+## Data-use disclosures
 
-Select the dashboard categories that correspond to these flows:
+Website content:
 
-- **Website content:** homework text, visible test text/screenshots, and files the
-  user explicitly asks the extension to solve. Used only to produce the answer.
-- **Authentication information:** the СМЭШ license key, one-device activation
-  credential, and any provider key retained by an older installation. Stored in
-  trusted extension storage and sent only to the service that verifies or uses it.
-- **User activity:** only if the user separately enables anonymous statistics.
-  Events contain action type, canonical subject, provider/model, browser family,
-  extension version, license type, and a random device UUID. They never contain
-  homework text, answers, files, the license key, or financial totals.
+> Selected homework/test text, visible screenshot and user-selected attachment
+> are used only to produce the requested answer.
 
-Do not select financial/payment information, health information, precise
-location, personal communications, or web history: the extension does not
-collect those categories. Payment happens on the separate website, not in the
-extension.
+Authentication information:
 
-**Child-audience declaration.** The dashboard asks whether the item is directed
-to children. The audience is Russian schoolchildren, so this cannot be answered
-by reflex: the extension stores a random device UUID and offers an off-by-default
-analytics toggle, which is what the question is actually about. Decide the answer
-together with the same counsel who signs off the Russian age label below, and
-keep the two answers consistent.
+> The СМЭШ license and one-device activation credential are sent only to the
+> license service. The AI gateway receives a 10-minute signed entitlement, not
+> the raw credentials.
 
-Certify all Limited Use statements. The data is used for the visible homework
-assistant, its security, and optional aggregate product analytics. It is not
-sold, used for advertising, or used for credit decisions.
+User activity:
+
+> Only after a separate optional opt-in. Bounded events may include action,
+> canonical subject, processor/model, browser family, extension version,
+> license type, random device UUID and server-observed token/cost counts. Never
+> task text, answers, files, license keys or payment details.
+
+Do not select financial/card details, health, precise location, personal
+communications or browsing history for the extension. Payment is a separate
+website flow and the extension does not receive full card data.
+
+Certify the Limited Use statements only after confirming the current package
+matches these disclosures. Data is not sold, used for advertising or used for
+credit decisions.
+
+## Children/audience
+
+The product is likely to be accessed by schoolchildren. Answer the dashboard's
+child-audience question accordingly and keep it consistent with the privacy
+policy. The product asks for a legal-permission/parental-permission attestation
+but does not verify age or collect a child's email/document; do not describe
+that checkbox as verified parental consent.
 
 ## Reviewer instructions
 
-This item needs test instructions because the main features require both a
-valid СМЭШ license and access to an electronic-journal diary/test page.
+1. Install the extension and finish the onboarding page.
+2. Open the popup.
+3. Check the three required confirmations; leave telemetry off to verify it is
+   optional.
+4. Enter the review-only license and press «Начать».
+5. Open the supplied non-personal journal test account and select one task.
+6. Start a solution; for a test, verify that fields are filled only on command
+   and the form is not submitted.
+7. Open Settings and verify independent consent/telemetry controls and local
+   data deletion.
 
-**Steps:**
+Dashboard-only reviewer data:
 
-1. Install the extension. Chrome opens the onboarding tour
-   (`src/welcome/welcome.html`) in a full tab: six Russian steps ending on ГДЗ,
-   with the price and the working `https://smeshai.xyz/` link on step 2. It is
-   shown once per device — the ✕ confirms before dismissing it, and reopening
-   the extension afterwards goes straight to the popup.
-2. Open the toolbar popup. It shows the consent and license screen.
-3. Enter the reviewer license below, accept the disclosure, and press «Начать».
-4. Sign in with the reviewer electronic-journal account below and open its
-   homework section.
-5. Open the extension, select a homework row, and press «Решить».
-6. For the test flow, open a test in the electronic journal, choose
-   «Тест» in the popup, and press «Решить тест». The extension will not submit.
-7. Open Settings → «Конфиденциальность и данные» to inspect consent withdrawal,
-   statistics withdrawal, and local-data deletion.
+- Review license: [ISSUE A REVIEW-ONLY KEY]
+- Non-personal test account login: [ADD IF LAWFULLY SHAREABLE]
+- Test account password: [ADD IF LAWFULLY SHAREABLE]
+- Screen-recording URL: [USE WHEN JOURNAL CREDENTIALS CANNOT BE SHARED]
 
-**REQUIRED BEFORE SUBMISSION — replace these lines in the dashboard, not in the extension package:**
-
-- Reviewer license: `[ISSUE A LONG-LIVED REVIEW-ONLY SMESH KEY]`
-- Reviewer electronic-journal login: `[PROVIDE A NON-PERSONAL TEST ACCOUNT — SEE THE WARNING BELOW]`
-- Reviewer electronic-journal password: `[PROVIDE THE TEST ACCOUNT PASSWORD]`
-- Any extra navigation note: `[ADD ONLY IF THE TEST CONTENT IS NOT IMMEDIATELY VISIBLE]`
-
-⚠️ **Steps 4–6 depend on an electronic-journal account issued to enrolled
-pupils.** There may be no account you can
-lawfully hand to a Google reviewer, and an item a reviewer cannot exercise is
-commonly rejected as unverifiable. Decide this before submitting, not after the
-first rejection. In order of preference:
-
-1. Obtain a genuine non-personal demo/teacher account if the department issues
-   one, and say in the notes that it contains no real pupil data.
-2. Otherwise, host an unlisted screen recording that walks all seven steps
-   end to end, link it in the reviewer notes, and state plainly that journal
-   credentials cannot be shared because they identify a real minor.
-   Steps 1–3 and 7 (install, welcome page, consent, licence, privacy controls)
-   still work with no journal account at all — say so explicitly, so the reviewer
-   knows how much they can verify directly.
-
-## Russian-market compliance sign-off
-
-These are human/account-level checks and cannot be proven by the extension ZIP.
-Complete them before sending public traffic to the paid product:
-
-- Confirm that the seller/contractor details shown on the live site, agreement,
-  Robokassa shop, receipts, and support channel all identify the same party.
-- Have Russian counsel confirm the current personal-data operator notification,
-  Russian primary-storage setup, and any required cross-border-transfer filings
-  for the AI and infrastructure recipients named in the privacy policy.
-- Have the accountant confirm the Robokassa fiscalization mode and receipt
-  values (`sno`, tax, payment method, payment object), including the current
-  requirements for online-payment receipts.
-- In production, complete one real low-value purchase and one refund. Verify the
-  signed callback, license delivery and revocation, fiscal receipts, and the
-  reconciliation/admin-health queues end to end.
-- Confirm that the public agreement and cancellation/refund process match the
-  actual license product, and record the age-label decision for this
-  school-oriented service.
-- Apply the current Russian internet-ad labeling process to any paid launch
-  placements; the Chrome Web Store listing copy must remain factual and
-  evidence-backed.
-
-This is a release-control checklist, not legal or tax sign-off. The operator,
-data-transfer, consumer-term, receipt, and age-label decisions should be
-confirmed for the actual business entity and production architecture.
-
-## Production prerequisites (verify by curl, not by memory)
-
-The extension ZIP can be perfect while the services behind it are not. Re-run
-these checks before every submission — a green test suite says nothing about
-what is actually deployed.
-
-- [x] **Deploy the current AI proxy.** `GET https://ai.smeshapi.site/ready` must
-      return `ok:true` with all three checks true. **Done 2026-08-27** — the box
-      had been running the 11 July build for six weeks, missing the +2034/−228
-      rewrite, so every `vps-*` regression was green about code that was not
-      serving traffic. Re-deploy by re-running the installer (see
-      `backend-vps/README.md` step 7), never by copying `server.js` alone.
-      `/health` is liveness only and returns `ok:true` even on a stale build —
-      `/ready` is the gate, because it is the endpoint a stale build lacks.
-- [ ] **Optional: publish the signed runtime config.** Not a launch blocker —
-      `getRuntimeConfig()` is fail-open, so a 404 changes nothing for users. It
-      buys the ability to fix an electronic-journal DOM change, post a notice, or set
-      `minExtensionVersion` *without* waiting on a store review. Publish at the
-      **apex** (`www.` 301s there and the fetch refuses redirects). Signed
-      envelopes expire after 7 days, so only turn this on alongside a re-signing
-      job — see `docs/RUNTIME-CONFIG.md`.
-- [ ] **Confirm the license backend.** `POST https://smeshapi.site/verify` with a
-      junk key must answer a structured JSON error, and `GET /health` must report
-      `maintenance:false`.
+Do not put live pupil credentials in the submission. A screen recording can
+cover the journal-only steps while the reviewer directly verifies installation,
+consent, settings and license behavior.
 
 ## Final publisher checklist
 
-- [ ] Register the developer account and enable two-step verification.
-- [ ] Verify ownership of `smeshai.xyz` in Google Search Console.
-- [ ] Clear the production prerequisites above.
-- [ ] Resolve the three open screenshot/promo problems listed under "Graphic assets".
-- [ ] Decide the reviewer-access plan for the journal-dependent steps (see the warning in "Reviewer instructions").
-- [ ] Confirm the live privacy and terms URLs match the disclosures above.
-- [ ] Complete the Russian-market compliance sign-off above with counsel and the accountant.
-- [ ] Issue the review-only license and non-personal electronic-journal test account.
-- [ ] Upload the verified ZIP and the store assets listed above.
-- [ ] Paste the listing, permission, data-use, and reviewer text from this file.
-- [ ] Choose Russian, Education, and the intended distribution regions.
-- [ ] Select deferred publishing so approval does not publish before the launch check.
-- [ ] After approval, install the staged item in a clean Chrome profile and run the seven reviewer steps once more.
+- npm run verify and package verification pass.
+- Live privacy, agreement, AI and processors pages return 200.
+- Three required choices are independent; telemetry starts unchecked.
+- Raw license/activation credentials do not enter the AI inference request.
+- Journal session token is absent from popup, backend and logs.
+- Processor register equals the enabled server routing allowlist.
+- All eight kill switches are tested from smeshaidashboard.
+- Cloudflare Observability/Logpush/Analytics and APM/crash content capture are
+  disabled; Caddy has no access log.
+- Roskomnadzor operator and separate cross-border notices have been reviewed.
+- Seller identity, Robokassa shop, receipt configuration, prices, refunds and
+  support contact agree.
+- Review assets contain no personal data or unlicensed third-party material.

@@ -53,7 +53,8 @@ function verifyBudgetDb() {
 {
   const env = {
     DB: verifyBudgetDb(),
-    OWNER_LICENSE_KEY: 'SMESH-OWNER-TEST-KEY'
+    OWNER_LICENSE_KEY: 'SMESH-OWNER-TEST-KEY',
+    ENTITLEMENT_SECRET: 'test-entitlement-secret-at-least-32-bytes'
   };
   const res = await worker.fetch(new Request('https://api.example/verify', {
     method: 'POST',
@@ -61,7 +62,10 @@ function verifyBudgetDb() {
     body: JSON.stringify({ key: 'SMESH-OWNER-TEST-KEY', device_id: DEVICE_ID })
   }), env, ctx);
   assert.equal(res.status, 200);
-  assert.equal((await res.json()).ok, true);
+  const verdict = await res.json();
+  assert.equal(verdict.ok, true);
+  assert.match(verdict.entitlement_token || '', /^et1\./,
+    'a successful verification must mint a short-lived AI capability');
 
   const legacyGet = await worker.fetch(
     new Request(`https://api.example/verify?key=SMESH-OWNER-TEST-KEY&device_id=${DEVICE_ID}`),
@@ -90,15 +94,14 @@ assert.match(licenseClient, /method:\s*'POST'/);
 assert.match(licenseClient, /redirect:\s*'error'/,
   'license credentials must not follow an upstream redirect');
 assert.doesNotMatch(licenseClient, /searchParams\.set\(['"]key/);
-// The VPS verify leg rides postJsonFresh (node:https, fresh connection per
-// request — see the 2026-07-14 incident note in server.js). The payload must
-// carry key + device + activation capability and never move into the query string.
-// node's https.request never follows redirects, so that leg fails closed on
-// redirects by construction — no redirect:'error' needed there.
-assert.match(vps, /postJsonFresh\(LICENSE_VERIFY_URL,\s*\{[\s\S]*?key: licenseKey,[\s\S]*?device_id: deviceId,[\s\S]*?activation_token: activationToken/);
-assert.match(vps, /const req = transport\.request\(url,\s*\{\s*method: 'POST',\s*agent: false/,
-  'VPS license verification must use node http(s).request with agent:false (no redirect following, no shared pool)');
-assert.doesNotMatch(vps, /LICENSE_VERIFY_URL\}\?key=/);
+// The license authority exchanges the reusable key for a short-lived,
+// purpose-bound capability. Only that capability crosses into the AI service.
+const proxyClient = source('../src/lib/smesh-proxy.js');
+assert.match(proxyClient, /entitlement_token: status\.entitlement_token/);
+assert.doesNotMatch(proxyClient, /license_key:|activation_token:|device_id:/,
+  'AI requests must never contain reusable license or activation credentials');
+assert.match(vps, /verifyEntitlement\(body\.entitlement_token\)/,
+  'the VPS must authorize inference locally from the signed capability');
 assert.ok((vps.match(/redirect:\s*'error'/g) || []).length >= 2,
   'VPS AI-provider and telemetry credentials must fail closed on redirects');
 
@@ -141,19 +144,22 @@ assert.doesNotMatch(settingsJs, /PROVIDER_TO_OPTION/);
 assert.match(settingsJs, /PROVIDER_OPTIONS\.has\(stored\.aiProvider\) \? stored\.aiProvider/);
 assert.match(settingsJs, /setTelemetryPreference\(false\)/,
   'server erasure must also withdraw statistics through the serialized preference writer');
-// With the checkbox folded into the single agreement, this button is the only
-// remaining way to stop collection without withdrawing consent entirely.
-assert.doesNotMatch(settingsJs, /telemetryToggle/,
-  'the statistics checkbox is gone; nothing may still reach for it');
+assert.match(settingsJs, /consentTelemetry/,
+  'statistics must remain an independent optional control');
 
 // Both halves of the consent boundary are explicit and fail closed.
 assert.match(source('../src/lib/smesh-proxy.js'), /telemetryOptIn = stored\.telemetryEnabled === true/);
 assert.match(vps, /job\.telemetryOptIn !== true/);
 
 // Bearer credentials and user/provider content must not appear in operational
-// logs, including error stacks whose URL embeds Telegram's bot token.
+// logs, including exception messages that may contain tokens or task text.
 assert.match(workerSource, /safeErrorText\(e, env\)/);
-assert.match(workerSource, /\/bot\[REDACTED\]/);
+const safeErrorSource = workerSource.slice(
+  workerSource.indexOf('function safeErrorText'),
+  workerSource.indexOf('async function readUpstreamJson')
+);
+assert.doesNotMatch(safeErrorSource, /\.message|\.stack|String\(errorValue\)/,
+  'operational error logging must not serialize exception content');
 assert.doesNotMatch(licenseBackend, /console\.warn\([^\n]*license\.key/);
 assert.doesNotMatch(supportBackend, /console\.error\([^\n]*step\.error/);
 assert.doesNotMatch(aiProxy, /console\.error\([^\n]*text\.slice/);

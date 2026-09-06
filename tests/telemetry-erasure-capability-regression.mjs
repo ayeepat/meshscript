@@ -61,6 +61,7 @@ const env = {
   LICENSES: new MemoryKV(),
   OWNER_LICENSE_KEY: 'SMESH-OWNER-ERASURE',
   INGEST_KEY: SECRET,
+  ENTITLEMENT_SECRET: 'erasure-test-entitlement-secret-at-least-32-bytes',
   DEVICE_LIMIT: '1',
 };
 const ctx = { waitUntil() {} };

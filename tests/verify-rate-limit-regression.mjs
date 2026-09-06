@@ -73,6 +73,7 @@ const db = new FakeD1();
 const kv = new FakeKV();
 const env = {
   DB: db, LICENSES: kv,
+  ENTITLEMENT_SECRET: 'verify-rate-test-entitlement-secret-at-least-32-bytes',
   OWNER_LICENSE_KEY: 'SMESH-OWNER-VALID-KEY'
 };
 const ctx = { waitUntil() {} };
@@ -156,7 +157,7 @@ const thrown = await verify(
   'SMESH-THROWN-VERIFY-KEY',
   '22222222-2222-4222-8222-222222222222',
   thrownIp,
-  { DB: db, LICENSES: throwingKv }
+  { ...env, LICENSES: throwingKv }
 );
 assert.equal(thrown.status, 200);
 const thrownBody = await thrown.json();

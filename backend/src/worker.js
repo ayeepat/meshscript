@@ -56,6 +56,7 @@ import { readJsonBounded } from './request-body.js';
 import {
   issueTelemetryToken, verifyTelemetryToken, issueErasureToken, verifyErasureToken
 } from './telemetry-token.js';
+import { issueEntitlementToken, verifyEntitlementToken } from './entitlement-token.js';
 import {
   configuredWriteEpoch, enforceRuntimeWriteFence, isRuntimeWriteFenceError
 } from './write-fence.js';
@@ -95,7 +96,8 @@ function statsCors(request, env) {
 const isStatsPath = (path) => path.startsWith('/admin/stats/');
 
 const isPublicExtensionPath = (path) =>
-  path === '/verify' || path === '/deactivate' || path === '/ai/chat' || path === '/gdz/fetch' ||
+  path === '/verify' || path === '/deactivate' || path === '/consent/receipt' ||
+  path === '/ai/chat' || path === '/gdz/fetch' ||
   path.startsWith('/referral/') ||
   path === '/payments/robokassa/order' || path.startsWith('/checkout/') ||
   path === '/t' || path === '/t/ai' || path === '/t/delete';
@@ -128,25 +130,15 @@ const error = (status, reason, headers = {}) => json({ ok: false, reason }, { st
 
 const SECRET_ENCODER = new TextEncoder();
 
-function safeErrorText(errorValue, env = {}) {
-  let text = String(errorValue?.stack || errorValue || 'error');
-  // Telegram embeds the bot token in the request path. Fetch failures may
-  // include that URL in their stack/cause, so redact both the path shape and
-  // every configured credential that could plausibly appear in an error.
-  text = text.replace(/\/bot[^/\s]+/gi, '/bot[REDACTED]');
-  for (const name of [
-    'ADMIN_SECRET', 'STATS_SECRET', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_WEBHOOK_SECRET',
-    'ROBOKASSA_PASSWORD1', 'ROBOKASSA_PASSWORD2',
-    'ROBOKASSA_PASSWORD1_PRODUCTION', 'ROBOKASSA_PASSWORD2_PRODUCTION',
-    'ROBOKASSA_PASSWORD1_TEST', 'ROBOKASSA_PASSWORD2_TEST',
-    'ROBOKASSA_PASSWORD3_PRODUCTION', 'ROBOKASSA_PASSWORD3_TEST', 'RESEND_API_KEY',
-    'AI_PROXY_API_KEY', 'INGEST_KEY', 'CHECKOUT_CAPABILITY_SECRET',
-    'CHECKOUT_PROMO_CODE', 'CHECKOUT_PROMO2_CODE', 'OWNER_LICENSE_KEY'
-  ]) {
-    const secret = String(env[name] || '');
-    if (secret.length >= 4) text = text.split(secret).join('[REDACTED]');
-  }
-  return text.slice(0, 2000);
+function safeErrorText(errorValue) {
+  const name = typeof errorValue?.name === 'string' &&
+    /^(?:Error|TypeError|RangeError|SyntaxError|AbortError|TimeoutError)$/.test(errorValue.name)
+    ? errorValue.name
+    : 'Error';
+  const code = typeof errorValue?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(errorValue.code)
+    ? errorValue.code
+    : 'UNCLASSIFIED';
+  return `${name}:${code}`;
 }
 
 async function readUpstreamJson(res, maxBytes = 64 * 1024) {
@@ -202,6 +194,9 @@ export default {
 
       if (path === '/verify' && method === 'POST') return await handleVerify(request, env);
       if (path === '/deactivate' && method === 'POST') return await handleDeactivate(request, env);
+      if (path === '/consent/receipt' && method === 'POST') {
+        return await handleConsentReceipt(request, env);
+      }
       if (path === '/ai/chat' && method === 'POST') {
         if (!legacyAiProxyEnabled(env)) return error(410, 'legacy_ai_proxy_disabled', VERIFY_CORS);
         return await handleAiChat(request, env);
@@ -302,10 +297,10 @@ export default {
           try {
             const response = await settleReconciledRobokassaPayment(env, ctx, paid);
             if (!response.ok) {
-              console.error('automatic payment fulfillment needs review', paid.order?.order_id, response.status);
+              console.error('automatic payment fulfillment needs review', response.status);
             }
           } catch (e) {
-            console.error('automatic payment fulfillment failed', paid.order?.order_id, safeErrorText(e, env));
+            console.error('automatic payment fulfillment failed', safeErrorText(e, env));
           }
         }
       } catch (e) { console.error('payment reconciliation sweep failed', safeErrorText(e, env)); }
@@ -330,7 +325,7 @@ export default {
             await referrals.reverseReferralCreditForPurchase(env, refund.license_key);
             await payments.finalizeRobokassaRefund(env, refund);
           } catch (e) {
-            console.error('refund settlement failed', refund.order_id, safeErrorText(e, env));
+            console.error('refund settlement failed', safeErrorText(e, env));
             await payments.recordRefundPollFailure(env, refund.order_id, e);
           }
         }
@@ -368,7 +363,8 @@ async function handleVerify(request, env) {
   if (!deviceId) return error(400, 'bad_device', VERIFY_CORS);
   // Malformed credentials are rejected by normalizeKey without touching KV,
   // so they do not need an expensive-lookup reservation.
-  if (!normalizeKey(key)) {
+  const normalizedKey = normalizeKey(key);
+  if (!normalizedKey) {
     return json({ ok: false, reason: 'not_found' }, { headers: VERIFY_CORS });
   }
 
@@ -406,27 +402,44 @@ async function handleVerify(request, env) {
   }
   let response = result;
   if (result.ok) {
-    // Telemetry is optional and must never turn a valid entitlement into an
-    // outage. Readiness still reports a missing/broken INGEST_KEY, while the
-    // paid license path remains available and simply omits the capability.
+    // AI authorization is mandatory: the raw license key must stop here and
+    // the inference service accepts only the short-lived capability.
+    let entitlement = null;
+    try {
+      entitlement = await issueEntitlementToken(env, {
+        licenseKey: normalizedKey,
+        deviceId,
+        licenseType: result.type || null,
+        licenseExpiresAt: result.expires_at || null
+      });
+    } catch (e) {
+      console.error('entitlement issuance failed', safeErrorText(e, env));
+    }
+    if (!entitlement) return error(503, 'service_unavailable', VERIFY_CORS);
+    response = {
+      ...result,
+      entitlement_token: entitlement.token,
+      entitlement_token_expires_at: entitlement.expires_at
+    };
+
+    // Telemetry remains independently optional. A telemetry-secret problem
+    // cannot disable the paid feature or expose the license to the VPS.
     try {
       const [telemetry, erasure] = await Promise.all([
         issueTelemetryToken(env, deviceId),
         issueErasureToken(env, deviceId)
       ]);
-      if (telemetry || erasure) {
-        response = {
-          ...result,
-          ...(telemetry ? {
-            telemetry_token: telemetry.token,
-            telemetry_token_expires_at: telemetry.expires_at
-          } : {}),
-          ...(erasure ? {
-            erasure_token: erasure.token,
-            erasure_token_expires_at: erasure.expires_at
-          } : {})
-        };
-      }
+      response = {
+        ...response,
+        ...(telemetry ? {
+          telemetry_token: telemetry.token,
+          telemetry_token_expires_at: telemetry.expires_at
+        } : {}),
+        ...(erasure ? {
+          erasure_token: erasure.token,
+          erasure_token_expires_at: erasure.expires_at
+        } : {})
+      };
     } catch (e) {
       console.error('telemetry token issuance failed', safeErrorText(e, env));
     }
@@ -435,6 +448,50 @@ async function handleVerify(request, env) {
     status: result.reason === 'service_unavailable' ? 503 : 200,
     headers: VERIFY_CORS
   });
+}
+
+/* ------------------------- /consent/receipt -------------------------- */
+
+async function handleConsentReceipt(request, env) {
+  const parsed = await readJsonBounded(request, 4096);
+  if (!parsed.ok) {
+    return error(parsed.status, parsed.reason === 'too_large' ? 'body_too_large' : 'bad_json', VERIFY_CORS);
+  }
+  const body = parsed.value;
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return error(400, 'bad_json', VERIFY_CORS);
+  }
+  const allowedFields = new Set([
+    'entitlement_token', 'receipt_id', 'version', 'terms',
+    'ai_processing', 'telemetry', 'eligibility', 'client_at'
+  ]);
+  if (Object.keys(body).some((field) => !allowedFields.has(field))) {
+    return error(400, 'bad_receipt', VERIFY_CORS);
+  }
+  const entitlement = await verifyEntitlementToken(env, body.entitlement_token);
+  if (!entitlement.ok) return error(403, 'bad_entitlement', VERIFY_CORS);
+  const receiptId = typeof body.receipt_id === 'string' ? body.receipt_id : '';
+  const clientAt = typeof body.client_at === 'string' ? body.client_at : '';
+  const clientTime = Date.parse(clientAt);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(receiptId) ||
+      body.version !== 4 || !Number.isFinite(clientTime) || clientAt.length > 40 ||
+      clientTime < Date.UTC(2025, 0, 1) || clientTime > Date.now() + 24 * 60 * 60 * 1000 ||
+      !['terms', 'ai_processing', 'telemetry', 'eligibility']
+        .every((field) => typeof body[field] === 'boolean')) {
+    return error(400, 'bad_receipt', VERIFY_CORS);
+  }
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO consent_receipts
+      (receipt_id, license_ref, device_id, consent_version, terms,
+       ai_processing, telemetry, eligibility, client_at, received_at)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+  `).bind(
+    receiptId, entitlement.license_ref, entitlement.device_id, body.version,
+    body.terms ? 1 : 0, body.ai_processing ? 1 : 0,
+    body.telemetry ? 1 : 0, body.eligibility ? 1 : 0,
+    new Date(clientTime).toISOString(), Date.now()
+  ).run();
+  return json({ ok: true }, { status: 201, headers: VERIFY_CORS });
 }
 
 /* ---------------------------- /deactivate ---------------------------- */
@@ -1053,7 +1110,7 @@ async function handleRobokassa(request, env, ctx) {
   // runs after the response goes out via ctx.waitUntil.
   const ip = request.headers.get('cf-connecting-ip') || '';
   if (robokassa.shouldEnforceIpAllowlist(env) && !robokassa.isRobokassaIp(ip)) {
-    console.warn('robokassa: rejected ip', ip);
+    console.warn('robokassa: rejected source address');
     return error(403, 'forbidden');
   }
 
@@ -1071,7 +1128,7 @@ async function handleRobokassa(request, env, ctx) {
   }
   const signed = await robokassa.verifyResultSignature(fields, password2, env.ROBOKASSA_HASH_ALGO);
   if (!signed.ok) {
-    console.warn('robokassa: bad signature', signed.reason, robokassa.invoiceId(fields) || '(no invoice)');
+    console.warn('robokassa: bad signature', signed.reason);
     return error(403, 'bad_signature');
   }
 
@@ -1101,7 +1158,7 @@ async function handleRobokassa(request, env, ctx) {
   }
   const bound = payments.validateRobokassaCallbackOrder(env, order, n, fields);
   if (!bound.ok) {
-    console.error('robokassa: callback/order mismatch', bound.reason, n.payment_id);
+    console.error('robokassa: callback/order mismatch', bound.reason);
     if (bound.retry) return error(409, bound.reason);
     return ackUnissuedPayment(env, n, fields, bound.reason, order);
   }
@@ -1115,7 +1172,7 @@ async function handleRobokassa(request, env, ctx) {
 
 async function fulfillAuthorizedRobokassaOrder(env, ctx, order, n, fields) {
   if (!order.email && !order.telegram_user_id) {
-    console.error('robokassa: payment without delivery contact', n.payment_id);
+    console.error('robokassa: payment without delivery contact');
     return ackUnissuedPayment(env, n, fields, 'no_contact', order);
   }
   const plan = order.plan_type === 'subscription'
@@ -1226,7 +1283,7 @@ async function settleIssuedRobokassaPayment(
   // amount is not a redelivery of this frozen claim. Keep the winner immutable,
   // suppress delivery/referral side effects, and journal the anomaly.
   if (!issuedAmountMatches(license, n.amount_kopecks)) {
-    console.error('robokassa: issued payment amount mismatch', n.payment_id);
+    console.error('robokassa: issued payment amount mismatch');
     return ackUnissuedPayment(env, n, fields, 'issued_amount_mismatch', order);
   }
 
@@ -1925,7 +1982,7 @@ async function adminFailures(env, ip, bump) {
     if (count >= ADMIN_FAIL_DAILY_LIMIT) analytics.markBudgetBlocked(day, 'admin_fail', ip);
     return count;
   } catch (e) {
-    console.error('admin fail counter unavailable', String(e));
+    console.error('admin fail counter unavailable', safeErrorText(e));
     return 0;
   }
 }
@@ -1977,6 +2034,8 @@ async function statsGate(request, env, dashboardCors = null) {
 // the PRIMARY KEY, NOT NULL, or default that makes concurrent paths correct.
 const HEALTH_REQUIRED_TABLE_SIGNATURES = {
   counters: 'name:TEXT:0::1|value:INTEGER:1::0',
+  consent_receipts:
+    'receipt_id:TEXT:0::1|license_ref:TEXT:1::0|device_id:TEXT:1::0|consent_version:INTEGER:1::0|terms:INTEGER:1::0|ai_processing:INTEGER:1::0|telemetry:INTEGER:1::0|eligibility:INTEGER:1::0|client_at:TEXT:1::0|received_at:INTEGER:1::0',
   delivery_outbox:
     'license_key:TEXT:0::1|email:TEXT:0::0|telegram_user_id:INTEGER:0::0|is_preorder:INTEGER:1:0:0|created_at:INTEGER:1::0|attempts:INTEGER:1:0:0|next_attempt_at:INTEGER:1::0|claim_token:TEXT:0::0|lease_until:INTEGER:0::0|delivered_at:INTEGER:0::0',
   device_tombstones: 'device_id:TEXT:0::1|deleted_at:INTEGER:1::0',
@@ -2044,6 +2103,7 @@ const HEALTH_ACCEPTED_LEGACY_TABLE_SIGNATURES = {
 // Both known complete products are listed exactly.
 const HEALTH_REQUIRED_TABLE_DDL = {
   counters: ['createtablecounters(nametextprimarykey,valueintegernotnull)'],
+  consent_receipts: ["createtableconsent_receipts(receipt_idtextprimarykey,license_reftextnotnull,device_idtextnotnull,consent_versionintegernotnull,termsintegernotnullcheck(termsin(0,1)),ai_processingintegernotnullcheck(ai_processingin(0,1)),telemetryintegernotnullcheck(telemetryin(0,1)),eligibilityintegernotnullcheck(eligibilityin(0,1)),client_attextnotnull,received_atintegernotnull)"],
   delivery_outbox: ['createtabledelivery_outbox(license_keytextprimarykey,emailtext,telegram_user_idinteger,is_preorderintegernotnulldefault0,created_atintegernotnull,attemptsintegernotnulldefault0,next_attempt_atintegernotnull,claim_tokentext,lease_untilinteger,delivered_atinteger)'],
   device_tombstones: [
     'createtabledevice_tombstones(device_idtextprimarykey,deleted_atintegernotnull--msepoch)',
@@ -2124,6 +2184,11 @@ const HEALTH_OPTIONAL_PLATFORM_TABLE_DDL = {
 };
 const HEALTH_REQUIRED_TABLES = Object.keys(HEALTH_REQUIRED_TABLE_SIGNATURES);
 const HEALTH_REQUIRED_INDEXES = {
+  idx_consent_receipts_subject_time: {
+    table: 'consent_receipts', unique: false,
+    columns: ['license_ref', 'device_id', 'received_at'],
+    ddl: 'createindexidx_consent_receipts_subject_timeonconsent_receipts(license_ref,device_id,received_atdesc)'
+  },
   idx_license_activations_device: {
     table: 'license_activations', unique: false, partial: true,
     columns: ['device_id'],
@@ -2266,7 +2331,9 @@ async function handleAdminHealth(request, env) {
     // Production has one quota/admission authority: the VPS. The Worker route
     // remains available only as an explicit emergency compatibility switch.
     ai_proxy_key: !legacyAiProxyEnabled(env) || !!env.AI_PROXY_API_KEY,
-    ingest_key: typeof env.INGEST_KEY === 'string' && env.INGEST_KEY.length >= 32
+    ingest_key: typeof env.INGEST_KEY === 'string' && env.INGEST_KEY.length >= 32,
+    entitlement_secret: typeof env.ENTITLEMENT_SECRET === 'string' &&
+      env.ENTITLEMENT_SECRET.length >= 32
   };
   let missingTables = [];
   const missingColumns = [];

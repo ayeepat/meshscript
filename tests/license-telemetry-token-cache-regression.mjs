@@ -26,12 +26,15 @@ globalThis.fetch = async () => new Response(JSON.stringify(payload), {
 
 const { verifyKey } = await import('../src/lib/license.js?telemetry-cache');
 const goodToken = `tm1.${'A'.repeat(64)}.${'B'.repeat(43)}`;
+const entitlementToken = 'et1.test.signature';
 const expiry = Date.now() + 60_000;
 payload = {
   ok: true,
   type: 'lifetime',
   expires_at: null,
   activation_token: 'a'.repeat(43),
+  entitlement_token: entitlementToken,
+  entitlement_token_expires_at: expiry,
   developer_mode: true,
   telemetry_token: goodToken,
   telemetry_token_expires_at: expiry
@@ -47,6 +50,8 @@ payload = {
   ok: true,
   type: 'lifetime',
   activation_token: 'b'.repeat(43),
+  entitlement_token: entitlementToken,
+  entitlement_token_expires_at: Date.now() + 60_000,
   telemetry_token: 'not-a-token',
   telemetry_token_expires_at: Date.now() + 60_000
 };
@@ -60,6 +65,8 @@ payload = {
   ok: true,
   type: 'lifetime',
   activation_token: 'c'.repeat(43),
+  entitlement_token: entitlementToken,
+  entitlement_token_expires_at: Date.now() + 60_000,
   developer_mode: 'true',
   telemetry_token: goodToken,
   telemetry_token_expires_at: Date.now() - 1

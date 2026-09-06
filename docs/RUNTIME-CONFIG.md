@@ -1,41 +1,29 @@
-# Signing the runtime config
+# Runtime feature switches
 
-The extension accepts only a P-256-signed envelope at
-`https://smeshai.xyz/extension-config.json`. Bare JSON and legacy cached
-objects are deliberately rejected.
+The owner changes eight independent switches in `smeshaidashboard`. The VPS
+stores the versioned configuration and publishes only the switch values at:
 
-**Publish at the apex host, not `www.`.** The site 301-redirects every
-`www.smeshai.xyz` request to the apex, and `fetchFresh()` in
-`src/lib/remote-config.js` uses `redirect: 'error'` on purpose — a `www.` URL
-can therefore never resolve, whatever is published behind it. The URL in
-`src/lib/config.js` and the `host_permissions` entry in `manifest.json` must
-keep naming that same apex origin; `tests/runtime-config-host-regression.mjs`
-fails the build if they drift apart.
+`https://ai.smeshapi.site/public/runtime-config`
 
-1. Edit a private, bare JSON file. `configVersion` must increase monotonically.
-   Include signed integer millisecond timestamps `issuedAt` and `expiresAt`;
-   validity may be at most seven days, so publish a newly signed config at
-   least weekly. Reusing a version with different content is rejected.
-2. Sign it without exposing the key:
+The response is a P-256-signed envelope. The extension pins the matching public
+key, rejects unsigned, malformed, expired or rolled-back payloads, and refreshes
+an accepted value every five minutes while online. The private key is supplied
+to the VPS only as `RUNTIME_CONFIG_PRIVATE_KEY_B64`; never commit or expose it
+to the dashboard.
 
-   ```sh
-   node scripts/sign-runtime-config.mjs config.private.json extension-config.json
-   ```
+The VPS enforces `ai_text`, `ai_images` and `ai_documents` immediately for new
+jobs. The extension enforces all eight switches at its message boundary:
+AI text, AI images, AI documents, journal attachments, autofill, other-site
+solving, telemetry and GDZ.
 
-3. Publish only `extension-config.json`. Never publish or commit
-   `.secrets/runtime-config-signing-key.pem`; it is ignored by Git and must be
-   backed up in the deployment secret store.
+Operational check after a change:
 
-The signer refuses non-P-256 keys, keys that do not match the public key pinned
-in `src/lib/config.js`, and any output path that aliases the input or private
-key. It self-verifies the signature before atomically replacing the named
-output file.
+1. Save once in the dashboard and confirm the revision increased.
+2. Open `/public/runtime-config`, decode only for inspection, and verify that
+   the signature is still accepted by the extension regression tests.
+3. For an AI switch, send a synthetic request with no user content and confirm
+   the VPS rejects it before the paid upstream.
+4. Record the revision, operator and reason in the change log.
 
-The only accepted `homeworkAnchorSelector` values are the exact strings in
-`APPROVED_HOMEWORK_SELECTORS` in `src/lib/remote-config.js`. Supporting a new
-An electronic-journal DOM change requires reviewing and shipping that selector in the extension
-before remote config can select it.
-
-Notice links are limited to `smeshai.xyz`, `www.smeshai.xyz`, and the Chrome
-Web Store. Adding a destination requires an extension release and review; a
-signed config cannot introduce an arbitrary link.
+The older manual signer remains useful only for local cryptographic testing; it
+is not the production publication path.

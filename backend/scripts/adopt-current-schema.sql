@@ -113,6 +113,23 @@ CREATE TABLE IF NOT EXISTS license_activations (
 CREATE INDEX IF NOT EXISTS idx_license_activations_device
   ON license_activations(device_id) WHERE status = 'active';
 
+-- Additive 0012 consent evidence. Receipts deliberately contain only
+-- pseudonymous entitlement references, the four choices and timestamps.
+CREATE TABLE IF NOT EXISTS consent_receipts (
+  receipt_id      TEXT    PRIMARY KEY,
+  license_ref     TEXT    NOT NULL,
+  device_id       TEXT    NOT NULL,
+  consent_version INTEGER NOT NULL,
+  terms           INTEGER NOT NULL CHECK (terms IN (0, 1)),
+  ai_processing   INTEGER NOT NULL CHECK (ai_processing IN (0, 1)),
+  telemetry       INTEGER NOT NULL CHECK (telemetry IN (0, 1)),
+  eligibility     INTEGER NOT NULL CHECK (eligibility IN (0, 1)),
+  client_at       TEXT    NOT NULL,
+  received_at     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consent_receipts_subject_time
+  ON consent_receipts(license_ref, device_id, received_at DESC);
+
 -- D1 rejects CREATE TEMP TABLE. These ordinary helper tables live only for
 -- this atomic remote-file ingestion and are dropped on success; any failure
 -- restores the pre-ingestion database. Omit IF NOT EXISTS so a name collision
@@ -140,6 +157,8 @@ CREATE TABLE _smesh_expected_current_ddl (
 INSERT INTO _smesh_expected_current_shape(table_name, signature) VALUES
   ('counters',
    'name:TEXT:0::1|value:INTEGER:1::0'),
+  ('consent_receipts',
+   'receipt_id:TEXT:0::1|license_ref:TEXT:1::0|device_id:TEXT:1::0|consent_version:INTEGER:1::0|terms:INTEGER:1::0|ai_processing:INTEGER:1::0|telemetry:INTEGER:1::0|eligibility:INTEGER:1::0|client_at:TEXT:1::0|received_at:INTEGER:1::0'),
   ('d1_migrations',
    'id:INTEGER:0::1|name:TEXT:0::0|applied_at:TIMESTAMP:1:CURRENT_TIMESTAMP:0'),
   ('delivery_outbox',
@@ -202,6 +221,7 @@ INSERT INTO _smesh_expected_current_shape(table_name, signature) VALUES
 -- never forge a missing constraint: the complete stored DDL must equal one of
 -- these known snapshot/migration products, not merely contain a keyword.
 INSERT INTO _smesh_expected_current_ddl(table_name, ddl_signature) VALUES
+  ('consent_receipts', 'createtableconsent_receipts(receipt_idtextprimarykey,license_reftextnotnull,device_idtextnotnull,consent_versionintegernotnull,termsintegernotnullcheck(termsin(0,1)),ai_processingintegernotnullcheck(ai_processingin(0,1)),telemetryintegernotnullcheck(telemetryin(0,1)),eligibilityintegernotnullcheck(eligibilityin(0,1)),client_attextnotnull,received_atintegernotnull)'),
   ('counters', 'createtablecounters(nametextprimarykey,valueintegernotnull)'),
   ('d1_migrations', 'createtabled1_migrations(idintegerprimarykeyautoincrement,nametextunique,applied_attimestampdefaultcurrent_timestampnotnull)'),
   ('delivery_outbox', 'createtabledelivery_outbox(license_keytextprimarykey,emailtext,telegram_user_idinteger,is_preorderintegernotnulldefault0,created_atintegernotnull,attemptsintegernotnulldefault0,next_attempt_atintegernotnull,claim_tokentext,lease_untilinteger,delivered_atinteger)'),
@@ -255,6 +275,9 @@ CREATE TABLE _smesh_expected_current_indexes (
 INSERT INTO _smesh_expected_current_indexes
   (index_name, table_name, is_unique, origin_kind, is_partial, columns_sig,
    ddl_signature) VALUES
+  ('idx_consent_receipts_subject_time', 'consent_receipts', 0, 'c', 0,
+   'license_ref|device_id|received_at',
+   'createindexidx_consent_receipts_subject_timeonconsent_receipts(license_ref,device_id,received_atdesc)'),
   ('idx_license_activations_device', 'license_activations', 0, 'c', 1,
    'device_id',
    'createindexidx_license_activations_deviceonlicense_activations(device_id)wherestatus=''active'''),
@@ -318,7 +341,8 @@ INSERT INTO _smesh_expected_migration_order(name, position) VALUES
   ('0008_telegram_update_idempotency.sql', 8),
   ('0009_telegram_ticket_binding.sql', 9),
   ('0010_single_device_activation.sql', 10),
-  ('0011_subscription_lifecycle.sql', 11);
+  ('0011_subscription_lifecycle.sql', 11),
+  ('0012_consent_receipts.sql', 12);
 
 CREATE TABLE _smesh_adoption_guard (
   ok INTEGER NOT NULL

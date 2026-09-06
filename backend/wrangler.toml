@@ -22,6 +22,7 @@
 #        npx wrangler secret put CHECKOUT_PROMO2_CODE        # optional second private discount code
 #        npx wrangler secret put AI_PROXY_API_KEY            # only if the legacy Worker proxy is explicitly enabled
 #        npx wrangler secret put INGEST_KEY                  # >=32 random bytes: /verify telemetry HMAC + VPS /t/ai
+#        npx wrangler secret put ENTITLEMENT_SECRET          # >=32 random bytes; must match the VPS
 #  4. Apply every schema migration BEFORE deploying payment code:
 #        npx wrangler d1 migrations apply smesh-analytics --remote
 #  5. First deploy: `npx wrangler deploy --keep-vars --var RUNTIME_WRITE_EPOCH:1`
@@ -42,6 +43,11 @@ keep_vars = true
 routes = [
   { pattern = "smeshapi.site", custom_domain = true }
 ]
+
+# Do not persist request URLs, exception messages, or console output in
+# Workers Observability. Aggregate Cloudflare zone metrics remain available.
+[observability]
+enabled = false
 
 # Cron: re-drives failed license deliveries (delivery_outbox) and stranded
 # referral credits until they land — the durable retry channel behind the

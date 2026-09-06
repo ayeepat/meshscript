@@ -1,0 +1,135 @@
+{
+  "schema_version": 1,
+  "last_reviewed": "2026-09-05",
+  "product": "СМЭШ AI",
+  "controller": {
+    "name": "Саклаков Даниил Денисович",
+    "contact": "support@smeshai.xyz"
+  },
+  "defaults": {
+    "telemetry_enabled": false,
+    "remote_ai_before_consent": false,
+    "server_content_logging": false
+  },
+  "flows": [
+    {
+      "id": "consent",
+      "trigger": "Пользователь сохраняет настройки согласия",
+      "required_choices": ["terms", "ai_processing", "eligibility"],
+      "optional_choices": ["telemetry"],
+      "destinations": ["chrome.storage.local", "license Worker consent receipt"],
+      "server_fields": [
+        "receipt_id",
+        "pseudonymous_license_reference",
+        "device_uuid",
+        "consent_version",
+        "four_boolean_choices",
+        "client_timestamp",
+        "server_timestamp"
+      ],
+      "excluded": ["task_content", "answers", "files", "raw_license_key"]
+    },
+    {
+      "id": "license",
+      "trigger": "Активация или обновление доступа",
+      "source": "extension",
+      "destination": "Cloudflare Worker at smeshapi.site",
+      "data": ["license_key", "device_uuid", "one-device activation credential"],
+      "result": "short-lived purpose-bound AI entitlement token",
+      "note": "Raw license and activation credentials stop at the license Worker."
+    },
+    {
+      "id": "ai_inference",
+      "trigger": "Пользователь явно нажимает кнопку решения или отправки сообщения",
+      "path": ["extension", "ai.smeshapi.site", "302.AI", "enabled model processor"],
+      "data": [
+        "selected task text",
+        "user-selected screenshot or attachment when needed",
+        "short-lived entitlement token",
+        "optional content-free telemetry flag"
+      ],
+      "excluded": ["raw_license_key", "activation_credential", "MESH_session_token"],
+      "storage": "Content exists only in bounded transient memory while the job runs; no content logging or persistent content store.",
+      "processors_register": "https://smeshai.xyz/processors/"
+    },
+    {
+      "id": "mesh_attachment",
+      "trigger": "Пользователь выбирает задание с вложением",
+      "path": ["electronic-journal page", "extension service worker", "allowed journal host"],
+      "data": ["one-time in-memory journal session token", "requested attachment"],
+      "host_allowlist": ["school.mos.ru", "uchebnik.mos.ru"],
+      "excluded": ["СМЭШ backend", "popup UI", "logs", "persistent storage"],
+      "note": "Redirect targets are validated again and credentials are removed on cross-origin redirects."
+    },
+    {
+      "id": "telemetry",
+      "trigger": "Only after the separate optional telemetry switch is enabled",
+      "path": ["extension or inference gateway", "smeshapi.site telemetry endpoint"],
+      "data": [
+        "event type",
+        "canonical subject",
+        "provider and model",
+        "browser family",
+        "extension version",
+        "license type",
+        "device_uuid",
+        "token counts and estimated cost for server-observed AI usage"
+      ],
+      "excluded": ["task text", "answers", "files", "raw license key", "payment details"],
+      "retention_days": 90,
+      "default": "off"
+    },
+    {
+      "id": "local_history",
+      "trigger": "Пользователь получает ответ",
+      "destination": "chrome.storage.local on the user's device",
+      "data": ["task", "answer", "user-selected attachments embedded in the chat"],
+      "retention_days": 7,
+      "server_copy": false
+    },
+    {
+      "id": "other_sites",
+      "trigger": "Пользователь отдельно разрешает один origin в системном диалоге Chrome",
+      "data": ["bounded visible text and form labels from the top-level document"],
+      "excluded": ["child frames", "automatic submission", "screenshot"],
+      "revocable": true
+    },
+    {
+      "id": "payments_and_delivery",
+      "trigger": "Покупатель начинает оплату",
+      "path": ["smeshai.xyz", "Cloudflare Worker", "Robokassa", "Telegram or Resend when selected"],
+      "data": ["order id", "amount", "payment status", "email and/or Telegram id", "license record"],
+      "excluded": ["full bank-card details", "homework content"]
+    },
+    {
+      "id": "gdz",
+      "trigger": "Пользователь выбирает справочный ответ",
+      "path": ["extension", "smeshapi.site", "server-allowlisted public reference host"],
+      "data": ["public reference URL", "license/device authorization at license Worker"],
+      "excluded": ["homework text", "journal session token"]
+    }
+  ],
+  "infrastructure": {
+    "site_and_license_services": "Cloudflare infrastructure; operator must keep actual account region and products documented.",
+    "ai_gateway": "Foreign VPS currently declared by the operator as Germany; deployment region must be re-verified after every host change.",
+    "model_processing": "Foreign processor locations depend on the enabled 302.AI/model chain and must match the public live register.",
+    "russian_vps": false
+  },
+  "logging_policy": {
+    "caddy_access_log": false,
+    "cloudflare_workers_observability": false,
+    "content_in_application_logs": false,
+    "content_in_apm_or_crash_reports": false,
+    "operator_action": "Keep Pages/Functions analytics, Logpush, APM and crash-report request capture disabled unless this manifest and notices are reviewed first."
+  },
+  "feature_switches": [
+    "ai_text",
+    "ai_images",
+    "ai_documents",
+    "mesh_attachments",
+    "autofill",
+    "other_sites",
+    "telemetry",
+    "gdz"
+  ]
+}

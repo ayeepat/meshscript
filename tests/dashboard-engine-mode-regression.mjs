@@ -11,7 +11,10 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 
 const store = {
-  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
+  aiConsent: {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }
 };
 
 function pick(keys) {
@@ -202,7 +205,7 @@ assert.equal((await postedSolve('think')).payload.engine, 'think');
 // inputs. These probes survive harmless reformatting and fail on behavior
 // changes such as swapping the two models or downgrading explicit think mode.
 {
-  const mapping = sourceSection(workerSource, 'const engineProvider =', '// PDFs require');
+  const mapping = sourceSection(workerSource, 'const engineProvider =', 'const provider = engineProvider');
   function mapEngine(engine) {
     const context = { engine };
     vm.runInNewContext(
@@ -250,55 +253,12 @@ assert.equal((await postedSolve('think')).payload.engine, 'think');
   );
 }
 
-// PDF routing must respect the engine-selected provider. Run the actual async
-// branch with storage/BYO-key fakes rather than checking for a chosen line.
+// PDF routing uses the same licensed engine route; there is no BYO diversion.
 {
-  const pdfRouting = sourceSection(
-    workerSource,
-    'let provider = engineProvider || undefined;',
-    '// When we auto-attached'
-  );
-  const context = {
-    hasPdf: (files) => files.some((file) => file.pdf === true),
-    isPdfFile: (file) => file.pdf === true,
-    normalizeAIProvider: (value) => value || 'openrouter',
-  };
-  vm.runInNewContext(
-    `globalThis.__routePdf = async (input) => {
-      const { engineProvider, files, history } = input;
-      const sessionId = null;
-      const getByoKey = async () => input.byoKey || null;
-      const chrome = { storage: { local: { get: async (key) =>
-        key === 'aiProvider'
-          ? { aiProvider: input.storedProvider }
-          : { openrouterApiKey: input.openrouterKey }
-      } } };
-      ${pdfRouting}
-      return { provider };
-    };`,
-    context,
-    { filename: 'worker-pdf-engine-routing.js' }
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(await context.__routePdf({
-      engineProvider: 'qwen',
-      files: [{ pdf: true }],
-      history: [],
-      storedProvider: 'groq',
-    }))),
-    { provider: 'qwen' }
-  );
-  assert.deepEqual(
-    JSON.parse(JSON.stringify(await context.__routePdf({
-      engineProvider: 'qwen',
-      files: [{ pdf: true }],
-      history: [],
-      byoKey: 'byo',
-      openrouterKey: 'or',
-      storedProvider: 'groq',
-    }))),
-    { provider: 'openrouter' }
-  );
+  const solveBody = sourceSection(workerSource, 'async function solve(', 'async function solveTest(');
+  assert.match(solveBody, /const provider = engineProvider \|\| undefined;/);
+  assert.doesNotMatch(solveBody, /openrouterApiKey|getByoKey|provider\s*=\s*'openrouter'/,
+    'PDF handling must not resurrect a direct OpenRouter route');
 }
 
 // This final source-level assertion is intentionally structural: validateMessage

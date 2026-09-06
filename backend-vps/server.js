@@ -1,53 +1,19 @@
 /**
- * СМЭШ AI proxy — the OFF-CLOUDFLARE half of the backend (AWS EC2 box).
+ * СМЭШ AI inference gateway.
  *
- * Why this exists, v2 (2026-07-08): Russian DPI (TSPU) applies a bandwidth
- * clamp keyed on the TLS SNI `*.smeshapi.site` — ANY connection to that name
- * that lives longer than ~6–12s gets throttled to zero, on Cloudflare AND on
- * this box alike. Proven from an RU client: the same 2s-heartbeat probe died
- * at ~6s via the CF worker and ~12s via this box (h2, so not QUIC), while a
- * 66-second stream from httpbin.org on the SAME RU connection completed fine.
- * Short requests finish before the clamp bites — that's why /verify and
- * /health always worked from RU. So the v1 premise ("move off Cloudflare and
- * streaming works") was wrong: streaming to RU is off the table on any host
- * carrying this SNI.
+ * The extension starts a bounded server-side job and reads its output through
+ * short authenticated polls. New work is authorized locally with a short-lived
+ * HMAC capability issued by the license Worker; raw license keys and activation
+ * tokens are never accepted here. Quotas, processor routing, feature switches,
+ * upload capabilities and no-content operational logging are enforced in this
+ * process. Caddy terminates TLS and proxies only to the loopback listener.
  *
- * The fix: the extension uses a POLLING pseudo-stream, where every RU-facing
- * request is sub-second:
- *
- *   POST /ai/start  → verify license (via the CF worker /verify), charge the
- *                     daily quota, return { job_id } IMMEDIATELY; the 302.AI
- *                     stream is opened server-side in the background (this
- *                     box ↔ 302.AI never touches Russia) and its SSE bytes
- *                     accumulate in memory.
- *   GET  /ai/poll   → ?job=<id>&cursor=<n>: return the buffered SSE text
- *                     since <n> plus { done, error }. The client feeds the
- *                     chunks into the same SSE parser it uses for direct
- *                     streams, so the UI still reveals tokens progressively.
- *   POST /ai/cancel → abort the upstream fetch (stop paying 302.AI) when the
- *                     student aborts / closes the tab.
- *
- * The old byte-for-byte streaming POST /ai/chat is kept for curl diagnostics
- * and non-RU use; the extension no longer calls it.
- *
- * Same trust model as backend/src/ai-proxy.js:
- *   - license is verified per request by calling the EXISTING Cloudflare
- *     worker /verify (a quick request, works from anywhere) — no license
- *     data is duplicated here;
- *   - per-license + global daily quotas are enforced locally (JSON file);
- *   - the single 302.AI key lives in this box's env (AI_PROXY_API_KEY),
- *     never in the client.
- *
- * Zero npm dependencies on purpose (Node 24 built-ins only): global fetch,
- * node:http, node:stream, node:fs, node:crypto. Runs behind Caddy, which
- * terminates TLS and reverse-proxies to 127.0.0.1:PORT with
- * `flush_interval -1` (only the legacy streaming route still needs that).
+ * Zero npm runtime dependencies: Node 24 built-ins only.
  */
 
 'use strict';
 
 const http = require('node:http');
-const https = require('node:https');
 const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
@@ -96,13 +62,6 @@ function parseServiceUrl(name, value, fallback) {
 const PORT = parsePort(process.env.PORT);
 const HOST = parseLoopbackHost(process.env.HOST);
 
-// The Cloudflare worker that still owns licenses.
-const LICENSE_VERIFY_URL = parseServiceUrl(
-  'LICENSE_VERIFY_URL',
-  process.env.LICENSE_VERIFY_URL,
-  'https://smeshapi.site/verify'
-);
-
 // 302.AI (OpenAI-compatible). ai-proxy.js appends /chat/completions itself.
 const UPSTREAM_BASE_URL = parseServiceUrl(
   'AI_PROXY_BASE_URL',
@@ -116,6 +75,12 @@ const ADMIN_KEY = process.env.ADMIN_KEY || '';
 // cannot be used at the provider. It is safe to type into the owner dashboard
 // for one browser session, but must still be a high-entropy secret.
 const MODEL_ADMIN_KEY = process.env.MODEL_ADMIN_KEY || '';
+// Shared only with the license Worker. Clients receive signed, ten-minute AI
+// capabilities; the VPS never receives or stores their license/activation keys.
+const ENTITLEMENT_SECRET = process.env.ENTITLEMENT_SECRET || '';
+const ENTITLEMENT_SECRET_VALID = Buffer.byteLength(ENTITLEMENT_SECRET) >= 32 &&
+  Buffer.byteLength(ENTITLEMENT_SECRET) <= 512;
+const RUNTIME_CONFIG_PRIVATE_KEY_B64 = process.env.RUNTIME_CONFIG_PRIVATE_KEY_B64 || '';
 function parseDashboardOrigin(value) {
   const raw = String(value || 'https://ayeepat.github.io').replace(/\/+$/, '');
   let url;
@@ -167,6 +132,13 @@ const QUOTA_READINESS_DEEP_PROBE_MS = Number.isSafeInteger(configuredQuotaProbeM
 const MAX_QUOTA_FILE_BYTES = 2 * 1024 * 1024;
 
 const env = process.env;
+function safeErrorCode(error) {
+  const name = typeof error?.name === 'string' && /^[A-Za-z]{1,32}$/.test(error.name)
+    ? error.name : 'Error';
+  const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,48}$/.test(error.code)
+    ? error.code : 'UNCLASSIFIED';
+  return `${name}:${code}`;
+}
 const quotaConfigErrors = [];
 const boundedQuotaVar = (name, v, fallback, min, max) => {
   if (v === undefined || v === null || String(v).trim() === '') return fallback;
@@ -216,10 +188,12 @@ function providerById(id) {
 // chain: 302.AI's Gemini accepts a {type:'file'} data-URI part and reads it in
 // streaming mode (verified live 2026-07-08). Any PDF job is routed here; its
 // quota is still charged to the stable client route the student selected.
-const PDF_MODEL = (env.PROXY_PDF_MODEL || 'gemini-2.5-flash').trim();
+// -lite leads: it reads a PDF file part just as well (verified live
+// 2026-07-11) at a fraction of the per-token price.
+const PDF_MODEL = (env.PROXY_PDF_MODEL || 'gemini-2.5-flash-lite').trim();
 // gemini-2.0-flash is gone from 302.AI (returns -10003 parameter error,
-// checked 2026-07-11); -lite verified live same day: reads a PDF file part.
-const PDF_FALLBACK_MODELS = env.PROXY_PDF_FALLBACK_MODELS || 'gemini-2.5-flash-lite';
+// checked 2026-07-11), so the fallback is the full 2.5 Flash.
+const PDF_FALLBACK_MODELS = env.PROXY_PDF_FALLBACK_MODELS || 'gemini-2.5-flash';
 
 /* ------------------------- live model routing ------------------------ */
 
@@ -228,6 +202,32 @@ const MAX_MODEL_CONFIG_BYTES = 64 * 1024;
 const MAX_MODEL_HISTORY = 10;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const MODEL_ROUTE_IDS = ['qwen', 'deepseek', 'standard'];
+const FEATURE_IDS = [
+  'ai_text', 'ai_images', 'ai_documents', 'mesh_attachments',
+  'autofill', 'other_sites', 'telemetry', 'gdz'
+];
+
+// Every capability ships ON. These switches exist so the operator can take a
+// feature down from the dashboard during an incident, not as a default-off
+// posture: a fresh deployment must serve text, images and documents.
+const defaultFeatures = () => Object.fromEntries(FEATURE_IDS.map((id) => [id, true]));
+
+function defaultProcessor(model) {
+  const lower = model.toLowerCase();
+  if (lower.startsWith('qwen')) {
+    return { display_name: 'Qwen', operator: 'Alibaba Cloud', privacy_url: 'https://www.alibabacloud.com/help/en/model-studio/privacy-notice', enabled: true };
+  }
+  if (lower.startsWith('gemini')) {
+    return { display_name: 'Gemini', operator: 'Google via 302.AI', privacy_url: 'https://price.302.ai/en/privacy/', enabled: true };
+  }
+  if (lower.startsWith('glm')) {
+    return { display_name: 'GLM', operator: 'Zhipu AI via 302.AI', privacy_url: 'https://price.302.ai/en/privacy/', enabled: true };
+  }
+  if (lower.startsWith('deepseek')) {
+    return { display_name: 'DeepSeek', operator: 'DeepSeek via 302.AI', privacy_url: 'https://price.302.ai/en/privacy/', enabled: true };
+  }
+  return { display_name: model, operator: '302.AI gateway', privacy_url: 'https://price.302.ai/en/privacy/', enabled: true };
+}
 
 function commaModels(value) {
   const seen = new Set();
@@ -296,7 +296,12 @@ function bootstrapModelConfig() {
       'qwen-vl-plus': { input_usd_per_m: 0.32, output_usd_per_m: 1.28 },
       'glm-5.3-flash': { input_usd_per_m: 0.075, output_usd_per_m: 0.25 },
       'glm-4.6v-flash': { input_usd_per_m: 0, output_usd_per_m: 0 }
-    }
+    },
+    processors: Object.fromEntries([
+      ...qwenText, ...qwenVision, ...deepseekText, ...deepseekVision,
+      'glm-5.3-flash', PDF_MODEL, ...commaModels(PDF_FALLBACK_MODELS)
+    ].filter(Boolean).map((model) => [model, defaultProcessor(model)])),
+    features: defaultFeatures()
   };
 }
 
@@ -331,7 +336,7 @@ function validLimit(value, name, min, max) {
 }
 
 function validateModelConfig(input) {
-  exactKeys(input, ['limits', 'routes', 'rates'], 'config');
+  exactKeys(input, ['limits', 'routes', 'rates', 'processors', 'features'], 'config');
   exactKeys(input.limits, [
     'requests_per_minute', 'frontier_per_license', 'standard_per_license',
     'global_daily', 'force_standard'
@@ -399,7 +404,63 @@ function validateModelConfig(input) {
     }
     rates[model] = { input_usd_per_m: inputRate, output_usd_per_m: outputRate };
   }
-  return { limits, routes, rates };
+  const routedModels = new Set([
+    ...MODEL_ROUTE_IDS.flatMap((id) => [...routes[id].text, ...routes[id].vision]),
+    ...routes.pdf.models
+  ]);
+  const processorInput = input.processors == null
+    ? Object.fromEntries([...routedModels].map((model) => [model, defaultProcessor(model)]))
+    : input.processors;
+  exactKeys(processorInput, Object.keys(processorInput), 'config.processors');
+  if (Object.keys(processorInput).length > 64) throw new Error('config.processors has too many models');
+  const processors = {};
+  for (const [model, processor] of Object.entries(processorInput)) {
+    if (!MODEL_ID.test(model)) throw new Error('config.processors contains an invalid model id');
+    exactKeys(processor, ['display_name', 'operator', 'privacy_url', 'enabled'], `config.processors.${model}`);
+    const displayName = typeof processor.display_name === 'string' ? processor.display_name.trim() : '';
+    const operator = typeof processor.operator === 'string' ? processor.operator.trim() : '';
+    const privacyUrl = typeof processor.privacy_url === 'string' ? processor.privacy_url.trim() : '';
+    let parsedPrivacy;
+    try { parsedPrivacy = new URL(privacyUrl); } catch { parsedPrivacy = null; }
+    if (!displayName || displayName.length > 80 || !operator || operator.length > 120 ||
+        !parsedPrivacy || parsedPrivacy.protocol !== 'https:' || parsedPrivacy.username ||
+        parsedPrivacy.password || typeof processor.enabled !== 'boolean') {
+      throw new Error(`config.processors.${model} is invalid`);
+    }
+    processors[model] = {
+      display_name: displayName,
+      operator,
+      privacy_url: parsedPrivacy.href,
+      enabled: processor.enabled
+    };
+  }
+  const featureInput = input.features == null ? defaultFeatures() : input.features;
+  exactKeys(featureInput, FEATURE_IDS, 'config.features');
+  const features = {};
+  for (const id of FEATURE_IDS) {
+    if (typeof featureInput[id] !== 'boolean') throw new Error(`config.features.${id} must be boolean`);
+    features[id] = featureInput[id];
+  }
+  // A processor must be registered+enabled only when this revision can
+  // actually route content to it. This lets the operator atomically disable a
+  // feature and its processor in one dashboard save; inactive route templates
+  // remain available for a later reviewed re-enable.
+  const activeRoutedModels = new Set();
+  if (features.ai_text) {
+    for (const id of MODEL_ROUTE_IDS) {
+      for (const model of routes[id].text) activeRoutedModels.add(model);
+      if (features.ai_images) {
+        for (const model of routes[id].vision) activeRoutedModels.add(model);
+      }
+    }
+    if (features.ai_documents) {
+      for (const model of routes.pdf.models) activeRoutedModels.add(model);
+    }
+  }
+  for (const model of activeRoutedModels) {
+    if (!processors[model]?.enabled) throw new Error(`active routed model ${model} is not enabled in processors`);
+  }
+  return { limits, routes, rates, processors, features };
 }
 
 function validateModelState(input) {
@@ -468,6 +529,8 @@ function readModelState() {
       throw new Error('model config changed while reading');
     }
     const raw = bytes.subarray(0, total).toString('utf8');
+    // A config saved before processors/features existed carries neither key;
+    // validateModelConfig fills both from the shipped defaults.
     return validateModelState(JSON.parse(raw));
   } finally {
     if (fd !== undefined) fs.closeSync(fd);
@@ -518,6 +581,10 @@ function persistModelState(nextState) {
 
 function routeForRequest(providerId, tier, hasImages, hasPdfs, state = modelState) {
   const config = state.config;
+  if (!config.features.ai_text || (hasImages && !config.features.ai_images) ||
+      (hasPdfs && !config.features.ai_documents)) {
+    return { name: 'Disabled', models: [], reasoningEffort: false };
+  }
   if (hasPdfs) {
     return { name: config.routes.pdf.label, models: [...config.routes.pdf.models], reasoningEffort: false };
   }
@@ -570,13 +637,9 @@ const MAX_JOBS_PER_IP = 4;
 const JOB_START_IP_RATE_LIMIT = 60;
 const JOB_START_RATE_WINDOW_MS = 60 * 1000;
 const JOB_START_IP_RATE_WINDOW_MS = 10 * 60 * 1000;
-// Anonymous requests reach the Worker license verifier before they can prove a
-// license. Bound that pre-authentication work separately so random credentials
-// cannot occupy every outbound socket or consume the Worker request quota.
-const MAX_VERIFY_IN_FLIGHT = 64;
-const MAX_VERIFY_IN_FLIGHT_PER_IP = 4;
-const VERIFY_ATTEMPT_RATE_LIMIT = 60;
-const VERIFY_ATTEMPT_RATE_WINDOW_MS = 10 * 60 * 1000;
+// Request bodies arrive before their signed entitlement can be verified.
+// Bound that pre-authentication work separately so random traffic cannot
+// occupy every outbound socket or consume the service's request budget.
 const UPSTREAM_CONNECT_TIMEOUT_MS = 20 * 1000;
 // PDF jobs: 302.AI holds the response (headers included) until Gemini has
 // ingested the whole file — measured live 2026-07-11: a 2.8 MB PDF took 31 s
@@ -617,9 +680,9 @@ const MAX_POLL_CHUNK_JSON_BYTES = 8 * 1024;
 // image / PDF can't ride one /ai/start POST from RU — the upload clamps mid-
 // body — so the client slices it into /ai/blob chunks that reassemble here,
 // then references the blob from a tiny /ai/start. Blobs are ephemeral and
-// bounded: no license check per chunk (a quick /verify per chunk would defeat
-// the point), so the store is capped hard and swept on a short TTL. A blob is
-// USELESS without a valid /ai/start, which still verifies the license.
+// bounded: no entitlement check per chunk, so the store is capped hard and
+// swept on a short TTL. A blob is useless without a valid /ai/start, which
+// verifies the signed capability again.
 const BLOB_TTL_MS = 90 * 1000;
 // Sliding-only expiry let duplicate chunks pin reservations and blob memory
 // forever. Production is ten minutes; a bounded override keeps lifecycle tests
@@ -809,6 +872,61 @@ function publicModelState() {
   };
 }
 
+function publicProcessors() {
+  const active = new Set();
+  if (modelState.config.features.ai_text) {
+    for (const id of MODEL_ROUTE_IDS) {
+      for (const model of modelState.config.routes[id].text) active.add(model);
+      if (modelState.config.features.ai_images) {
+        for (const model of modelState.config.routes[id].vision) active.add(model);
+      }
+    }
+    if (modelState.config.features.ai_documents) {
+      for (const model of modelState.config.routes.pdf.models) active.add(model);
+    }
+  }
+  return Object.entries(modelState.config.processors).map(([model, processor]) => ({
+    model,
+    display_name: processor.display_name,
+    operator: processor.operator,
+    privacy_url: processor.privacy_url,
+    enabled: processor.enabled,
+    in_use: active.has(model)
+  }));
+}
+
+let runtimeSigningKey;
+function getRuntimeSigningKey() {
+  if (runtimeSigningKey !== undefined) return runtimeSigningKey;
+  runtimeSigningKey = null;
+  if (!RUNTIME_CONFIG_PRIVATE_KEY_B64 || RUNTIME_CONFIG_PRIVATE_KEY_B64.length > 16384) return null;
+  try {
+    const pem = Buffer.from(RUNTIME_CONFIG_PRIVATE_KEY_B64, 'base64').toString('utf8');
+    const key = crypto.createPrivateKey(pem);
+    if (key.asymmetricKeyType !== 'ec' || key.asymmetricKeyDetails?.namedCurve !== 'prime256v1') return null;
+    runtimeSigningKey = key;
+  } catch { /* invalid or missing signing key */ }
+  return runtimeSigningKey;
+}
+
+function signedRuntimeConfig() {
+  const key = getRuntimeSigningKey();
+  if (!key) return null;
+  const now = Date.now();
+  const payloadBytes = Buffer.from(JSON.stringify({
+    configVersion: modelState.revision,
+    issuedAt: now,
+    // Clients refresh every five minutes. A one-hour signed lifetime tolerates
+    // a brief control-plane outage without letting an old "enabled" policy
+    // survive an emergency stop for a full day.
+    expiresAt: now + 60 * 60 * 1000,
+    features: modelState.config.features
+  }));
+  const signature = crypto.sign('sha256', payloadBytes, { key, dsaEncoding: 'ieee-p1363' });
+  if (signature.length !== 64) return null;
+  return { payload: payloadBytes.toString('base64url'), signature: signature.toString('base64url') };
+}
+
 function handleModelConfigGet(req, res, corsHeaders) {
   const auth = modelAdminAllowed(req);
   if (!auth.ok) {
@@ -940,16 +1058,6 @@ function isCanonicalBase64DataUri(value, prefix) {
   return true;
 }
 
-function redactVerifyDiagnostic(text, licenseKey, deviceId) {
-  let redacted = String(text || '');
-  for (const secret of [licenseKey, deviceId]) {
-    if (typeof secret === 'string' && secret.length >= 4) redacted = redacted.split(secret).join('[REDACTED]');
-  }
-  // Defense in depth if an intermediary normalizes or wraps the request body
-  // before reflecting it: never allow a license-shaped bearer into journald.
-  return redacted.replace(/SMESH-[A-Z0-9-]{8,}/gi, 'SMESH-[REDACTED]');
-}
-
 /* ------------------------------ quota (local) ------------------------- */
 // In-memory counters mirrored to a JSON file so they survive a restart. Low
 // pre-launch traffic makes one synchronous atomic write per admitted job a
@@ -968,6 +1076,7 @@ let quotaAuthoritativeTarget = MISSING_QUOTA_TARGET;
 let quotaLastReadinessTarget = MISSING_QUOTA_TARGET;
 let quotaLastWriteCommitted = false;
 function quotaLicenseRef(licenseKey) {
+  if (/^h:[a-f0-9]{64}$/.test(String(licenseKey))) return String(licenseKey);
   return `h:${crypto.createHash('sha256').update(String(licenseKey)).digest('hex')}`;
 }
 
@@ -1475,7 +1584,9 @@ if (!quotaLoadBlocked) {
 // `requestStandard` is the client's downgrade-only hint (any-site solving). It
 // can force the standard tier but never the frontier one, so the worst a
 // hostile client achieves is spending its own cheap bucket.
-function chargeQuota(licenseKey, providerId, provider, requestStandard = false) {
+function chargeQuota(
+  licenseKey, providerId, provider, requestStandard = false, hasImages = false, hasPdfs = false
+) {
   if (!QUOTA_CONFIG_VALID || !modelConfigHealthy) {
     return { ok: false, status: 503, message: UNAVAILABLE };
   }
@@ -1521,7 +1632,10 @@ function chargeQuota(licenseKey, providerId, provider, requestStandard = false) 
     return { ok: false, status: 429, message: OVERLOADED };
   }
 
-  const route = routeForRequest(providerId, tier, false, false, routingState);
+  // Resolve the exact content route before touching durable counters. A
+  // document/image kill switch must reject admission without spending quota or
+  // creating an empty job that fails later in the background runner.
+  const route = routeForRequest(providerId, tier, hasImages, hasPdfs, routingState);
   if (!route.models.length) return { ok: false, status: 503, message: UNAVAILABLE };
 
   const previousQuota = quota;
@@ -1578,202 +1692,55 @@ function refundQuota(day, licenseKey, bucket) {
   return true;
 }
 
-/* --------------------------- license verify --------------------------- */
-// Delegate to the Cloudflare worker /verify. Fails CLOSED: without a positive
-// verdict we do not spend upstream tokens.
+/* ------------------------ entitlement verify -------------------------- */
+// Verify the license Worker's short-lived AI capability locally. The token is
+// purpose-bound and carries only a pseudonymous quota subject plus device id.
+const ENTITLEMENT_TOKEN = /^et1\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]+)$/;
+const ENTITLEMENT_TTL_MS = 10 * 60 * 1000;
+const ENTITLEMENT_CLOCK_SKEW_MS = 60 * 1000;
 
-// Short-lived cache of POSITIVE verdicts, keyed by license+device. A large-
-// attachment solve verifies twice (once in /ai/upload-ticket, again in
-// /ai/start → prepareChat), and rapid successive solves re-verify needlessly —
-// every verify is a round-trip to the CF worker from this box (GCP↔CF, up to a
-// second). Caching ONLY ok:true verdicts for a minute removes the redundant
-// hops. The one accepted risk is that a license revoked mid-window keeps
-// working for up to VERIFY_CACHE_TTL_MS; negative verdicts are never cached (a
-// renewed / just-fixed license must take effect immediately) and neither is
-// `_unreachable` (a transient network blip must never stick as a verdict).
-// Operators/tests may shorten the cache, but never extend the accepted
-// revocation window beyond the reviewed one-minute production ceiling.
-const VERIFY_CACHE_TTL_MS = Math.min(
-  60 * 1000,
-  Math.max(100, Number(env.PROXY_VERIFY_CACHE_TTL_MS) || 60 * 1000)
-);
-const MAX_VERIFY_CACHE = 5000;               // bounds the attacker-controlled license/device keyspace
-const verifyCache = new Map();               // `${licenseKey}|${deviceId}|${token hash}` -> { verdict, expiresAt }
-
-// Last-known-good store, consulted ONLY when /verify is unreachable (incident
-// 2026-07-14: Cloudflare answered 404 on /verify for ~20 min and every real
-// solve failed with UNAVAILABLE even though the licenses were fine). A key
-// that verified ok within the grace window keeps working through a verify
-// outage; a key that never verified on this box still fails closed. Accepted
-// risk: a license revoked mid-outage works for up to VERIFY_GRACE_TTL_MS —
-// bounded, logged, and strictly better than dropping every paying user.
-// Any explicit negative verdict evicts the grace entry immediately.
-const VERIFY_GRACE_TTL_MS = 10 * 60 * 1000;
-const verifyGrace = new Map();               // `${licenseKey}|${deviceId}` -> { verdict, expiresAt }
-const verifyPending = new Map();             // same key -> one shared authoritative lookup
-let verifyInFlight = 0;
-const verifyInFlightByIp = new Map();
-const verifyAttemptsByIp = new Map();
-
-function recentVerificationAttempts(ip, now = Date.now()) {
-  const cutoff = now - VERIFY_ATTEMPT_RATE_WINDOW_MS;
-  const recent = (verifyAttemptsByIp.get(ip) || []).filter((timestamp) => timestamp > cutoff);
-  if (recent.length) verifyAttemptsByIp.set(ip, recent);
-  else verifyAttemptsByIp.delete(ip);
-  return recent;
-}
-
-function reserveVerification(ip) {
-  const key = ip || 'unknown';
-  if (verifyInFlight >= MAX_VERIFY_IN_FLIGHT) {
-    return { err: { status: 503, message: OVERLOADED } };
+function verifyEntitlement(rawToken, now = Date.now()) {
+  const token = typeof rawToken === 'string' && rawToken.length <= 2048 ? rawToken : '';
+  const match = ENTITLEMENT_TOKEN.exec(token);
+  if (!match || !ENTITLEMENT_SECRET_VALID) return { ok: false, reason: 'bad_entitlement' };
+  let payloadBytes;
+  let signature;
+  try {
+    payloadBytes = Buffer.from(match[1], 'base64url');
+    signature = Buffer.from(match[2], 'base64url');
+  } catch {
+    return { ok: false, reason: 'bad_entitlement' };
   }
-  if (mapCount(verifyInFlightByIp, key) >= MAX_VERIFY_IN_FLIGHT_PER_IP) {
-    return { err: { status: 429, message: 'Слишком много проверок лицензии. Подождите минуту и попробуйте снова.' } };
+  if (payloadBytes.toString('base64url') !== match[1] ||
+      signature.toString('base64url') !== match[2] || signature.length !== 32) {
+    return { ok: false, reason: 'bad_entitlement' };
   }
-  const attempts = recentVerificationAttempts(key);
-  if (attempts.length >= VERIFY_ATTEMPT_RATE_LIMIT) {
-    return { err: { status: 429, message: 'Слишком много проверок лицензии. Подождите несколько минут и попробуйте снова.' } };
+  const expected = crypto.createHmac('sha256', ENTITLEMENT_SECRET)
+    .update(`et1.${match[1]}`).digest();
+  if (!crypto.timingSafeEqual(signature, expected)) return { ok: false, reason: 'bad_entitlement' };
+  let payload;
+  try { payload = JSON.parse(payloadBytes.toString('utf8')); }
+  catch { return { ok: false, reason: 'bad_entitlement' }; }
+  const issuedAt = Number(payload?.iat);
+  const expiresAt = Number(payload?.exp);
+  const current = Math.trunc(Number(now));
+  if (payload?.v !== 1 || payload?.p !== 'ai' ||
+      !/^h:[a-f0-9]{64}$/.test(payload?.l || '') ||
+      !normalizeDeviceId(payload?.d) ||
+      !Number.isSafeInteger(current) || !Number.isSafeInteger(issuedAt) ||
+      !Number.isSafeInteger(expiresAt) || issuedAt < 0 ||
+      expiresAt <= issuedAt || expiresAt > issuedAt + ENTITLEMENT_TTL_MS ||
+      issuedAt > current + ENTITLEMENT_CLOCK_SKEW_MS || expiresAt <= current ||
+      expiresAt > current + ENTITLEMENT_TTL_MS + ENTITLEMENT_CLOCK_SKEW_MS) {
+    return { ok: false, reason: expiresAt <= current ? 'expired_entitlement' : 'bad_entitlement' };
   }
-  attempts.push(Date.now());
-  verifyAttemptsByIp.set(key, attempts);
-  verifyInFlight += 1;
-  addMapCount(verifyInFlightByIp, key);
-  return { ip: key, released: false };
+  return {
+    ok: true,
+    licenseRef: payload.l,
+    deviceId: normalizeDeviceId(payload.d),
+    expiresAt
+  };
 }
-
-function releaseVerification(reservation) {
-  if (!reservation || reservation.released) return;
-  reservation.released = true;
-  verifyInFlight = Math.max(0, verifyInFlight - 1);
-  removeMapCount(verifyInFlightByIp, reservation.ip);
-}
-
-// POST a small JSON body over a FRESH TLS connection — `agent: false`, no
-// keep-alive pool. Deliberate, load-bearing (incident 2026-07-14): the shared
-// undici pool behind global fetch() held a poisoned keep-alive connection to
-// a Cloudflare edge that answered 404 for /verify for ~20 minutes, while
-// fresh connections from the same box (curl, a fresh node process) got 200
-// every time. Verify traffic is low (cached 60s per license) and the extra
-// handshake to CF is ~50 ms, so pooling buys nothing here — never "optimize"
-// this back to fetch()/keep-alive.
-function postJsonFresh(url, bodyObj, timeoutMs) {
-  return new Promise((resolve, reject) => {
-    const payload = Buffer.from(JSON.stringify(bodyObj));
-    // http: exists only for the local mock in tests — the production
-    // LICENSE_VERIFY_URL is always https. Neither module follows redirects,
-    // so this leg fails closed on a 3xx by construction.
-    const transport = url.startsWith('http:') ? http : https;
-    let response = null;
-    let settled = false;
-    // request.setTimeout (the `timeout` option) ultimately configures the
-    // SOCKET timeout, which Node documents as INACTIVITY — every byte received
-    // rearms it. A verifier dribbling one byte at a time therefore never trips
-    // it: a live probe returned after 14,024 ms under a 10,000 ms setting, and
-    // sustained dribbling can pin all MAX_VERIFY_IN_FLIGHT slots indefinitely.
-    // This independent timer is the actual complete-operation deadline, and it
-    // destroys the response too — destroying only the request leaves an
-    // in-flight response streaming.
-    const deadline = setTimeout(() => {
-      const error = new Error('verify deadline exceeded');
-      try { response?.destroy(error); } catch { /* already gone */ }
-      try { req.destroy(error); } catch { /* already gone */ }
-      fail(error);
-    }, timeoutMs);
-    deadline.unref?.();
-    const finish = (value) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      resolve(value);
-    };
-    const fail = (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(deadline);
-      reject(error);
-    };
-    const req = transport.request(url, {
-      method: 'POST',
-      agent: false,
-      headers: { 'Content-Type': 'application/json', 'Content-Length': payload.length, Connection: 'close' },
-      timeout: timeoutMs
-    }, (res) => {
-      response = res;
-      const chunks = [];
-      let total = 0;
-      res.on('data', (chunk) => {
-        total += chunk.length;
-        if (total > 64 * 1024) { res.destroy(new Error('verify response too large')); return; }
-        chunks.push(chunk);
-      });
-      res.on('end', () => finish({
-        status: res.statusCode || 0,
-        headers: res.headers,
-        text: Buffer.concat(chunks).toString('utf8')
-      }));
-      res.on('error', fail);
-    });
-    req.on('timeout', () => req.destroy(new Error('verify timeout')));
-    req.on('error', fail);
-    req.end(payload);
-  });
-}
-
-const VERIFY_UPSTREAM_ATTEMPTS = 2;      // one retry, covers a single-edge blip
-const VERIFY_UPSTREAM_RETRY_DELAY_MS = 400;
-
-async function verifyLicenseUpstream(licenseKey, deviceId, activationToken) {
-  // Ordinary license verdicts ride a 200. A 503/service_unavailable means the
-  // Worker could not consult its authoritative revocation/device registry;
-  // all other non-200s are worker/network infrastructure trouble. Neither is
-  // a negative verdict on the key. Each
-  // attempt opens a fresh connection (see postJsonFresh), so a retry cannot
-  // land on the same broken socket.
-  let authorityUnavailable = false;
-  for (let attempt = 1; attempt <= VERIFY_UPSTREAM_ATTEMPTS; attempt++) {
-    if (attempt > 1) await sleep(VERIFY_UPSTREAM_RETRY_DELAY_MS);
-    let r;
-    try {
-      r = await postJsonFresh(LICENSE_VERIFY_URL, {
-        key: licenseKey,
-        device_id: deviceId,
-        activation_token: activationToken
-      }, 10000);
-    } catch (e) {
-      console.error('verify unreachable', 'attempt', attempt, String(e));
-      continue;
-    }
-    if (r.status !== 200) {
-      try {
-        const failure = JSON.parse(r.text);
-        if (failure && failure.reason === 'service_unavailable') authorityUnavailable = true;
-      } catch { /* diagnostic body can be HTML/plain text */ }
-      // Log enough to tell a Cloudflare-edge failure (route miss, WAF) from a
-      // worker-produced error: ray id + server say who answered, the body
-      // snippet says why. A bare status once proved undiagnosable live.
-      const snippet = redactVerifyDiagnostic(r.text, licenseKey, deviceId).replace(/\s+/g, ' ').slice(0, 300);
-      console.error('verify http error', r.status, 'attempt', attempt,
-        'ray=' + (r.headers['cf-ray'] || '-'),
-        'server=' + (r.headers['server'] || '-'),
-        'body=' + JSON.stringify(snippet));
-      continue;
-    }
-    let j = null;
-    try { j = JSON.parse(r.text); } catch { /* malformed */ }
-    if (j && typeof j === 'object' && !Array.isArray(j) && typeof j.ok === 'boolean') {
-      // Consumers need only the boolean verdict and bounded reason. Do not
-      // retain arbitrary authority-controlled fields in two 5,000-entry
-      // in-memory caches.
-      return j.ok === true
-        ? { ok: true }
-        : { ok: false, reason: typeof j.reason === 'string' ? j.reason.slice(0, 64) : '' };
-    }
-    console.error('verify malformed body', 'attempt', attempt);
-  }
-  return { ok: false, reason: authorityUnavailable ? 'service_unavailable' : '_unreachable' };
-}
-
 async function readResponseTextBounded(response, maxBytes) {
   if (!response?.body) return '';
   const chunks = [];
@@ -1793,82 +1760,6 @@ async function readResponseTextBounded(response, maxBytes) {
     }
   } catch { return ''; }
   return Buffer.concat(chunks, retained).toString('utf8');
-}
-
-// Bound the cache when it hits its cap: drop EXPIRED entries first, then the
-// oldest-inserted, until under cap. Better than a blunt clear() that would
-// throw away every live verdict (re-hammering /verify) on one burst of new
-// license/device pairs.
-function evictVerifyCache(cache = verifyCache) {
-  const now = Date.now();
-  for (const [key, entry] of cache) {
-    if (entry.expiresAt <= now) cache.delete(key);
-  }
-  while (cache.size >= MAX_VERIFY_CACHE) {
-    const oldest = cache.keys().next().value;
-    if (oldest === undefined) break;
-    cache.delete(oldest);
-  }
-}
-
-async function verifyLicenseFresh(licenseKey, deviceId, activationToken, ip, cacheKey) {
-  const reservation = reserveVerification(ip);
-  if (reservation.err) {
-    return {
-      ok: false,
-      reason: '_verification_limited',
-      status: reservation.err.status,
-      message: reservation.err.message
-    };
-  }
-  let verdict;
-  try { verdict = await verifyLicenseUpstream(licenseKey, deviceId, activationToken); }
-  finally { releaseVerification(reservation); }
-  if (verdict && verdict.ok === true) {
-    if (verifyCache.size >= MAX_VERIFY_CACHE) evictVerifyCache();
-    if (verifyGrace.size >= MAX_VERIFY_CACHE) evictVerifyCache(verifyGrace);
-    // delete-then-set so a refreshed key lands at the most-recent position,
-    // keeping Map insertion order aligned with recency for the eviction above.
-    verifyCache.delete(cacheKey);
-    verifyCache.set(cacheKey, { verdict, expiresAt: Date.now() + VERIFY_CACHE_TTL_MS });
-    verifyGrace.delete(cacheKey);
-    verifyGrace.set(cacheKey, { verdict, expiresAt: Date.now() + VERIFY_GRACE_TTL_MS });
-  } else if (verdict && (verdict.reason === '_unreachable' || verdict.reason === 'service_unavailable')) {
-    // /verify itself is down or unreachable — not a verdict on the key. Fall
-    // back to the last-known-good verdict inside the grace window so a
-    // worker/edge outage doesn't fail every active user (see verifyGrace).
-    const grace = verifyGrace.get(cacheKey);
-    if (grace && grace.expiresAt > Date.now()) {
-      console.warn('verify unreachable — serving last-known-good verdict within grace window');
-      return grace.verdict;
-    }
-    verifyCache.delete(cacheKey);
-  } else {
-    // An explicit negative verdict: evict everywhere. A revoked/expired key
-    // must not be resurrected by the grace store during a later outage.
-    verifyCache.delete(cacheKey);
-    verifyGrace.delete(cacheKey);
-  }
-  return verdict;
-}
-
-async function verifyLicense(licenseKey, deviceId, activationToken, ip) {
-  const tokenHash = sha256Hex(activationToken);
-  const cacheKey = `${licenseKey}|${deviceId}|${tokenHash}`;
-  const cached = verifyCache.get(cacheKey);
-  if (cached && cached.expiresAt > Date.now()) return cached.verdict;
-
-  // Concurrent upload-ticket/start calls for the same license+device must not
-  // stampede the authority or let older and newer verdicts race to repopulate
-  // the positive/grace caches in reverse order.
-  const existing = verifyPending.get(cacheKey);
-  if (existing) return existing;
-  const pending = verifyLicenseFresh(licenseKey, deviceId, activationToken, ip, cacheKey)
-    .finally(() => {
-      if (verifyPending.get(cacheKey) === pending) verifyPending.delete(cacheKey);
-    });
-  verifyPending.set(cacheKey, pending);
-  return pending;
 }
 
 /* ------------------------- message sanitizer -------------------------- */
@@ -1941,10 +1832,10 @@ function hasPdfParts(messages) {
 const blobs = new Map();
 let totalBlobChars = 0;
 let reservedBlobChars = 0;
-// Short-lived, license-verified capabilities for /ai/blob. A blob upload happens
+// Short-lived, entitlement-verified capabilities for /ai/blob. A blob upload happens
 // before /ai/start can charge a quota, so accepting anonymous chunks turned this
 // bounded memory store into a public denial-of-service primitive.
-const uploadTickets = new Map(); // token -> { blobId, licenseKey, deviceId, activationHash, ip, declaredChars, chars, createdAt, expiresAt, lastAccess }
+const uploadTickets = new Map(); // token -> { blobId, licenseKey, deviceId, ip, declaredChars, chars, createdAt, expiresAt, lastAccess }
 const uploadTicketStartsByLicense = new Map();
 const uploadTicketStartsByIp = new Map();
 
@@ -2005,33 +1896,14 @@ async function handleUploadTicket(req, res, rawBody) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     return sendErr(res, 400, 'Некорректный запрос.');
   }
-  const licenseKey = normalizeKey(typeof body.license_key === 'string' ? body.license_key : '');
-  const deviceId = normalizeDeviceId(body.device_id);
-  const activationToken = typeof body.activation_token === 'string' && ACTIVATION_TOKEN.test(body.activation_token)
-    ? body.activation_token
-    : '';
+  const entitlement = verifyEntitlement(body.entitlement_token);
+  const licenseKey = entitlement.ok ? entitlement.licenseRef : '';
+  const deviceId = entitlement.ok ? entitlement.deviceId : '';
   const suppliedSize = Number(body.size);
-  // Old clients did not declare size. Reserve the full per-blob ceiling for
-  // them so compatibility cannot bypass admission control.
   const declaredChars = Number.isInteger(suppliedSize) && suppliedSize >= 1 && suppliedSize <= MAX_BLOB_CHARS
     ? suppliedSize : MAX_BLOB_CHARS;
-  if (!licenseKey) return sendErr(res, 403, NEED_LICENSE);
-  if (!deviceId) return sendErr(res, 403, NEED_DEVICE_ID);
-  if (!activationToken) return sendErr(res, 403, NEED_DEVICE_ID);
-
-  const verdict = await verifyLicense(licenseKey, deviceId, activationToken, requestIp(req));
-  // The client may disappear while the authoritative lookup is in flight. A
-  // capability whose response can no longer be delivered is unreachable and
-  // must not reserve upload memory for its full TTL.
-  if (responseGone(res)) return;
+  if (!entitlement.ok) return sendErr(res, 403, NEED_LICENSE);
   if (shutdownStarted) return sendErr(res, 503, OVERLOADED, { 'Connection': 'close' });
-  if (verdict?.ok !== true) {
-    if (verdict?.reason === '_verification_limited') return sendErr(res, verdict.status, verdict.message);
-    if (verdict?.reason === '_unreachable' || verdict?.reason === 'service_unavailable') {
-      return sendErr(res, 503, UNAVAILABLE);
-    }
-    return sendErr(res, 403, licenseErrorMessage(verdict?.reason));
-  }
 
   let activeForDevice = 0;
   let activeForLicense = 0;
@@ -2087,7 +1959,7 @@ async function handleUploadTicket(req, res, rawBody) {
   const uploadToken = crypto.randomBytes(32).toString('base64url');
   const blobId = crypto.randomUUID();
   uploadTickets.set(uploadToken, {
-    blobId, licenseKey, deviceId, activationHash: sha256Hex(activationToken), ip,
+    blobId, licenseKey, deviceId, ip,
     declaredChars, chars: 0, createdAt: now,
     expiresAt: Math.min(now + BLOB_TTL_MS, now + UPLOAD_ABSOLUTE_TTL_MS),
     progressDeadline: now + UPLOAD_FIRST_CHUNK_DEADLINE_MS,
@@ -2250,8 +2122,8 @@ function handleBlob(req, res, rawBody) {
 
 /* --------------------- shared request preparation --------------------- */
 // Everything /ai/chat and /ai/start have in common: parse, validate and verify
-// the license. Job slots and quota are reserved only AFTER this returns, so an
-// anonymous slow/invalid verification cannot consume scarce active-job slots.
+// the entitlement. Job slots and quota are reserved only AFTER this returns,
+// so an anonymous invalid request cannot consume scarce active-job slots.
 
 async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {}) {
   if (!UPSTREAM_KEY) { console.error('AI_PROXY_API_KEY not set'); return { err: { status: 503, message: UNAVAILABLE } }; }
@@ -2267,29 +2139,13 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
   if (!provider) return { err: { status: 400, message: 'Неизвестный провайдер.' } };
   const providerId = body.provider;
 
-  const licenseKey = normalizeKey(typeof body.license_key === 'string' ? body.license_key : '');
-  const deviceId = normalizeDeviceId(body.device_id);
-  const activationToken = typeof body.activation_token === 'string' && ACTIVATION_TOKEN.test(body.activation_token)
-    ? body.activation_token
-    : '';
+  const entitlement = verifyEntitlement(body.entitlement_token);
+  const licenseKey = entitlement.ok ? entitlement.licenseRef : '';
+  const deviceId = entitlement.ok ? entitlement.deviceId : '';
   const telemetryOptIn = body.telemetry_opt_in === true;
-  if (!licenseKey) return { err: { status: 403, message: NEED_LICENSE } };
-  if (!deviceId) return { err: { status: 403, message: NEED_DEVICE_ID } };
-  if (!activationToken) return { err: { status: 403, message: NEED_DEVICE_ID } };
-
-  const verdict = await verifyLicense(licenseKey, deviceId, activationToken, requestIp(req));
-  if (responseGone(res)) return { aborted: true };
+  if (!entitlement.ok) return { err: { status: 403, message: NEED_LICENSE } };
   if (shutdownStarted) {
     return { err: { status: 503, message: OVERLOADED, headers: { 'Connection': 'close' } } };
-  }
-  if (verdict?.ok !== true) {
-    if (verdict?.reason === '_verification_limited') {
-      return { err: { status: verdict.status, message: verdict.message } };
-    }
-    if (verdict?.reason === '_unreachable' || verdict?.reason === 'service_unavailable') {
-      return { err: { status: 503, message: UNAVAILABLE } };
-    }
-    return { err: { status: 403, message: licenseErrorMessage(verdict?.reason) } };
   }
 
   // /ai/start retries must be recognized before consuming a one-shot
@@ -2297,9 +2153,7 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
   // plus the authenticated principal; an identical retry can therefore recover
   // the original job even though its upload was deliberately freed.
   const idempotencyKey = readIdempotencyKey(body);
-  const principal = sha256Hex(
-    `${licenseKey}\u0000${deviceId}\u0000${sha256Hex(activationToken)}`
-  );
+  const principal = sha256Hex(`${licenseKey}\u0000${deviceId}`);
   const requestDigest = sha256Hex(rawBody);
   if (checkStartReplay && idempotencyKey) {
     pruneStartIdempotency(Date.now());
@@ -2332,8 +2186,7 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
     if (!blob || !blob.done) {
       return { err: { status: 410, message: 'Загруженное вложение устарело. Пришлите его ещё раз.' } };
     }
-    if (blob.licenseKey !== licenseKey || blob.deviceId !== deviceId ||
-        blob.activationHash !== sha256Hex(activationToken)) {
+    if (blob.licenseKey !== licenseKey || blob.deviceId !== deviceId) {
       return { err: { status: 403, message: 'Загрузка не принадлежит этому устройству. Пришлите вложение ещё раз.' } };
     }
     // Bind the recorded start to the immutable completed upload as well as its
@@ -2368,7 +2221,7 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
 
   return {
     provider, providerId, body: requestOptions, messages,
-    hasImages, hasPdfs, licenseKey, deviceId, activationToken, telemetryOptIn,
+    hasImages, hasPdfs, licenseKey, deviceId, telemetryOptIn,
     // Surfaced separately because `body` above is deliberately reduced to the
     // two whitelisted upstream options — the raw parsed request is not kept.
     idempotencyKey, principal, requestDigest, blobId, blobDigest
@@ -2378,7 +2231,7 @@ async function prepareChat(req, res, rawBody, { checkStartReplay = false } = {})
 /* ------------------------ upstream connection ------------------------- */
 // Open the 302.AI stream, walking the model fallback chain. Returns
 // { upstream } (a fetch Response with .ok) or { err: { status, message } }.
-// Shared by the legacy streaming route and the poll-job runner.
+// Shared by the diagnostic streaming route and the poll-job runner.
 
 // Two solves fired at once (each a PDF-sized body) can make the OUTBOUND
 // fetch to 302.AI itself throw — not a 4xx/5xx from 302.AI, but a transport-
@@ -2503,7 +2356,7 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
           return { err: { status: 499, message: UNAVAILABLE, refundable: !providerMayHaveRun } };
         }
         console.error('upstream fetch failed', usedModel, 'attempt', attempt + 1,
-          'pre_dispatch=' + retryable, String(e));
+          'pre_dispatch=' + retryable, safeErrorCode(e));
         if (!retryable) break;
       }
     }
@@ -2559,7 +2412,7 @@ const pollsByIp = new Map();
 
 // Admission is intentionally plain synchronous state: Node cannot interleave
 // another request between the checks and increments below. Callers reach this
-// only after license verification and perform no await before job registration.
+// only after local entitlement verification and perform no await before job registration.
 let activeJobSlots = 0;
 const activeJobsByLicense = new Map();
 const activeJobsByDevice = new Map();
@@ -2671,7 +2524,8 @@ function admitJobStart(reservation, prep) {
   // Quota and sliding-window admission are committed together with no await,
   // so a rejected burst neither slips through nor consumes extra daily quota.
   const q = chargeQuota(
-    prep.licenseKey, prep.providerId, prep.provider, prep.body?.tier === 'standard'
+    prep.licenseKey, prep.providerId, prep.provider,
+    prep.body?.tier === 'standard', prep.hasImages, prep.hasPdfs
   );
   if (!q.ok) return { err: { status: q.status || 503, message: q.message } };
   const route = routeForRequest(
@@ -2690,7 +2544,8 @@ function admitJobStart(reservation, prep) {
     tier: q.tier,
     configRevision: q.revision,
     route,
-    rates: q.routingState.config.rates
+    rates: q.routingState.config.rates,
+    telemetryEnabled: q.routingState.config.features.telemetry === true
   };
 }
 
@@ -2760,11 +2615,6 @@ setInterval(() => {
   for (const [key] of uploadTicketStartsByIp) {
     recentStarts(uploadTicketStartsByIp, key, now, UPLOAD_TICKET_RATE_WINDOW_MS);
   }
-  // Expired positive-verdict cache entries (60s TTL) — same keyspace bound.
-  for (const [key, entry] of verifyCache) {
-    if (entry.expiresAt <= now) verifyCache.delete(key);
-  }
-  for (const [ip] of verifyAttemptsByIp) recentVerificationAttempts(ip, now);
 }, JOB_GC_INTERVAL_MS).unref();
 
 /* -------------------------- usage reporting --------------------------- */
@@ -2780,6 +2630,10 @@ const USAGE_RATES = [
   [/^glm-5\.3-flash$/i, { in: 0.075 / 1e6, out: 0.25 / 1e6 }],
   [/^qwen/i,        { in: 0.32 / 1e6, out: 1.28 / 1e6 }],
   [/^deepseek/i,    { in: 0.20 / 1e6, out: 0.40 / 1e6 }],
+  // -lite first: it is the PDF chain's lead model and an order of magnitude
+  // cheaper on output than full 2.5 Flash, so the broader pattern must not
+  // claim it.
+  [/^gemini-2\.5-flash-lite/i, { in: 0.10 / 1e6, out: 0.40 / 1e6 }],
   [/^gemini-2\.5/i, { in: 0.30 / 1e6, out: 2.50 / 1e6 }],
   [/^gemini/i,      { in: 0.10 / 1e6, out: 0.40 / 1e6 }]
 ];
@@ -2902,10 +2756,10 @@ function reportJobUsage(job) {
       // it immediately so a buggy/hostile dependency cannot retain one socket
       // per opt-in job forever after sending only response headers.
       try { await response.body?.cancel(); } catch { /* already closed */ }
-    }).catch((e) => console.error('usage report failed', String(e && e.message || e)))
+    }).catch((e) => console.error('usage report failed', safeErrorCode(e)))
       .finally(() => clearTimeout(timer));
   } catch (e) {
-    console.error('usage report failed', String(e));
+    console.error('usage report failed', safeErrorCode(e));
   }
 }
 
@@ -2992,7 +2846,7 @@ async function runJob(job, provider, body, messages, hasImages, hasPdfs) {
     // available to the poller, but must never be presented or saved as a
     // complete answer.
     if (!job.ctrl.signal.aborted && !job.limitError) {
-      console.error('job stream broke', String(e));
+      console.error('job stream broke', safeErrorCode(e));
       job.error = job.text
         ? `${provider.name}: соединение с ИИ-сервисом прервалось, ответ получен не полностью. Попробуйте ещё раз.`
         : `${provider.name}: не удалось получить ответ. Попробуйте ещё раз.`;
@@ -3076,7 +2930,7 @@ async function handleAiStart(req, res, rawBody) {
     });
   }
 
-  // prepareChat performs the replay lookup only after authoritative license
+  // prepareChat performs the replay lookup only after local entitlement
   // verification, so an unauthenticated caller cannot probe which keys exist.
   const idempotencyKey = prep.idempotencyKey;
   const principal = prep.principal;
@@ -3105,7 +2959,10 @@ async function handleAiStart(req, res, rawBody) {
       // resurrectable by a later identical retry.
       idempotencyKey,
       quotaDay: admission.quotaDay,
-      telemetryOptIn: prep.telemetryOptIn,
+      // Both parties must allow telemetry: the user opted in AND the operator
+      // has not thrown the central kill switch. This snapshot is from the same
+      // immutable config revision that admitted and routed the job.
+      telemetryOptIn: prep.telemetryOptIn && admission.telemetryEnabled,
       // Per-phase timing marks for the usage report (see reportJobUsage). This
       // box is the only place that measures where the model time actually goes,
       // so it can answer "where does the average solve sit" without guesswork.
@@ -3139,7 +2996,7 @@ async function handleAiStart(req, res, rawBody) {
       if (runnerStarted) return;
       runnerStarted = true;
       runJob(job, admission.route, prep.body, prep.messages, prep.hasImages, prep.hasPdfs).catch((e) => {
-        console.error('job runner crashed', e && e.stack || String(e));
+        console.error('job runner crashed', safeErrorCode(e));
         job.error = job.error || UNAVAILABLE;
         job.done = true;
         releaseJobAccounting(job.accounting);
@@ -3318,7 +3175,7 @@ function handleAiCancel(req, res, rawBody) {
   sendJson(res, 200, { ok: true });
 }
 
-/* ---------------------- /ai/chat (legacy streaming) ------------------- */
+/* -------------------- /ai/chat (diagnostic streaming) ----------------- */
 // Byte-for-byte SSE passthrough. NOT used by the extension anymore (RU DPI
 // kills long-lived connections to this SNI) — kept for curl diagnostics.
 
@@ -3396,7 +3253,7 @@ async function handleAiChat(req, res, rawBody) {
       res.write(chunk); // capped at 2 MB, so diagnostics cannot build an unbounded socket buffer
     }
   } catch (e) {
-    if (!ctrl.signal.aborted) console.error('stream pipe failed', String(e));
+    if (!ctrl.signal.aborted) console.error('stream pipe failed', safeErrorCode(e));
     if (!res.headersSent) sendErr(res, 502, limitError || UNAVAILABLE);
   } finally {
     clearTimeout(connectTimer);
@@ -3445,7 +3302,7 @@ function handleStreamTest(req, res, url) {
 
 // Collect a bounded request body, then hand off. Shared by all POST routes.
 // Accounting stays reserved through the async handler because parsing and
-// license verification still retain the decoded string/object after `end`.
+// entitlement verification still retains the decoded string/object after `end`.
 let bodyRequestsInFlight = 0;
 let bufferedBodyBytes = 0;
 const bodyRequestsByIp = new Map();
@@ -3541,7 +3398,7 @@ function withBody(req, res, handler, maxBytes = MAX_BODY_BYTES) {
     }
     chunks.length = 0;
     Promise.resolve(handler(rawBody))
-      .catch((e) => { console.error('handler unexpected', e && e.stack || String(e)); if (!res.headersSent) sendErr(res, 503, UNAVAILABLE); })
+      .catch((e) => { console.error('handler unexpected', safeErrorCode(e)); if (!res.headersSent) sendErr(res, 503, UNAVAILABLE); })
       .finally(release);
   });
   // A prematurely closed request is terminal. Mark it before releasing the
@@ -3563,6 +3420,22 @@ const server = http.createServer((req, res) => {
   try { url = new URL(req.url || '/', 'http://localhost'); }
   catch { return sendErr(res, 400, 'Некорректный запрос.'); }
   const pathName = url.pathname;
+
+  if (pathName === '/processors' && req.method === 'GET') {
+    return sendJson(res, 200, {
+      ok: true,
+      revision: modelState.revision,
+      updated_at: modelState.updated_at,
+      gateway: { name: '302.AI', privacy_url: 'https://price.302.ai/en/privacy/' },
+      processors: publicProcessors()
+    }, { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+  }
+  if (pathName === '/public/runtime-config' && req.method === 'GET') {
+    const envelope = signedRuntimeConfig();
+    return envelope
+      ? sendJson(res, 200, envelope, { 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' })
+      : sendJson(res, 503, { ok: false, reason: 'runtime_signing_unavailable' }, { 'Cache-Control': 'no-store' });
+  }
 
   if (pathName === '/admin/model-config') {
     const corsHeaders = modelAdminCors(req);
@@ -3599,6 +3472,8 @@ const server = http.createServer((req, res) => {
   if (pathName === '/ready') {
     const checks = {
       upstream_key: Boolean(UPSTREAM_KEY),
+      entitlement_secret: ENTITLEMENT_SECRET_VALID,
+      runtime_signing_key: Boolean(getRuntimeSigningKey()),
       quota_config: QUOTA_CONFIG_VALID,
       quota_store: verifyQuotaPersistenceForReadiness(),
       model_config: modelConfigHealthy
@@ -3632,7 +3507,7 @@ server.maxHeadersCount = 64;
 server.maxConnections = 128;
 
 server.listen(PORT, HOST, () => {
-  console.log(`smesh-proxy listening on ${HOST}:${PORT} → upstream ${upstreamUrl()} · verify ${LICENSE_VERIFY_URL}`);
+  console.log(`smesh-proxy listening on ${HOST}:${PORT} → upstream ${upstreamUrl()} · entitlement local`);
 });
 
 function shutdown(signal) {

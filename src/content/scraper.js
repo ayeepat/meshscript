@@ -430,12 +430,13 @@ function scanFromText() {
  * authenticated school.mos.ru session, so we can find those materials.
  *
  * Division of labour (this matters for MV3):
- *  - The content script only DISCOVERS the file URLs. Mesh is an SPA, so the
+ *  - The content script discovers the file URLs and immediately passes a
+ *    one-time token to the service worker for any cross-origin download. Mesh is an SPA, so the
  *    materials live behind its family API; we hit that API here because it is
  *    SAME-ORIGIN (school.mos.ru) and so carries the page's auth cookies, plus
  *    we can read the auth token from the page's localStorage for the header.
- *  - The actual file DOWNLOADS happen in the service worker (see
- *    DOWNLOAD_FILES), NOT here. In MV3 a content-script fetch is bound by the
+ *  - Cross-origin file downloads happen in the service worker (see
+ *    DOWNLOAD_FILES). In MV3 a content-script fetch is bound by the
  *    page's CORS and does NOT get the extension's host_permissions, so a
  *    cross-origin file (e.g. uchebnik.mos.ru) would be blocked here. The
  *    service worker DOES get host_permissions and can fetch it.
@@ -836,7 +837,7 @@ async function resolveStudentId(headers) {
       const own = cleanStudentId(j?.profile?.id ?? j?.id ?? j?.contingent_guid);
       if (own) direct.add(own);
       tried[tried.length - 1].keys = j && typeof j === 'object' ? Object.keys(j) : typeof j;
-    } catch (e) { tried.push({ url, error: String(e) }); }
+    } catch (e) { tried.push({ url, error: e?.name || 'Error' }); }
   }
   const candidates = listed.size ? [...listed] : [...direct];
   if (candidates.length === 1) return { id: candidates[0], source: listed.size ? 'single_student_from_api' : 'single_profile_from_api', debug: tried };
@@ -1199,10 +1200,10 @@ async function fetchInlineFile(url) {
     // Same-origin inline downloads do not need redirects. Rejecting one avoids
     // forwarding diary cookies to a target selected by an attachment response.
     const res = await fetch(safe.href, { credentials: 'include', redirect: 'error', signal: ctrl.signal });
-    if (!res.ok) { dbg('[СМЭШ AI] cs-download http', res.status, url); return null; }
+    if (!res.ok) { dbg('[СМЭШ AI] cs-download http', res.status); return null; }
     const ct = (res.headers.get('content-type') || '').split(';')[0].toLowerCase();
     if (ct.includes('text/html') || ct.includes('text/xml')) {
-      dbg('[СМЭШ AI] cs-download got HTML (auth redirect?)', url);
+      dbg('[СМЭШ AI] cs-download got HTML (auth redirect?)');
       return { __auth: true };
     }
     const name = fileNameFromUrl(safe.href);
@@ -1211,30 +1212,53 @@ async function fetchInlineFile(url) {
     // base64 expansion the licensed proxy has only 9 MB for its messages blob.
     const maxBytes = isAudioAttachment(name, mimeType) ? MAX_AUDIO_UPLOAD_BYTES : MAX_STANDARD_UPLOAD_BYTES;
     const bytes = await readBoundedBody(res, maxBytes, ctrl);
-    if (!bytes) { dbg('[СМЭШ AI] cs-download size limit skip', url); return null; }
-    if (!bytes.byteLength) { dbg('[СМЭШ AI] cs-download empty file skip', url); return null; }
+    if (!bytes) { dbg('[СМЭШ AI] cs-download size limit skip'); return null; }
+    if (!bytes.byteLength) { dbg('[СМЭШ AI] cs-download empty file skip'); return null; }
     return {
       mimeType,
       dataBase64: bytesToBase64(bytes),
       name
     };
-  } catch (e) { dbg('[СМЭШ AI] cs-download exception', String(e), url); return null; }
+  } catch (e) { dbg('[СМЭШ AI] cs-download exception', e?.name || 'Error'); return null; }
   finally {
     clearTimeout(timer);
     ctrl.abort();
   }
 }
 
+/** Bind one bearer-bearing download to a single-use service-worker action. */
+async function sendAttachmentDownload(payload) {
+  const grant = await chrome.runtime.sendMessage({
+    type: 'GET_ACTION_TOKEN',
+    action: 'DOWNLOAD_FILES'
+  });
+  if (!grant?.ok || typeof grant.token !== 'string') return null;
+  return chrome.runtime.sendMessage({
+    type: 'DOWNLOAD_FILES',
+    payload,
+    token: grant.token
+  });
+}
+
+async function attachmentFeatureEnabled() {
+  try {
+    const response = await chrome.runtime.sendMessage({ type: 'GET_RUNTIME_CONFIG' });
+    return response?.ok === true && response.config?.features?.mesh_attachments !== false;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Discover a homework's attachment(s) and download the SAME-ORIGIN ones right
  * here (the content script carries the page's real session, so the download
- * doesn't bounce to the auth page). Cross-origin URLs (e.g. uchebnik.mos.ru) are
- * returned for the service worker to fetch with host_permissions.
+ * doesn't bounce to the auth page). Cross-origin URLs are handed directly to
+ * the service worker with a freshly read token. The popup receives files and
+ * candidate labels, never the token or auth headers.
  *
- * Returns a `stage` so failures are VISIBLE instead of silently falling back to
- * manual upload. `files` are already-inlined same-origin attachments; `urls` are
- * leftover cross-origin ones for the service worker.
- * @returns {Promise<{ok:boolean, files:object[], urls:string[], candidates:object[], token:string|null, headers:object, stage:string, status?:number}>}
+ * Returns a `stage` so failures are visible instead of silently falling back to
+ * manual upload.
+ * @returns {Promise<{ok:boolean, files:object[], candidates:object[], stage:string, status?:number}>}
  */
 async function listMaterialUrls(
   lessonId,
@@ -1243,10 +1267,14 @@ async function listMaterialUrls(
   rowToken,
   expectedPrincipal,
   expectedPrincipalError,
+  scanId,
 ) {
   // Check before even reading the bearer token. The popup card is a snapshot;
   // a same-document account/child switch must make it powerless.
   assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
+  if (!(await attachmentFeatureEnabled())) {
+    return { ok: false, files: [], candidates: [], stage: 'disabled' };
+  }
   const token = findAuthToken();
   const headers = meshHeaders(token);
   const log = (stage, extra) => dbg('[СМЭШ AI] auto-fetch:', stage, extra ?? '');
@@ -1266,18 +1294,18 @@ async function listMaterialUrls(
         const ambiguous = !!student.error;
         const studentStage = ambiguous ? 'ambiguous_student' : 'no_student_id';
         log(studentStage, student.error);
-        return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: studentStage, error: student.error };
+        return { ok: false, files: [], candidates: [], stage: studentStage, error: student.error };
       }
       const studentId = student.id;
       const apiUrl = LESSON_API(lessonId, studentId, personId);
-      log('request', { lessonId, studentId, personId, apiUrl });
+      log('request');
       const { res, json } = await fetchMeshJson(
         apiUrl, { credentials: 'include', headers }, MESH_LESSON_JSON_MAX_BYTES
       );
       assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
       if (!res.ok) {
         log('api_error', res.status);
-        return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: 'api_error', status: res.status };
+        return { ok: false, files: [], candidates: [], stage: 'api_error', status: res.status };
       }
       const matched = urlsForHomework(json, taskText, homeworkItemId);
       urls = matched.urls.slice(0, 5);
@@ -1285,8 +1313,8 @@ async function listMaterialUrls(
       stage = urls.length ? 'found_api' : 'no_urls';
     } catch (e) {
       if (e?.code === HOMEWORK_CONTEXT_CHANGED) throw e;
-      log('exception', String(e));
-      return { ok: false, files: [], urls: [], candidates: [], token, headers, stage: 'exception' };
+      log('exception', e?.name || 'Error');
+      return { ok: false, files: [], candidates: [], stage: 'exception' };
     }
   }
 
@@ -1309,7 +1337,7 @@ async function listMaterialUrls(
     assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
     const why = !lessonId ? 'no_lesson_id' : !token ? 'no_token' : 'no_urls';
     log(why);
-    return { ok: false, files: [], urls: [], candidates, token, headers, stage: why };
+    return { ok: false, files: [], candidates, stage: why };
   }
 
   // Download same-origin attachments inline (real cookies); leave cross-origin
@@ -1325,14 +1353,45 @@ async function listMaterialUrls(
     if (f?.__auth) sawAuth = true;
     else if (f) files.push(f);
   }
-  if (!files.length && !crossOrigin.length) {
+  if (crossOrigin.length && token) {
+    const downloaded = await sendAttachmentDownload({
+      urls: crossOrigin,
+      token,
+      scanId,
+      principal: expectedPrincipal,
+      principalError: expectedPrincipalError,
+      rowToken
+    });
     assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
-    log(sawAuth ? 'auth_redirect' : 'download_failed', urls);
-    return { ok: false, files: [], urls: [], candidates, token, headers, stage: sawAuth ? 'auth_redirect' : 'download_failed' };
+    if (downloaded?.ok && Array.isArray(downloaded.files)) files.push(...downloaded.files);
+  }
+  if (!files.length) {
+    assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
+    log(sawAuth ? 'auth_redirect' : 'download_failed', { urlCount: urls.length });
+    return { ok: false, files: [], candidates, stage: sawAuth ? 'auth_redirect' : 'download_failed' };
   }
   assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
-  log('ok', { files: files.map((f) => f.name), crossOrigin });
-  return { ok: true, files, urls: crossOrigin, candidates, token, headers, stage };
+  log('ok', { fileCount: files.length, crossOriginCount: crossOrigin.length });
+  return { ok: true, files, candidates, stage };
+}
+
+async function downloadMaterialCandidate(url, rowToken, expectedPrincipal, expectedPrincipalError, scanId) {
+  assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
+  if (!(await attachmentFeatureEnabled())) {
+    return { ok: false, files: [], stage: 'disabled' };
+  }
+  const token = findAuthToken();
+  if (!token) return { ok: false, files: [], stage: 'no_token' };
+  const downloaded = await sendAttachmentDownload({
+    urls: [url], token, scanId,
+    principal: expectedPrincipal,
+    principalError: expectedPrincipalError,
+    rowToken
+  });
+  assertHomeworkContext(expectedPrincipal, expectedPrincipalError, rowToken);
+  return downloaded?.ok
+    ? { ok: true, files: downloaded.files || [] }
+    : { ok: false, files: [], stage: 'download_failed' };
 }
 
 /**
@@ -4462,6 +4521,7 @@ if (!window.__smeshListenerAdded) {
           msg.rowToken,
           msg.principal,
           msg.principalError,
+          msg.scanId,
         )
           .then((r) => sendResponse(r))
           .catch((e) => sendResponse({
@@ -4470,9 +4530,19 @@ if (!window.__smeshListenerAdded) {
             urls: [],
             files: [],
             candidates: [],
-            token: null,
-            headers: null,
             stage: e?.code === HOMEWORK_CONTEXT_CHANGED ? 'binding_changed' : 'exception',
+          }));
+        return true;
+      }
+      if (msg && msg.type === 'MESH_DOWNLOAD_CANDIDATE') {
+        downloadMaterialCandidate(
+          msg.url, msg.rowToken, msg.principal, msg.principalError, msg.scanId
+        )
+          .then((result) => sendResponse(result))
+          .catch((e) => sendResponse({
+            ok: false,
+            files: [],
+            stage: e?.code === HOMEWORK_CONTEXT_CHANGED ? 'binding_changed' : 'exception'
           }));
         return true;
       }

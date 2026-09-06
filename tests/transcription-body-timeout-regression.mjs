@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 
 const store = {
   groqApiKey: 'gsk_test_key',
-  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
+  aiConsent: {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }
 };
 const readStore = (keys) => {
   if (Array.isArray(keys)) return Object.fromEntries(keys.map((key) => [key, store[key]]));

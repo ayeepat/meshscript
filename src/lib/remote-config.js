@@ -25,6 +25,17 @@ const NOTICE_ORIGINS = new Set([
   'https://www.smeshai.xyz',
   'https://chromewebstore.google.com'
 ]);
+const FEATURE_IDS = [
+  'ai_text', 'ai_images', 'ai_documents', 'mesh_attachments',
+  'autofill', 'other_sites', 'telemetry', 'gdz'
+];
+// These are remote KILL switches, so their resting state is on: a student
+// offline, behind a blocked config host, or on a build predating a new switch
+// keeps every shipped capability. Only an authentic signed `false` takes one
+// down. The VPS stays authoritative for AI admission — it re-checks each job
+// against the same switches — so an unreachable config host cannot be used to
+// re-enable something the operator disabled server-side.
+const defaultFeatures = () => Object.fromEntries(FEATURE_IDS.map((id) => [id, true]));
 
 // Finite policy, deliberately duplicated in the classic content script as a
 // second trust-boundary check. Remote config may select a pre-reviewed DOM path;
@@ -44,6 +55,7 @@ function emptyConfig() {
     homeworkAnchorSelector: null,
     minExtensionVersion: null,
     notice: null,
+    features: defaultFeatures(),
     fetchedAt: 0
   };
 }
@@ -81,6 +93,15 @@ function cleanNotice(n) {
   return url ? { text, url } : { text };
 }
 
+function cleanFeatures(value) {
+  const features = defaultFeatures();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return features;
+  for (const id of FEATURE_IDS) {
+    if (typeof value[id] === 'boolean') features[id] = value[id];
+  }
+  return features;
+}
+
 export function sanitizeRuntimeConfig(raw, fetchedAt = Date.now()) {
   const cfg = emptyConfig();
   if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
@@ -93,6 +114,7 @@ export function sanitizeRuntimeConfig(raw, fetchedAt = Date.now()) {
     cfg.homeworkAnchorSelector = cleanSelector(raw.homeworkAnchorSelector);
     cfg.minExtensionVersion = cleanVersion(raw.minExtensionVersion);
     cfg.notice = cleanNotice(raw.notice);
+    cfg.features = cleanFeatures(raw.features);
   }
   cfg.fetchedAt = fetchedAt;
   return cfg;
@@ -142,13 +164,29 @@ export async function verifySignedConfigEnvelope(envelope, {
     if (!valid) return null;
     const raw = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(payloadBytes));
     if (!raw || typeof raw !== 'object' || Array.isArray(raw) ||
-        !Number.isSafeInteger(raw.configVersion) || raw.configVersion < 1 ||
+        !Number.isSafeInteger(raw.configVersion) || raw.configVersion < 0 ||
         !Number.isSafeInteger(raw.issuedAt) || !Number.isSafeInteger(raw.expiresAt) ||
         raw.issuedAt < 0 || raw.issuedAt > now + CONFIG_CLOCK_SKEW_MS ||
         raw.expiresAt <= now || raw.expiresAt <= raw.issuedAt ||
         raw.expiresAt - raw.issuedAt > MAX_SIGNED_VALIDITY_MS) return null;
     return sanitizeRuntimeConfig(raw, fetchedAt);
   } catch { return null; }
+}
+
+function policyValue(config) {
+  return {
+    configVersion: config.configVersion,
+    subjectVocabulary: config.subjectVocabulary,
+    homeworkAnchorSelector: config.homeworkAnchorSelector,
+    minExtensionVersion: config.minExtensionVersion,
+    notice: config.notice,
+    features: config.features
+  };
+}
+
+/** Same signed policy, allowing only its issuance/expiry/cache timestamps to renew. */
+export function sameRuntimePolicy(left, right) {
+  return JSON.stringify(policyValue(left)) === JSON.stringify(policyValue(right));
 }
 
 async function validateCached(cached) {
@@ -211,11 +249,10 @@ async function commitFreshConfig() {
     return current.config;
   }
   if (current && fresh.config.configVersion === current.config.configVersion) {
-    // The sequence number identifies one immutable payload. Accept an exact
-    // re-sign/republication, but reject same-version equivocation so a CDN or
-    // config-host compromise cannot swap policy without advancing the audit
-    // trail.
-    if (fresh.envelope.payload !== current.envelope.payload) return current.config;
+    // The sequence number identifies one immutable policy. Timestamps need to
+    // renew so an unchanged revision remains usable, but any same-version
+    // semantic change is equivocation and must advance the dashboard revision.
+    if (!sameRuntimePolicy(fresh.config, current.config)) return current.config;
     const refreshed = { envelope: fresh.envelope, fetchedAt: fresh.fetchedAt };
     try { await chrome.storage.local.set({ [CACHE_KEY]: refreshed }); } catch { /* cache is optional */ }
     return fresh.config;

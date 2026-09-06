@@ -4,7 +4,10 @@ import { readFileSync } from 'node:fs';
 import { parse as parseHtml } from 'parse5';
 
 const store = {
-  aiConsent: { accepted: true, version: 3, at: new Date().toISOString() }
+  aiConsent: {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }
 };
 
 function pick(keys) {
@@ -107,12 +110,12 @@ assert.equal(normalizeAIProvider('nararouter'), DEFAULT_PROVIDER);
 assert.equal(normalizeAIProvider('nararouter', null), null);
 assert.equal(routeVisionPreferredProvider('deepseek', true), 'deepseek',
   'licensed Auto must keep visual test work on its multimodal live route');
-assert.equal(routeVisionPreferredProvider('deepseek', true, true), 'qwen',
-  'hidden BYO DeepSeek must still upgrade visual work to BYO Qwen');
+assert.equal(routeVisionPreferredProvider('deepseek', true, true), 'deepseek',
+  'legacy BYO flags must not change the licensed route');
 assert.equal(routeVisionPreferredProvider('deepseek', false), 'deepseek',
   'text homework must keep the stable Auto route');
-assert.equal(routeVisionPreferredProvider('groq', true), 'groq',
-  'a grandfathered explicit BYO provider must remain selected');
+assert.equal(routeVisionPreferredProvider('groq', true), DEFAULT_PROVIDER,
+  'a legacy BYO provider id must collapse to the licensed default');
 
 // Generic-page screenshot re-solves must stay on the licensed Auto proxy even
 // on an old install that still carries the hidden Alibaba key. Without both
@@ -148,27 +151,24 @@ assert.ok(
   'DEFAULT_PROVIDER must be a licensed provider while the provider picker is hidden'
 );
 
-// Grandfathering: a stored BYO provider keeps answering while its key is there,
-// and falls back to the licensed default once it is not — otherwise an install
-// carried over from an earlier build is stuck with no way to fix it.
+// Legacy provider selections and keys never resurrect direct provider egress.
 {
   const saved = { ...store };
   store.aiProvider = 'openrouter';
   store.openrouterApiKey = 'sk-or-v1-test';
-  assert.equal(await resolveStoredProvider('openrouter'), 'openrouter',
-    'a BYO provider with a stored key must keep working');
+  assert.equal(await resolveStoredProvider('openrouter'), DEFAULT_PROVIDER);
 
   delete store.openrouterApiKey;
   assert.equal(
     await resolveStoredProvider('openrouter'),
-    SHOW_PROVIDER_UI ? 'openrouter' : DEFAULT_PROVIDER,
+    DEFAULT_PROVIDER,
     'a keyless BYO provider must fall back to the licensed default'
   );
 
   store.groqApiKey = 'gsk_test';
-  assert.equal(await resolveStoredProvider('groq'), 'groq');
+  assert.equal(await resolveStoredProvider('groq'), DEFAULT_PROVIDER);
   delete store.groqApiKey;
-  assert.equal(await resolveStoredProvider('groq'), SHOW_PROVIDER_UI ? 'groq' : DEFAULT_PROVIDER);
+  assert.equal(await resolveStoredProvider('groq'), DEFAULT_PROVIDER);
 
   // Licensed providers are never rerouted, and neither is an unset value.
   assert.equal(await resolveStoredProvider('qwen'), 'qwen');
@@ -256,7 +256,10 @@ function createOnboardingHarness({
 } = {}) {
   const providerButtons = [element({ dataset: { p: 'groq' } }), element({ dataset: { p: 'openrouter' } })];
   const elements = {
-    obConsent: element({ checked: true }),
+    obTerms: element({ checked: true }),
+    obAiProcessing: element({ checked: true }),
+    obTelemetry: element({ checked: false }),
+    obEligibility: element({ checked: true }),
     obKey: element({ value: typed }),
     obStart: element(),
     obError: element({ hidden: true }),
@@ -294,7 +297,7 @@ function createOnboardingHarness({
       if (throwVerification) throw new Error('simulated transport failure');
       return verdict;
     },
-    async setConsent(value) { consentWrites.push(value); },
+    async setConsentChoices(value) { consentWrites.push(value); },
     async setLicenseKey() { return licenseStatus; },
     async getLicenseStatus() { return licenseStatus; },
     isUsableLicenseStatus: (status) => !!status?.key && status.ok === true &&
@@ -332,7 +335,9 @@ function createOnboardingHarness({
   assert.equal(harness.writes.length, 1);
   assert.equal(harness.writes[0].aiProvider, 'groq');
   assert.equal(harness.writes[0].groqApiKey, 'gsk_test');
-  assert.deepEqual(harness.consentWrites, [true]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.consentWrites)), [{
+    terms: true, ai_processing: true, telemetry: false, eligibility: true
+  }]);
   assert.equal(harness.scans(), 1);
   assert.equal(harness.elements.onboardView.hidden, true);
   assert.ok(harness.providerButtons.every((button) => button.disabled === false));
@@ -358,7 +363,9 @@ for (const testCase of [
   const harness = createOnboardingHarness({ verdict: { ok: false, reason: 'unreachable' } });
   await harness.context.__onboarding.finishOnboarding();
   assert.equal(harness.writes.length, 1, 'an ambiguous network outage may not reject a potentially valid key');
-  assert.deepEqual(harness.consentWrites, [true]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.consentWrites)), [{
+    terms: true, ai_processing: true, telemetry: false, eligibility: true
+  }]);
   assert.equal(harness.scans(), 1);
 }
 
@@ -426,9 +433,12 @@ assertContains('../src/background/service-worker.js',
 assertContains('../src/background/service-worker.js', 'const providerOverride = normalizeAIProvider(provider, null);');
 assertContains('../src/background/service-worker.js', 'if (providerOverride) askOpts.provider = providerOverride;');
 assertContains('../src/background/service-worker.js', 'visionPreferred: hasVisualMedia === true,');
-assertContains('../src/lib/deepseek.js', 'if (allowImages && isImageFile(f))');
+assertContains('../src/lib/deepseek.js', 'if (isImageFile(f))');
 assertContains('../src/lib/deepseek.js', "type: 'image_url'");
-assertContains('../src/lib/deepseek.js', 'const capabilities = { allowImages: !key, allowPdf: !key };');
+assert.doesNotMatch(source('../src/lib/deepseek.js'), /dashscope-intl|qwenApiKey|Authorization:\s*`Bearer/,
+  'Auto route must have no direct vendor credential path');
+assert.doesNotMatch(source('../src/lib/qwen.js'), /dashscope-intl|qwenApiKey|Authorization:\s*`Bearer/,
+  'Think route must have no direct vendor credential path');
 assertContains('../src/lib/smesh-proxy.js', 'const UPLOAD_TICKET_URL = `${AI_BACKEND_URL}/ai/upload-ticket`;');
 assertContains('../src/lib/smesh-proxy.js', 'upload_token: uploadToken');
 
@@ -448,7 +458,9 @@ assertContains('../src/lib/smesh-proxy.js', 'upload_token: uploadToken');
     'a stored BYO provider must not survive onboarding while the picker is hidden');
   assert.equal(harness.writes[0].groqApiKey, undefined,
     'the hidden-picker path must not persist an API key');
-  assert.deepEqual(harness.consentWrites, [true]);
+  assert.deepEqual(JSON.parse(JSON.stringify(harness.consentWrites)), [{
+    terms: true, ai_processing: true, telemetry: false, eligibility: true
+  }]);
   assert.equal(harness.scans(), 1);
 }
 

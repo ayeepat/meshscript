@@ -1,13 +1,7 @@
 /**
- * The bring-your-own-key provider surface and the manifest must agree.
- *
- * `SHOW_PROVIDER_UI = false` is what makes the direct-to-vendor adapters
- * unreachable, so the Chrome Web Store build drops their host permissions
- * rather than asking for access it can never use. The two facts are only safe
- * together: flipping the flag back without restoring the hosts would leave
- * every BYO request failing at fetch() with an opaque CORS error instead of the
- * adapter's own message — and it would do so silently, because nothing in the
- * product surfaces a missing host permission.
+ * Release AI transport is gateway-only. Legacy UI markup may remain hidden for
+ * a separate developer build, but release code cannot dispatch homework or
+ * audio directly to vendor hosts and does not request their permissions.
  */
 
 import assert from 'node:assert/strict';
@@ -30,15 +24,25 @@ const providerUiShown = flag[1] === 'true';
 
 const granted = BYO_HOSTS.filter((host) => manifest.host_permissions.includes(host));
 
-if (providerUiShown) {
-  assert.deepEqual(granted, BYO_HOSTS,
-    'SHOW_PROVIDER_UI is on, so the BYO provider host permissions must be restored ' +
-    'in manifest.json — otherwise every pasted key dead-ends on a CORS error');
-} else {
-  assert.deepEqual(granted, [],
-    'no shipped UI path can reach a BYO provider while SHOW_PROVIDER_UI is off; ' +
-    'an unreachable host permission is a Chrome Web Store review risk');
-}
+assert.equal(providerUiShown, false, 'the release must not expose the legacy BYO surface');
+assert.deepEqual(granted, [],
+  'gateway-only release must not request direct AI-vendor host permissions');
+
+const releaseTransport = [
+  source('../src/lib/ai.js'),
+  source('../src/lib/qwen.js'),
+  source('../src/lib/deepseek.js'),
+  source('../src/background/service-worker.js')
+].join('\n');
+assert.doesNotMatch(releaseTransport, /https:\/\/(?:openrouter\.ai|api\.groq\.com|dashscope-intl\.aliyuncs\.com)/,
+  'active dispatcher and adapters must not contain direct vendor endpoints');
+assert.doesNotMatch(source('../src/background/service-worker.js'), /transcribeAudioFiles\(/,
+  'release solve flow must not send audio to a hidden BYO transcription path');
+assert.doesNotMatch(source('../src/background/service-worker.js'), /chrome\.storage\.local\.get\(['"]groqApiKey['"]\)/,
+  'a dormant vendor key must not bypass the deterministic missing-audio gate');
+assert.match(source('../src/settings/settings.js'),
+  /const KEY_FIELDS = SHOW_PROVIDER_UI \? \['openrouterApiKey', 'groqApiKey'\] : \[\];/,
+  'hidden vendor secret fields must not be read or persisted in the release');
 
 // Whatever the flag says, the licensed transport is not optional.
 for (const host of ['https://ai.smeshapi.site/*', 'https://smeshapi.site/*']) {
@@ -50,11 +54,11 @@ for (const host of ['https://ai.smeshapi.site/*', 'https://smeshapi.site/*']) {
 // getKey), so with the picker hidden an audio clip can never be transcribed.
 if (!providerUiShown) {
   const listing = source('../docs/CHROME-WEB-STORE.md');
-  const description = listing.slice(
-    listing.indexOf('**Detailed description:**'),
-    listing.indexOf('## Graphic assets'),
-  );
-  assert.ok(description, 'the store listing description section must exist');
+  const descriptionStart = listing.indexOf('Detailed description:');
+  const descriptionEnd = listing.indexOf('## URLs', descriptionStart);
+  assert.ok(descriptionStart >= 0 && descriptionEnd > descriptionStart,
+    'the store listing description section must exist');
+  const description = listing.slice(descriptionStart, descriptionEnd);
   assert.doesNotMatch(description, /изображениями, PDF и аудио/,
     'the store description must not advertise audio solving while transcription needs a BYO key');
 

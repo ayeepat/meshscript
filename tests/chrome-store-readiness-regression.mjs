@@ -36,7 +36,7 @@ for (const required of [
   'Permission justifications',
   'Data-use disclosures',
   'Reviewer instructions',
-  'REQUIRED BEFORE SUBMISSION',
+  'Final publisher checklist',
   'https://smeshai.xyz/privacy',
 ]) {
   assert.ok(listing.includes(required), `store submission guide is missing ${required}`);

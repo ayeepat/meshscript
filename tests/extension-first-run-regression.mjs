@@ -15,7 +15,7 @@ function sourceSection(text, startMarker, endMarker) {
 const installSource = sourceSection(
   worker,
   "const WELCOME_PAGE = 'src/welcome/welcome.html';",
-  '// NaraRouter was removed'
+  '// Remove provider secrets from legacy builds.'
 );
 
 // One shared claim stands in for lib/onboarding.js: granted once, refused for

@@ -473,7 +473,9 @@ export async function handleGdzFetch(request, env, ctx) {
   try {
     return await handleGdzFetchInner(request, env, ctx);
   } catch (e) {
-    console.error('gdz-proxy: unexpected error', e?.stack || String(e));
+    // Exception messages/stacks from parsers and upstream clients can echo
+    // lesson URLs or page content. Log only a bounded class, never the value.
+    console.error('gdz-proxy: unexpected error', String(e?.name || 'Error').slice(0, 64));
     return errResponse(503, UNAVAILABLE);
   }
 }

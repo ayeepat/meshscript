@@ -24,6 +24,7 @@
 import { BACKEND_URL, DEFAULT_PROVIDER } from './config.js';
 import { getDeviceId } from './history.js';
 import { hasConsent } from './consent.js';
+import { getRuntimeConfig } from './remote-config.js';
 
 const FLUSH_DELAY_MS = 1500;   // short: MV3 service workers die young
 const MAX_QUEUE = 20;
@@ -127,7 +128,8 @@ async function flush() {
       !(await hasConsent()) ||
       !licenseStatus?.ok ||
       !telemetryToken ||
-      telemetryExpiresAt <= Date.now()
+      telemetryExpiresAt <= Date.now() ||
+      (await getRuntimeConfig()).features.telemetry !== true
     ) return;
     const body = {
       device_id: await getDeviceId(),

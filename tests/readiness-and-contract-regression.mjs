@@ -238,7 +238,8 @@ for (const table of HEALTH_TABLES) {
   const env = {
     LICENSES: new FakeKV(),
     DB: new FakeD1(HEALTH_TABLES),
-    OWNER_LICENSE_KEY: 'SMESH-OWNER-TEST-KEY'
+    OWNER_LICENSE_KEY: 'SMESH-OWNER-TEST-KEY',
+    ENTITLEMENT_SECRET: 'test-entitlement-secret-that-is-at-least-32-bytes'
   };
   const post = (body) => worker.fetch(new Request('https://api.example/verify', {
     method: 'POST',
@@ -321,6 +322,7 @@ for (const table of HEALTH_TABLES) {
     SUPPORT_CHAT_ID: '42',
     AI_PROXY_API_KEY: 'k',
     INGEST_KEY: 'test-ingest-key-that-is-at-least-32-bytes',
+    ENTITLEMENT_SECRET: 'test-entitlement-secret-that-is-at-least-32-bytes',
     RUNTIME_WRITE_EPOCH: '1'
   };
   const get = (env, token = healthy.ADMIN_SECRET) =>
@@ -463,6 +465,11 @@ for (const table of HEALTH_TABLES) {
   assert.equal(noIngestKey.status, 503,
     'telemetry attestation cannot operate without a strong signing secret');
   assert.equal((await noIngestKey.json()).checks.ingest_key, false);
+
+  const noEntitlementSecret = await get({ ...healthy, ENTITLEMENT_SECRET: undefined });
+  assert.equal(noEntitlementSecret.status, 503,
+    'readiness must fail while the inference capability secret is missing');
+  assert.equal((await noEntitlementSecret.json()).checks.entitlement_secret, false);
 
   const noStatsSecret = await get({ ...healthy, STATS_SECRET: undefined });
   assert.equal(noStatsSecret.status, 503,

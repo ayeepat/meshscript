@@ -7,8 +7,6 @@
  * and quota usage of two. A client-generated idempotency key bound to the
  * principal and the request digest now returns the original job on retry.
  *
- * M-4: the verifier's timeout must be a wall-clock deadline, not Node's
- * inactivity-based socket timeout, which a dribbling server never trips.
  */
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
@@ -17,10 +15,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 const LICENSE = 'SMESH-IDEMPOTENT-START';
 const DEVICE = '11111111-1111-4111-8111-111111111111';
-const ACTIVATION_TOKEN = 'A'.repeat(43);
 
 function listen(server) {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server.address().port)));
@@ -38,20 +36,7 @@ async function waitFor(url) {
 }
 
 let upstreamCalls = 0;
-let verifyDribble = false;
 const mock = http.createServer((req, res) => {
-  if (req.url.startsWith('/verify')) {
-    if (verifyDribble) {
-      // Headers, then one byte every 200 ms forever. Every byte rearms Node's
-      // socket timeout, so `request.setTimeout` alone never fires here.
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      const timer = setInterval(() => { try { res.write(' '); } catch { clearInterval(timer); } }, 200);
-      res.on('close', () => clearInterval(timer));
-      return;
-    }
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    return res.end(JSON.stringify({ ok: true, type: 'lifetime', expires_at: null }));
-  }
   if (req.url === '/v1/chat/completions') {
     upstreamCalls += 1;
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -68,6 +53,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
@@ -79,12 +65,23 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   stdio: 'pipe'
 });
 
+const entitlementByPrincipal = new Map();
+function authenticatedBody(body) {
+  if (!body?.license_key) return body;
+  const { license_key: licenseKey, device_id: deviceId, activation_token: _unused, ...rest } = body;
+  const principal = `${licenseKey}\u0000${deviceId}`;
+  let entitlement = entitlementByPrincipal.get(principal);
+  if (!entitlement) {
+    entitlement = entitlementBody({ licenseKey, deviceId });
+    entitlementByPrincipal.set(principal, entitlement);
+  }
+  return { ...rest, ...entitlement };
+}
+
 const start = (body) => fetch(`${base}/ai/start`, {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify(body?.license_key && body.activation_token == null
-    ? { ...body, activation_token: ACTIVATION_TOKEN }
-    : body)
+  body: JSON.stringify(authenticatedBody(body))
 });
 
 async function drain(job) {
@@ -163,9 +160,7 @@ try {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      license_key: LICENSE,
-      device_id: DEVICE,
-      activation_token: ACTIVATION_TOKEN,
+      ...entitlementBody({ licenseKey: LICENSE, deviceId: DEVICE }),
       size: blobMessages.length,
     }),
   });
@@ -205,26 +200,7 @@ try {
   assert.equal(replayBlobJob.job_token, firstBlobJob.job_token);
   await drain(firstBlobJob);
 
-  /* ---- M-4: a dribbling verifier is cut off by the absolute deadline ---- */
-  // A license the server has never verified, so the 60s verdict cache cannot
-  // short-circuit the upstream call this is measuring.
-  verifyDribble = true;
-  const startedAt = Date.now();
-  const stalled = await start({
-    provider: 'qwen',
-    license_key: 'SMESH-DRIBBLE-DEADLINE',
-    device_id: '33333333-3333-4333-8333-333333333333',
-    idempotency_key: 'dribble-key-0001',
-    messages: [{ role: 'user', content: 'dribble' }]
-  });
-  const elapsed = Date.now() - startedAt;
-  // Two verify attempts at a 10s deadline each, plus the 400ms retry gap.
-  assert.ok(elapsed < 25000,
-    `a dribbling verifier must not outlive the deadline (took ${elapsed} ms)`);
-  assert.equal(stalled.status, 503,
-    'an unreachable authority fails closed rather than granting access');
-
-  console.log('vps /ai/start idempotency and verifier deadline regression passed');
+  console.log('vps /ai/start idempotency regression passed');
 } finally {
   proc.kill('SIGTERM');
   await Promise.race([once(proc, 'exit'), new Promise((resolve) => setTimeout(resolve, 1000))]);

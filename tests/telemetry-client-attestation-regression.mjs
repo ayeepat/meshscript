@@ -5,7 +5,10 @@ const TOKEN = `tm1.${'A'.repeat(64)}.${'B'.repeat(43)}`;
 const store = new Map([
   ['telemetryEnabled', true],
   ['aiProvider', 'qwen'],
-  ['aiConsent', { accepted: true, version: 3, at: new Date().toISOString() }],
+  ['aiConsent', {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: true, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }],
   ['deviceId', DEVICE]
 ]);
 
@@ -38,7 +41,35 @@ try {
 }
 
 const requests = [];
+const runtimePayload = Buffer.from(JSON.stringify({
+  configVersion: 1,
+  issuedAt: Date.now() - 1_000,
+  expiresAt: Date.now() + 60_000,
+  features: { telemetry: true }
+})).toString('base64url');
+const originalCrypto = globalThis.crypto;
+Object.defineProperty(globalThis, 'crypto', {
+  configurable: true,
+  value: {
+    randomUUID: originalCrypto.randomUUID.bind(originalCrypto),
+    subtle: {
+      importKey: async () => ({}),
+      verify: async () => true
+    }
+  }
+});
 globalThis.fetch = async (url, init) => {
+  if (String(url).endsWith('/public/runtime-config')) {
+    // Signature mechanics are covered by runtime-config-host-regression. This
+    // test supplies an authenticated policy boundary so it can focus on the
+    // independent consent + capability requirements for telemetry transport.
+    return new Response(JSON.stringify({
+      payload: runtimePayload,
+      signature: Buffer.alloc(64, 1).toString('base64url')
+    }), {
+      headers: { 'content-type': 'application/json' }
+    });
+  }
   requests.push({ url: String(url), init });
   return new Response(JSON.stringify({ ok: true }), {
     headers: { 'content-type': 'application/json' }

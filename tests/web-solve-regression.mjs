@@ -371,11 +371,11 @@ function sectionOf(text, startMarker, endMarker) {
     'a re-solve off Mesh must force the same licensed proxy route');
 
   const deepseek = source('../src/lib/deepseek.js');
-  assert.ok(deepseek.includes('const key = proxyOnly ? null : await getByoKey();'),
-    'the forced web route must ignore a hidden Alibaba BYO key');
+  assert.doesNotMatch(deepseek, /getByoKey|dashscope-intl|Authorization:\s*`Bearer/,
+    'the licensed Auto adapter must have no hidden direct provider route');
   const ai = source('../src/lib/ai.js');
-  assert.ok(ai.includes('const legacyDeepseekByo = opts.proxyOnly ? false : Boolean(await getByoKey());'),
-    'a screenshot re-solve must not be diverted to direct BYO by the vision router');
+  assert.doesNotMatch(ai, /askOpenRouter|askGroq|getByoKey/,
+    'a screenshot re-solve cannot be diverted to a direct provider by the dispatcher');
 
   // Downgrade-only, in the client...
   const proxy = source('../src/lib/smesh-proxy.js');

@@ -4,7 +4,10 @@ const records = new Map([
   ['aiProvider', 'openrouter'],
   ['openrouterApiKey', 'test-key'],
   ['groqApiKey', 'test-key'],
-  ['aiConsent', { accepted: true, version: 3, at: new Date().toISOString() }],
+  ['aiConsent', {
+    version: 4, terms: true, ai_processing: true,
+    telemetry: false, eligibility: true, at: new Date().toISOString(), receipt_id: 'test-consent'
+  }],
 ]);
 const changeListeners = new Set();
 let consentBarrier = null;

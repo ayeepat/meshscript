@@ -2,16 +2,22 @@
 
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { createPublicKey, verify as verifySignature } from 'node:crypto';
 import { mkdtemp, readFile } from 'node:fs/promises';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
+import {
+  entitlementBody, TEST_RUNTIME_CONFIG_PUBLIC_KEY_JWK, TEST_VPS_SECURITY_ENV
+} from './helpers/vps-entitlement.mjs';
+import { verifySignedConfigEnvelope } from '../src/lib/remote-config.js';
 
 const temp = await mkdtemp(path.join(os.tmpdir(), 'smesh-model-control-'));
 const quotaFile = path.join(temp, 'quota.json');
 const modelFile = path.join(temp, 'model-config.json');
 const calls = [];
 const upstreamBodies = [];
+const usageReports = [];
 
 const upstream = http.createServer(async (req, res) => {
   const chunks = [];
@@ -32,6 +38,12 @@ const upstream = http.createServer(async (req, res) => {
     );
     return;
   }
+  if (req.url === '/t/ai') {
+    usageReports.push(body);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end('{"ok":true}');
+    return;
+  }
   res.writeHead(404).end();
 });
 await new Promise((resolve) => upstream.listen(0, '127.0.0.1', resolve));
@@ -49,6 +61,7 @@ const proxy = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: new URL('..', import.meta.url),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     PORT: String(proxyPort),
     HOST: '127.0.0.1',
     AI_PROXY_API_KEY: 'test-upstream-key',
@@ -57,7 +70,9 @@ const proxy = spawn(process.execPath, ['backend-vps/server.js'], {
     QUOTA_FILE: quotaFile,
     MODEL_CONFIG_FILE: modelFile,
     MODEL_ADMIN_KEY: 'model-admin-test-key-with-enough-entropy',
-    MODEL_DASHBOARD_ORIGIN: 'https://ayeepat.github.io'
+    MODEL_DASHBOARD_ORIGIN: 'https://ayeepat.github.io',
+    INGEST_URL: `http://127.0.0.1:${upstreamPort}/t/ai`,
+    INGEST_KEY: 'model-control-ingest-key'
   },
   stdio: ['ignore', 'pipe', 'pipe']
 });
@@ -128,6 +143,41 @@ try {
   assert.equal(initialState.config.limits.requests_per_minute, 5);
   assert.equal(initialState.config.limits.frontier_per_license, 15);
   assert.equal(initialState.config.limits.standard_per_license, 70);
+  assert.equal(initialState.config.features.ai_documents, true,
+    'every capability ships on — these switches are an incident lever, not a default-off posture');
+
+  const processorsResponse = await fetch(`${base}/processors`);
+  assert.equal(processorsResponse.status, 200);
+  assert.equal(processorsResponse.headers.get('access-control-allow-origin'), '*');
+  const processors = await processorsResponse.json();
+  assert.equal(processors.revision, initialState.revision);
+  assert.ok(processors.processors.some((processor) =>
+    processor.model === 'qwen3.7-plus' && processor.enabled && processor.in_use));
+  assert.ok(processors.processors.some((processor) =>
+    /^gemini/i.test(processor.model) && processor.enabled && processor.in_use),
+  'the PDF chain is Gemini, so it must be registered, enabled and live out of the box');
+  assert.equal(JSON.stringify(processors).includes('model-admin-test-key'), false);
+
+  const runtimeResponse = await fetch(`${base}/public/runtime-config`);
+  assert.equal(runtimeResponse.status, 200);
+  assert.equal(runtimeResponse.headers.get('access-control-allow-origin'), '*');
+  const runtimeEnvelope = await runtimeResponse.json();
+  const runtimePayloadBytes = Buffer.from(runtimeEnvelope.payload, 'base64url');
+  const runtimePayload = JSON.parse(runtimePayloadBytes.toString('utf8'));
+  assert.equal(verifySignature(
+    'sha256', runtimePayloadBytes,
+    { key: createPublicKey({ key: TEST_RUNTIME_CONFIG_PUBLIC_KEY_JWK, format: 'jwk' }), dsaEncoding: 'ieee-p1363' },
+    Buffer.from(runtimeEnvelope.signature, 'base64url')
+  ), true, 'the public runtime config must be signed by the configured VPS key');
+  assert.deepEqual(runtimePayload.features, initialState.config.features);
+  assert.equal(runtimePayload.expiresAt - runtimePayload.issuedAt, 60 * 60 * 1000,
+    'a signed emergency-switch policy must not remain valid for more than one hour');
+  const acceptedRuntime = await verifySignedConfigEnvelope(runtimeEnvelope, {
+    publicJwk: TEST_RUNTIME_CONFIG_PUBLIC_KEY_JWK,
+    now: Date.now()
+  });
+  assert.equal(acceptedRuntime.configVersion, 0,
+    'a fresh VPS bootstrap policy must be accepted before the first dashboard save');
 
   const nextConfig = structuredClone(initialState.config);
   delete nextConfig.limits.requests_per_minute;
@@ -136,6 +186,14 @@ try {
   nextConfig.routes.deepseek.text = ['frontier-test-model'];
   nextConfig.routes.qwen.text = ['qwen-frontier-test-model'];
   nextConfig.routes.standard.text = ['glm-5.3-flash'];
+  for (const model of ['frontier-test-model', 'qwen-frontier-test-model', 'step-3.5-flash']) {
+    nextConfig.processors[model] = {
+      display_name: model,
+      operator: 'Regression test processor',
+      privacy_url: 'https://example.test/privacy',
+      enabled: true
+    };
+  }
   const saved = await fetch(`${base}/admin/model-config`, {
     method: 'PUT', headers: adminHeaders,
     body: JSON.stringify({ expected_revision: 0, reason: 'regression setup', config: nextConfig })
@@ -152,15 +210,22 @@ try {
   });
   assert.equal(stale.status, 409);
 
-  const requestBody = (provider, nonce, identity = {}) => ({
-    provider,
-    license_key: identity.licenseKey || 'SMESH-MODEL-CONTROL-TEST',
-    device_id: identity.deviceId || '123e4567-e89b-42d3-a456-426614174000',
-    activation_token: 'a'.repeat(43),
-    messages: [{ role: 'user', content: `hello ${nonce}` }],
-    reasoning_effort: 'low',
-    idempotency_key: `model-control-${nonce}`
-  });
+  const entitlementByPrincipal = new Map();
+  const requestBody = (provider, nonce, identity = {}) => {
+    const licenseKey = identity.licenseKey || 'SMESH-MODEL-CONTROL-TEST';
+    const deviceId = identity.deviceId || '123e4567-e89b-42d3-a456-426614174000';
+    const principal = `${licenseKey}\u0000${deviceId}`;
+    if (!entitlementByPrincipal.has(principal)) {
+      entitlementByPrincipal.set(principal, entitlementBody({ licenseKey, deviceId }));
+    }
+    return {
+      provider,
+      ...entitlementByPrincipal.get(principal),
+      messages: [{ role: 'user', content: `hello ${nonce}` }],
+      reasoning_effort: 'low',
+      idempotency_key: `model-control-${nonce}`
+    };
+  };
   const start = async (provider, nonce, identity) => {
     const expectedCalls = calls.length + 1;
     const response = await fetch(`${base}/ai/start`, {
@@ -304,8 +369,8 @@ try {
   const imageDataUri = 'data:image/png;base64,' +
     Buffer.from('smesh-model-control-regression-image').toString('base64');
   const qwenIdentity = {
-    license_key: 'SMESH-QWEN-CONTROL-TEST',
-    device_id: '123e4567-e89b-42d3-a456-426614174002'
+    licenseKey: 'SMESH-QWEN-CONTROL-TEST',
+    deviceId: '123e4567-e89b-42d3-a456-426614174002'
   };
   const startQwen = async (nonce, content) => {
     const expectedCalls = calls.length + 1;
@@ -313,8 +378,7 @@ try {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         provider: 'deepseek',
-        ...qwenIdentity,
-        activation_token: 'a'.repeat(43),
+        ...entitlementBody(qwenIdentity),
         messages: [{ role: 'user', content }],
         // Exactly what solveTest sends for a test page it judged easy.
         reasoning_effort: 'low',
@@ -348,6 +412,153 @@ try {
     'Qwen JSON mode is unreliable once an image is in the request (same finding ' +
     'that makes src/lib/qwen.js drop it client-side); the answer parser recovers ' +
     'the {answers:[{n,a}]} shape from prose instead');
+
+  const saveFeatureState = async (changes, reason) => {
+    const current = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
+    const config = structuredClone(current.config);
+    Object.assign(config.features, changes);
+    const response = await fetch(`${base}/admin/model-config`, {
+      method: 'PUT', headers: adminHeaders,
+      body: JSON.stringify({ expected_revision: current.revision, reason, config })
+    });
+    if (response.status !== 200) {
+      throw new Error(`feature save failed: ${response.status} ${await response.text()}`);
+    }
+    return response.json();
+  };
+  const expectBlockedWithoutCharge = async (body, expectedFeature) => {
+    const quotaBefore = JSON.parse(await readFile(quotaFile, 'utf8'));
+    const callsBefore = calls.length;
+    const response = await fetch(`${base}/ai/start`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    assert.equal(response.status, 503, `${expectedFeature} switch must reject new work immediately`);
+    assert.equal(calls.length, callsBefore, `${expectedFeature} switch must stop paid upstream traffic`);
+    const quotaAfter = JSON.parse(await readFile(quotaFile, 'utf8'));
+    assert.deepEqual(quotaAfter.counts, quotaBefore.counts,
+      `${expectedFeature} switch must reject before durable quota is charged`);
+  };
+
+  await saveFeatureState({ ai_text: true, ai_images: false, ai_documents: false }, 'image switch test');
+  const imageBlocked = requestBody('deepseek', 'switch-image', {
+    licenseKey: 'SMESH-SWITCH-IMAGE', deviceId: '123e4567-e89b-42d3-a456-426614174101'
+  });
+  imageBlocked.messages = [{ role: 'user', content: [
+    { type: 'text', text: 'synthetic image check' },
+    { type: 'image_url', image_url: { url: imageDataUri } }
+  ] }];
+  await expectBlockedWithoutCharge(imageBlocked, 'ai_images');
+
+  // Turning documents back on is a plain dashboard save — the PDF chain is
+  // Gemini and it ships enabled. The one rejected shape is an inconsistent
+  // revision: a live route whose processor is switched off would send student
+  // work to a model the public registry claims is unused.
+  const beforeDocumentSave = await (await fetch(
+    `${base}/admin/model-config`, { headers: adminHeaders }
+  )).json();
+  const inconsistentConfig = structuredClone(beforeDocumentSave.config);
+  inconsistentConfig.features.ai_documents = true;
+  for (const model of inconsistentConfig.routes.pdf.models) {
+    inconsistentConfig.processors[model].enabled = false;
+  }
+  const inconsistentSave = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: beforeDocumentSave.revision,
+      reason: 'must reject a live route with a disabled processor',
+      config: inconsistentConfig
+    })
+  });
+  assert.equal(inconsistentSave.status, 400,
+    'a feature must not go live while its own processor is disabled');
+  assert.match((await inconsistentSave.json()).reason, /not enabled in processors/i);
+
+  const documentsOnConfig = structuredClone(beforeDocumentSave.config);
+  documentsOnConfig.features.ai_documents = true;
+  const documentsOnSave = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: beforeDocumentSave.revision,
+      reason: 'documents back on the Gemini chain',
+      config: documentsOnConfig
+    })
+  });
+  assert.equal(documentsOnSave.status, 200,
+    'the Gemini PDF chain must stay switchable from the dashboard');
+
+  await saveFeatureState({ ai_text: true, ai_images: true, ai_documents: false }, 'document switch test');
+  const pdfBlocked = requestBody('deepseek', 'switch-pdf', {
+    licenseKey: 'SMESH-SWITCH-PDF', deviceId: '123e4567-e89b-42d3-a456-426614174102'
+  });
+  pdfBlocked.messages = [{ role: 'user', content: [
+    { type: 'text', text: 'synthetic document check' },
+    {
+      type: 'file',
+      file: {
+        filename: 'synthetic.pdf',
+        file_data: 'data:application/pdf;base64,' + Buffer.from('%PDF synthetic').toString('base64')
+      }
+    }
+  ] }];
+  await expectBlockedWithoutCharge(pdfBlocked, 'ai_documents');
+
+  await saveFeatureState(
+    { ai_text: true, ai_images: true, ai_documents: false, telemetry: false },
+    'telemetry switch test'
+  );
+  const telemetryBlocked = requestBody('deepseek', 'switch-telemetry', {
+    licenseKey: 'SMESH-SWITCH-TELEMETRY', deviceId: '123e4567-e89b-42d3-a456-426614174104'
+  });
+  telemetryBlocked.telemetry_opt_in = true;
+  const callsBeforeTelemetry = calls.length;
+  const telemetryResponse = await fetch(`${base}/ai/start`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(telemetryBlocked)
+  });
+  assert.equal(telemetryResponse.status, 200, await telemetryResponse.text());
+  for (let i = 0; i < 100 && calls.length === callsBeforeTelemetry; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(usageReports.length, 0,
+    'the central telemetry switch must override a stale client opt-in');
+
+  const finalSwitchState = await saveFeatureState(
+    { ai_text: false, ai_images: true, ai_documents: false }, 'text switch test'
+  );
+  await expectBlockedWithoutCharge(requestBody('deepseek', 'switch-text', {
+    licenseKey: 'SMESH-SWITCH-TEXT', deviceId: '123e4567-e89b-42d3-a456-426614174103'
+  }), 'ai_text');
+
+  const inactiveConfig = structuredClone(finalSwitchState.config);
+  const inactiveGemini = Object.keys(inactiveConfig.processors)
+    .filter((model) => model.toLowerCase().startsWith('gemini'));
+  assert.ok(inactiveGemini.length > 0, 'the PDF fixture must contain Gemini processors');
+  for (const model of inactiveGemini) inactiveConfig.processors[model].enabled = false;
+  const inactiveSavedResponse = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: finalSwitchState.revision,
+      reason: 'disable an inactive processor',
+      config: inactiveConfig
+    })
+  });
+  assert.equal(inactiveSavedResponse.status, 200,
+    'an operator must be able to disable processors behind an inactive feature in one revision');
+  const inactiveSaved = await inactiveSavedResponse.json();
+  const inactiveProcessors = await (await fetch(`${base}/processors`)).json();
+  for (const model of inactiveGemini) {
+    const processor = inactiveProcessors.processors.find((item) => item.model === model);
+    assert.equal(processor.enabled, false);
+    assert.equal(processor.in_use, false);
+  }
+
+  const signedAfterSwitch = await (await fetch(`${base}/public/runtime-config`)).json();
+  const switchedPayload = JSON.parse(Buffer.from(signedAfterSwitch.payload, 'base64url').toString('utf8'));
+  assert.equal(switchedPayload.configVersion, inactiveSaved.revision);
+  assert.equal(switchedPayload.features.ai_text, false,
+    'the same saved switch state must be published to extension clients');
 } finally {
   proxy.kill('SIGTERM');
   upstream.close();

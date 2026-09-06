@@ -1,12 +1,9 @@
 /**
- * Settings: theme, API keys, provider, daily limits, referrals, GDZ textbooks,
+ * Settings: theme, licensed route, daily limits, referrals, GDZ textbooks,
  * 7-day history.
  *
- * The provider picker, the BYO key fields, the per-vendor daily limits and the
- * usage chart's series switcher are all hidden behind config.SHOW_PROVIDER_UI
- * (see applyProviderVisibility). They are hidden, not removed — the save and
- * hydrate paths still read them, so flipping that one flag brings the whole
- * surface back.
+ * Legacy BYO markup is hidden in the shipped build. Its secret fields are not
+ * read or written unless a separate developer build explicitly enables the UI.
  */
 import { initTheme, getThemePref, setThemePref } from '../common/theme.js';
 import { iconSvg } from '../common/icons.js';
@@ -19,7 +16,7 @@ import {
   normalizeEnteredLicenseKey, validateEnteredLicenseKey
 } from '../lib/license.js';
 import { getMyReferralCode, fetchReferralStatus } from '../lib/referral.js';
-import { hasConsent, setConsent } from '../lib/consent.js';
+import { getConsent, setConsentChoices } from '../lib/consent.js';
 import { getDeviceId, deleteAllLocalData } from '../lib/history.js';
 import {
   SUPPORT_BOT_URL, BACKEND_URL, SHOW_PROVIDER_UI, DEFAULT_PROVIDER, REFERRALS_ENABLED
@@ -42,10 +39,7 @@ if (supportLink) supportLink.href = SUPPORT_BOT_URL;
 const brandVersion = document.getElementById('brandVersion');
 if (brandVersion) brandVersion.textContent = `Настройки · v${chrome.runtime.getManifest().version}`;
 
-// No qwenApiKey here: Qwen/DeepSeek run through the СМЭШ proxy on the license
-// key (see lib/smesh-proxy.js) — students never handle an Alibaba key. A BYO
-// key set directly in storage still works as a hidden power-user path.
-const KEY_FIELDS = ['openrouterApiKey', 'groqApiKey'];
+const KEY_FIELDS = SHOW_PROVIDER_UI ? ['openrouterApiKey', 'groqApiKey'] : [];
 const SAVE_SECTIONS = new Set(['general', 'analytics']);
 
 let activeSection = 'general';
@@ -137,7 +131,9 @@ function wireReveals() {
 
 /* ---------- Load / save ---------- */
 
-const PROVIDER_OPTIONS = new Set(['openrouter', 'groq', 'qwen', 'deepseek']);
+const PROVIDER_OPTIONS = new Set(
+  SHOW_PROVIDER_UI ? ['openrouter', 'groq', 'qwen', 'deepseek'] : ['qwen', 'deepseek']
+);
 
 // Show BYO key fields for OpenRouter/Groq; Qwen/DeepSeek need only the license.
 function syncProviderKeys() {
@@ -152,9 +148,8 @@ function syncProviderKeys() {
  *
  * The markup ships `hidden` so a vendor name can never flash before this runs —
  * which also means the shipped HTML is honest about what a student sees. The
- * inputs stay in the DOM either way, so readSettingsFormData /
- * hydrateSettingsForm and the whole save transaction are untouched, and
- * flipping the flag in config.js restores the full UI with no other edit.
+ * inputs stay in the DOM for a developer build, but KEY_FIELDS is empty in the
+ * release so hidden secrets are neither hydrated nor persisted.
  */
 function applyProviderVisibility() {
   if (!SHOW_PROVIDER_UI) return;
@@ -453,20 +448,28 @@ let consentUiGeneration = 0;
 let consentWriteQueue = Promise.resolve();
 async function loadConsentUi() {
   const generation = consentUiGeneration;
-  const accepted = await hasConsent();
-  if (generation !== consentUiGeneration || touchedControls.has('consentToggle')) return;
-  setCheckedUnlessTouched('consentToggle', accepted);
+  const consent = await getConsent();
+  const accepted = consent.terms && consent.ai_processing && consent.eligibility;
+  if (generation !== consentUiGeneration) return;
+  setCheckedUnlessTouched('consentTerms', consent.terms);
+  setCheckedUnlessTouched('consentAiProcessing', consent.ai_processing);
+  setCheckedUnlessTouched('consentTelemetry', consent.telemetry);
+  setCheckedUnlessTouched('consentEligibility', consent.eligibility);
   renderConsentStatus(accepted);
 }
 
 function wireConsent() {
-  document.getElementById('consentToggle').onchange = async (e) => {
-    const accepted = e.target.checked;
+  const ids = ['consentTerms', 'consentAiProcessing', 'consentTelemetry', 'consentEligibility'];
+  const writeChoices = async () => {
+    const choices = {
+      terms: document.getElementById('consentTerms').checked,
+      ai_processing: document.getElementById('consentAiProcessing').checked,
+      telemetry: document.getElementById('consentTelemetry').checked,
+      eligibility: document.getElementById('consentEligibility').checked
+    };
+    const accepted = choices.terms && choices.ai_processing && choices.eligibility;
     const generation = ++consentUiGeneration;
-    // Serialize rapid true -> false toggles. Paint generations alone prevent a
-    // stale UI update, but without write ordering the older `true` storage write
-    // can still finish last and silently persist the wrong consent state.
-    const write = consentWriteQueue.then(() => setConsent(accepted));
+    const write = consentWriteQueue.then(() => setConsentChoices(choices));
     consentWriteQueue = write.catch(() => {});
     try {
       await write;
@@ -474,14 +477,11 @@ function wireConsent() {
     } catch {
       if (generation !== consentUiGeneration) return;
       try {
-        const stored = await hasConsent();
-        if (generation === consentUiGeneration) {
-          document.getElementById('consentToggle').checked = stored;
-          renderConsentStatus(stored);
-        }
-      } catch { /* leave the user's visible choice; a later save can retry */ }
+        if (generation === consentUiGeneration) await loadConsentUi();
+      } catch { /* a later interaction can retry */ }
     }
   };
+  for (const id of ids) document.getElementById(id).onchange = writeChoices;
 }
 
 /* ---------- Privacy: data deletion ---------- */
@@ -491,7 +491,7 @@ function wireConsent() {
 let telemetryWriteQueue = Promise.resolve();
 function setTelemetryPreference(enabled) {
   const write = telemetryWriteQueue.then(() =>
-    chrome.storage.local.set({ telemetryEnabled: !!enabled })
+    getConsent().then((current) => setConsentChoices({ ...current, telemetry: !!enabled }))
   );
   telemetryWriteQueue = write.catch(() => {});
   return write;
@@ -506,11 +506,6 @@ function privacyFlash(text, state = 'ok') {
 }
 
 function wirePrivacy() {
-  // Statistics no longer have their own checkbox: they are part of the single
-  // agreement accepted above (consent.js setConsent writes telemetryEnabled).
-  // The erasure button below is what turns them back off, and lib/telemetry.js
-  // still refuses to send anything unless BOTH flags are true at flush time.
-
   // Server-side erasure: removes this device's pseudonymous rows from the
   // analytics DB. The device id is the only identifier the backend has.
   document.getElementById('deleteStats').onclick = async (e) => {

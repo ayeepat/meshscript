@@ -5,8 +5,9 @@ import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
-
-const ACTIVATION_TOKEN = 'A'.repeat(43);
+import {
+  entitlementBody, issueTestEntitlement, TEST_VPS_SECURITY_ENV
+} from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -27,6 +28,7 @@ async function expectStartupReject(envPatch, pattern) {
     cwd: process.cwd(),
     env: {
       ...process.env,
+      ...TEST_VPS_SECURITY_ENV,
       HOST: '127.0.0.1',
       PORT: '32123',
       ...envPatch
@@ -41,22 +43,8 @@ async function expectStartupReject(envPatch, pattern) {
   assert.match(output, pattern);
 }
 
-let inFlight = 0;
-let maxInFlight = 0;
-let verifyCalls = 0;
 let upstreamCalls = 0;
 const mock = http.createServer((req, res) => {
-  if (req.url === '/verify') {
-    verifyCalls += 1;
-    inFlight += 1;
-    maxInFlight = Math.max(maxInFlight, inFlight);
-    setTimeout(() => {
-      inFlight -= 1;
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, type: 'lifetime', expires_at: null }));
-    }, 350);
-    return;
-  }
   if (req.url === '/v1/chat/completions') {
     upstreamCalls += 1;
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -73,6 +61,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,
@@ -85,95 +74,48 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
 
 try {
   await waitFor(`${base}/health`);
-  const requests = Array.from({ length: 6 }, (_, index) => fetch(`${base}/ai/upload-ticket`, {
+  const postTicket = (body) => fetch(`${base}/ai/upload-ticket`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Forwarded-For': '198.51.100.77'
-    },
-    body: JSON.stringify({
-      license_key: `SMESH-VERIFY-${index}`,
-      device_id: `00000000-0000-4000-8000-${String(index + 1).padStart(12, '0')}`,
-      activation_token: ACTIVATION_TOKEN,
-      size: 1,
-    })
-  }));
-  const responses = await Promise.all(requests);
-  const statuses = responses.map((response) => response.status).sort((a, b) => a - b);
-  assert.deepEqual(statuses, [200, 200, 200, 200, 429, 429],
-    'one anonymous IP may hold at most four outbound license verifications');
-  assert.equal(verifyCalls, 4, 'rejected attempts must never reach the Worker');
-  assert.equal(maxInFlight, 4);
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...body, size: 1 })
+  });
 
-  const beforeShared = verifyCalls;
-  const shared = await Promise.all(Array.from({ length: 4 }, () => fetch(`${base}/ai/upload-ticket`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Forwarded-For': '198.51.100.88'
-    },
-    body: JSON.stringify({
-      license_key: 'SMESH-SHARED-VERIFY-KEY',
-      device_id: '00000000-0000-4000-8000-000000000071',
-      activation_token: ACTIVATION_TOKEN,
-      size: 1
-    })
-  })));
+  const rawCredentials = await postTicket({
+    license_key: 'SMESH-RAW-KEY-MUST-STOP-AT-WORKER',
+    device_id: '00000000-0000-4000-8000-000000000071',
+    activation_token: 'A'.repeat(43)
+  });
+  assert.equal(rawCredentials.status, 403,
+    'the inference service must never accept a raw license or activation token');
+
+  const validToken = issueTestEntitlement({
+    licenseKey: 'SMESH-LOCAL-ENTITLEMENT',
+    deviceId: '00000000-0000-4000-8000-000000000071'
+  });
+  assert.equal((await postTicket({ entitlement_token: validToken })).status, 200);
+
+  const tamperedToken = validToken.slice(0, -1) + (validToken.endsWith('A') ? 'B' : 'A');
+  assert.equal((await postTicket({ entitlement_token: tamperedToken })).status, 403,
+    'a modified capability must fail local signature verification');
+  assert.equal((await postTicket({
+    entitlement_token: issueTestEntitlement({ now: Date.now() - 11 * 60 * 1000 })
+  })).status, 403, 'an expired capability must fail closed');
+
+  const sharedBody = entitlementBody({
+    licenseKey: 'SMESH-SHARED-TICKET-CAP',
+    deviceId: '00000000-0000-4000-8000-000000000072'
+  });
+  const shared = await Promise.all(Array.from({ length: 4 }, () => postTicket(sharedBody)));
   assert.deepEqual(shared.map((response) => response.status).sort((a, b) => a - b),
-    [200, 200, 429, 429],
-    'the per-device upload cap still applies after a shared verification');
-  assert.equal(verifyCalls - beforeShared, 1,
-    'concurrent requests for one license/device must share one authoritative verification');
-
-  // Once the complete body has arrived, disconnect while /verify is delayed.
-  // The verifier may finish and warm its positive cache, but the unreachable
-  // start response must not charge quota or create paid upstream work.
-  const beforeDisconnected = verifyCalls;
-  const abandoned = http.request({
-    host: '127.0.0.1',
-    port: proxyPort,
-    path: '/ai/start',
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.99' }
-  });
-  abandoned.on('error', () => {});
-  abandoned.end(JSON.stringify({
-    provider: 'qwen',
-    license_key: 'SMESH-DISCONNECTED-START-KEY',
-    device_id: '00000000-0000-4000-8000-000000000072',
-    activation_token: ACTIVATION_TOKEN,
-    messages: [{ role: 'user', content: 'must never run' }]
-  }));
-  for (let i = 0; i < 80 && verifyCalls === beforeDisconnected; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(verifyCalls, beforeDisconnected + 1, 'the disconnect probe must reach license verification');
-  abandoned.destroy();
-  await new Promise((resolve) => setTimeout(resolve, 500));
-  assert.equal(upstreamCalls, 0,
-    'a client that disappeared during verification must not create unreachable paid work');
-
-  const reachable = await fetch(`${base}/ai/start`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Forwarded-For': '198.51.100.99' },
-    body: JSON.stringify({
-      provider: 'qwen',
-      license_key: 'SMESH-DISCONNECTED-START-KEY',
-      device_id: '00000000-0000-4000-8000-000000000072',
-      activation_token: ACTIVATION_TOKEN,
-      messages: [{ role: 'user', content: 'control' }]
-    })
-  });
-  assert.equal(reachable.status, 200, 'the neighboring connected start must remain available');
-  for (let i = 0; i < 40 && upstreamCalls === 0; i++) {
-    await new Promise((resolve) => setTimeout(resolve, 10));
-  }
-  assert.equal(upstreamCalls, 1);
+    [200, 200, 429, 429], 'the per-principal upload-ticket cap remains enforced');
+  assert.equal(upstreamCalls, 0, 'ticket authorization must not contact the paid model gateway');
 
   const source = await readFile(new URL('../backend-vps/server.js', import.meta.url), 'utf8');
   const start = source.slice(source.indexOf('async function handleAiStart'), source.indexOf('function hasJobToken'));
   assert.ok(start.indexOf('await prepareChat') < start.indexOf('reserveJobAccounting'),
     'active AI slots must be reserved only after authentication completes');
+  assert.doesNotMatch(source, /LICENSE_VERIFY_URL|verifyLicenseUpstream|activation_token/,
+    'the VPS must have no fallback path for raw license verification');
   assert.match(source, /server\.requestTimeout\s*=\s*30\s*\*\s*1000/);
   assert.match(source, /server\.headersTimeout\s*=\s*15\s*\*\s*1000/);
   assert.match(source, /MAX_ACTIVE_JOBS\s*=\s*24/,
@@ -202,10 +144,6 @@ try {
     { AI_PROXY_BASE_URL: 'http://example.com/v1' },
     /Invalid AI_PROXY_BASE_URL: HTTPS is required/
   );
-  await expectStartupReject(
-    { LICENSE_VERIFY_URL: 'https://user:secret@smeshapi\.site/verify' },
-    /Invalid LICENSE_VERIFY_URL: credentials, query strings, and fragments are not allowed/
-  );
   const setup = await readFile(new URL('../backend-vps/setup.sh', import.meta.url), 'utf8');
   assert.match(setup, /Invalid DOMAIN: expected a DNS hostname/,
     'installer must not interpolate an unvalidated environment value into Caddy config');
@@ -221,7 +159,7 @@ try {
   assert.match(setup, /header_up X-Forwarded-For \{remote_host\}/,
     'Caddy must replace attacker-supplied forwarding chains with the real TLS peer address');
 
-  console.log('vps verification admission regressions passed');
+  console.log('vps local entitlement admission regressions passed');
 } finally {
   proc.kill('SIGTERM');
   await Promise.race([once(proc, 'exit'), new Promise((resolve) => setTimeout(resolve, 1000))]);

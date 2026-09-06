@@ -5,6 +5,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { entitlementBody, TEST_VPS_SECURITY_ENV } from './helpers/vps-entitlement.mjs';
 
 async function listen(server) {
   server.listen(0, '127.0.0.1');
@@ -25,12 +26,12 @@ async function waitFor(url) {
   throw last || new Error('proxy did not start');
 }
 
-const ACTIVATION_TOKEN = 'A'.repeat(43);
-
 async function post(url, body, headers = {}) {
-  const authenticatedBody = body?.license_key && body.activation_token == null
-    ? { ...body, activation_token: ACTIVATION_TOKEN }
-    : body;
+  let authenticatedBody = body;
+  if (body?.license_key) {
+    const { license_key: licenseKey, device_id: deviceId, activation_token: _unused, ...rest } = body;
+    authenticatedBody = { ...rest, ...entitlementBody({ licenseKey, deviceId }) };
+  }
   return fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', ...headers },
@@ -58,6 +59,7 @@ const proc = spawn(process.execPath, ['backend-vps/server.js'], {
   cwd: process.cwd(),
   env: {
     ...process.env,
+    ...TEST_VPS_SECURITY_ENV,
     HOST: '127.0.0.1',
     PORT: String(proxyPort),
     LICENSE_VERIFY_URL: `http://127.0.0.1:${mockPort}/verify`,

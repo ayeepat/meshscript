@@ -214,8 +214,8 @@ function feed(sink, frames) {
 // Threading onReasoning through one adapter and not the rest would silently
 // produce empty «Рассуждение» sections on exactly the route being debugged.
 for (const [file, calls] of Object.entries({
-  '../src/lib/qwen.js': ['askViaProxy', 'postStream'],
-  '../src/lib/deepseek.js': ['askViaProxy', 'postStream'],
+  '../src/lib/qwen.js': ['askViaProxy'],
+  '../src/lib/deepseek.js': ['askViaProxy'],
   '../src/lib/openrouter.js': ['postStream'],
   '../src/lib/groq.js': ['postStream'],
   '../src/lib/smesh-proxy.js': ['createSseSink'],

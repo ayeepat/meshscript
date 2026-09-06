@@ -40,8 +40,9 @@ try {
   await assert.rejects(ensureLicensed(), /Не удалось подтвердить активацию/,
     'the solve gate must not pass a license that the proxy cannot authenticate');
 
-  // Current server behavior intentionally omits the bearer on routine
-  // re-verification. A valid prior capability must survive that response.
+  // Routine re-verification may omit the unchanged activation bearer, but it
+  // must issue a fresh short-lived AI entitlement. The prior installation
+  // capability survives while the new AI capability replaces the old one.
   store.set('licenseStatus', {
     key,
     ok: true,
@@ -50,21 +51,35 @@ try {
     activation_token: 'a'.repeat(43),
     lastVerifiedAt: NOW - 1000
   });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    ok: true,
+    type: 'lifetime',
+    expires_at: null,
+    entitlement_token: 'et1.test.signature',
+    entitlement_token_expires_at: NOW + 10 * 60 * 1000
+  }), {
+    status: 200,
+    headers: { 'Content-Type': 'application/json' }
+  });
   const refreshed = await verifyKey(key);
   assert.equal(isUsableLicenseStatus(refreshed), true,
     'routine re-verification must retain the valid installation capability');
   assert.equal(refreshed.activation_token, 'a'.repeat(43));
 
-  globalThis.fetch = async () => {
-    throw new Error('proxy fetch must not run for an unusable local entitlement');
+  let attemptedUrl = '';
+  globalThis.fetch = async (url) => {
+    attemptedUrl = String(url);
+    throw new Error('offline');
   };
   store.set('licenseStatus', { key, ok: true, expires_at: null });
   const { askViaProxy } = await import('../src/lib/smesh-proxy.js');
   await assert.rejects(
     askViaProxy('deepseek', [{ role: 'user', content: 'test' }]),
-    /Не удалось подтвердить активацию/,
-    'a direct proxy caller must reject before sending an unauthenticated request'
+    /Не удалось связаться с сервером/,
+    'a direct proxy caller must reject when it cannot renew its capability'
   );
+  assert.match(attemptedUrl, /\/verify$/,
+    'the only permitted network attempt is an authoritative license refresh, never AI inference');
 
   const popupSource = fs.readFileSync(new URL('../src/popup/popup.js', import.meta.url), 'utf8');
   const settingsSource = fs.readFileSync(new URL('../src/settings/settings.js', import.meta.url), 'utf8');

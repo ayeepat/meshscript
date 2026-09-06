@@ -94,6 +94,7 @@ livePrincipal = principalA;
 const discoveryContext = {
   ...bindingContext,
   currentPrincipalIdentity: () => livePrincipal,
+  attachmentFeatureEnabled: async () => true,
   findAuthToken: () => 'secret-bearer',
   meshHeaders: (token) => ({ Authorization: `Bearer ${token}` }),
   dbg() {},
@@ -134,7 +135,7 @@ assert.equal(apiCalls, 0,
 // Exercise the worker's two independent owners: current local scan state and
 // the live content-script row/principal check.
 const verifyStart = worker.indexOf('async function verifyHomeworkDownloadBinding(');
-const verifyEnd = worker.indexOf('\n// `headers`', verifyStart);
+const verifyEnd = worker.indexOf('\n// Only the MESH content script', verifyStart);
 assert.ok(verifyStart >= 0 && verifyEnd > verifyStart,
   'worker homework binding verifier must be extractable');
 const verifySource = worker.slice(verifyStart, verifyEnd);
@@ -215,7 +216,7 @@ await assert.rejects(
   downloadContext.downloadFiles({
     ...downloadBinding,
     urls: ['https://school.mos.ru/private.pdf'],
-    headers: {},
+    token: 'one-time-mesh-token',
   }),
   /binding changed while downloading/,
 );
@@ -226,9 +227,34 @@ assert.match(
   'discovery must carry the immutable scan principal',
 );
 assert.match(
+  scraper,
+  /type: 'DOWNLOAD_FILES'[\s\S]*?token,[\s\S]*?scanId,[\s\S]*?principal: expectedPrincipal,[\s\S]*?rowToken/,
+  'the content script must pass the one-time token with scan/principal/row binding',
+);
+assert.match(
+  scraper,
+  /type: 'GET_ACTION_TOKEN'[\s\S]*?action: 'DOWNLOAD_FILES'[\s\S]*?type: 'DOWNLOAD_FILES'[\s\S]*?token: grant\.token/,
+  'the bearer-bearing request must consume a one-time action capability',
+);
+assert.match(
+  worker,
+  /const CONTENT_ACTIONS = new Set\([\s\S]*?'DOWNLOAD_FILES'/,
+  'the worker must actually require the one-time action capability for attachment downloads',
+);
+assert.match(
+  scraper,
+  /GET_RUNTIME_CONFIG[\s\S]*?features\?\.mesh_attachments[\s\S]*?await attachmentFeatureEnabled\(\)[\s\S]*?findAuthToken\(\)/,
+  'the signed attachment switch must be checked before the bearer is read',
+);
+assert.match(
   popup,
-  /type: 'DOWNLOAD_FILES'[\s\S]*?\.\.\.attachmentBindingPayload\(card\)/,
-  'privileged downloads must carry tab/scan/principal/row binding',
+  /type: 'MESH_DOWNLOAD_CANDIDATE'[\s\S]*?\.\.\.attachmentBindingPayload\(card\)/,
+  'manual candidate selection must retain tab/scan/principal/row binding',
+);
+assert.doesNotMatch(
+  popup,
+  /type: 'DOWNLOAD_FILES'|candidateAuth|Authorization:/,
+  'the popup must never receive or relay the MESH bearer token',
 );
 assert.match(
   popup,
@@ -242,8 +268,8 @@ assert.match(
 );
 assert.match(
   worker,
-  /DOWNLOAD_FILES:[\s\S]*?isSafeId\(msg\.payload\.tabId\)[\s\S]*?isHomeworkScanId\(msg\.payload\.scanId\)[\s\S]*?isHomeworkScanId\(msg\.payload\.rowToken\)/,
-  'the privileged message schema must require every binding component',
+  /DOWNLOAD_FILES:[\s\S]*?'token'[\s\S]*?isHomeworkScanId\(msg\.payload\.scanId\)[\s\S]*?isHomeworkScanId\(msg\.payload\.rowToken\)/,
+  'the privileged message schema must require the token and immutable binding components',
 );
 
 console.log('homework attachment binding regression passed');
