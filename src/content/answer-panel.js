@@ -55,6 +55,26 @@
       }`;
   }
 
+  /* ---------- Extension context liveness ---------- */
+  // Same trap the pill guards against (see content/test-pill.js): this script
+  // keeps running after СМЭШ is reloaded or updated, holding a dead
+  // chrome.runtime that fails only when a button is pressed. Without the probe
+  // the panel reports a transient «Ошибка» and restores the button, inviting a
+  // retry that can never succeed.
+  //
+  // The panel is deliberately NOT torn down. Its answers are plain text by now
+  // and remain perfectly usable — the student can read and copy them. Only the
+  // two controls that need the worker («Заполнить» and per-line «перерешать»)
+  // are retired, with a visible reason. Copy and «Разбор» are pure DOM and keep
+  // working.
+  function contextAlive() {
+    try { return !!chrome.runtime?.id; } catch { return false; }
+  }
+  const CONTEXT_LOST_NOTE =
+    'Расширение обновилось. Обновите страницу (F5), чтобы снова заполнять и перерешать. ' +
+    'Ответы выше остаются в силе — их можно списать или скопировать.';
+  let contextLost = false;
+
   let hostEl = null;
   let shadow = null;
   let lastPayload = null;
@@ -302,8 +322,15 @@
           min-width: 26px;
           transition: background 0.15s cubic-bezier(0.22, 0.61, 0.36, 1), border-color 0.15s ease, color 0.15s ease;
         }
-        button:hover { background: var(--p-btn-hover); border-color: var(--p-arrow); }
-        button:active { background: var(--p-btn-active); }
+        /* :not(:disabled) rather than a later override, so a down control keeps
+           its own colour instead of flickering to the hover border. */
+        button:hover:not(:disabled) { background: var(--p-btn-hover); border-color: var(--p-arrow); }
+        button:active:not(:disabled) { background: var(--p-btn-active); }
+        /* Permanently retired by context loss — distinct from the ordinary
+           disabled state a fill sets for its own duration, which should keep looking
+           like the button you just pressed. Matches the pill's button[disabled]
+           treatment. Pointer events stay on, so the title still explains why. */
+        button.retired { opacity: 0.5; cursor: default; }
         button:focus-visible { outline: none; box-shadow: 0 0 0 2px var(--p-accent); }
         /* Primary action: fill the form. Tinted to the brand accent. */
         .btn-fill { color: var(--p-accent); border-color: var(--p-accent); }
@@ -394,6 +421,9 @@
         }
         .panel[data-theme="dark"] .ai-note a { color: #60a5fa; }
         .ai-note a:hover { text-decoration: underline; }
+        /* Why «Заполнить» and «перерешать» went dead: the extension was replaced
+           under this page and only a reload can reconnect them. */
+        .ctx-note { color: var(--p-warn); }
         .panel.minimized .body { display: none; }
         .panel.minimized { max-height: none; }
         .copied { color: var(--p-answer); border-color: var(--p-answer); }
@@ -415,7 +445,9 @@
           transition: opacity 0.15s ease, color 0.15s ease, border-color 0.15s ease, transform 0.4s ease;
         }
         li:hover .btn-resolve { opacity: 0.9; }
-        .btn-resolve:hover { color: var(--p-accent); border-color: var(--p-accent); opacity: 1; }
+        /* Not while disabled: a ↻ that lights up teal under the cursor reads as
+           ready, whether it is mid-resolve or retired for good. */
+        .btn-resolve:hover:not(:disabled) { color: var(--p-accent); border-color: var(--p-accent); opacity: 1; }
         .btn-resolve:disabled { cursor: default; }
         .btn-resolve.spinning { opacity: 1; color: var(--p-accent); animation: smesh-resolve-spin 0.7s linear infinite; }
         .btn-resolve.failed { color: var(--p-danger); border-color: var(--p-danger); opacity: 1; }
@@ -600,6 +632,41 @@
     else if (kind === 'warn') { mark.className = 'mark warn'; mark.textContent = '⚠ '; }
   }
 
+  /**
+   * Retire the worker-backed controls after the extension went away, and say
+   * why. Idempotent, and safe to call on a panel that has since been replaced.
+   *
+   * The reason goes in a note row of its own rather than into the existing
+   * «Это ИИ» disclaimer: that line is a standing notice, not a status area, and
+   * overwriting it would quietly drop it for the rest of the session.
+   */
+  function noteContextLoss() {
+    if (contextLost) return;
+    contextLost = true;
+    if (!shadow) return;
+    const fill = shadow.querySelector('.btn-fill');
+    if (fill) {
+      fill.disabled = true;
+      fill.classList.remove('copied', 'failed');
+      fill.classList.add('retired');
+      // Shorter than «Заполнить», so no titlebar can be pushed out of shape.
+      fill.textContent = 'Обновите';
+      fill.title = CONTEXT_LOST_NOTE;
+    }
+    shadow.querySelectorAll('.btn-resolve').forEach((b) => {
+      b.disabled = true;
+      b.classList.remove('spinning', 'failed');
+      b.classList.add('retired');
+      b.title = CONTEXT_LOST_NOTE;
+    });
+    const body = shadow.querySelector('.body');
+    if (!body) return;
+    const note = document.createElement('div');
+    note.className = 'ai-note ctx-note';
+    note.textContent = CONTEXT_LOST_NOTE;
+    body.appendChild(note);
+  }
+
   // Fill the test form. The form often lives inside an iframe (Mesh embeds some
   // test players), which the panel's own frame can't reach — so ask the service
   // worker to run the fill in EVERY frame of the tab and merge the result. Do
@@ -710,6 +777,9 @@
       btn.disabled = false;
       aEl.classList.remove('resolving');
       aEl.textContent = prevText; // restore the prior answer
+      // Same rule as the fill button: an extension that is gone will not come
+      // back for a retry, so retire the control instead of flashing it red.
+      if (!contextAlive()) { noteContextLoss(); return; }
       btn.classList.add('failed');
       setTimeout(() => {
         if (isPanelCurrent(generation, panelNonce, btn)) btn.classList.remove('failed');
@@ -806,6 +876,9 @@
       }
       fillBtn.disabled = false;
       if (!summary) {
+        // A dead extension context is not a transient error: restoring the
+        // button after 1.6s would only invite the identical failure again.
+        if (!contextAlive()) { noteContextLoss(); return; }
         fillBtn.textContent = 'Ошибка';
         fillBtn.classList.add('failed');
         setTimeout(() => {

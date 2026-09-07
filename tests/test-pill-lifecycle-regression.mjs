@@ -68,6 +68,15 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
   let frames = ['https://uchebnik.mos.ru/player'];
   let panelHideCalls = 0;
   let nextTimer = 1;
+  // The detection poll is the only 1200 ms interval the pill starts on a Mesh
+  // page; startThinking() creates the rest. Tracking both ends lets the
+  // context-loss tests prove an orphaned script actually stops polling.
+  const intervals = [];
+  const clearedIntervals = [];
+  // Armed setTimeout callbacks, so a test can advance time. showResult() uses
+  // one to return the pill to idle and re-enable its buttons a few seconds
+  // later — the exact behaviour a terminal state has to suppress.
+  const timeouts = new Map();
 
   const location = {};
   const setUrl = (raw) => {
@@ -147,7 +156,10 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
             })[selector] || null;
           },
           querySelectorAll(selector) {
-            return selector === '.actions button' ? [pageButton, allButton, closeButton] : [];
+            // Only «Решить» and «все страницы» live in .actions — the × sits
+            // outside it in the real markup, so disabling the actions never
+            // takes away the student's way out of a stuck pill.
+            return selector === '.actions button' ? [pageButton, allButton] : [];
           }
         };
         host.shadow = shadow;
@@ -185,6 +197,9 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
   };
   const chrome = {
     runtime: {
+      // Present on every live content script — the pill reads it to decide
+      // whether the extension is still there. See handleContextLoss().
+      id: 'smeshid',
       lastError: null,
       getURL: (path) => `chrome-extension://test/${path}`,
       onMessage: { addListener() {} },
@@ -225,10 +240,18 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
     chrome,
     innerWidth: 1280,
     innerHeight: 800,
-    setInterval: () => nextTimer++,
-    clearInterval() {},
-    setTimeout: () => nextTimer++,
-    clearTimeout() {},
+    setInterval: (fn, ms) => {
+      const id = nextTimer++;
+      intervals.push({ id, fn, ms });
+      return id;
+    },
+    clearInterval: (id) => { clearedIntervals.push(id); },
+    setTimeout: (fn, ms) => {
+      const id = nextTimer++;
+      timeouts.set(id, { fn, ms });
+      return id;
+    },
+    clearTimeout: (id) => { timeouts.delete(id); },
     queueMicrotask,
     console
   };
@@ -262,7 +285,22 @@ function createHarness({ deferredReads = false, deferredTokens = false } = {}) {
       for (const listener of [...listeners]) listener(event);
     },
     latestHost: () => hosts[hosts.length - 1],
-    panelHideCalls: () => panelHideCalls
+    panelHideCalls: () => panelHideCalls,
+    // Reproduce an extension reload/update: Chrome invalidates the context of
+    // every content script already in the page, and chrome.runtime.id — which
+    // the pill probes — goes undefined. Nothing else about the page changes,
+    // which is exactly what makes the failure so easy to miss.
+    killContext() { chrome.runtime.id = undefined; },
+    pollTimer: () => intervals.find((entry) => entry.ms === 1200),
+    clearedIntervals: () => clearedIntervals,
+    armedTimeouts: () => timeouts.size,
+    // Let every armed timer fire, the way the clock eventually would.
+    fireArmedTimeouts() {
+      const armed = [...timeouts.values()];
+      timeouts.clear();
+      for (const entry of armed) entry.fn();
+      return armed.length;
+    }
   };
 }
 
@@ -445,6 +483,212 @@ for (const [label, stop] of [
   );
   assert.match(askOpts, /\n\s*signal,/,
     'solveTest must forward the signal to askAI so a cancelled solve stops spending');
+}
+
+/* ============ Extension context loss (reload / update under an open tab) ============
+ *
+ * Chrome does not re-inject content scripts into tabs that are already open, so
+ * an extension reload or auto-update leaves this script orphaned and permanently
+ * unable to reach the worker. Nothing about the page signals it: every storage
+ * read here is try/catch'd and falls back to defaults, so the pill used to keep
+ * mounting, keep looking ready, and answer each click with «Соединение с
+ * расширением прервалось. Попробуйте ещё раз.» — advice that cannot ever work.
+ */
+
+const CONTEXT_LOST = 'Расширение обновилось. Обновите страницу (F5).';
+
+// An orphaned pill stops polling, stops offering its actions, and says the one
+// thing that fixes it — while leaving the answers already on screen alone.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  const host = h.latestHost();
+  assert.ok(host?.connected, 'the pill must be mounted before the extension goes away');
+  const poll = h.pollTimer();
+  assert.ok(poll, 'the Mesh detection poll must be running');
+
+  h.killContext();
+  h.pillApi.evaluate(); // the next poll tick
+
+  assert.ok(host.connected,
+    'a pill that is already on screen must stay to explain itself, not vanish silently');
+  assert.equal(host.shadow.nodes.status.textContent, CONTEXT_LOST,
+    'an orphaned pill must name the reload, not offer a retry that cannot work');
+  assert.equal(host.shadow.nodes.pageButton.disabled, true,
+    '«Решить» must be retired once no click can reach the worker');
+  assert.equal(host.shadow.nodes.allButton.disabled, true,
+    '«все страницы» must be retired too');
+  assert.equal(host.shadow.nodes.closeButton.disabled, false,
+    'the student must still be able to dismiss a dead pill');
+  assert.ok(h.clearedIntervals().includes(poll.id),
+    'the detection poll must stop: it can never bring the pill back');
+  assert.equal(h.panelHideCalls(), 0,
+    'the answers already on screen stay valid — context loss must not hide the panel');
+
+  // Later ticks must not repaint or clear it either.
+  h.pillApi.evaluate();
+  assert.equal(host.shadow.nodes.status.textContent, CONTEXT_LOST,
+    'later ticks must not repaint or clear the terminal message');
+  assert.equal(host.shadow.nodes.pageButton.disabled, true,
+    'the buttons must not come back');
+}
+
+// The terminal state has to survive the clock. An ordinary error schedules
+// showResult's return to idle a few seconds out, and toIdle() re-enables the
+// buttons — so context loss arriving while that timer is armed must disarm it.
+// Otherwise the message reads "обновите страницу" while the buttons quietly
+// light up again underneath it, inviting the click that started all this.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  const host = h.latestHost();
+  host.shadow.nodes.pageButton.__listener('click')({ isTrusted: true });
+  await flushMicrotasks();
+
+  // A transient failure first: this is what arms the return-to-idle timer.
+  const solve = h.pendingSolves.find((entry) => entry.message.type === 'PILL_SOLVE_PAGE');
+  assert.ok(solve, 'the solve must be in flight');
+  solve.callback({ ok: false, error: 'нет связи с сервером' });
+  await flushMicrotasks();
+  assert.equal(host.shadow.nodes.pageButton.disabled, true,
+    'the buttons stay down while the error is on screen');
+  assert.ok(h.armedTimeouts() > 0,
+    'an ordinary error must arm the return-to-idle timer this case depends on');
+
+  // ...and now the extension goes away before that timer fires.
+  h.killContext();
+  h.pillApi.evaluate();
+  assert.equal(host.shadow.nodes.status.textContent, CONTEXT_LOST);
+
+  h.fireArmedTimeouts();
+  assert.equal(host.shadow.nodes.status.textContent, CONTEXT_LOST,
+    'the clock must not wipe the terminal message');
+  assert.equal(host.shadow.nodes.pageButton.disabled, true,
+    'and must not re-enable a button that can never work again');
+}
+
+// Same rule when the pill is NOT on screen — the student pressed × or Esc but
+// left the answer panel up to copy from. Context loss tears down the pill's own
+// remains silently, and must still leave those answers where they are: they were
+// solved and paid for, and nothing about them stopped being true.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  h.pillApi.hide();
+  const hidesAfterClose = h.panelHideCalls();
+
+  h.killContext();
+  h.pillApi.evaluate();
+  assert.equal(h.panelHideCalls(), hidesAfterClose,
+    'losing the extension must not take the answer panel down with it');
+}
+
+// The route watcher must not rebuild a working-looking pill after the extension
+// is gone. This is the case that actually reaches students: the tab was open,
+// СМЭШ auto-updated, and the next SPA navigation into a test mounted a fresh
+// pill whose every button was already dead.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  const before = h.hosts.length;
+  h.killContext();
+  h.pillApi.evaluate();
+
+  h.setUrl('https://school.mos.ru/course/cwork?id=next');
+  h.pillApi.evaluate();
+  await flushMicrotasks();
+  assert.equal(h.hosts.length, before,
+    'an orphaned script must never mount a fresh pill on a new route');
+}
+
+// A click that lands before the poll notices must fail instantly with the same
+// message — not burn the 5-second action-token timeout and then report a
+// generic timeout, which reads as a network problem and sends the student off
+// to check their connection.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  const host = h.latestHost();
+  h.killContext();
+
+  host.shadow.nodes.pageButton.__listener('click')({ isTrusted: true });
+  await flushMicrotasks();
+
+  assert.equal(h.pendingTokens.length, 0,
+    'no action token may be requested through a dead runtime');
+  assert.equal(h.pendingSolves.length, 0, 'and no solve may be attempted');
+  assert.equal(host.shadow.nodes.status.textContent, CONTEXT_LOST,
+    'a click after context loss must report the reload immediately');
+  assert.equal(host.shadow.nodes.pageButton.disabled, true,
+    'and must not re-arm the button');
+}
+
+// The other half of the split: a LIVE extension whose worker merely dropped the
+// reply is genuinely retryable, and must keep saying so. The two failures are
+// indistinguishable by error text — "message port closed" is what Chrome
+// reports for both — so only the runtime probe separates them.
+{
+  const h = createHarness();
+  await flushMicrotasks();
+  const host = h.latestHost();
+  host.shadow.nodes.pageButton.__listener('click')({ isTrusted: true });
+  await flushMicrotasks();
+
+  const solve = h.pendingSolves.find((entry) => entry.message.type === 'PILL_SOLVE_PAGE');
+  assert.ok(solve, 'the solve must have reached the worker while the context was live');
+  solve.callback({
+    ok: false,
+    error: 'The message port closed before a response was received.'
+  });
+  await flushMicrotasks();
+
+  assert.equal(
+    host.shadow.nodes.status.textContent,
+    'Соединение с расширением прервалось. Попробуйте ещё раз.',
+    'a recycled worker on a live extension must still invite a retry'
+  );
+  assert.equal(host.shadow.nodes.pill.classList.contains('result'), true,
+    'and must land in the ordinary, expiring error state');
+}
+
+// The answer panel is the other surface a student touches after a solve, and it
+// carries the same orphaning risk. Its answers are plain text by then, so it
+// must retire only the two worker-backed controls and keep the panel readable.
+{
+  const panelSource = readFileSync(
+    new URL('../src/content/answer-panel.js', import.meta.url), 'utf8'
+  );
+  assert.match(panelSource, /function contextAlive\(\)\s*\{\s*try \{ return !!chrome\.runtime\?\.id; \}/,
+    'the panel must probe the runtime id the same way the pill does');
+  assert.match(panelSource, /if \(!contextAlive\(\)\) \{ noteContextLoss\(\); return; \}/g,
+    'a failed fill must check for a dead context before painting a transient error');
+  assert.equal(
+    (panelSource.match(/if \(!contextAlive\(\)\) \{ noteContextLoss\(\); return; \}/g) || []).length,
+    2,
+    'both worker-backed controls (fill and per-line resolve) must check'
+  );
+  assert.doesNotMatch(panelSource, /\.ai-note'\)[^\n]*\.textContent =/,
+    'the standing «Это ИИ» disclaimer must not be overwritten by the status note');
+  assert.match(panelSource, /body\.appendChild\(note\);/,
+    'the status note must be appended alongside that disclaimer, not replace it');
+
+  // «Заполнить» and every ↻ must be both inert AND visibly retired. Disabling
+  // alone left them at full strength with a live hover, still reading as ready.
+  const retire = panelSource.slice(
+    panelSource.indexOf('function noteContextLoss()'),
+    panelSource.indexOf('// Fill the test form.')
+  );
+  for (const control of ['.btn-fill', '.btn-resolve']) {
+    assert.ok(retire.includes(control), `noteContextLoss must reach ${control}`);
+  }
+  assert.equal((retire.match(/classList\.add\('retired'\)/g) || []).length, 2,
+    'both control families must be marked retired, not merely disabled');
+  assert.match(panelSource, /button\.retired \{ opacity: 0\.5; cursor: default; \}/,
+    'the retired class must actually mute the control');
+  // Scoped to `.retired`, never to :disabled — an ordinary in-flight fill
+  // disables the button too, and that state must keep looking untouched.
+  assert.doesNotMatch(panelSource, /\bbutton:disabled \{ opacity/,
+    'the ordinary mid-fill disabled state must not be restyled by this fix');
 }
 
 console.log('test pill lifecycle regressions passed');

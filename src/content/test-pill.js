@@ -40,6 +40,28 @@
   const DEBUG = false;
   const log = (...a) => { if (DEBUG) { try { console.debug('[СМЭШ AI pill]', ...a); } catch { /* */ } } };
 
+  /* ---------- Extension context liveness ---------- */
+  // A content script OUTLIVES the extension that injected it. Reloading,
+  // updating or disabling СМЭШ leaves THIS script running in the page with a
+  // dead chrome.runtime, and Chrome does not re-inject into tabs that are
+  // already open — so the orphan is final for this document.
+  //
+  // It does not fail loudly, which is the trap: every storage read below is
+  // wrapped in try/catch and resolves to defaults, so the poll keeps evaluating,
+  // build() keeps mounting a normal-looking pill, and only the click fails. The
+  // student then reads "попробуйте ещё раз" and retries forever.
+  //
+  // chrome.runtime.id is the cheapest reliable probe — it becomes undefined the
+  // instant the context is invalidated. It is also the ONLY thing that separates
+  // the two failures that produce identical error text: a recycled MV3 worker
+  // (retry works) and a replaced extension (only a reload does).
+  function contextAlive() {
+    try { return !!chrome.runtime?.id; } catch { return false; }
+  }
+  const CONTEXT_LOST_TEXT = 'Расширение обновилось. Обновите страницу (F5).';
+  // Latches once: nothing in this document can reach the extension again.
+  let contextLost = false;
+
   /* ---------- Test-page detection (single source of truth) ---------- */
   // The manifest matches both МЭШ hosts broadly (uchebnik.mos.ru + school.mos.ru
   // minus /diary). This decides whether the CURRENT page is actually a test
@@ -273,6 +295,7 @@
   let runGen = 0;
   let thinker = null;
   let activeDragCleanup = null;
+  let pollTimer = null; // the detection poll, so context loss can stop it for good
 
   let themePref = 'system';
   // Active AI provider. The tiny GRQ/OPR/QWN/DSK tag it used to paint on the
@@ -868,6 +891,22 @@
     if (!shadow) return;
     shadow.querySelectorAll('.actions button').forEach((b) => { b.disabled = d; });
   }
+  // showResult, but the state never expires. For failures that CANNOT be retried
+  // in this document: showResult's auto-return to idle would re-enable the
+  // buttons a few seconds later and invite another click that must also fail.
+  function showTerminal(text) {
+    if (thinker) { thinker.stop(); thinker = null; }
+    if (!shadow) return;
+    const pill = shadow.querySelector('.pill');
+    const stext = shadow.querySelector('.stext');
+    pill.classList.remove('busy');
+    pill.classList.add('result');
+    stext.classList.add('err');
+    stext.textContent = text;
+    setButtonsDisabled(true);
+    clearTimeout(showResult._t);
+    showResult._t = null;
+  }
 
   // Mirror popup.js renderPaginationSummary so the autopilot ends with the same
   // wording the toolbar flow uses.
@@ -925,6 +964,11 @@
   // One long-lived privileged message to the worker. A generous guard so a
   // recycled service worker (dropped reply) never leaves the pill spinning.
   async function send(type, timeoutMs) {
+    // Fail fast and honestly when the extension is already gone. Without this the
+    // token request burns its full 5-s timeout first and then reports 'timeout',
+    // which reads as "slow internet" and sends the student to check their
+    // connection over a problem only a page reload can fix.
+    if (!contextAlive()) return { ok: false, error: 'context invalidated' };
     // Allocate and PUBLISH the operation id before the first await. The token
     // request is a round trip to the worker, and a ×/Esc/route change/pagehide
     // during it used to find activeOpId still empty: no cancel was sent, and
@@ -979,7 +1023,7 @@
     const r = await send(IS_MESH ? 'PILL_SOLVE_PAGE' : 'WEB_SOLVE_PAGE', 240000);
     if (gen !== runGen || !shadow) return;
     busy = false;
-    if (!r.ok) { showResult(errText(r.error), true); return; }
+    if (!r.ok) { showFailure(r.error); return; }
     if (!r.count) {
       showResult(IS_MESH
         ? 'Вопросы не распознаны. Проверьте, что тест на экране.'
@@ -1011,9 +1055,28 @@
     const r = await send('PILL_SOLVE_ALL', 30 * 60000);
     if (gen !== runGen || !shadow) return;
     busy = false;
-    if (!r.ok) { showResult(errText(r.error), true); return; }
+    if (!r.ok) { showFailure(r.error); return; }
     const reused = Number(r.cached) > 0 ? ` Из истории: ${r.cached}.` : '';
     showResult(paginationSummary(r.outcome, r.solved) + reused);
+  }
+
+  /**
+   * Single place that decides whether a failed run is worth retrying.
+   *
+   * The PROBE outranks the error text, and that ordering is the whole point:
+   * "The message port closed before a response was received" is byte-identical
+   * whether the MV3 worker was merely recycled — where «попробуйте ещё раз» is
+   * exactly right — or the extension was replaced under us, where no number of
+   * retries can ever work and only a reload can. Only chrome.runtime.id tells
+   * those apart. The string check stays as a second gate for the browsers or
+   * teardown orderings where the throw arrives before the id clears.
+   */
+  function showFailure(err) {
+    if (!contextAlive() || /context invalidated/i.test(String(err || ''))) {
+      handleContextLoss();
+      return;
+    }
+    showResult(errText(err), true);
   }
 
   // Turn a raw worker error into something readable. The worker's own errors
@@ -1022,9 +1085,10 @@
   function errText(err) {
     const e = String(err || 'ошибка');
     if (e === 'timeout') return 'Долго нет ответа. Проверьте интернет и ключ ИИ в настройках, попробуйте снова.';
-    // Service worker recycled / extension reloaded mid-run → English runtime
-    // error. Don't leak it; ask the user to retry (the page keeps any fills).
-    if (/message port closed|context invalidated|Receiving end|establish connection/i.test(e)) {
+    // A live context that still lost the channel: the worker was recycled or
+    // failed to wake. Genuinely retryable — showFailure has already ruled out
+    // the invalidated-extension case, which is not.
+    if (/message port closed|Receiving end|establish connection/i.test(e)) {
       return 'Соединение с расширением прервалось. Попробуйте ещё раз.';
     }
     if (/^[А-ЯЁ]/.test(e)) return e; // worker's own guiding Russian sentence
@@ -1157,6 +1221,36 @@
   }
 
   /**
+   * The extension went away under us — reloaded, updated or disabled.
+   *
+   * Unlike every other teardown here this one is FINAL for this document. A new
+   * route, a later poll tick and a retry are all equally dead, because Chrome
+   * will not re-inject a content script into a tab that is already open. So stop
+   * the poll for good, and if the pill is on screen replace its status with the
+   * one instruction that actually works.
+   *
+   * Stays silent when nothing is mounted: an update that lands while the student
+   * is reading a lesson deserves no message at all, and the pill is meant to be
+   * discreet. Idempotent — the poll and a failing click both land here.
+   *
+   * Deliberately does NOT hide the answer panel. The answers already on screen
+   * are still correct and still worth reading; only the buttons that need the
+   * worker are dead. The panel disables those itself.
+   */
+  function handleContextLoss() {
+    if (contextLost) return;
+    contextLost = true;
+    log('extension context lost — pill is done on this page');
+    if (pollTimer != null) { clearInterval(pollTimer); pollTimer = null; }
+    // No worker is left to cancel against and PILL_CANCEL would only throw.
+    // Clearing the id first makes the teardown below skip that doomed message.
+    activeOpId = '';
+    if (!hostEl || !shadow) { invalidatePillLifecycle(); return; }
+    busy = false;
+    showTerminal(CONTEXT_LOST_TEXT);
+  }
+
+  /**
    * Show the pill even when the generic score missed this page. The student
    * asked for it from the toolbar, which outranks any heuristic — and, unlike
    * the score, it also clears a previous Esc/× on this page.
@@ -1182,6 +1276,14 @@
   // it runs on every page of every granted site.
   let lastHref = location.href;
   function evaluate() {
+    // Checked FIRST, before any DOM work. The extension can be replaced between
+    // two ticks, and from that moment every path below is a lie: the storage
+    // reads fall back to defaults without erroring, so build() would happily
+    // mount a fresh, fully functional-looking pill on the next SPA route into a
+    // test — the exact state in which a student clicks «Решить» and is told to
+    // simply try again.
+    if (contextLost) return;
+    if (!contextAlive()) { handleContextLoss(); return; }
     if (location.href !== lastHref) {
       lastHref = location.href;
       dismissed = false; // a new route may show the pill again
@@ -1220,7 +1322,10 @@
 
   log('loaded', location.href, '· show=' + shouldShowPill());
   evaluate();
-  setInterval(evaluate, IS_MESH ? 1200 : 2500);
+  // That first evaluate() can already have latched context loss (injected just
+  // as the extension was replaced), and it runs before pollTimer exists — so
+  // handleContextLoss had no timer to clear. Don't start one it can't stop.
+  if (!contextLost) pollTimer = setInterval(evaluate, IS_MESH ? 1200 : 2500);
   window.addEventListener('popstate', evaluate);
   window.addEventListener('hashchange', evaluate);
 })();

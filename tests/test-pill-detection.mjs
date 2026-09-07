@@ -26,6 +26,10 @@ function detectorFor(rawUrl, iframeSources = []) {
       }
     },
     chrome: {
+      // A live content script always has a runtime id; the pill probes it to
+      // tell a working extension from one that was replaced under the page.
+      // Omitting it here would make every detection case look orphaned.
+      runtime: { id: 'smeshid' },
       storage: {
         session: {
           // Keep the async build suspended: this test exercises detection only.

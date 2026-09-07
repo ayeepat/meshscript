@@ -442,7 +442,9 @@ function pillFor(href, { counts = {}, texts = [], clock = null, probe = null, fu
         session: { get() { /* suspend build: detection only */ } },
         onChanged: { addListener() {} },
       },
-      runtime: { onMessage: { addListener() {} } },
+      // `id` is what the pill probes to tell a live extension from one that was
+      // reloaded under the page; a live content script always carries it.
+      runtime: { id: 'smeshid', onMessage: { addListener() {} } },
     },
     setInterval() {}, clearInterval() {}, setTimeout() {}, clearTimeout() {},
     Date: clock ? { now: () => clock.now } : Date,
