@@ -75,6 +75,7 @@ const MODELS = new Set([
   'gemini-2.5-flash-lite',
   'llama-3.3-70b-versatile',
   'meta-llama/llama-4-scout-17b-16e-instruct',
+  'qwen3.8-flash',
   'qwen3.7-plus',
   'qwen-vl-plus',
   'qwen-plus',

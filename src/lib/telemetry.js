@@ -47,14 +47,18 @@ export function detectBrowser() {
  * present. Everyone else (Qwen/DeepSeek via Model Studio's plain OpenAI-
  * compatible mode, no such extension) falls back to a published list rate
  * below. Groq has no entry here — it's genuinely free, so falls through to 0.
- * These rates are approximate (e.g. Qwen's real pricing is bracket-tiered by
- * input length) and will drift as providers reprice — good enough for the
- * Settings spend chart, not a billing-grade figure.
+ * These rates are approximate and will drift as providers reprice — good
+ * enough for the Settings spend chart, not a billing-grade figure. They are
+ * keyed by the CLIENT route id, which is not the vendor: `deepseek` is the
+ * frozen wire id of the licensed Auto route, and the gateway resolves both
+ * licensed routes to the same model. A PDF job is charged to whichever route
+ * the student picked while actually running on the Gemini chain, so its local
+ * estimate is the route's rate, not the PDF model's.
  */
 const FALLBACK_RATES = {
   openrouter: { in: 0.30 / 1e6, out: 2.50 / 1e6 },  // google/gemini-2.5-flash
-  qwen: { in: 0.32 / 1e6, out: 1.28 / 1e6 },         // qwen3.7-plus, short-context tier
-  deepseek: { in: 0.20 / 1e6, out: 0.40 / 1e6 }      // deepseek-v4-flash
+  qwen: { in: 0.15 / 1e6, out: 0.47 / 1e6 },        // qwen3.8-flash (Think)
+  deepseek: { in: 0.15 / 1e6, out: 0.47 / 1e6 }     // qwen3.8-flash (Auto) — NOT DeepSeek
 };
 export function costFromUsage(provider, usage) {
   if (!usage) return 0;

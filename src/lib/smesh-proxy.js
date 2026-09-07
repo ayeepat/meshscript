@@ -440,12 +440,14 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   };
   if (responseFormat) body.response_format = responseFormat;
   // OpenRouter-style {effort} → the flat reasoning_effort field the proxy
-  // whitelists. The VPS applies the final policy per actual live model (for
-  // example, Qwen thinks by default and is sent no effort at all, while
-  // GLM-5.3-Flash is forced to thinking=max).
+  // whitelists. This is a HINT, not a setting: the VPS applies the final policy
+  // per actual live model, translating the value into that model's own
+  // vocabulary and overriding it upward on frontier work (qwen3.8-flash runs
+  // МЭШ solves at xhigh whatever arrives here; older Qwen is sent no effort at
+  // all; GLM-5.3-Flash is forced to thinking=max).
   if (reasoning?.effort) body.reasoning_effort = reasoning.effort;
   // Optional DOWNGRADE-only route hint. 'standard' asks the proxy to answer on
-  // the cheap chain (GLM-5.3-Flash) and to charge the standard bucket, leaving
+  // the cheap chain and to charge the standard bucket, leaving
   // the frontier allowance for МЭШ. The proxy is free to ignore it — a server
   // that predates this field simply answers on the ordinary route, which costs
   // more but is never wrong. It can never REQUEST the frontier chain.

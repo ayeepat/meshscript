@@ -232,13 +232,19 @@ const boundedQuotaVar = (name, v, fallback, min, max) => {
   return n;
 };
 
+// One model answers everything that is not a PDF: qwen3.8-flash is multimodal
+// (text + images), cheaper per token than qwen3.7-plus on both sides, and —
+// unlike the 3.7 line — exposes a real reasoning_effort dial. qwen3.7-plus
+// stays as the first fallback rather than being deleted: it is the model this
+// service ran on for months, so a qwen3.8-flash outage or de-listing degrades
+// to something already proven live instead of to nothing.
 const PROVIDERS = {
   qwen: {
     name: 'Qwen',
-    model: (env.PROXY_QWEN_MODEL || 'qwen3.7-plus').trim(),
-    fallbacks: (env.PROXY_QWEN_FALLBACK_MODELS || 'qwen-vl-plus,qwen-plus'),
-    visionFallbacks: (env.PROXY_QWEN_VISION_FALLBACK_MODELS || 'qwen-vl-plus'),
-    reasoningEffort: false
+    model: (env.PROXY_QWEN_MODEL || 'qwen3.8-flash').trim(),
+    fallbacks: (env.PROXY_QWEN_FALLBACK_MODELS || 'qwen3.7-plus,qwen-vl-plus,qwen-plus'),
+    visionFallbacks: (env.PROXY_QWEN_VISION_FALLBACK_MODELS || 'qwen3.7-plus,qwen-vl-plus'),
+    reasoningEffort: true
   },
   deepseek: {
     // `deepseek` is a frozen client route id, not the upstream vendor. Old
@@ -246,10 +252,10 @@ const PROVIDERS = {
     // them until a Web Store update. The dashboard remains the authority that
     // can point this route back at DeepSeek (or any other 302.AI model).
     name: 'Auto',
-    model: (env.PROXY_AUTO_MODEL || 'qwen3.7-plus').trim(),
+    model: (env.PROXY_AUTO_MODEL || 'qwen3.8-flash').trim(),
     fallbacks: '',
-    // qwen3.7-plus is multimodal, so Auto needs no separate vision model.
-    visionFallbacks: (env.PROXY_AUTO_VISION_FALLBACK_MODELS || 'qwen-vl-plus'),
+    // qwen3.8-flash is multimodal, so Auto needs no separate vision model.
+    visionFallbacks: (env.PROXY_AUTO_VISION_FALLBACK_MODELS || 'qwen3.7-plus,qwen-vl-plus'),
     reasoningEffort: true
   }
 };
@@ -339,6 +345,12 @@ function bootstrapModelConfig() {
   const deepseekVision = commaModels([
     PROVIDERS.deepseek.model, PROVIDERS.deepseek.visionFallbacks
   ].filter(Boolean).join(','));
+  // The cheap chain runs the SAME model as the frontier routes, at a lower
+  // reasoning_effort rather than on a different vendor: qwen3.8-flash's `low`
+  // effort is what makes an any-site solve cheap (see the effort policy below).
+  // glm-5.3-flash trails it — vision-capable, and a different vendor — so a
+  // Qwen-wide outage still leaves the post-frontier allowance servable.
+  const standardChain = commaModels(`${PROVIDERS.deepseek.model},glm-5.3-flash`);
   return {
     limits: {
       requests_per_minute: boundedQuotaVar(
@@ -365,15 +377,26 @@ function bootstrapModelConfig() {
         label: 'Auto', text: deepseekText, vision: deepseekVision,
         reasoning_effort: PROVIDERS.deepseek.reasoningEffort
       },
+      // reasoning_effort stays FALSE here even though the chain's lead model
+      // takes one. This flag governs only the generic passthrough branch — the
+      // "anything else the dashboard picks" case — and the standard route is
+      // reached two very different ways: an any-site solve that asked for it,
+      // and МЭШ homework spilling over after the frontier allowance. Only
+      // `body.tier` tells those apart, so the per-model branches read that
+      // instead, and an unknown model here must not inherit a client's 'low'.
       standard: {
-        label: 'Standard', text: ['glm-5.3-flash'], vision: ['glm-5.3-flash'],
+        label: 'Standard', text: [...standardChain], vision: [...standardChain],
         reasoning_effort: false
       },
       pdf: {
         label: 'PDF', models: commaModels(`${PDF_MODEL},${PDF_FALLBACK_MODELS}`)
       }
     },
+    // Published list rates, USD per 1M tokens. These are the dashboard's
+    // starting estimate, not a bill: 302.AI resells at its own margin, so the
+    // operator overwrites any row that drifts from the invoice.
     rates: {
+      'qwen3.8-flash': { input_usd_per_m: 0.15, output_usd_per_m: 0.47 },
       'qwen3.7-plus': { input_usd_per_m: 0.32, output_usd_per_m: 1.28 },
       'qwen-vl-plus': { input_usd_per_m: 0.32, output_usd_per_m: 1.28 },
       'glm-5.3-flash': { input_usd_per_m: 0.075, output_usd_per_m: 0.25 },
@@ -381,7 +404,7 @@ function bootstrapModelConfig() {
     },
     processors: Object.fromEntries([
       ...qwenText, ...qwenVision, ...deepseekText, ...deepseekVision,
-      'glm-5.3-flash', PDF_MODEL, ...commaModels(PDF_FALLBACK_MODELS)
+      ...standardChain, PDF_MODEL, ...commaModels(PDF_FALLBACK_MODELS)
     ].filter(Boolean).map((model) => [model, defaultProcessor(model)])),
     features: defaultFeatures()
   };
@@ -678,13 +701,38 @@ function routeForRequest(providerId, tier, hasImages, hasPdfs, state = modelStat
   };
 }
 
+// The vocabulary the CLIENT may send (src/lib/task-classifier.js emits these).
+// It is not any single vendor's vocabulary — each model's branch below
+// translates it.
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
 const GLM_53_FLASH = /^glm-5\.3-flash$/i;
-// The Qwen line on 302.AI THINKS BY DEFAULT and has no OpenAI-style effort
-// levels — its only knobs are enable_thinking/thinking_budget. Sending
-// reasoning_effort is at best ignored and at worst a -10003 parameter error,
-// so the Auto route's effort passthrough is suppressed per ACTUAL model rather
-// than per route: the dashboard can point Auto at a model that does honour it.
+// Older Qwen (3.7-plus, -vl-plus, -plus) THINKS BY DEFAULT and has no
+// OpenAI-style effort levels — its only knobs are enable_thinking/
+// thinking_budget. Sending reasoning_effort there is at best ignored and at
+// worst a -10003 parameter error, so the effort passthrough is suppressed per
+// ACTUAL model rather than per route.
+//
+// qwen3.8-flash is the exception this pattern is narrowed for: it DOES take a
+// top-level reasoning_effort, so it is excluded here and handled by
+// QWEN_38_FLASH below. Without the exclusion the live model would silently
+// inherit the "send nothing" branch and always run at its own xhigh default,
+// with no way for the cheap any-site chain to ask for less.
+const QWEN_NO_EFFORT = /^qwen(?!3\.8-flash\b)/i;
+// qwen3.8-flash and its -next sibling. Their effort vocabulary is
+// low / medium / xhigh (xhigh is the model's own default) — there is NO
+// 'high', so the client's hint is TRANSLATED, never passed through raw.
+const QWEN_38_FLASH = /^qwen3\.8-flash\b/i;
+const QWEN_38_EFFORT = { low: 'low', medium: 'medium', high: 'xhigh' };
+// Schoolwork and tests are what this service is for, so the frontier routes
+// always ask for the deepest setting: an installed client sends 'low' as a
+// generic cost hint, and honouring it there would under-think real homework.
+// Same asymmetry as the GLM branch below.
+const QWEN_38_FRONTIER_EFFORT = 'xhigh';
+// JSON mode is dropped for EVERY Qwen model on an image request, qwen3.8-flash
+// included — that is a separate, unrelated finding from the effort knob (see
+// dropJsonForQwenVision) and stays deliberately broad until a live probe says
+// otherwise. Widening it costs nothing: the answer parser recovers the shape
+// from prose.
 const QWEN_MODEL = /^qwen/i;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
 // Request bodies arrive before JSON credentials can be verified. Bound that
@@ -2356,13 +2404,36 @@ function isNonBillableRejection(status, text) {
   return NON_BILLABLE_STATUSES.has(status) || isUnpurchased(text);
 }
 
+/**
+ * "You sent a field I don't accept" — 302.AI answers this with HTTP 400 and
+ * {"error":{"err_code":-10003,"message":"Parameter error"}}; a plain
+ * OpenAI-compatible upstream answers with an invalid_request_error naming the
+ * field. Unlike isUnpurchased this does NOT mean "try the next model": the
+ * same model may well work once the offending field is dropped.
+ *
+ * It exists for exactly one field. reasoning_effort support is a per-model,
+ * per-reseller fact that can only be established by a live probe
+ * (tests/302ai-verify.sh), and a wrong guess in the effort policy above would
+ * otherwise turn into a 502 on EVERY request rather than a quality downgrade.
+ */
+function isParameterRejection(status, text) {
+  return status === 400 &&
+    /"err_code"\s*:\s*-10003|invalid_request_error|unsupported[_ ]parameter|unknown field|reasoning_effort/i.test(text || '');
+}
+
 async function connectUpstream(provider, body, messages, hasImages, hasPdfs, signal = null) {
   let upstream = null, lastFailure = null, usedModel = null;
   // Flips only once a response proves the request reached the provider, or an
   // ambiguous transport failure means it may have. A connect-level refusal is
   // positively pre-dispatch and remains refundable even after fetch() began.
   let providerMayHaveRun = false;
-  for (const model of modelChoices(provider)) {
+  // One entry per dispatch, not per model: a model whose only questionable
+  // field is the reasoning_effort this function synthesized is re-queued once
+  // with `dropEffort` set, rather than being abandoned for the next model in
+  // the chain. See isParameterRejection at the bottom of the loop.
+  const attempts = modelChoices(provider).map((model) => ({ model, dropEffort: false }));
+  for (let i = 0; i < attempts.length; i++) {
+    const { model, dropEffort } = attempts[i];
     usedModel = model;
     const upstreamBody = {
       model, messages, temperature: 0.3, max_tokens: MAX_TOKENS_OUT,
@@ -2381,14 +2452,26 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
     // The quality policy is enforced per ACTUAL model, not per route: the
     // dashboard owns which model each route resolves to, and every model has a
     // different thinking knob.
-    //   - Qwen (the live Auto/Think model) thinks by default and has no effort
-    //     levels, so nothing is sent — see QWEN_MODEL.
-    //   - GLM-5.3-Flash (the cheap standard chain) needs forced thinking at max
-    //     effort, otherwise a client's LOW hint leaves it shallow.
+    //   - qwen3.8-flash (the live model for everything but PDFs) takes a real
+    //     reasoning_effort, in its own low/medium/xhigh vocabulary.
+    //   - older Qwen thinks by default and has no effort levels, so nothing is
+    //     sent — see QWEN_NO_EFFORT.
+    //   - GLM-5.3-Flash (the cheap chain's fallback) needs forced thinking at
+    //     max effort, otherwise a client's LOW hint leaves it shallow.
     //   - anything else the dashboard picks keeps the ordinary passthrough.
     // PDF jobs use the separate Gemini chain, where these fields are unverified.
-    if (hasPdfs || QWEN_MODEL.test(model)) {
+    if (hasPdfs || QWEN_NO_EFFORT.test(model)) {
       // no effort knob to send
+    } else if (QWEN_38_FLASH.test(model)) {
+      // Who asked decides the depth. A client that explicitly requested the
+      // standard tier is the any-site path — it MEANT cheap, and honouring its
+      // hint is the whole point of sending one. Everything else is МЭШ
+      // homework or a test, and gets the deepest setting regardless of the
+      // generic 'low' an already-installed build sends.
+      upstreamBody.reasoning_effort =
+        body.tier === 'standard' && REASONING_EFFORTS.has(body.reasoning_effort)
+          ? QWEN_38_EFFORT[body.reasoning_effort]
+          : QWEN_38_FRONTIER_EFFORT;
     } else if (GLM_53_FLASH.test(model)) {
       // GLM has to be told to think at all. The EFFORT, though, depends on who
       // asked: an already-installed Auto client sends 'low' as a generic cost
@@ -2403,6 +2486,11 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
     } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
+    // The degradation retry: same model, same messages, no effort field. The
+    // model's own default depth applies instead — a worse answer than the one
+    // the policy asked for, but an answer.
+    if (dropEffort) delete upstreamBody.reasoning_effort;
+    const sentEffort = upstreamBody.reasoning_effort !== undefined;
     // Serialize ONCE per model attempt, not once per retry — retries resend
     // the identical bytes, no need to re-stringify a possibly multi-MB body.
     const upstreamPayload = JSON.stringify(upstreamBody);
@@ -2456,10 +2544,20 @@ async function connectUpstream(provider, body, messages, hasImages, hasPdfs, sig
     }
 
     if (upstream.ok) break;
+    const status = upstream.status;
     const text = await readResponseTextBounded(upstream, 64 * 1024);
-    lastFailure = { status: upstream.status, text, model };
+    lastFailure = { status, text, model };
     upstream = null;
     if (isUnpurchased(text)) { console.warn('model not enabled, trying fallback', model); continue; }
+    // A rejected parameter is not a rejected model. Retry THIS model once
+    // without the effort field before spending the chain's next fallback on
+    // what may be a body problem. A 400 is a non-billable refusal, so the
+    // extra dispatch costs nothing but latency.
+    if (sentEffort && !dropEffort && isParameterRejection(status, text)) {
+      console.warn('upstream rejected reasoning_effort, retrying without it', model);
+      attempts.splice(i + 1, 0, { model, dropEffort: true });
+      continue;
+    }
     break;
   }
 
@@ -2710,6 +2808,10 @@ setInterval(() => {
 // event is tagged est_rates so the dashboard can say so).
 const USAGE_RATES = [
   [/^glm-5\.3-flash$/i, { in: 0.075 / 1e6, out: 0.25 / 1e6 }],
+  // qwen3.8-flash before the general Qwen pattern: it is the live model for
+  // everything but PDFs and is roughly half the price of the 3.7 line, so the
+  // broader pattern must not claim it and bill it at 3.7 rates.
+  [/^qwen3\.8-flash/i, { in: 0.15 / 1e6, out: 0.47 / 1e6 }],
   [/^qwen/i,        { in: 0.32 / 1e6, out: 1.28 / 1e6 }],
   [/^deepseek/i,    { in: 0.20 / 1e6, out: 0.40 / 1e6 }],
   // -lite first: it is the PDF chain's lead model and an order of magnitude

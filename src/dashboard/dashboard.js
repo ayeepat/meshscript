@@ -1547,8 +1547,8 @@ chrome.storage.local.get('answerMode').then(({ answerMode: saved }) => {
 
 /* ---------- Engine toggle (Авто / Думать) ---------- */
 
-// Which route solves: «Авто» uses the live owner-controlled model (Qwen 3.7
-// Plus by default); «Думать» uses Qwen. Applies to the NEXT
+// Which route solves: «Авто» and «Думать» are two owner-controlled routes that
+// today resolve to the same live model (qwen3.8-flash). Applies to the NEXT
 // send — an in-flight solve keeps the engine it started with.
 const engineSeg = document.getElementById('engineSeg');
 function markEngine(engine) {

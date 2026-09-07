@@ -136,25 +136,40 @@ The extension sends only the stable internal routes `deepseek` (Auto) and
 model chains. A dashboard save affects every **new** request immediately; an
 in-flight job keeps the route snapshot it started with.
 
-`deepseek` is now only a compatibility id. The default Auto text and image
-chains use `qwen3.7-plus` (multimodal, falling back to `qwen-vl-plus` for
-images), which is also the default Think chain — so a test solve and a homework
-solve run on the same model whichever route the client picked.
+`deepseek` is now only a compatibility id. **One model answers everything that
+is not a PDF**: Auto, Think and the cheap standard chain all default to
+`qwen3.8-flash` (multimodal, so no separate vision model), with `qwen3.7-plus`
+and `qwen-vl-plus` behind it as fallbacks. PDFs keep their own independently
+verified chain on `gemini-2.5-flash-lite`. A test solve and a homework solve
+therefore run on the same model whichever route the client picked.
 
 The quality policy is applied per **actual model**, not per route, because each
 model has a different thinking knob:
 
 | model | what the VPS sends |
 | --- | --- |
-| `qwen*` | nothing — Qwen thinks by default and has no effort levels, so a client's `reasoning_effort` hint is dropped. `response_format: json_object` is also dropped when the request carries an image, where Qwen's JSON mode is unreliable. |
+| `qwen3.8-flash` | `reasoning_effort` in **Qwen's** vocabulary — `low` / `medium` / `xhigh`, note there is no `high`. МЭШ homework and tests always get `xhigh`; only a request that explicitly sent `tier: "standard"` (the any-site path) may ask for less, and its `low`/`medium`/`high` hint is translated. |
+| other `qwen*` | nothing — pre-3.8 Qwen thinks by default and has no effort levels, so a client's hint is dropped. |
 | `glm-5.3-flash` | `thinking: {type: "enabled"}` + `reasoning_effort: "max"`, regardless of the low-effort hint an older extension sends. |
 | anything else | the client's `reasoning_effort`, if the route has passthrough enabled. |
 
-The standard (cheap) chain deliberately stays on `glm-5.3-flash`: it is the
-post-frontier fallback, and GLM is roughly four times cheaper per token than
-Qwen 3.7 Plus. The dashboard's presets switch Auto between Qwen 3.7 Plus, GLM
-and DeepSeek; the DeepSeek preset restores `deepseek-v4-flash` for Auto text but
+`response_format: json_object` is dropped for **every** Qwen model when the
+request carries an image, where Qwen's JSON mode is unreliable; the answer
+parser recovers the shape from prose.
+
+Cheapness on the standard chain now comes from a lower **effort**, not a
+different vendor: `qwen3.8-flash` at `low` rather than GLM. `glm-5.3-flash`
+still trails that chain as a fallback, so a Qwen-wide outage does not take the
+post-frontier allowance down with it, and it is one click away as a dashboard
+preset. The DeepSeek preset restores `deepseek-v4-flash` for Auto text but
 keeps a multimodal model for images, because DeepSeek V4 is text-only.
+
+If 302.AI ever rejects `reasoning_effort` on a model the policy sends it to, it
+answers HTTP 400 with `err_code: -10003`. That is treated as a rejected
+**field**, not a rejected model: the same model is retried once with the field
+removed (`isParameterRejection`), so the failure mode is a shallower answer
+rather than a dead route. `API_302_KEY=… bash tests/302ai-verify.sh` is the
+check that settles per-model support.
 
 The owner dashboard calls `GET/PUT /admin/model-config` with
 `X-Model-Admin-Key`. This key is separate from `ADMIN_KEY`, `STATS_SECRET`,

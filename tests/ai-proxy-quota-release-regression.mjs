@@ -146,11 +146,12 @@ const realFetch = globalThis.fetch;
 let licenseSeq = 0;
 const nextLicense = () => `${LICENSE}-${++licenseSeq}`;
 
-/* -- emergency Auto route mirrors the VPS: Qwen 3.7 Plus, no effort knob -- */
-// Qwen thinks by default and has no OpenAI-style effort levels, so the low
-// hint an installed client sends with a test solve must be DROPPED here —
-// forwarding it risks a -10003 parameter error, and GLM's thinking/max pair
-// belongs to a different vendor entirely.
+/* --- emergency Auto route mirrors the VPS: qwen3.8-flash at full depth --- */
+// This route has no standard tier — it is the emergency МЭШ path — so the low
+// hint an installed client sends with a test solve must be OVERRIDDEN, not
+// forwarded: schoolwork is never answered shallowly to save a fraction of a
+// cent. 'xhigh', not 'high': that is Qwen's own vocabulary, and GLM's
+// thinking/max pair belongs to a different vendor entirely.
 {
   const db = new QuotaD1(5, 10);
   const key = nextLicense();
@@ -170,11 +171,80 @@ const nextLicense = () => `${LICENSE}-${++licenseSeq}`;
     assert.equal(response.status, 200);
   } finally { globalThis.fetch = realFetch; }
 
-  assert.equal(upstreamBody.model, 'qwen3.7-plus');
-  assert.equal(upstreamBody.reasoning_effort, undefined);
+  assert.equal(upstreamBody.model, 'qwen3.8-flash');
+  assert.equal(upstreamBody.reasoning_effort, 'xhigh',
+    "a low client hint must not shallow-think МЭШ homework, and 'high' is not a Qwen level");
   assert.equal(upstreamBody.thinking, undefined);
   assert.deepEqual(upstreamBody.response_format, { type: 'json_object' },
     'a text test solve keeps JSON mode');
+}
+
+/* ---- older Qwen keeps the "no effort knob at all" branch ---- */
+// The narrowed QWEN_NO_EFFORT pattern must still catch every pre-3.8 Qwen:
+// those models have only enable_thinking/thinking_budget, so an effort field
+// is at best ignored and at worst a -10003 parameter error.
+{
+  const db = new QuotaD1(5, 10);
+  const key = nextLicense();
+  let upstreamBody = null;
+  globalThis.fetch = async (_url, options) => {
+    upstreamBody = JSON.parse(options.body);
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+  };
+  try {
+    const response = await handleAiChat(
+      chatRequest(key, 'deepseek', { reasoning_effort: 'low' }),
+      environment(db, key, { PROXY_AUTO_MODEL: 'qwen3.7-plus' })
+    );
+    assert.equal(response.status, 200);
+  } finally { globalThis.fetch = realFetch; }
+
+  assert.equal(upstreamBody.model, 'qwen3.7-plus');
+  assert.equal(upstreamBody.reasoning_effort, undefined);
+  assert.equal(upstreamBody.thinking, undefined);
+}
+
+/* ---- an upstream that rejects the effort field degrades, not breaks ---- */
+// reasoning_effort support is a per-model, per-reseller fact that only a live
+// probe settles (tests/302ai-verify.sh). If 302.AI answers -10003, the SAME
+// model must be retried once without the field — a shallower answer, not a
+// 502 on every request. The 400 is non-billable, so the retry is free.
+{
+  const db = new QuotaD1(5, 10);
+  const key = nextLicense();
+  const bodies = [];
+  globalThis.fetch = async (_url, options) => {
+    bodies.push(JSON.parse(options.body));
+    if (bodies.length === 1) {
+      return new Response(
+        JSON.stringify({ error: { err_code: -10003, message: 'Parameter error' } }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response(
+      'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+      { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+    );
+  };
+  try {
+    const response = await handleAiChat(
+      chatRequest(key, 'deepseek', { reasoning_effort: 'low' }),
+      environment(db, key)
+    );
+    assert.equal(response.status, 200,
+      'a rejected parameter must not surface to the student as a failed solve');
+  } finally { globalThis.fetch = realFetch; }
+
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].model, 'qwen3.8-flash');
+  assert.equal(bodies[0].reasoning_effort, 'xhigh');
+  assert.equal(bodies[1].model, 'qwen3.8-flash',
+    'a rejected PARAMETER is not a rejected model — the same model is retried');
+  assert.equal(bodies[1].reasoning_effort, undefined,
+    'the retry drops the field the upstream refused');
 }
 
 /* ---- GLM stays selectable, and keeps its forced maximum thinking ---- */

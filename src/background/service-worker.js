@@ -622,8 +622,10 @@ async function solve(
 
   const systemPrompt = await buildSystemPrompt(subject, mode);
   // Dashboard engine toggle («Авто» / «Думать») selects a stable proxy route:
-  // auto → legacy wire id `deepseek`, currently Qwen 3.7 Plus via live model
-  // control; think → Qwen. Absent/unknown values keep the stored provider.
+  // auto → legacy wire id `deepseek`, think → `qwen`. Live model control
+  // resolves both to the same model today (qwen3.8-flash), so the toggle is a
+  // route choice, not a model choice. Absent/unknown values keep the stored
+  // provider.
   const engineProvider = engine === 'think' ? 'qwen' : engine === 'auto' ? 'deepseek' : null;
   const provider = engineProvider || undefined;
   // When we auto-attached GDZ answer images above, tell the model what they are
@@ -640,8 +642,9 @@ async function solve(
   // LOW reasoning effort for turns that don't need model thinking (pure time-
   // to-first-answer AND billed thinking tokens). The live Auto route is never
   // downgraded here: its actual model is owner-controlled, and the VPS applies
-  // model-specific reasoning safely (Qwen 3.7 Plus thinks by default and is
-  // sent no effort at all; GLM-5.3-Flash is forced to max).
+  // model-specific reasoning safely — on МЭШ work it OVERRIDES this hint
+  // upward (qwen3.8-flash runs at xhigh; GLM-5.3-Flash is forced to max), so
+  // the hint only ever takes effect where a shallower answer is acceptable.
   //  - 'easy':    first-turn recall/lookup/choice (isEasyTask);
   //  - 'chatty':  first-turn greetings / "что ты умеешь" — nothing to solve;
   //  - 'followup': clarification of an already-solved task («объясни, я не
@@ -2678,7 +2681,7 @@ async function solveWebPage({ text, signal = null, pageUrl = null } = {}) {
     tier: WEB_SOLVE_TIER,
     // Generic pages always use the licensed proxy. In particular, an old
     // stored Groq/OpenRouter selection or hidden Alibaba key must not bypass
-    // the GLM-5.3-Flash route promised for this feature.
+    // the cheap standard chain promised for this feature.
     provider: WEB_SOLVE_PROVIDER,
     proxyOnly: true,
     signal,

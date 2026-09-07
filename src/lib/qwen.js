@@ -3,10 +3,10 @@
  * sends content exclusively through the СМЭШ gateway. Vendor credentials are
  * deployment-only and never read from extension storage.
  *
- * Model: qwen3.7-plus — the vision+reasoning sibling of the Qwen3.7 line
- * (Qwen3.7-Max, despite the flagship name, is TEXT ONLY). One model handles
- * both images and text, so — unlike Groq — there's no separate vision/text
- * model to switch between here.
+ * Model: whatever the gateway's live routing resolves this route to — today
+ * qwen3.8-flash, multimodal, with qwen3.7-plus behind it as a fallback. One
+ * model handles both images and text, so — unlike Groq — there's no separate
+ * vision/text model to switch between here.
  *
  * Streams when opts.onDelta is given. Set opts.responseFormat = 'json_object'
  * for structured replies (test solver); dropped on the vision path, mirroring
@@ -64,12 +64,12 @@ function historyToMessage(m) {
 }
 
 export async function askQwen(systemPrompt, userText, files = [], history = [], opts = {}) {
-  // opts.reasoning ({effort}) is deliberately NOT wired here (same as groq.js):
-  // qwen3.7-plus has no effort levels — it THINKS BY DEFAULT on every request
-  // (verified live on 302.AI; reasoning_content deltas that postStream hides),
-  // and its only knobs are enable_thinking/thinking_budget, which don't map to
-  // medium/high effort. The solver's effort setting is already honored where a
-  // real knob exists: OpenRouter (body.reasoning) and DeepSeek (reasoning_effort).
+  // opts.reasoning ({effort}) is deliberately NOT wired here (same as groq.js).
+  // Think is a frontier route: the gateway runs it at the deepest setting the
+  // live model offers no matter what a client asks for (see QWEN_38_FLASH in
+  // backend-vps/server.js), so forwarding a hint could only ever ask for LESS
+  // thinking on МЭШ homework. The cheap any-site path is where a hint changes
+  // anything, and that one goes out through deepseek.js with tier:'standard'.
   const {
     onDelta = null, responseFormat = null, signal = null, onUsage = null,
     onReasoning = null, tier = null,

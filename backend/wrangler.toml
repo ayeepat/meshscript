@@ -196,23 +196,28 @@ AI_PROXY_LEGACY_ENABLED = "false"
 # KYC for a direct key). ai-proxy.js appends /chat/completions itself.
 AI_PROXY_BASE_URL = "https://api.302.ai/v1"
 # Models can be changed without code if the reseller renames/drops a model.
-# All three verified live on 302.AI 2026-07-07 (fallbacks via product pages).
-PROXY_QWEN_MODEL = "qwen3.7-plus"
-# Used for TEXT-ONLY requests. qwen-plus is text-only and, on a live probe,
-# answered a vision request with HTTP 200 + a WRONG guess instead of erroring
-# — never let it stand in for a vision request (see PROXY_QWEN_VISION_FALLBACK_MODELS).
-PROXY_QWEN_FALLBACK_MODELS = "qwen-vl-plus,qwen-plus"
+# Both routes run qwen3.8-flash: one multimodal model for text AND images,
+# cheaper than the 3.7 line on both sides, and the only Qwen here that takes a
+# real reasoning_effort (low/medium/xhigh — see ai-proxy.js QWEN_38_FLASH).
+# Re-verify a model change with `API_302_KEY=… bash tests/302ai-verify.sh`.
+PROXY_QWEN_MODEL = "qwen3.8-flash"
+# Used for TEXT-ONLY requests. qwen3.7-plus leads the fallbacks because it ran
+# this service in production for months. qwen-plus is text-only and, on a live
+# probe, answered a vision request with HTTP 200 + a WRONG guess instead of
+# erroring — never let it stand in for a vision request (see
+# PROXY_QWEN_VISION_FALLBACK_MODELS).
+PROXY_QWEN_FALLBACK_MODELS = "qwen3.7-plus,qwen-vl-plus,qwen-plus"
 # Used instead of the above when the request carries an image (ai-proxy.js
-# modelChoices). qwen-vl-plus is vision-capable (verified live); deliberately
+# modelChoices). Both entries are vision-capable (verified live); deliberately
 # excludes qwen-plus.
-PROXY_QWEN_VISION_FALLBACK_MODELS = "qwen-vl-plus"
+PROXY_QWEN_VISION_FALLBACK_MODELS = "qwen3.7-plus,qwen-vl-plus"
 # `deepseek` remains the wire route id for compatibility; this retired
-# emergency path resolves it to Qwen 3.7 Plus, same as the live VPS default.
-PROXY_AUTO_MODEL = "qwen3.7-plus"
-# Auto is multimodal, so this only matters if qwen3.7-plus itself is refused.
+# emergency path resolves it to qwen3.8-flash, same as the live VPS default.
+PROXY_AUTO_MODEL = "qwen3.8-flash"
+# Auto is multimodal, so this only matters if qwen3.8-flash itself is refused.
 # Vision-capable models ONLY — text-only stand-ins answer image requests with a
 # confident wrong guess (see PROXY_QWEN_VISION_FALLBACK_MODELS above).
-PROXY_AUTO_VISION_FALLBACK_MODELS = "qwen-vl-plus"
+PROXY_AUTO_VISION_FALLBACK_MODELS = "qwen3.7-plus,qwen-vl-plus"
 # per-license per-provider…
 PROXY_QWEN_DAILY = "80"
 PROXY_DEEPSEEK_DAILY = "150"

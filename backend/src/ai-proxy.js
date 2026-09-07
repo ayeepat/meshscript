@@ -35,9 +35,14 @@ import { cleanPublicDeviceId } from './referrals.js';
 
 const DEFAULT_COMPAT_BASE_URL = 'https://api.302.ai/v1';
 
+// One model answers everything that is not a PDF: qwen3.8-flash is multimodal,
+// cheaper per token than qwen3.7-plus on both sides, and — unlike the 3.7 line
+// — exposes a real reasoning_effort dial. qwen3.7-plus stays as the first
+// fallback rather than being deleted: it is the model this service ran on for
+// months, so a qwen3.8-flash outage degrades to something already proven live.
 const PROVIDERS = {
   qwen: {
-    modelDefault: 'qwen3.7-plus',
+    modelDefault: 'qwen3.8-flash',
     modelVar: 'PROXY_QWEN_MODEL',
     fallbackVar: 'PROXY_QWEN_FALLBACK_MODELS',
     // A live probe found qwen-plus (text-only) answers a vision request with
@@ -49,23 +54,21 @@ const PROVIDERS = {
     visionFallbackVar: 'PROXY_QWEN_VISION_FALLBACK_MODELS',
     name: 'Qwen',
     capVar: 'PROXY_QWEN_DAILY',
-    capDefault: 80
-    // No reasoningEffort: qwen3.7-plus THINKS BY DEFAULT on 302.AI and has no
-    // effort levels — only enable_thinking/thinking_budget, neither of which
-    // maps to the solver's medium/high effort semantics.
+    capDefault: 80,
+    // qwen3.8-flash honours reasoning_effort; the per-model policy below still
+    // decides the value, so this only governs the generic passthrough branch.
+    reasoningEffort: true
   },
   deepseek: {
     // Frozen route id for old extension builds; it is not the upstream vendor.
-    modelDefault: 'qwen3.7-plus',
+    modelDefault: 'qwen3.8-flash',
     modelVar: 'PROXY_AUTO_MODEL',
-    // qwen3.7-plus is multimodal, so Auto needs no separate vision model; the
+    // qwen3.8-flash is multimodal, so Auto needs no separate vision model; the
     // vision fallback stays vision-capable for the same reason as PROVIDERS.qwen.
     visionFallbackVar: 'PROXY_AUTO_VISION_FALLBACK_MODELS',
     name: 'Auto',
     capVar: 'PROXY_DEEPSEEK_DAILY',
     capDefault: 150,
-    // Kept true so an env switch back to DeepSeek/GLM restores passthrough; the
-    // per-model policy below suppresses it while Auto resolves to Qwen.
     reasoningEffort: true
   }
 };
@@ -74,9 +77,22 @@ const PROVIDERS = {
 // scripted caller can't smuggle arbitrary strings into the upstream request.
 const REASONING_EFFORTS = new Set(['low', 'medium', 'high']);
 const GLM_53_FLASH = /^glm-5\.3-flash$/i;
-// Qwen thinks by default and exposes no OpenAI-style effort levels (only
-// enable_thinking/thinking_budget), so reasoning_effort is never sent to it.
-// Mirrors backend-vps/server.js QWEN_MODEL — keep both in sync.
+// Older Qwen (3.7-plus, -vl-plus, -plus) thinks by default and exposes no
+// OpenAI-style effort levels (only enable_thinking/thinking_budget), so
+// reasoning_effort is never sent to it. qwen3.8-flash is excluded from this
+// pattern because it DOES take one — without the exclusion the live model
+// would silently inherit the "send nothing" branch.
+// Mirrors backend-vps/server.js QWEN_NO_EFFORT — keep both in sync.
+const QWEN_NO_EFFORT = /^qwen(?!3\.8-flash\b)/i;
+// qwen3.8-flash's effort vocabulary is low / medium / xhigh (xhigh is its own
+// default) — there is no 'high', so a client hint could never be forwarded
+// verbatim anyway. This route is the emergency МЭШ path and has no standard
+// tier, so it always sends the deepest setting and needs no translation table
+// (backend-vps/server.js, which does serve the cheap any-site chain, has one).
+const QWEN_38_FLASH = /^qwen3\.8-flash\b/i;
+const QWEN_38_FRONTIER_EFFORT = 'xhigh';
+// JSON mode is dropped for EVERY Qwen model on an image request — a separate
+// finding from the effort knob, kept deliberately broad.
 const QWEN_MODEL = /^qwen/i;
 
 const MAX_BODY_BYTES = 8 * 1024 * 1024; // base64 photos of worksheets fit; nothing sane exceeds this
@@ -225,6 +241,20 @@ function isNonBillableRejection(status, text) {
 }
 
 /**
+ * "You sent a field I don't accept" — 302.AI answers HTTP 400 with
+ * {"error":{"err_code":-10003,…}}. Unlike isUnpurchased this does NOT mean
+ * "try the next model": the same model may work once the field is dropped.
+ * It guards exactly one field — the reasoning_effort the policy above
+ * synthesizes — so a per-model support fact that only a live probe can settle
+ * (tests/302ai-verify.sh) degrades answer depth instead of returning a 502 on
+ * every request. Mirrors backend-vps/server.js — keep both in sync.
+ */
+function isParameterRejection(status, text) {
+  return status === 400 &&
+    /"err_code"\s*:\s*-10003|invalid_request_error|unsupported[_ ]parameter|unknown field|reasoning_effort/i.test(text || '');
+}
+
+/**
  * POST /ai/chat — thin wrapper so ANY uncaught failure inside (a missing
  * proxy_quota table, a D1 outage, a future bug) still returns the friendly
  * Russian 503 WITH the proxy's CORS headers. Without this, an exception here
@@ -301,7 +331,12 @@ async function handleAiChatInner(request, env) {
   const refundUnusedQuota = () => releaseQuota(env, quota.day, licenseKey, body.provider);
 
   let res, usedModel = null, lastFailure = null;
-  for (const model of modelChoices(env, provider, hasImages)) {
+  // One entry per dispatch, not per model — see the isParameterRejection
+  // branch at the bottom of the loop.
+  const attempts = modelChoices(env, provider, hasImages)
+    .map((model) => ({ model, dropEffort: false }));
+  for (let i = 0; i < attempts.length; i++) {
+    const { model, dropEffort } = attempts[i];
     usedModel = model;
     const upstreamBody = {
       model,
@@ -318,17 +353,26 @@ async function handleAiChatInner(request, env) {
     if (body.response_format === 'json_object' && !(hasImages && QWEN_MODEL.test(model))) {
       upstreamBody.response_format = { type: 'json_object' };
     }
-    // Per-ACTUAL-model quality policy, mirroring backend-vps/server.js: Qwen
-    // has no effort knob, GLM must be forced to think, everything else keeps
-    // the ordinary client passthrough.
-    if (QWEN_MODEL.test(model)) {
+    // Per-ACTUAL-model quality policy, mirroring backend-vps/server.js:
+    // qwen3.8-flash takes a translated effort, older Qwen has no effort knob,
+    // GLM must be forced to think, everything else keeps the ordinary client
+    // passthrough. This route has no standard tier — it is the emergency МЭШ
+    // path — so qwen3.8-flash always runs at the frontier depth.
+    if (QWEN_NO_EFFORT.test(model)) {
       // no effort knob to send
+    } else if (QWEN_38_FLASH.test(model)) {
+      upstreamBody.reasoning_effort = QWEN_38_FRONTIER_EFFORT;
     } else if (GLM_53_FLASH.test(model)) {
       upstreamBody.thinking = { type: 'enabled' };
       upstreamBody.reasoning_effort = 'max';
     } else if (provider.reasoningEffort && REASONING_EFFORTS.has(body.reasoning_effort)) {
       upstreamBody.reasoning_effort = body.reasoning_effort;
     }
+    // Same degradation retry as the VPS: a rejected parameter is not a
+    // rejected model, so this model gets one more dispatch with the effort
+    // field removed before the chain moves on. See isParameterRejection.
+    if (dropEffort) delete upstreamBody.reasoning_effort;
+    const sentEffort = upstreamBody.reasoning_effort !== undefined;
 
     try {
       res = await fetch(upstreamUrl(env), {
@@ -355,6 +399,11 @@ async function handleAiChatInner(request, env) {
     lastFailure = { status: res.status, text, model };
     if (isUnpurchased(res.status, text)) {
       console.warn('ai-proxy: model not enabled, trying fallback', model);
+      continue;
+    }
+    if (sentEffort && !dropEffort && isParameterRejection(res.status, text)) {
+      console.warn('ai-proxy: upstream rejected reasoning_effort, retrying without it', model);
+      attempts.splice(i + 1, 0, { model, dropEffort: true });
       continue;
     }
     break;

@@ -132,14 +132,22 @@ try {
   assert.equal(initial.status, 200);
   const initialState = await initial.json();
   assert.equal(initialState.revision, 0);
-  assert.deepEqual(initialState.config.routes.deepseek.text, ['qwen3.7-plus']);
-  assert.deepEqual(initialState.config.routes.deepseek.vision, ['qwen3.7-plus', 'qwen-vl-plus']);
-  assert.deepEqual(initialState.config.routes.qwen.vision, ['qwen3.7-plus', 'qwen-vl-plus'],
+  assert.deepEqual(initialState.config.routes.deepseek.text, ['qwen3.8-flash']);
+  assert.deepEqual(initialState.config.routes.deepseek.vision,
+    ['qwen3.8-flash', 'qwen3.7-plus', 'qwen-vl-plus']);
+  assert.deepEqual(initialState.config.routes.qwen.vision,
+    ['qwen3.8-flash', 'qwen3.7-plus', 'qwen-vl-plus'],
     'vision chains must contain vision-capable models only — text-only qwen-plus ' +
     'answers an image request with a confident wrong guess instead of an error');
-  assert.equal(initialState.config.routes.standard.text[0], 'glm-5.3-flash',
-    'the cheap post-frontier chain stays on GLM: it is ~4x cheaper per token than Qwen');
-  assert.equal(initialState.config.routes.standard.vision[0], 'glm-5.3-flash');
+  assert.equal(initialState.config.routes.standard.text[0], 'qwen3.8-flash',
+    'the cheap post-frontier chain is the SAME model at a lower reasoning_effort, ' +
+    'not a different vendor');
+  assert.equal(initialState.config.routes.standard.vision[0], 'qwen3.8-flash');
+  assert.equal(initialState.config.routes.standard.text.at(-1), 'glm-5.3-flash',
+    'a different vendor still trails the cheap chain so a Qwen-wide outage does ' +
+    'not take the post-frontier allowance down with it');
+  assert.ok(Number(initialState.config.rates['qwen3.8-flash']?.input_usd_per_m) > 0,
+    'the live model must ship with a cost row, or every solve is estimated at zero');
   assert.equal(initialState.config.limits.requests_per_minute, 5);
   assert.equal(initialState.config.limits.frontier_per_license, 15);
   assert.equal(initialState.config.limits.standard_per_license, 70);
@@ -345,11 +353,12 @@ try {
   assert.equal(persisted.config.routes.standard.text[0], 'glm-5.3-flash');
   assert.equal(persisted.history[0].revision, 3);
 
-  /* ---- the live Auto model: Qwen 3.7 Plus, on its own quality policy ---- */
-  // Qwen thinks by default and has NO OpenAI-style effort levels, so the
-  // low-effort hint every installed client sends with a test solve must be
+  /* ---- the fallback Qwen: no effort knob at all ---- */
+  // Pre-3.8 Qwen thinks by default and has NO OpenAI-style effort levels, so
+  // the low-effort hint every installed client sends with a test solve must be
   // dropped rather than forwarded — and never turned into GLM's thinking/max
-  // pair, which is a different vendor's knob.
+  // pair, which is a different vendor's knob. Narrowing QWEN_NO_EFFORT for
+  // qwen3.8-flash must not widen it here.
   const beforeQwen = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
   const qwenConfig = structuredClone(beforeQwen.config);
   qwenConfig.limits.frontier_per_license = 5;
@@ -372,7 +381,7 @@ try {
     licenseKey: 'SMESH-QWEN-CONTROL-TEST',
     deviceId: '123e4567-e89b-42d3-a456-426614174002'
   };
-  const startQwen = async (nonce, content) => {
+  const startQwen = async (nonce, content, extra = {}) => {
     const expectedCalls = calls.length + 1;
     const response = await fetch(`${base}/ai/start`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -383,7 +392,8 @@ try {
         // Exactly what solveTest sends for a test page it judged easy.
         reasoning_effort: 'low',
         response_format: 'json_object',
-        idempotency_key: `qwen-policy-${nonce}`
+        idempotency_key: `qwen-policy-${nonce}`,
+        ...extra
       })
     });
     if (response.status !== 200) throw new Error(`qwen start failed: ${response.status} ${await response.text()}`);
@@ -412,6 +422,55 @@ try {
     'Qwen JSON mode is unreliable once an image is in the request (same finding ' +
     'that makes src/lib/qwen.js drop it client-side); the answer parser recovers ' +
     'the {answers:[{n,a}]} shape from prose instead');
+
+  /* ---- the live model: qwen3.8-flash, which DOES have effort levels ---- */
+  // The narrowed pattern must let the effort field through — and the value has
+  // to be Qwen's own ('xhigh', not the client's 'high'). Depth is decided by
+  // WHO ASKED: МЭШ homework and tests always get the deepest setting, however
+  // cheap a hint an installed build sends; only an explicit standard-tier
+  // request (the any-site path, which meant cheap) may ask for less.
+  const before38 = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
+  const config38 = structuredClone(before38.config);
+  config38.limits.frontier_per_license = 5;
+  config38.routes.deepseek.text = ['qwen3.8-flash'];
+  config38.routes.deepseek.vision = ['qwen3.8-flash'];
+  config38.routes.standard.text = ['qwen3.8-flash'];
+  config38.processors['qwen3.8-flash'] = {
+    display_name: 'Qwen', operator: 'Alibaba Cloud',
+    privacy_url: 'https://www.alibabacloud.com/help/en/model-studio/privacy-notice',
+    enabled: true
+  };
+  const saved38 = await fetch(`${base}/admin/model-config`, {
+    method: 'PUT', headers: adminHeaders,
+    body: JSON.stringify({
+      expected_revision: before38.revision, reason: 'auto → qwen3.8-flash', config: config38
+    })
+  });
+  if (saved38.status !== 200) throw new Error(`qwen3.8 save failed: ${saved38.status} ${await saved38.text()}`);
+
+  const frontier38 = await startQwen('38-text', 'реши тест');
+  assert.equal(calls.at(-1), 'qwen3.8-flash');
+  assert.equal(frontier38.reasoning_effort, 'xhigh',
+    "a low hint must not shallow-think schoolwork, and 'high' is not one of " +
+    "qwen3.8-flash's levels (low / medium / xhigh)");
+  assert.equal(frontier38.thinking, undefined,
+    "GLM's forced-thinking pair belongs to a different vendor");
+
+  const vision38 = await startQwen('38-vision', [
+    { type: 'text', text: 'реши тест по скриншоту' },
+    { type: 'image_url', image_url: { url: imageDataUri } }
+  ]);
+  assert.equal(calls.at(-1), 'qwen3.8-flash');
+  assert.equal(vision38.reasoning_effort, 'xhigh');
+  assert.equal(vision38.response_format, undefined,
+    'the image JSON-mode drop covers every Qwen model, 3.8 included');
+
+  const standard38 = await startQwen('38-standard', 'какой ответ?', { tier: 'standard' });
+  assert.equal(calls.at(-1), 'qwen3.8-flash',
+    'the cheap chain is the same model, distinguished by effort rather than vendor');
+  assert.equal(standard38.reasoning_effort, 'low',
+    'an any-site solve explicitly asked to be cheap — honouring its hint is the ' +
+    'whole point of sending one');
 
   const saveFeatureState = async (changes, reason) => {
     const current = await (await fetch(`${base}/admin/model-config`, { headers: adminHeaders })).json();
