@@ -3204,7 +3204,7 @@ function validateMessage(senderClass, msg) {
   return null;
 }
 
-function blockedFeature(msg, config) {
+function blockedFeature(msg, config, senderClass = null) {
   const features = config?.features || {};
   if (msg.type === 'DOWNLOAD_FILES' && features.mesh_attachments === false) return 'Вложения из дневника временно отключены.';
   // The pill/web commands perform their own fill internally, so they belong
@@ -3213,7 +3213,11 @@ function blockedFeature(msg, config) {
   if (['FILL_ANSWERS_ALL', 'FILL_ANSWERS_TAB', 'TEST_NEXT_PAGE',
     'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'WEB_SOLVE_PAGE'].includes(msg.type) &&
       features.autofill === false) return 'Автозаполнение временно отключено.';
-  if (['WEB_SOLVE_PAGE', 'ACTIVATE_WEB_SITE'].includes(msg.type) &&
+  // Retained panels and popup captures remain usable after the pill's initial
+  // solve. Their actions must obey the same site switch on every invocation.
+  const webPanelAction = senderClass === 'web' && PANEL_ACTIONS.has(msg.type);
+  const webCaptureAction = msg.type === 'FILL_ANSWERS_TAB' && isWebCapture(msg.payload?.capture);
+  if ((['WEB_SOLVE_PAGE', 'ACTIVATE_WEB_SITE'].includes(msg.type) || webPanelAction || webCaptureAction) &&
       features.other_sites === false) return 'Работа на других сайтах временно отключена.';
   if (msg.type.startsWith('GDZ_') && features.gdz === false) return 'ГДЗ временно отключено.';
   if (['SOLVE', 'SOLVE_TEST', 'PILL_SOLVE_PAGE', 'PILL_SOLVE_ALL', 'RESOLVE_QUESTION', 'WEB_SOLVE_PAGE']
@@ -3297,7 +3301,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   (async () => {
     try {
-      const featureError = blockedFeature(msg, await getRuntimeConfig());
+      const featureError = blockedFeature(msg, await getRuntimeConfig(), senderClass);
       if (featureError) {
         sendResponse({ ok: false, error: featureError });
         return;

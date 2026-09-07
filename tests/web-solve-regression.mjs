@@ -54,6 +54,66 @@ function sectionOf(text, startMarker, endMarker) {
   return text.slice(start, end);
 }
 
+// Execute the real message handler so a missing sender argument at its feature
+// gate cannot hide behind unit tests of blockedFeature alone.
+{
+  let handler;
+  let effects = 0;
+  let otherSites = false;
+  let panelCapture = { mode: CAPTURE_MODE_WEB };
+  const context = {
+    chrome: { runtime: { onMessage: { addListener(fn) { handler = fn; } } } },
+    classifyMessageSender: (sender) => sender.kind,
+    validateMessage: () => null,
+    CONTENT_ACTIONS: new Set(['RESOLVE_QUESTION', 'FILL_ANSWERS_ALL']),
+    PANEL_ACTIONS: new Set(['RESOLVE_QUESTION', 'FILL_ANSWERS_ALL']),
+    consumeActionToken: () => true,
+    getRuntimeConfig: async () => ({ features: { other_sites: otherSites } }),
+    isWebCapture,
+    isImageFile: () => false,
+    isPdfFile: () => false,
+    withTabSolveLock: async (_tab, fn) => fn(),
+    withKeepAlive: async (fn) => fn(),
+    matchingAnswerPanelContext: () => ({ capture: panelCapture }),
+    readTestCaptureContext: async () => panelCapture,
+    withMatchingTestCapture: async (_capture, _read, fn) => fn(),
+    resolveOneQuestion: async () => { effects++; return { answer: '4' }; },
+    patchCachedTestAnswer: async () => {},
+    fillAllFrames: async () => { effects++; return { filled: [1] }; },
+    track: () => {},
+    errorCode: () => 'test',
+  };
+  vm.runInNewContext(
+    sectionOf(worker, 'function blockedFeature(', 'function clearExpiredActionTokens(') +
+    sectionOf(worker, 'chrome.runtime.onMessage.addListener(', '// MV3 keepalive.'),
+    context
+  );
+  const send = (type, kind, capture = panelCapture) => new Promise((resolve) => handler({
+    type, token: 'test-grant', payload: { tabId: 1, capture, panelNonce: 'test-panel', questions: [] },
+  }, { kind, tab: { id: 1 } }, resolve));
+
+  for (const [type, kind] of [
+    ['RESOLVE_QUESTION', 'web'], ['FILL_ANSWERS_ALL', 'web'],
+    ['FILL_ANSWERS_TAB', 'extension'],
+  ]) {
+    const response = await send(type, kind);
+    assert.equal(response.ok, false);
+    assert.match(response.error, /Работа на других сайтах временно отключена/);
+    assert.equal(effects, 0, 'disabled generic-page actions must not reach solve or fill');
+  }
+  otherSites = true;
+  assert.equal((await send('RESOLVE_QUESTION', 'web')).ok, true);
+  assert.equal((await send('FILL_ANSWERS_ALL', 'web')).ok, true);
+  assert.equal((await send('FILL_ANSWERS_TAB', 'extension')).ok, true);
+  assert.equal(effects, 3);
+  otherSites = false;
+  panelCapture = {}; // Mesh captures have no web discriminator.
+  assert.equal((await send('RESOLVE_QUESTION', 'content')).ok, true);
+  assert.equal((await send('FILL_ANSWERS_ALL', 'content')).ok, true);
+  assert.equal((await send('FILL_ANSWERS_TAB', 'extension')).ok, true);
+  assert.equal(effects, 6, 'the other-sites switch must leave Mesh actions usable');
+}
+
 /* ================= 1. Reach ================= */
 
 {
