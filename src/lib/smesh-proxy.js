@@ -418,7 +418,7 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
   if (!hasFreshEntitlement(status)) throw new Error(reasonMessage('bad_entitlement'));
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
 
-  const dbg = null;
+  const dbg = () => {};
   // Server-side usage reporting follows the same explicit opt-in as client
   // telemetry. Treat every missing, malformed, or unreadable value as false.
   let telemetryOptIn = false;
@@ -478,7 +478,16 @@ export async function askViaProxy(provider, messages, { label = 'AI', onDelta = 
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       throw new Error(`${label}: ${e?.message || 'не удалось загрузить вложение. Попробуйте ещё раз.'}`);
     }
-    const slim = { ...body };
+    // Uploads can outlive the ten-minute capability (or its remaining life).
+    // Refresh BEFORE the first start, then freeze the bytes for idempotent
+    // retries. Never attach another installation's credential to this blob.
+    await ensureLicensed();
+    const refreshed = await getLicenseStatus();
+    if (!isUsableLicenseStatus(refreshed) || !hasFreshEntitlement(refreshed) ||
+        refreshed.key !== status.key || refreshed.activation_token !== status.activation_token) {
+      throw new Error('Активация изменилась во время загрузки. Начните решение заново.');
+    }
+    const slim = { ...body, entitlement_token: refreshed.entitlement_token };
     delete slim.messages;
     slim.messages_blob = blobId;
     payload = JSON.stringify(slim);
