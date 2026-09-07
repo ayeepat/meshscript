@@ -480,6 +480,23 @@ export function reconcileAnswer(answer, work) {
   // than floating-point dust.
   if (rationalsEqual(parsed.value, computed)) return verified(stated);
 
+  // We do not receive the question's requested precision. If the answer is
+  // exactly the computed value rounded to its written decimal places, preserve
+  // it as unchecked: replacing 0.33 with 0.325 can spoil a correct hundredths
+  // answer. Use integers so decimal ties never depend on floating-point error.
+  if (parsed.shape === 'decimal') {
+    const numeric = stated.trim().replace(/[−‒–—―]/g, '-').slice(0,
+      parsed.suffix ? -parsed.suffix.length : undefined).replace(/\s+/g, '');
+    const places = numeric.includes('.') ? numeric.split('.')[1].length : 0;
+    const scale = 10n ** BigInt(places);
+    const difference = computed.n * parsed.value.d - parsed.value.n * computed.d;
+    const distance = difference < 0n ? -difference : difference;
+    // Include both tie endpoints: we do not know the requested tie convention.
+    if (distance * 2n * scale <= computed.d * parsed.value.d) {
+      return unchecked(stated, 'ответ может быть округлён по условию');
+    }
+  }
+
   // Write the fix back in the shape the model used. A fraction question wants a
   // fraction; substituting a decimal there would swap one wrong answer for
   // another. When the value cannot be written that way (a repeating decimal in

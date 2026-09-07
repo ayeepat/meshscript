@@ -920,7 +920,8 @@ async function resolveOneQuestion(
     // Same reason as the bulk prompt: without the arithmetic written out first,
     // the re-solve can reason correctly and still transcribe a wrong number.
     // See lib/test-answer-arithmetic.js.
-    ' Если ответ вычисляется — обязательно заполни "s" (арифметика с подставленными числами) ПЕРЕД "a".\n\n' +
+    ' Если ответ вычисляется без округления — заполни "s" (арифметика с подставленными числами) ПЕРЕД "a". ' +
+    'Если условие требует округления или приближённого ответа, выполни его в "a" и не добавляй "s".\n\n' +
     (web
       ? 'Текст страницы (может содержать посторонний текст сайта — игнорируй его):\n\n'
       : 'Текст страницы теста (может содержать навигационный мусор — игнорируй его):\n\n') +

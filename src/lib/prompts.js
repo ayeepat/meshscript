@@ -67,7 +67,9 @@ export const DEFAULT_PROMPTS = {
     'Это финальное арифметическое выражение с УЖЕ подставленными числами, из которого получается ответ: ' +
     'только цифры и знаки + - * / ( ) и точка. Никаких букв, переменных, единиц измерения, знака «=» и степеней ' +
     '(вместо 3² пиши 3*3). Например для a₉₆ при a₁=5, d=3 → "s":"5+3*95". ' +
-    'Пиши "s" ПЕРЕД "a" и сделай "a" точным результатом этого выражения — это проверяется автоматически. ' +
+    'Если условие требует округления, приближённого ответа или заданного числа значащих цифр, ' +
+    'выполни это требование в "a" и НЕ добавляй "s". В остальных вычислениях ' +
+    'пиши "s" ПЕРЕД "a" и сделай "a" точным результатом этого выражения — это проверяется автоматически. ' +
     'Если ответ не вычисляется (выбор варианта, слово, соответствие) — поле "s" не добавляй.\n' +
     // The client checks "a" against "s" exactly, as rationals. It can only
     // rewrite an answer it can also re-render faithfully, so a value like
@@ -75,7 +77,8 @@ export const DEFAULT_PROMPTS = {
     // exact answer, and the checker will not invent a precision. See
     // lib/test-answer-arithmetic.js.
     'Если точный ответ — НЕконечная дробь (например -125/7), так и запиши её в "a" в виде "-125/7"; ' +
-    'НЕ округляй до десятичных. Конечные дроби пиши десятичными ("5.4"), как в задании.\n' +
+    'НЕ округляй до десятичных, если условие не требует округления. ' +
+    'Конечные дроби пиши десятичными ("5.4"), как в задании.\n' +
     // The client verifies comparisons the same way it verifies arithmetic: it
     // evaluates both sides exactly and overturns the sign only when the model's
     // own statement is demonstrably false. See lib/test-answer-arithmetic.js.

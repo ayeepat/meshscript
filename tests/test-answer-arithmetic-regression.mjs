@@ -232,6 +232,21 @@ assert.equal(reconcileAnswer('164,0', '8+1.6*102').answer, '164,0');
 assert.equal(reconcileAnswer('164,0', '8+1.6*102').status, 'unchecked');
 assert.equal(reconcileAnswer('164.0', '8+1.6*102').answer, '171.2');
 
+// The question can request rounding; the checker has no precision contract.
+// Preserve plausible rounded values (including ties, signs and units) without
+// claiming that they were verified against the question.
+for (const [answer, work] of [
+  ['0.33', '1/8+1/5'], ['-0.33', '-(1/8+1/5)'],
+  ['0.33 кг', '1/8+1/5'], ['2', '5/2'], ['-2', '-7/4'],
+  ['0.00', '1/1000'], ['1.20', '1.204'], ['-0.00', '-1/1000'],
+]) {
+  const result = reconcileAnswer(answer, work);
+  assert.equal(result.answer, answer, `must preserve potentially rounded ${answer}`);
+  assert.equal(result.status, 'unchecked');
+}
+assert.equal(reconcileAnswer('0.34', '1/8+1/5').answer, '0.325',
+  'an answer that is not a rounded result must still be corrected');
+
 // A multi-select answer is the case that made the comma rule necessary: it must
 // survive even when "s" evaluates to something else entirely.
 assert.equal(reconcileAnswer('2,3', '1+1').answer, '2,3');
@@ -356,6 +371,9 @@ assert.equal(reconcileAnswer('287/1', '5+3*95').answer, '290');
     `${worker.slice(start, end)}\nvar __parse = parseTestAnswers;`,
     context
   );
+
+  const roundedReply = context.__parse('{"answers":[{"n":1,"s":"1/8+1/5","a":"0.33"}]}');
+  assert.equal(roundedReply[0].answer, '0.33', 'rounding must survive the actual answer parser');
 
   // Verbatim from the capture, with the "s" the prompt now requires. The "a"
   // values are the wrong ones the model actually produced.
