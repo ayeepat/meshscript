@@ -246,8 +246,9 @@ function isNonBillableRejection(status, text) {
  * "try the next model": the same model may work once the field is dropped.
  * It guards exactly one field — the reasoning_effort the policy above
  * synthesizes — so a per-model support fact that only a live probe can settle
- * (tests/302ai-verify.sh) degrades answer depth instead of returning a 502 on
- * every request. Mirrors backend-vps/server.js — keep both in sync.
+ * (tests/302ai-verify.sh — qwen3.8-flash verified 2026-09-07) degrades answer
+ * depth instead of returning a 502 on every request when a model swap
+ * invalidates it. Mirrors backend-vps/server.js — keep both in sync.
  */
 function isParameterRejection(status, text) {
   return status === 400 &&

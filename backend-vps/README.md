@@ -164,12 +164,19 @@ post-frontier allowance down with it, and it is one click away as a dashboard
 preset. The DeepSeek preset restores `deepseek-v4-flash` for Auto text but
 keeps a multimodal model for images, because DeepSeek V4 is text-only.
 
-If 302.AI ever rejects `reasoning_effort` on a model the policy sends it to, it
-answers HTTP 400 with `err_code: -10003`. That is treated as a rejected
-**field**, not a rejected model: the same model is retried once with the field
-removed (`isParameterRejection`), so the failure mode is a shallower answer
-rather than a dead route. `API_302_KEY=… bash tests/302ai-verify.sh` is the
-check that settles per-model support.
+`qwen3.8-flash`'s effort support was verified live on 302.AI on 2026-09-07
+(`xhigh`/`medium`/`low` all 200, with visibly different reasoning depth). Note
+that 302.AI also *accepts* `high` rather than rejecting it — which is why the
+policy translates the client's hint instead of forwarding it: an
+accepted-but-unrecognized value silently buys the model's fallback depth.
+
+If 302.AI ever rejects `reasoning_effort` on a model the policy sends it to —
+say after a dashboard model swap — it answers HTTP 400 with `err_code: -10003`.
+That is treated as a rejected **field**, not a rejected model: the same model is
+retried once with the field removed (`isParameterRejection`), so the failure
+mode is a shallower answer rather than a dead route.
+`API_302_KEY=… bash tests/302ai-verify.sh` is the check that settles per-model
+support.
 
 The owner dashboard calls `GET/PUT /admin/model-config` with
 `X-Model-Admin-Key`. This key is separate from `ADMIN_KEY`, `STATS_SECRET`,

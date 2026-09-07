@@ -639,6 +639,10 @@ const QWEN_NO_EFFORT = /^qwen(?!3\.8-flash\b)/i;
 // qwen3.8-flash and its -next sibling. Their effort vocabulary is
 // low / medium / xhigh (xhigh is the model's own default) — there is NO
 // 'high', so the client's hint is TRANSLATED, never passed through raw.
+// Translating rather than forwarding is load-bearing: 302.AI ACCEPTS 'high'
+// with HTTP 200 instead of rejecting it (verified live 2026-09-07), so an
+// un-translated hint would silently buy the model's fallback depth on work
+// that is supposed to get the deep setting.
 const QWEN_38_FLASH = /^qwen3\.8-flash\b/i;
 const QWEN_38_EFFORT = { low: 'low', medium: 'medium', high: 'xhigh' };
 // Schoolwork and tests are what this service is for, so the frontier routes
@@ -2330,9 +2334,10 @@ function isNonBillableRejection(status, text) {
  * same model may well work once the offending field is dropped.
  *
  * It exists for exactly one field. reasoning_effort support is a per-model,
- * per-reseller fact that can only be established by a live probe
- * (tests/302ai-verify.sh), and a wrong guess in the effort policy above would
- * otherwise turn into a 502 on EVERY request rather than a quality downgrade.
+ * per-reseller fact that only a live probe establishes (tests/302ai-verify.sh
+ * — qwen3.8-flash verified 2026-09-07), and a model swap from the dashboard
+ * can invalidate it without a code change. Without this branch that would be a
+ * 502 on EVERY request instead of a quality downgrade.
  */
 function isParameterRejection(status, text) {
   return status === 400 &&

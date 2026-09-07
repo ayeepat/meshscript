@@ -21,20 +21,21 @@
 #        breaking if 302.AI ever changes their error format
 #
 # CHECK 6 IS THE LOAD-BEARING ONE. The whole routing consolidation rests on
-# 302.AI accepting `reasoning_effort` on qwen3.8-flash: Qwen documents the knob
-# for this model (levels xhigh / medium / low — note there is NO "high"), but a
-# reseller passthrough is a separate fact from a vendor doc, and only this
-# script settles it. If the xhigh case fails with err_code -10003, the model
-# does NOT take the field on 302.AI: move `qwen3.8-flash` back under
-# QWEN_NO_EFFORT in backend-vps/server.js + backend/src/ai-proxy.js and say so
-# in the comment there. (Until then the servers degrade rather than break — a
-# -10003 makes them retry the same model once with the field removed, see
-# isParameterRejection.)
+# 302.AI accepting `reasoning_effort` on qwen3.8-flash. VERIFIED LIVE
+# 2026-09-07 against the production key: xhigh / medium / low all return 200
+# with visibly different reasoning_content depth. If the xhigh case ever starts
+# failing with err_code -10003, the model has stopped taking the field: move
+# `qwen3.8-flash` back under QWEN_NO_EFFORT in backend-vps/server.js +
+# backend/src/ai-proxy.js. (Until someone does, the servers degrade rather than
+# break — a -10003 makes them retry the same model once with the field removed,
+# see isParameterRejection.)
 #
-# The "high" case below documents the vocabulary gap: the client's hint set is
-# low/medium/high, so the servers TRANSLATE high → xhigh rather than forwarding
-# it. If that check starts passing, 302.AI has widened what it accepts and the
-# translation is merely redundant, not wrong.
+# The "high" case below documents the vocabulary gap. Qwen's levels are
+# xhigh / medium / low; the client's hint set is low/medium/high. 302.AI
+# ACCEPTS "high" (HTTP 200, live 2026-09-07) rather than rejecting it, which is
+# exactly why the servers TRANSLATE high → xhigh instead of forwarding: an
+# accepted-but-unrecognized value buys the model's fallback depth silently,
+# where the translated one buys the deep setting МЭШ work is supposed to get.
 #
 # Usage:  API_302_KEY=sk-... bash tests/302ai-verify.sh
 set -u
