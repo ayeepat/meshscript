@@ -79,7 +79,7 @@ assert.doesNotMatch(welcome, /<script(?![^>]*src=)/,
   'the welcome page must not contain inline script blocked by the extension CSP');
 
 const manifest = JSON.parse(source('../manifest.json'));
-assert.equal(manifest.version, '1.0.0');
+assert.equal(manifest.version, '1.0.1');
 assert.equal(manifest.homepage_url, 'https://smeshai.xyz/');
 assert.ok(manifest.host_permissions.includes('https://smeshai.xyz/*'));
 assert.ok(!manifest.host_permissions.includes('https://*.smeshai.xyz/*'),

@@ -146,7 +146,30 @@ function mutateCache(mutator) {
 function usableQuestion(question) {
   return !!question && typeof question === 'object' && !Array.isArray(question) &&
     (typeof question.index === 'number' || typeof question.index === 'string') &&
-    typeof question.answer === 'string';
+    typeof question.answer === 'string' && !!question.answer.trim() &&
+    !/не\s*видно|прокрут/i.test(question.answer);
+}
+
+function sameQuestionIds(questions, expectedIds) {
+  if (!Array.isArray(expectedIds) || !expectedIds.length || expectedIds.length > 512 ||
+      !Array.isArray(questions) || questions.length !== expectedIds.length) return false;
+  const ids = expectedIds.map((id) => String(id ?? '').trim());
+  if (ids.some((id) => !id) || new Set(ids).size !== ids.length) return false;
+  const actual = questions.map((question) => String(question?.index ?? '').trim());
+  return new Set(actual).size === actual.length && actual.every((id) => ids.includes(id));
+}
+
+// Salvaged output is useful to show, but never proof that a page is complete.
+// Accept a whole JSON object (optionally fenced), not a suffix rescued from a
+// truncated response. The DOM inventory independently witnesses the answer ids.
+function completeResponse(raw, expectedIds) {
+  try {
+    const text = String(raw ?? '').trim().replace(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i, '$1');
+    const answers = JSON.parse(text)?.answers;
+    if (!Array.isArray(answers)) return false;
+    const questions = answers.map((q) => ({ index: q?.n, answer: q?.a }));
+    return questions.every(usableQuestion) && sameQuestionIds(questions, expectedIds);
+  } catch { return false; }
 }
 
 function liveEntry(cache, key) {
@@ -155,15 +178,18 @@ function liveEntry(cache, key) {
   if (!Number.isFinite(entry.at) || Date.now() - entry.at > TEST_ANSWER_CACHE_TTL_MS) return null;
   const questions = Array.isArray(entry.v?.questions) ? entry.v.questions : null;
   if (!questions?.length || !questions.every(usableQuestion)) return null;
+  // Older entries never recorded completeness; let them age out without reuse.
+  if (entry.v.complete !== 1 || !sameQuestionIds(questions, entry.v.expectedIds)) return null;
   return entry;
 }
 
 /**
  * @param {object} capture the exact capture the answers would be filled into
- * @param {{image?: boolean}} options whether this request can see a screenshot
+ * @param {{image?: boolean, expectedIds?: string[]|null}} options screenshot
+ *   availability and the current DOM inventory (null means unknown).
  * @returns {Promise<{questions: object[], image: boolean}|null>}
  */
-export async function readCachedTestAnswers(capture, { image = false } = {}) {
+export async function readCachedTestAnswers(capture, { image = false, expectedIds } = {}) {
   const key = testAnswerCacheKey(capture);
   if (!key) return null;
   let cache;
@@ -172,16 +198,25 @@ export async function readCachedTestAnswers(capture, { image = false } = {}) {
   } catch { return null; } // a storage hiccup costs one solve, never an error
   const entry = liveEntry(cache, key);
   if (!entry) return null;
+  if (expectedIds !== undefined && !sameQuestionIds(entry.v.questions, expectedIds)) return null;
   if (image === true && entry.v.image !== true) return null;
   return { questions: entry.v.questions, image: entry.v.image === true };
 }
 
-/** Remember one solved page. Best-effort: a failed write only costs a re-solve. */
-export function writeCachedTestAnswers(capture, questions, { image = false } = {}) {
+/**
+ * Remember only a complete response covering the independent DOM inventory.
+ * `raw` is the original provider reply, so parser salvage cannot certify it.
+ * Unknown inventory and failed storage degrade to a fresh solve next time.
+ */
+export function writeCachedTestAnswers(capture, questions, { image = false, raw, expectedIds } = {}) {
   const key = testAnswerCacheKey(capture);
-  if (!key || !Array.isArray(questions) || !questions.length) return Promise.resolve(false);
+  if (!key || !sameQuestionIds(questions, expectedIds) || !questions.every(usableQuestion) ||
+      !completeResponse(raw, expectedIds)) return Promise.resolve(false);
   return mutateCache((cache) => {
-    cache[key] = { v: { questions, image: image === true }, at: Date.now() };
+    cache[key] = {
+      v: { questions, image: image === true, complete: 1, expectedIds: [...expectedIds] },
+      at: Date.now(),
+    };
     const keys = Object.keys(cache);
     if (keys.length > MAX_ENTRIES) {
       keys.sort((a, b) => (cache[a]?.at || 0) - (cache[b]?.at || 0));
@@ -204,7 +239,7 @@ export function writeCachedTestAnswers(capture, questions, { image = false } = {
  * to be image-backed, or that text answer would later be served to a screenshot
  * request the guard exists to protect.
  */
-export function patchCachedTestAnswer(capture, index, { answer, parts, explain, image = false } = {}) {
+export function patchCachedTestAnswer(capture, index, { answer, choice, parts, explain, image = false } = {}) {
   const key = testAnswerCacheKey(capture);
   if (!key || typeof answer !== 'string' || !answer.trim()) return Promise.resolve(false);
   return mutateCache((cache) => {
@@ -216,6 +251,8 @@ export function patchCachedTestAnswer(capture, index, { answer, parts, explain, 
       if (String(question?.index ?? '').trim() !== wanted) return question;
       matched = true;
       const patched = { ...question, answer };
+      if (choice != null && String(choice).trim()) patched.choice = String(choice).trim();
+      else delete patched.choice;
       if (Array.isArray(parts) && parts.length) patched.parts = parts;
       else delete patched.parts;
       // The stored «разбор» was written for the answer it replaced. Keep the

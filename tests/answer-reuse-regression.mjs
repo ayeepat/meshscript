@@ -67,8 +67,14 @@ const {
   patchCachedTestAnswer,
   readCachedTestAnswers,
   testAnswerCacheKey,
-  writeCachedTestAnswers,
+  writeCachedTestAnswers: writeCompletePage,
 } = await import('../src/lib/test-answer-cache.js');
+// These fixtures represent complete provider responses with a known DOM inventory.
+const writeCachedTestAnswers = (capture, questions, options = {}) => writeCompletePage(capture, questions, {
+  raw: JSON.stringify({ answers: questions.map((q) => ({ n: q.index, a: q.answer })) }),
+  expectedIds: questions.map((q) => String(q.index)),
+  ...options,
+});
 const { appendSolveTurn, cleanupLocalData, findLessonSession } = await import('../src/lib/history.js');
 
 const source = (relative) => readFileSync(new URL(relative, import.meta.url), 'utf8');
@@ -312,7 +318,7 @@ function captureAs(principal, ...signatures) {
   assert.equal(await patchCachedTestAnswer(page, '2', { answer: 'Лермонтов' }), true);
   const patched = await readCachedTestAnswers(page);
   assert.equal(patched.questions[1].answer, 'Лермонтов');
-  assert.equal(patched.questions[1].choice, 'б', 'unrelated fields of the corrected question are kept');
+  assert.equal(patched.questions[1].choice, undefined, 'a correction without option indices clears the rejected hint');
   assert.equal(patched.questions[0].answer, '42', 'other questions are untouched');
   assert.equal(await patchCachedTestAnswer(page, '99', { answer: 'нет такого' }), false,
     'an unknown question number must not drop the rest of the page');
@@ -377,6 +383,7 @@ function captureAs(principal, ...signatures) {
       async capturePageForPill() {
         return { pageText: 'вопрос 1 …', capture: pageCapture, hasVisualMedia: false };
       },
+      async readTestAnswerIds() { return ['1']; },
       async readCachedTestAnswers() { return cached; },
       async solveTest() {
         calls.solveTest += 1;

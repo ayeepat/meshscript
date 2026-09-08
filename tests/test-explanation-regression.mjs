@@ -237,7 +237,7 @@ const { parseTestAnswers, serializeTestAnswers, MAX_EXPLANATION_CHARS } = parser
   await writeCachedTestAnswers(capture, [
     { index: 1, text: '', answer: '287', explain: 'Старое пояснение.' },
     { index: 2, text: '', answer: 'Пушкин', explain: 'Другой вопрос.' },
-  ]);
+  ], { expectedIds: ['1', '2'], raw: '{"answers":[{"n":1,"a":"287"},{"n":2,"a":"Пушкин"}]}' });
 
   await patchCachedTestAnswer(capture, 1, { answer: '290', explain: 'Новое пояснение.' });
   let cached = await readCachedTestAnswers(capture);

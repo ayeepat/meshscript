@@ -1912,7 +1912,11 @@ function collectUnits() {
   // --- radio groups ---
   const radioByKey = new Map();
   for (const r of pickControls('input[type=radio]')) {
-    const key = r.name ? 'name:' + r.name : 'grp:' + elUid(r.closest('[role=radiogroup]') || r.parentElement);
+    // Native groups share a name, form OWNER (including form="…"), and tree.
+    // Independent forms routinely reuse "answer" for different questions.
+    const key = r.name
+      ? JSON.stringify([elUid(r.getRootNode()), r.form ? elUid(r.form) : null, r.name])
+      : 'grp:' + elUid(r.closest('[role=radiogroup]') || r.parentElement);
     if (!radioByKey.has(key)) radioByKey.set(key, []);
     radioByKey.get(key).push(r);
     consumed.add(r);
@@ -3159,6 +3163,38 @@ function testQuestionUnitInventory() {
   }
 }
 window.__smeshQuestionInventory = testQuestionUnitInventory;
+
+// Independent completeness witness for answer reuse. A page with no reliable
+// inventory can still be solved and filled; it simply cannot skip a later solve.
+function testAnswerInventory() {
+  try {
+    const markers = collectQuestionMarkers().filter((m) => isVisible(m.node));
+    const markerIds = [...new Set(markers.map((m) => String(m.number)))];
+    let ids;
+    if (isWebSolvableDocument()) {
+      const units = webQuestionUnits();
+      // webQuestionUnits is bounded; at the cap we cannot prove no tail was lost.
+      if (units.length >= MAX_WEB_UNITS) return null;
+      const numbering = webUnitIds(units);
+      if (units.length && markerIds.length && !numbering.numbered) return null;
+      ids = [...new Set([...numbering.ids, ...markerIds])];
+    } else {
+      const inventory = testQuestionUnitInventory();
+      if (!inventory.ok) return null;
+      const units = inventory.units;
+      if (units.some((u) => u.id == null)) {
+        // Only a single mechanism with wholly positional numbering is clear.
+        if (markerIds.length || units.some((u) => u.id != null) ||
+            new Set(units.map((u) => u.source)).size !== 1) return null;
+        ids = units.map((_, i) => String(i + 1));
+      } else {
+        ids = [...new Set([...units.map((u) => u.id), ...markerIds])];
+      }
+    }
+    return ids.length <= 512 ? { ids } : null;
+  } catch { return null; }
+}
+window.__smeshAnswerInventory = testAnswerInventory;
 
 // True only for a positively identified Mesh assessment document. The top
 // school/uchebnik wrapper is captured separately by the worker; this predicate

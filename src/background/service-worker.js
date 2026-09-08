@@ -911,7 +911,7 @@ async function resolveOneQuestion(
     (questionText ? ` Вопрос: «${String(questionText).slice(0, 600)}».` : '') +
     (prevAnswer ? ` Предыдущий ответ был «${String(prevAnswer).slice(0, 300)}» — реши заново и дай самый точный ответ (можешь подтвердить или исправить).` : '') +
     ` Верни JSON {"answers":[{"n":"${n}","s":"…","a":"…","e":"…"}]} ровно с одним элементом для этого вопроса` +
-    ' (если у вопроса несколько полей для ответа — добавь поле "p", как описано в инструкции).' +
+    ' (для вариантов ответа добавь свежие индексы в "c"; если полей несколько — добавь "p", как описано в инструкции).' +
     // The panel line keeps its «разбор» in step with the answer above it: a
     // re-solved question that returned no new sentence clears the old one
     // rather than leaving it explaining a number that changed.
@@ -980,8 +980,8 @@ async function resolveOneQuestion(
   // fills every box, not just the first — and the fresh «разбор», so the panel
   // line's explanation belongs to the answer printed above it.
   const resolved = match
-    ? { answer: match.answer, parts: match.parts || null, explain: match.explain || '' }
-    : { answer: '', parts: null, explain: '' };
+    ? { answer: match.answer, choice: match.choice || null, parts: match.parts || null, explain: match.explain || '' }
+    : { answer: '', choice: null, parts: null, explain: '' };
   return withMatchingTestCapture(capture, readTestCaptureContext, async () => resolved);
 }
 
@@ -2069,6 +2069,26 @@ async function runInCapturedDocumentsWithIds(capture, fnName) {
   return normalized;
 }
 
+// Cache completeness uses question-bearing documents, just like the cache key.
+// Failed/ambiguous discovery is a cache miss, not a failed paid solve. The
+// normal capture guards still run before presenting or filling any answer.
+async function readTestAnswerIds(capture) {
+  try {
+    const results = await runInCapturedDocumentsWithIds(capture, '__smeshAnswerInventory');
+    const children = capture.documents.filter((d) => d.frameId !== 0);
+    const documents = children.length ? children : capture.documents;
+    const ids = [];
+    for (const document of documents) {
+      const inventory = results.find((entry) => entry.documentId === document.documentId)?.result;
+      if (!Array.isArray(inventory?.ids) || inventory.ids.length > 512) return null;
+      ids.push(...inventory.ids);
+    }
+    if (!ids.length || ids.length > 512 || ids.some((id) => typeof id !== 'string' || !/^\d{1,3}$/.test(id)) ||
+        new Set(ids).size !== ids.length) return null;
+    return ids;
+  } catch { return null; }
+}
+
 // Combined signature of the visible test page across all frames — lets the
 // popup detect whether clicking «Далее» actually advanced the page.
 async function testPageSig(tabId) {
@@ -2435,7 +2455,8 @@ async function pillSolveOnePage(tabId, provider, signal = null) {
   // activeTab, so the pill solves from the captured DOM text alone.
   throwIfPillCancelled(signal);
   const { pageText, capture, hasVisualMedia } = await capturePageForPill(tabId);
-  const reused = await readCachedTestAnswers(capture);
+  const expectedIds = await readTestAnswerIds(capture);
+  const reused = await readCachedTestAnswers(capture, { expectedIds });
   // Reuse skips solveTest, and with it solveTest's own gates. Filling a test is
   // the licensed action whether or not this particular page costs a completion,
   // and a withdrawn consent must stop the extension answering — so the reuse
@@ -2473,7 +2494,7 @@ async function pillSolveOnePage(tabId, provider, signal = null) {
     questions = parseTestAnswers(answer);
     // Remember the page BEFORE filling it: the fill mutates the student's form,
     // and only the answers themselves are worth another attempt's money.
-    if (questions.length) await writeCachedTestAnswers(capture, questions);
+    if (questions.length) await writeCachedTestAnswers(capture, questions, { raw: answer, expectedIds });
   }
   throwIfPillCancelled(signal);
   return withMatchingTestCapture(capture, readTestCaptureContext, async () => {
@@ -2823,7 +2844,8 @@ async function fillWebAnswersInTab(capture, questions) {
 async function webSolveOnePage(tabId, provider, signal = null) {
   throwIfPillCancelled(signal);
   const { pageText, capture, unitCount } = await capturePageForWeb(tabId);
-  const reused = await readCachedTestAnswers(capture);
+  const expectedIds = await readTestAnswerIds(capture);
+  const reused = await readCachedTestAnswers(capture, { expectedIds });
   // Reuse skips solveWebPage's gates; run them here for the same reason the
   // Mesh path does — filling is the licensed action whether or not this
   // particular page costs a completion.
@@ -2852,7 +2874,7 @@ async function webSolveOnePage(tabId, provider, signal = null) {
       text: pageText, signal, pageUrl: capture.url,
     });
     questions = parseTestAnswers(answer);
-    if (questions.length) await writeCachedTestAnswers(capture, questions);
+    if (questions.length) await writeCachedTestAnswers(capture, questions, { raw: answer, expectedIds });
   }
   throwIfPillCancelled(signal);
   return withMatchingTestCapture(capture, readTestCaptureContext, async () => {
@@ -3346,7 +3368,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           // the screenshot route exists for pages the DOM text can't carry.
           const withImage = msg.payload.hasVisualMedia === true && !!msg.payload.screenshot;
           const { answer, questions, cached } = await withTabSolveLock(tabId, () => withKeepAlive(async () => {
-            const reused = await readCachedTestAnswers(capture, { image: withImage });
+            const expectedIds = await readTestAnswerIds(capture);
+            const reused = await readCachedTestAnswers(capture, { image: withImage, expectedIds });
             // Reuse skips solveTest's licence/consent gates — run them here, so
             // an expired key or a withdrawn consent stops this path too.
             if (reused) {
@@ -3377,7 +3400,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
               });
             }
             if (!reused && parsed.length) {
-              await writeCachedTestAnswers(capture, parsed, { image: withImage });
+              await writeCachedTestAnswers(capture, parsed, { image: withImage, raw: solved, expectedIds });
             }
             await withMatchingTestCapture(capture, readTestCaptureContext, async () => {
               // Hand the screenshot to the panel: the popup can take one, the
@@ -3586,6 +3609,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({
             ok: true,
             answer: resolved.answer,
+            choice: resolved.choice,
             parts: resolved.parts,
             explain: resolved.explain,
           });

@@ -791,6 +791,10 @@
     // the re-fill below spreads them across every box, not just the first. The
     // worker returns null `parts` for single-box questions — clear stale ones then.
     const nextQuestion = { ...q, answer: r.answer };
+    // Option indices belong to this answer, never to the rejected one. Clear
+    // them even when an older worker replies without the field.
+    if (r.choice) nextQuestion.choice = r.choice;
+    else delete nextQuestion.choice;
     if ('parts' in r) nextQuestion.parts = r.parts || undefined;
     // Same rule for the «разбор»: the sentence must belong to the answer above
     // it, so a re-solve that returned none clears the one that explained the
@@ -822,6 +826,8 @@
     // during a slow fill never gets a window in which it can display old-page
     // answer text before teardown.
     q.answer = nextQuestion.answer;
+    if (nextQuestion.choice) q.choice = nextQuestion.choice;
+    else delete q.choice;
     if ('parts' in r) q.parts = nextQuestion.parts;
     if ('explain' in r) {
       if (nextQuestion.explain) q.explain = nextQuestion.explain;
